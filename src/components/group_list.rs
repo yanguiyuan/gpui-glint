@@ -1,0 +1,494 @@
+use super::Icon;
+use crate::theme::ThemePreset;
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    Context, EventEmitter, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
+};
+use std::collections::HashSet;
+
+/// A group header in a [`GroupList`]: an icon + title row whose trailing
+/// actions appear only while hovered.
+#[derive(Clone, Debug)]
+pub struct GroupListHeader {
+    pub id: SharedString,
+    pub icon: Option<Icon>,
+    pub label: SharedString,
+    pub actions: Vec<Icon>,
+}
+
+impl GroupListHeader {
+    pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            icon: None,
+            label: label.into(),
+            actions: Vec::new(),
+        }
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Trailing action icons revealed while the header is hovered.
+    pub fn actions(mut self, actions: impl IntoIterator<Item = Icon>) -> Self {
+        self.actions = actions.into_iter().collect();
+        self
+    }
+}
+
+/// One entry inside a [`GroupListGroup`]. While hovered, the leading icon may
+/// swap to `hover_icon` and the trailing meta may swap to an `action` icon.
+#[derive(Clone, Debug)]
+pub struct GroupListItem {
+    pub id: SharedString,
+    pub icon: Option<Icon>,
+    pub label: SharedString,
+    pub meta: Option<SharedString>,
+    pub prefix: Option<SharedString>,
+    pub prefix_color: Option<u32>,
+    pub hover_icon: Option<Icon>,
+    pub action: Option<Icon>,
+}
+
+impl GroupListItem {
+    pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+        Self {
+            id: id.into(),
+            icon: None,
+            label: label.into(),
+            meta: None,
+            prefix: None,
+            prefix_color: None,
+            hover_icon: None,
+            action: None,
+        }
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// A short leading label, such as an HTTP method.
+    pub fn prefix(mut self, text: impl Into<SharedString>) -> Self {
+        self.prefix = Some(text.into());
+        self
+    }
+    pub fn prefix_color(mut self, color: u32) -> Self {
+        self.prefix_color = Some(color);
+        self
+    }
+    pub fn meta(mut self, meta: impl Into<SharedString>) -> Self {
+        self.meta = Some(meta.into());
+        self
+    }
+
+    /// Leading icon shown in place of `icon` while the row is hovered,
+    /// e.g. a pin shortcut.
+    pub fn hover_icon(mut self, icon: Icon) -> Self {
+        self.hover_icon = Some(icon);
+        self
+    }
+
+    /// Trailing action icon shown in place of `meta` while the row is hovered,
+    /// e.g. a delete shortcut.
+    pub fn action(mut self, icon: Icon) -> Self {
+        self.action = Some(icon);
+        self
+    }
+}
+
+/// A titled group of [`GroupListItem`]s.
+#[derive(Clone, Debug)]
+pub struct GroupListGroup {
+    pub header: GroupListHeader,
+    pub items: Vec<GroupListItem>,
+}
+
+impl GroupListGroup {
+    pub fn new(header: GroupListHeader) -> Self {
+        Self {
+            header,
+            items: Vec::new(),
+        }
+    }
+
+    pub fn item(mut self, item: GroupListItem) -> Self {
+        self.items.push(item);
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum GroupListEvent {
+    /// A group header row was clicked.
+    HeaderClicked { group: SharedString },
+    /// One of a header's hover actions was clicked, by its position in
+    /// [`GroupListHeader::actions`].
+    HeaderAction { group: SharedString, index: usize },
+    /// An item was clicked; the list updates its own selection first.
+    ItemSelected {
+        group: SharedString,
+        item: SharedString,
+    },
+    /// An item's hover action was clicked, e.g. the delete shortcut.
+    ItemAction {
+        group: SharedString,
+        item: SharedString,
+    },
+}
+
+/// A sidebar source list: titled groups with icon + label + meta rows,
+/// quiet hover states that reveal contextual actions, and a highlighted
+/// selection pill. Item ids are expected to be unique across groups.
+pub struct GroupList {
+    groups: Vec<GroupListGroup>,
+    selected: Option<SharedString>,
+    hovered: Option<SharedString>,
+    collapsed: HashSet<SharedString>,
+    theme: ThemePreset,
+    width: Option<f32>,
+}
+
+impl EventEmitter<GroupListEvent> for GroupList {}
+
+impl GroupList {
+    pub fn new(groups: impl IntoIterator<Item = GroupListGroup>) -> Self {
+        Self {
+            groups: groups.into_iter().collect(),
+            selected: None,
+            hovered: None,
+            collapsed: HashSet::new(),
+            theme: ThemePreset::default(),
+            width: None,
+        }
+    }
+
+    pub fn selected(mut self, selected: Option<SharedString>) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    /// Group ids that start collapsed; clicking a header toggles its group.
+    pub fn collapsed(mut self, groups: impl IntoIterator<Item = impl Into<SharedString>>) -> Self {
+        self.collapsed = groups.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn theme(mut self, theme: ThemePreset) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        if self.theme != theme {
+            self.theme = theme;
+            cx.notify();
+        }
+    }
+
+    /// Fixed width in pixels; by default the list fills its container.
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width.max(0.));
+        self
+    }
+
+    pub fn set_selected(&mut self, selected: Option<SharedString>, cx: &mut Context<Self>) {
+        self.selected = selected;
+        cx.notify();
+    }
+
+    /// The currently selected item id, if any.
+    pub fn selected_item(&self) -> Option<&SharedString> {
+        self.selected.as_ref()
+    }
+
+    /// Whether a group is currently collapsed.
+    pub fn is_collapsed(&self, group: &SharedString) -> bool {
+        self.collapsed.contains(group)
+    }
+
+    pub fn set_collapsed(
+        &mut self,
+        group: impl Into<SharedString>,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let group = group.into();
+        if collapsed {
+            self.collapsed.insert(group);
+        } else {
+            self.collapsed.remove(&group);
+        }
+        cx.notify();
+    }
+
+    /// Flips a group's collapsed state; the header click does this already.
+    pub fn toggle_group(&mut self, group: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let group = group.into();
+        if !self.collapsed.remove(&group) {
+            self.collapsed.insert(group);
+        }
+        cx.notify();
+    }
+
+    pub fn set_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = GroupListGroup>,
+        cx: &mut Context<Self>,
+    ) {
+        self.groups = groups.into_iter().collect();
+        cx.notify();
+    }
+
+    fn hovered_row(&mut self, hovered: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.hovered != hovered {
+            self.hovered = hovered;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for GroupList {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let p = theme.palette();
+        let dark = theme.is_dark();
+        let hover_bg = if dark {
+            rgba(0xffffff14)
+        } else {
+            rgb(p.surface_subtle)
+        };
+        let selected_bg = if dark {
+            rgba(0xffffff1f)
+        } else {
+            rgb(p.surface_subtle)
+        };
+
+        let mut root = div()
+            .id("glass-group-list")
+            .when_some(self.width, |list, width| list.w(px(width)))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .text_size(px(13.));
+
+        for group in &self.groups {
+            let group_id = group.header.id.clone();
+            let header_key = SharedString::from(format!("h:{}", group_id));
+            let header_hovered = self.hovered.as_ref() == Some(&header_key);
+            let mut header = div()
+                .id(header_key.clone())
+                .w_full()
+                .h(px(32.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(7.))
+                .text_size(px(13.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(p.text_muted))
+                .when(header_hovered && !group.header.actions.is_empty(), |row| {
+                    row.bg(hover_bg)
+                })
+                .on_hover(cx.listener({
+                    let key = header_key.clone();
+                    move |this, hovered: &bool, _, cx| {
+                        this.hovered_row(hovered.then(|| key.clone()), cx);
+                    }
+                }))
+                .on_click(cx.listener({
+                    let group_id = group_id.clone();
+                    move |this, _, _, cx| {
+                        this.toggle_group(group_id.clone(), cx);
+                        cx.emit(GroupListEvent::HeaderClicked {
+                            group: group_id.clone(),
+                        });
+                        cx.notify();
+                    }
+                }));
+            if let Some(icon) = group.header.icon {
+                header = header.child(icon.render(15.));
+            }
+            header = header.child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .child(group.header.label.clone()),
+            );
+            if header_hovered {
+                for (index, icon) in group.header.actions.iter().enumerate() {
+                    header = header.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "glass-group-list-header-action-{}-{index}",
+                                group_id
+                            )))
+                            .size(px(22.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .text_color(rgb(p.text_muted))
+                            .cursor_pointer()
+                            .hover(move |style| {
+                                style
+                                    .bg(if dark {
+                                        rgba(0xffffff1f)
+                                    } else {
+                                        rgb(p.border)
+                                    })
+                                    .text_color(rgb(p.text))
+                            })
+                            .on_click(cx.listener({
+                                let group_id = group_id.clone();
+                                move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(GroupListEvent::HeaderAction {
+                                        group: group_id.clone(),
+                                        index,
+                                    });
+                                    cx.notify();
+                                }
+                            }))
+                            .child(icon.render(14.)),
+                    );
+                }
+            }
+            let mut section = div().flex().flex_col().gap(px(2.)).child(header);
+
+            if self.collapsed.contains(&group_id) {
+                root = root.child(section);
+                continue;
+            }
+
+            for item in &group.items {
+                let item_id = item.id.clone();
+                let item_key = SharedString::from(format!("i:{}", item_id));
+                let item_hovered = self.hovered.as_ref() == Some(&item_key);
+                let is_selected = self.selected.as_ref() == Some(&item_id);
+                let mut row = div()
+                    .id(item_key.clone())
+                    .w_full()
+                    .h(px(34.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(7.))
+                    .text_size(px(13.))
+                    .text_color(rgb(p.text))
+                    .cursor_pointer()
+                    .when(is_selected, |row| row.bg(selected_bg))
+                    .when(item_hovered && !is_selected, |row| row.bg(hover_bg))
+                    .on_hover(cx.listener({
+                        let key = item_key.clone();
+                        move |this, hovered: &bool, _, cx| {
+                            this.hovered_row(hovered.then(|| key.clone()), cx);
+                        }
+                    }))
+                    .on_click(cx.listener({
+                        let group_id = group_id.clone();
+                        let item_id = item_id.clone();
+                        move |this, _, _, cx| {
+                            this.selected = Some(item_id.clone());
+                            cx.emit(GroupListEvent::ItemSelected {
+                                group: group_id.clone(),
+                                item: item_id.clone(),
+                            });
+                            cx.notify();
+                        }
+                    }));
+                let leading_icon = if item_hovered {
+                    item.hover_icon.or(item.icon)
+                } else {
+                    item.icon
+                };
+                if let Some(icon) = leading_icon {
+                    row = row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(p.text_muted))
+                            .child(icon.render(14.)),
+                    );
+                }
+                if let Some(prefix) = &item.prefix {
+                    row = row.child(
+                        div()
+                            .w(px(38.))
+                            .flex_shrink_0()
+                            .font_family("Menlo")
+                            .text_size(px(10.))
+                            .text_color(rgb(item.prefix_color.unwrap_or(p.text_muted)))
+                            .child(prefix.clone()),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .child(item.label.clone()),
+                );
+                let trailing_action = item_hovered.then_some(item.action).flatten();
+                if let Some(action) = trailing_action {
+                    row = row.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "glass-group-list-item-action-{}",
+                                item_id
+                            )))
+                            .size(px(22.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .text_color(rgb(p.text_muted))
+                            .cursor_pointer()
+                            .hover(move |style| {
+                                style
+                                    .bg(if dark {
+                                        rgba(0xffffff1f)
+                                    } else {
+                                        rgb(p.border)
+                                    })
+                                    .text_color(rgb(p.text))
+                            })
+                            .on_click(cx.listener({
+                                let group_id = group_id.clone();
+                                let item_id = item_id.clone();
+                                move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(GroupListEvent::ItemAction {
+                                        group: group_id.clone(),
+                                        item: item_id.clone(),
+                                    });
+                                    cx.notify();
+                                }
+                            }))
+                            .child(action.render(14.)),
+                    );
+                } else if let Some(meta) = &item.meta {
+                    row = row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(rgb(p.text_muted))
+                            .child(meta.clone()),
+                    );
+                }
+                section = section.child(row);
+            }
+            root = root.child(section);
+        }
+
+        root
+    }
+}

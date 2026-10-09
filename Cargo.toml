@@ -1,0 +1,63 @@
+[package]
+name = "gpui-glint"
+version = "0.1.0"
+description = "A refined component library for GPUI-CE."
+edition = "2024"
+rust-version = "1.95"
+authors = ["Yanguiyuan"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/yanguiyuan/gpui-glint"
+homepage = "https://github.com/yanguiyuan/gpui-glint"
+documentation = "https://docs.rs/gpui-glint"
+keywords = ["gpui", "gui", "widgets", "desktop", "ui"]
+categories = ["gui"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/**",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/rust-toolchain.toml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+webview = ["dep:wry"]
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+wry = { version = "0.55", optional = true }
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+pulldown-cmark = "0.13"
+serde_json = { version = "1", features = ["preserve_order"] }
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+image = { version = "0.25", default-features = false }
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+chrono = "0.4"
+unicode-segmentation = "1.13"
+
+[dev-dependencies]
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "brotli", "deflate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+encoding_rs = "0.8"
+gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11", "test-support"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+
+[[example]]
+name = "webview"
+path = "examples/webview.rs"
+required-features = ["webview"]
