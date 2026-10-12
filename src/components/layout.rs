@@ -1,7 +1,95 @@
 use crate::theme::ThemePreset;
 use gpui::{
-    AnyElement, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px, rgb, rgba,
+    AnyElement, App, InteractiveElement, IntoElement, MouseButton, ParentElement, RenderOnce,
+    Styled, Window, WindowControlArea, div, prelude::FluentBuilder, px, rgb, rgba,
 };
+
+/// A flexible titlebar spacer with native Windows dragging and double-click maximize.
+/// Place it between controls rather than wrapping interactive children in a drag area.
+pub fn window_drag_region() -> gpui::Div {
+    div()
+        .flex_1()
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+        .when(!cfg!(target_os = "windows"), |region| {
+            region.on_mouse_down(MouseButton::Left, |event, window, _| {
+                if event.click_count == 2 {
+                    window.zoom_window();
+                } else {
+                    window.start_window_move();
+                }
+            })
+        })
+}
+
+#[derive(IntoElement)]
+struct WindowControls(ThemePreset);
+
+impl RenderOnce for WindowControls {
+    fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
+        let palette = self.0.palette();
+        let maximized = window.is_maximized();
+        let mut controls = div().h_full().flex().flex_shrink_0();
+        for (id, area) in [
+            ("glint-window-minimize", WindowControlArea::Min),
+            ("glint-window-maximize", WindowControlArea::Max),
+            ("glint-window-close", WindowControlArea::Close),
+        ] {
+            let close = area == WindowControlArea::Close;
+            let symbol = match area {
+                WindowControlArea::Min => div()
+                    .w(px(10.))
+                    .h(px(1.))
+                    .bg(rgb(palette.text))
+                    .into_any_element(),
+                WindowControlArea::Max => div()
+                    .relative()
+                    .size(px(10.))
+                    .when(maximized, |icon| {
+                        icon.child(
+                            div()
+                                .absolute()
+                                .left(px(2.))
+                                .top(px(-2.))
+                                .size(px(8.))
+                                .border_1()
+                                .border_color(rgb(palette.text)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .size(px(10.))
+                            .border_1()
+                            .border_color(rgb(palette.text))
+                            .bg(rgb(palette.canvas)),
+                    )
+                    .into_any_element(),
+                _ => super::Icon::Close.render(14.).into_any_element(),
+            };
+            controls = controls.child(
+                div()
+                    .id(id)
+                    .w(px(46.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(palette.text))
+                    .window_control_area(area)
+                    .hover(move |style| {
+                        if close {
+                            style.bg(rgb(0xc42b1c)).text_color(rgb(0xffffff))
+                        } else {
+                            style.bg(rgb(palette.surface))
+                        }
+                    })
+                    .child(symbol),
+            );
+        }
+        controls
+    }
+}
 
 /// A full-window shell with a topbar, outer navigation rail, and workspace.
 ///
@@ -16,6 +104,7 @@ pub struct AppLayout {
     navigation_rail_width: f32,
     sidebar_width: f32,
     sidebar_visible: bool,
+    window_controls: bool,
     theme: ThemePreset,
 }
 
@@ -34,6 +123,7 @@ impl AppLayout {
             navigation_rail_width: 48.,
             sidebar_width: 248.,
             sidebar_visible: true,
+            window_controls: cfg!(target_os = "windows"),
             theme: ThemePreset::default(),
         }
     }
@@ -68,6 +158,13 @@ impl AppLayout {
         self
     }
 
+    /// Shows native Windows caption controls. Enabled on Windows by default.
+    /// Disable for embedded layout previews or windows with a system titlebar.
+    pub fn window_controls(mut self, visible: bool) -> Self {
+        self.window_controls = visible;
+        self
+    }
+
     pub fn render(self) -> gpui::Div {
         let palette = self.theme.palette();
         let topbar = div()
@@ -76,7 +173,10 @@ impl AppLayout {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .child(self.topbar);
+            .child(div().flex_1().min_w_0().h_full().child(self.topbar))
+            .when(self.window_controls && cfg!(target_os = "windows"), |bar| {
+                bar.child(WindowControls(self.theme))
+            });
 
         let sidebar = div()
             .w(px(self.sidebar_width))

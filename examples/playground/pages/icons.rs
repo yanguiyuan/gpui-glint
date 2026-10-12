@@ -31,6 +31,8 @@ impl Render for IconsPage {
             (Icon::Pulse, "状态"),
             (Icon::Key, "密钥"),
             (Icon::Folders, "文件夹"),
+            (Icon::Folder, "收起目录"),
+            (Icon::FolderOpen, "展开目录"),
             (Icon::Compass, "导航"),
             (Icon::Clock, "时间"),
             (Icon::User, "用户"),

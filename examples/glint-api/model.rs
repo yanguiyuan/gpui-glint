@@ -27,7 +27,16 @@ pub struct Draft {
     pub cookies: Vec<Pair>,
     pub token: String,
     pub auth: bool,
+    #[serde(default)]
+    pub skip_tls_verification: bool,
     pub environment: usize,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Exchange {
+    pub response: Option<super::http::HttpResponse>,
+    pub error: Option<String>,
+    pub preview: Option<String>,
+    pub traces: Vec<super::TraceEntry>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -36,11 +45,16 @@ pub struct Record {
     pub time: String,
     pub detail: String,
     pub elapsed_ms: Option<u128>,
+    #[serde(default)]
+    pub exchange: Option<Exchange>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
+    pub tree_order: u64,
     pub name: String,
     pub collection: String,
+    #[serde(rename = "folder", alias = "group", default)]
     pub group: String,
     pub draft: Draft,
     pub versions: Vec<Record>,
@@ -48,7 +62,10 @@ pub struct Request {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RequestGroups {
+    #[serde(default)]
+    pub folder_order: std::collections::BTreeMap<String, u64>,
     pub collection: String,
+    #[serde(rename = "folders", alias = "names", default)]
     pub names: Vec<String>,
 }
 impl RequestGroups {
@@ -65,6 +82,7 @@ impl RequestGroups {
         }
         Self {
             collection: "Test API".into(),
+            folder_order: Default::default(),
             names,
         }
     }
@@ -81,19 +99,41 @@ impl RequestGroups {
         }
         Ok(Self {
             collection: name.into(),
+            folder_order: Default::default(),
             names: vec![],
         })
     }
+    pub fn parent(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+    pub fn contains(&self, path: &str) -> bool {
+        path.is_empty() || self.names.iter().any(|folder| folder == path)
+    }
+    #[cfg(test)]
     pub fn add(&mut self, name: &str) -> Result<String, String> {
+        self.add_child("", name)
+    }
+    pub fn add_child(&mut self, parent: &str, name: &str) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("请输入分组名称".into());
+            return Err("请输入目录名称".into());
         }
-        if self.names.iter().any(|existing| existing == name) {
-            return Err("分组名称已存在".into());
+        if name.contains('/') {
+            return Err("目录名称不能包含 /".into());
         }
-        self.names.push(name.to_owned());
-        Ok(name.to_owned())
+        if !self.contains(parent) {
+            return Err("父目录不存在".into());
+        }
+        let path = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if self.names.contains(&path) {
+            return Err("同级目录名称已存在".into());
+        }
+        self.names.push(path.clone());
+        Ok(path)
     }
     pub fn rename(
         &mut self,
@@ -101,48 +141,348 @@ impl RequestGroups {
         name: &str,
         requests: &mut [Request],
     ) -> Result<(), String> {
+        if old.is_empty() || !self.names.iter().any(|folder| folder == old) {
+            return Err("目录不存在".into());
+        }
         let name = name.trim();
-        if old == "未分组" {
-            return Err("未分组为系统分组".into());
-        }
         if name.is_empty() {
-            return Err("请输入分组名称".into());
+            return Err("请输入目录名称".into());
         }
-        let index = self
-            .names
-            .iter()
-            .position(|group| group == old)
-            .ok_or("分组不存在")?;
-        if name != old && self.names.iter().any(|existing| existing == name) {
-            return Err("分组名称已存在".into());
+        if name.contains('/') {
+            return Err("目录名称不能包含 /".into());
         }
-        self.names[index] = name.to_owned();
+        let parent = Self::parent(old);
+        let new = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if new != old && self.names.contains(&new) {
+            return Err("同级目录名称已存在".into());
+        }
+        let prefix = format!("{old}/");
+        let replace = |path: &mut String| {
+            if path == old || path.starts_with(&prefix) {
+                *path = format!("{new}{}", &path[old.len()..]);
+            }
+        };
+        for path in &mut self.names {
+            replace(path);
+        }
+        self.folder_order = std::mem::take(&mut self.folder_order)
+            .into_iter()
+            .map(|(mut path, order)| {
+                replace(&mut path);
+                (path, order)
+            })
+            .collect();
         for request in requests
             .iter_mut()
-            .filter(|request| request.collection == self.collection && request.group == old)
+            .filter(|r| r.collection == self.collection)
         {
-            request.group = name.to_owned();
+            replace(&mut request.group);
         }
         Ok(())
     }
-    pub fn remove(&mut self, name: &str, requests: &mut [Request]) {
-        if name == "未分组" {
+    /// Remove a directory subtree while keeping its requests in the parent directory.
+    pub fn remove(&mut self, path: &str, requests: &mut [Request]) {
+        if path.is_empty() || !self.names.iter().any(|folder| folder == path) {
             return;
         }
-        self.names.retain(|group| group != name);
-        let mut moved = false;
+        let prefix = format!("{path}/");
+        self.names
+            .retain(|folder| folder != path && !folder.starts_with(&prefix));
+        self.folder_order
+            .retain(|folder, _| folder != path && !folder.starts_with(&prefix));
         for request in requests
             .iter_mut()
-            .filter(|request| request.collection == self.collection && request.group == name)
+            .filter(|r| r.collection == self.collection)
         {
-            request.group = "未分组".into();
-            moved = true;
-        }
-        if moved && !self.names.iter().any(|group| group == "未分组") {
-            self.names.push("未分组".into());
+            if request.group == path || request.group.starts_with(&prefix) {
+                request.group = Self::parent(path).to_owned();
+            }
         }
     }
 }
+/// Visible preorder rows of the request tree. Empty paths represent collection roots.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeEntry {
+    Directory {
+        collection: usize,
+        path: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Request {
+        index: usize,
+        depth: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeNode {
+    Directory { collection: usize, path: String },
+    Request(usize),
+}
+pub use gpui_glint::components::TreeDropPlacement as Placement;
+
+pub fn siblings(
+    collections: &[RequestGroups],
+    requests: &[Request],
+    collection: usize,
+    parent: &str,
+) -> Vec<TreeNode> {
+    let c = &collections[collection];
+    let mut nodes = c
+        .names
+        .iter()
+        .filter(|p| RequestGroups::parent(p) == parent)
+        .map(|p| TreeNode::Directory {
+            collection,
+            path: p.clone(),
+        })
+        .chain(
+            requests
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.collection == c.collection && r.group == parent)
+                .map(|(i, _)| TreeNode::Request(i)),
+        )
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|node| match node {
+        TreeNode::Directory { path, .. } => c.folder_order.get(path).copied().unwrap_or(0),
+        TreeNode::Request(i) => requests[*i].tree_order,
+    });
+    nodes
+}
+
+/// Move metadata without reindexing requests, preserving tabs, responses and history.
+pub fn move_node(
+    collections: &mut [RequestGroups],
+    requests: &mut [Request],
+    source: &TreeNode,
+    target: &TreeNode,
+    placement: Placement,
+) -> Result<TreeNode, String> {
+    if source == target {
+        return Ok(source.clone());
+    }
+    if let TreeNode::Directory { collection, path } = target {
+        if !collections
+            .get(*collection)
+            .is_some_and(|c| c.contains(path))
+        {
+            return Err("目标目录不存在".into());
+        }
+    }
+    if matches!(target, TreeNode::Request(_)) && placement == Placement::Inside {
+        return Err("请求是叶子节点，不能包含其他节点".into());
+    }
+    let (destination, parent) = match target {
+        TreeNode::Directory { collection, path } => (
+            *collection,
+            if placement == Placement::Inside {
+                path.clone()
+            } else {
+                if path.is_empty() {
+                    return Err("请将节点放入集合内".into());
+                }
+                RequestGroups::parent(path).to_owned()
+            },
+        ),
+        TreeNode::Request(i) => {
+            let request = requests.get(*i).ok_or("请求不存在")?;
+            (
+                collections
+                    .iter()
+                    .position(|c| c.collection == request.collection)
+                    .ok_or("集合不存在")?,
+                request.group.clone(),
+            )
+        }
+    };
+    let destination_collection = collections.get(destination).ok_or("集合不存在")?;
+    if !destination_collection.contains(&parent) {
+        return Err("目录不存在".into());
+    }
+    let destination_name = destination_collection.collection.clone();
+    let moved = match source {
+        TreeNode::Request(i) => {
+            let request = requests.get_mut(*i).ok_or("请求不存在")?;
+            request.collection = destination_name;
+            request.group = parent.clone();
+            source.clone()
+        }
+        TreeNode::Directory { collection, path } => {
+            if path.is_empty() {
+                return Err("集合只能在顶层排序".into());
+            }
+            let c = collections.get(*collection).ok_or("集合不存在")?;
+            if !c.names.contains(path) {
+                return Err("目录不存在".into());
+            }
+            if *collection == destination
+                && (parent == *path || parent.starts_with(&format!("{path}/")))
+            {
+                return Err("不能将目录移入自身或其子目录".into());
+            }
+            let name = path.rsplit('/').next().unwrap();
+            let next = if parent.is_empty() {
+                name.into()
+            } else {
+                format!("{parent}/{name}")
+            };
+            if (*collection != destination || next != *path)
+                && collections[destination].names.contains(&next)
+            {
+                return Err("目标目录下存在同名目录".into());
+            }
+            let old_name = c.collection.clone();
+            let subtree = |p: &str| p == path || p.starts_with(&format!("{path}/"));
+            let mapping = c
+                .names
+                .iter()
+                .filter(|p| subtree(p))
+                .map(|p| {
+                    (
+                        p.clone(),
+                        format!("{next}{}", &p[path.len()..]),
+                        c.folder_order.get(p).copied().unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            collections[*collection].names.retain(|p| !subtree(p));
+            collections[*collection]
+                .folder_order
+                .retain(|p, _| !subtree(p));
+            for (old, new, order) in &mapping {
+                collections[destination].names.push(new.clone());
+                collections[destination]
+                    .folder_order
+                    .insert(new.clone(), *order);
+                for request in requests
+                    .iter_mut()
+                    .filter(|r| r.collection == old_name && r.group == *old)
+                {
+                    request.collection = destination_name.clone();
+                    request.group = new.clone();
+                }
+            }
+            TreeNode::Directory {
+                collection: destination,
+                path: next,
+            }
+        }
+    };
+    let mut nodes = siblings(collections, requests, destination, &parent);
+    nodes.retain(|n| *n != moved);
+    let position = if placement == Placement::Inside {
+        nodes.len()
+    } else {
+        nodes
+            .iter()
+            .position(|n| n == target)
+            .ok_or("目标节点不存在")?
+            + usize::from(placement == Placement::After)
+    };
+    nodes.insert(position, moved.clone());
+    for (i, node) in nodes.iter().enumerate() {
+        let order = (i as u64 + 1) * 1024;
+        match node {
+            TreeNode::Request(index) => requests[*index].tree_order = order,
+            TreeNode::Directory { path, .. } => {
+                collections[destination]
+                    .folder_order
+                    .insert(path.clone(), order);
+            }
+        }
+    }
+    Ok(moved)
+}
+
+pub fn tree_list(
+    collections: &[RequestGroups],
+    requests: &[Request],
+    collapsed: &std::collections::HashSet<(usize, String)>,
+    query: &str,
+) -> gpui_glint::components::TreeList {
+    use gpui_glint::components::{TreeList, TreeListNode};
+    fn directory(
+        collections: &[RequestGroups],
+        requests: &[Request],
+        collection: usize,
+        path: &str,
+    ) -> TreeListNode {
+        let c = &collections[collection];
+        let label = if path.is_empty() {
+            c.collection.clone()
+        } else {
+            path.rsplit('/').next().unwrap_or(path).into()
+        };
+        TreeListNode::branch(
+            format!("request-directory:{collection}:{path}"),
+            label,
+            siblings(collections, requests, collection, path)
+                .into_iter()
+                .map(|node| match node {
+                    TreeNode::Directory { path, .. } => {
+                        directory(collections, requests, collection, &path)
+                    }
+                    TreeNode::Request(index) => {
+                        let r = &requests[index];
+                        TreeListNode::leaf(format!("request-leaf:{index}"), r.name.clone())
+                            .search_text(format!(
+                                "{} {} {} {}",
+                                r.name, r.group, r.draft.method, r.draft.url
+                            ))
+                    }
+                }),
+        )
+        .search_text(path.to_owned())
+    }
+    TreeList::new((0..collections.len()).map(|index| directory(collections, requests, index, "")))
+        .collapsed(
+            collapsed
+                .iter()
+                .map(|(collection, path)| format!("request-directory:{collection}:{path}").into()),
+        )
+        .query(query.to_owned())
+}
+pub fn tree_entry(row: &gpui_glint::components::TreeListRow) -> TreeEntry {
+    if let Some(index) = row.id.strip_prefix("request-leaf:") {
+        TreeEntry::Request {
+            index: index.parse().unwrap(),
+            depth: row.depth,
+        }
+    } else {
+        let (collection, path) = row
+            .id
+            .strip_prefix("request-directory:")
+            .unwrap()
+            .split_once(':')
+            .unwrap();
+        TreeEntry::Directory {
+            collection: collection.parse().unwrap(),
+            path: path.into(),
+            depth: row.depth,
+            expanded: row.expanded,
+        }
+    }
+}
+#[cfg(test)]
+pub fn tree_entries(
+    collections: &[RequestGroups],
+    requests: &[Request],
+    collapsed: &std::collections::HashSet<(usize, String)>,
+    query: &str,
+) -> Vec<TreeEntry> {
+    tree_list(collections, requests, collapsed, query)
+        .visible_rows()
+        .iter()
+        .map(tree_entry)
+        .collect()
+}
+
 #[cfg(test)]
 pub fn test_requests() -> Vec<Request> {
     ["资源", "资源", "资源", "集合"]
@@ -157,6 +497,7 @@ pub fn test_requests() -> Vec<Request> {
                 ..Draft::default()
             };
             Request {
+                tree_order: 0,
                 name: format!("Test request {i}"),
                 collection: "Test API".into(),
                 group: group.into(),
@@ -189,6 +530,7 @@ impl Default for Draft {
             cookies: vec![],
             token: String::new(),
             auth: false,
+            skip_tls_verification: false,
             environment: 0,
         }
     }
@@ -276,6 +618,184 @@ impl Draft {
 mod tests {
     use super::*;
     #[test]
+    fn moves_preserve_request_indices_and_reorder_mixed_siblings() {
+        let mut requests = test_requests();
+        let mut c = RequestGroups::create_collection("Test API", &[]).unwrap();
+        c.add_child("", "A").unwrap();
+        c.add_child("A", "Child").unwrap();
+        c.add_child("", "B").unwrap();
+        requests[0].group = "A/Child".into();
+        requests[1].group = "".into();
+        let before = requests[0].draft.clone();
+        let mut collections = vec![c, RequestGroups::create_collection("Other", &[]).unwrap()];
+        let a = TreeNode::Directory {
+            collection: 0,
+            path: "A".into(),
+        };
+        let b = TreeNode::Directory {
+            collection: 0,
+            path: "B".into(),
+        };
+        let child = TreeNode::Directory {
+            collection: 0,
+            path: "A/Child".into(),
+        };
+        assert!(
+            move_node(
+                &mut collections,
+                &mut requests,
+                &a,
+                &child,
+                Placement::Inside
+            )
+            .is_err()
+        );
+        move_node(
+            &mut collections,
+            &mut requests,
+            &TreeNode::Request(1),
+            &a,
+            Placement::Before,
+        )
+        .unwrap();
+        assert_eq!(
+            siblings(&collections, &requests, 0, "")[0],
+            TreeNode::Request(1)
+        );
+        move_node(&mut collections, &mut requests, &a, &b, Placement::Inside).unwrap();
+        assert_eq!(requests[0].group, "B/A/Child");
+        assert_eq!(requests[0].draft, before);
+        assert!(collections[0].contains("B/A/Child"));
+        let moved = TreeNode::Directory {
+            collection: 0,
+            path: "B/A".into(),
+        };
+        let other = TreeNode::Directory {
+            collection: 1,
+            path: "".into(),
+        };
+        move_node(
+            &mut collections,
+            &mut requests,
+            &moved,
+            &other,
+            Placement::Inside,
+        )
+        .unwrap();
+        assert_eq!(requests[0].collection, "Other");
+        assert_eq!(requests[0].group, "A/Child");
+        assert!(!collections[0].contains("B/A"));
+        assert!(collections[1].contains("A/Child"));
+        collections[1].add_child("", "B").unwrap();
+        let b_other = TreeNode::Directory {
+            collection: 1,
+            path: "B".into(),
+        };
+        assert!(
+            move_node(
+                &mut collections,
+                &mut requests,
+                &b,
+                &other,
+                Placement::Inside
+            )
+            .is_err()
+        );
+        assert!(collections[0].contains("B"));
+        move_node(
+            &mut collections,
+            &mut requests,
+            &TreeNode::Request(1),
+            &b_other,
+            Placement::Inside,
+        )
+        .unwrap();
+        assert_eq!(requests[1].collection, "Other");
+        assert_eq!(requests[1].group, "B");
+    }
+    #[test]
+    fn nested_directories_rename_and_delete_preserve_requests() {
+        let mut collection = RequestGroups::create_collection("Test API", &[]).unwrap();
+        collection.add_child("", "用户").unwrap();
+        collection.add_child("用户", "详情").unwrap();
+        collection.add_child("用户/详情", "内部").unwrap();
+        collection.add_child("", "用户备份").unwrap();
+        assert!(collection.add_child("不存在", "子目录").is_err());
+        assert!(collection.add_child("用户", "详情").is_err());
+        assert!(collection.add_child("用户", "bad/name").is_err());
+        collection.add_child("用户备份", "详情").unwrap();
+        let mut requests = test_requests();
+        requests[0].group.clear();
+        requests[1].group = "用户/详情/内部".into();
+        requests[2].group = "用户备份/详情".into();
+        requests[3].collection = "Other API".into();
+        requests[3].group = "用户/详情".into();
+        let original_drafts: Vec<_> = requests.iter().map(|r| r.draft.clone()).collect();
+        collection.rename("用户", "客户", &mut requests).unwrap();
+        assert!(collection.contains("客户/详情/内部"));
+        assert_eq!(requests[1].group, "客户/详情/内部");
+        assert_eq!(requests[2].group, "用户备份/详情");
+        assert_eq!(requests[3].group, "用户/详情");
+        collection.remove("客户/详情", &mut requests);
+        assert_eq!(requests[1].group, "客户");
+        assert!(!collection.contains("客户/详情/内部"));
+        collection.remove("客户", &mut requests);
+        assert!(requests[0].group.is_empty() && requests[1].group.is_empty());
+        assert_eq!(
+            original_drafts,
+            requests.iter().map(|r| r.draft.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tree_supports_root_requests_deep_nesting_collapse_and_search() {
+        let mut c = RequestGroups::create_collection("Test API", &[]).unwrap();
+        let mut path = String::new();
+        for _ in 0..24 {
+            path = c.add_child(&path, "目录").unwrap();
+        }
+        let mut requests = test_requests()[..2].to_vec();
+        requests[0].group.clear();
+        requests[0].name = "根部请求".into();
+        requests[1].group = path;
+        requests[1].name = "深层请求".into();
+        let collections = vec![c, RequestGroups::create_collection("Empty", &[]).unwrap()];
+        let mut collapsed = std::collections::HashSet::new();
+        let rows = tree_entries(&collections, &requests, &collapsed, "");
+        assert!(rows.contains(&TreeEntry::Request { index: 0, depth: 1 }));
+        assert!(rows.contains(&TreeEntry::Request {
+            index: 1,
+            depth: 25
+        }));
+        collapsed.insert((0, "目录".into()));
+        assert!(
+            !tree_entries(&collections, &requests, &collapsed, "")
+                .iter()
+                .any(|r| matches!(r, TreeEntry::Request { index: 1, .. }))
+        );
+        let searched = tree_entries(&collections, &requests, &collapsed, "深层请求");
+        assert_eq!(searched.len(), 26);
+        assert_eq!(
+            searched.last(),
+            Some(&TreeEntry::Request {
+                index: 1,
+                depth: 25
+            })
+        );
+        assert!(!searched.contains(&TreeEntry::Request { index: 0, depth: 1 }));
+        collapsed.insert((0, String::new()));
+        assert!(
+            tree_entries(&collections, &requests, &collapsed, "Test API")
+                .contains(&TreeEntry::Request { index: 0, depth: 1 })
+        );
+        assert_eq!(
+            tree_entries(&collections, &requests, &collapsed, "").len(),
+            2
+        );
+        assert!(tree_entries(&collections, &requests, &collapsed, "not-found").is_empty());
+    }
+
+    #[test]
     fn cookie_overrides_merge_enabled_headers_and_preserve_values() {
         let mut draft = test_requests().remove(0).draft;
         draft.auth = false;
@@ -328,11 +848,11 @@ mod tests {
         assert_eq!(requests[0].group, "资源");
         assert_eq!(requests.last().unwrap().group, "资源管理");
         collections[1].remove("资源管理", &mut requests);
-        assert_eq!(requests.last().unwrap().group, "未分组");
+        assert_eq!(requests.last().unwrap().group, "");
         assert_eq!(requests[0].group, "资源");
         assert_eq!(requests[0].draft, original);
         assert_eq!(requests.last().unwrap().draft, original);
-        assert!(collections[1].names.iter().any(|name| name == "未分组"));
+        assert!(collections[1].names.is_empty());
         assert!(!collections[0].names.iter().any(|name| name == "未分组"));
     }
 
@@ -360,11 +880,11 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.group == "未分组")
+                .filter(|request| request.group.is_empty())
                 .count(),
             3
         );
-        assert!(groups.names.iter().any(|name| name == "未分组"));
+        assert!(!groups.names.iter().any(|name| name == "未分组"));
         assert_eq!(
             drafts,
             requests
@@ -375,7 +895,7 @@ mod tests {
         groups.remove("空分组", &mut requests);
         assert!(!groups.names.iter().any(|name| name == "空分组"));
         groups.remove("未分组", &mut requests);
-        assert!(groups.names.iter().any(|name| name == "未分组"));
+        assert!(!groups.names.iter().any(|name| name == "未分组"));
     }
 
     #[test]

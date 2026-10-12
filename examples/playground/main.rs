@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     Render, StatefulInteractiveElement, Styled, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, point, px, rgb, rgba, size,
+    WindowBounds, WindowOptions, div, point, prelude::FluentBuilder, px, rgb, rgba, size,
 };
 use gpui_glint::components::{
     AppLayout, DropdownGroup, DropdownItem, GlintAssets, GroupedDropdown, Icon, IconButton,
@@ -262,13 +262,13 @@ impl Render for Playground {
             );
 
         let topbar = div()
-            .h_full()
+            .size_full()
             .flex()
             .items_center()
             .gap_4()
             .px_4()
             .text_color(rgb(self.theme.palette().text))
-            .child(div().w(px(56.)))
+            .when(cfg!(target_os = "macos"), |bar| bar.child(div().w(px(56.))))
             .child(
                 div()
                     .text_size(px(13.))
@@ -277,7 +277,7 @@ impl Render for Playground {
                     .child("GLINT UI"),
             )
             .child(div().text_size(px(13.)).child("组件预览"))
-            .child(div().flex_1())
+            .child(gpui_glint::components::window_drag_region())
             .child(
                 div()
                     .text_size(px(12.))

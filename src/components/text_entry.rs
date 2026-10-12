@@ -46,11 +46,17 @@ pub fn bind_text_entry_keys(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, None),
         KeyBinding::new("cmd-x", Cut, None),
         KeyBinding::new("cmd-c", Copy, None),
+        KeyBinding::new("ctrl-a", SelectAll, Some("GlassTextEntry")),
+        KeyBinding::new("ctrl-v", Paste, Some("GlassTextEntry")),
+        KeyBinding::new("ctrl-x", Cut, Some("GlassTextEntry")),
+        KeyBinding::new("ctrl-c", Copy, Some("GlassTextEntry")),
     ]);
 }
 
 /// A single-line native text entry with IME composition, selection, clipboard, and caret support.
 pub struct TextEntry {
+    read_only: bool,
+    fit_content: bool,
     reference_resolver: Option<TextReferenceResolver>,
     focus_subscriptions: Vec<Subscription>,
     search_query: SharedString,
@@ -68,6 +74,16 @@ pub struct TextEntry {
 }
 
 impl TextEntry {
+    /// Allow selection and copying while preventing keyboard and IME edits.
+    pub fn read_only(mut self, value: bool) -> Self {
+        self.read_only = value;
+        self
+    }
+    /// Keep the full text width, for example inside a horizontally scrolling cell.
+    pub fn fit_content(mut self) -> Self {
+        self.fit_content = true;
+        self
+    }
     /// Opt into resolved reference badges while blurred and expression highlights while editing.
     /// The resolver receives the complete `{{name}}` expression. Errors use warning colors.
     pub fn set_reference_resolver(
@@ -129,6 +145,8 @@ impl TextEntry {
         let content = value.into();
         let end = content.len();
         Self {
+            read_only: false,
+            fit_content: false,
             reference_resolver: None,
             focus_subscriptions: vec![],
             search_query: "".into(),
@@ -223,6 +241,9 @@ impl TextEntry {
     }
 
     fn replace_selection(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let range = self.selected_range.clone();
         self.content = format!(
             "{}{}{}",
@@ -278,6 +299,9 @@ impl TextEntry {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx);
         }
@@ -285,6 +309,9 @@ impl TextEntry {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor_offset()), cx);
         }
@@ -306,6 +333,9 @@ impl TextEntry {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.selected_range.is_empty() {
             self.copy(&Copy, window, cx);
             self.replace_selection("", cx);
@@ -410,6 +440,9 @@ impl EntityInputHandler for TextEntry {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -437,6 +470,9 @@ impl EntityInputHandler for TextEntry {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -628,7 +664,9 @@ impl Element for TextEntryElement {
             &runs,
             None,
         );
-        let show_cursor = input.focus_handle.is_focused(window) && input.selected_range.is_empty();
+        let show_cursor = !input.read_only
+            && input.focus_handle.is_focused(window)
+            && input.selected_range.is_empty();
         let (selection, cursor) = if input.selected_range.is_empty() || placeholder {
             let cursor = show_cursor.then(|| {
                 fill(
@@ -809,6 +847,21 @@ impl Render for TextEntry {
             .line_height(px(self.font_size * 1.5))
             .text_size(px(self.font_size))
             .text_color(rgb(theme.color(0x292d32)));
+        if self.fit_content {
+            let style = window.text_style();
+            let line = window.text_system().shape_line(
+                self.content.clone(),
+                px(self.font_size),
+                &[TextRun {
+                    len: self.content.len(),
+                    font: style.font(),
+                    color: style.color,
+                    ..Default::default()
+                }],
+                None,
+            );
+            root = root.min_w(line.width + px(1.)).flex_shrink_0();
+        }
         if preview {
             let mut content = div()
                 .id("reference-preview")
@@ -926,6 +979,30 @@ fn text_run_boundaries(text: &str, offsets: impl IntoIterator<Item = usize>) -> 
 mod selection_tests {
     use super::*;
     use gpui::AppContext;
+    #[gpui::test]
+    fn read_only_allows_copy_and_blocks_actions_and_ime(cx: &mut gpui::TestAppContext) {
+        let (input, window) =
+            cx.add_window_view(|_, cx| TextEntry::new(cx, "", "响应 🦀").read_only(true));
+        window.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.select_all(&SelectAll, window, cx);
+                input.copy(&Copy, window, cx);
+                input.cut(&Cut, window, cx);
+                input.backspace(&Backspace, window, cx);
+                input.delete(&Delete, window, cx);
+                input.paste(&Paste, window, cx);
+                input.replace_text_in_range(None, "typing", window, cx);
+                input.replace_and_mark_text_in_range(None, "输入", None, window, cx);
+                assert_eq!(input.value(), "响应 🦀");
+                assert_eq!(input.selected_range, 0.."响应 🦀".len());
+                assert!(input.marked_range.is_none());
+            });
+        });
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "响应 🦀"
+        );
+    }
     #[gpui::test]
     fn reference_badges_edit_raw_text_and_keep_inputs_independent(cx: &mut gpui::TestAppContext) {
         struct Inputs([Entity<TextEntry>; 2]);

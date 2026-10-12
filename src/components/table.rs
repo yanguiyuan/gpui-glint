@@ -295,6 +295,7 @@ pub struct DataTable {
     document: bool,
     compact: bool,
     add_row_label: Option<SharedString>,
+    empty_row_label: Option<SharedString>,
     columns: Vec<TableColumn>,
     rows: Vec<TableRow>,
     selected: BTreeSet<SharedString>,
@@ -317,6 +318,7 @@ impl DataTable {
             document: false,
             compact: false,
             add_row_label: None,
+            empty_row_label: None,
             columns: columns.into_iter().collect(),
             rows: unique_rows(rows),
             selected: BTreeSet::new(),
@@ -345,6 +347,17 @@ impl DataTable {
     pub fn add_row(mut self, label: impl Into<SharedString>) -> Self {
         self.add_row_label = Some(label.into());
         self
+    }
+    /// Show a single, left-aligned empty-state row instead of the large placeholder.
+    /// The row spans all columns, matches normal row height, and is not selectable data.
+    pub fn empty_row(mut self, label: impl Into<SharedString>) -> Self {
+        self.empty_row_label = Some(label.into());
+        self
+    }
+    /// Change the empty-state row text; `None` restores the default placeholder.
+    pub fn set_empty_row(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
+        self.empty_row_label = label;
+        cx.notify();
     }
     /// Document tables omit selection, row actions and pagination.
     pub fn document(mut self) -> Self {
@@ -792,7 +805,18 @@ impl Render for DataTable {
             .take(self.page_size)
             .collect();
         if visible.is_empty() {
-            body = body.child(
+            let empty = if let Some(label) = &self.empty_row_label {
+                div()
+                    .w_full()
+                    .h(px(if self.compact { 34. } else { 53. }))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .px(px(if self.compact { 8. } else { 12. }))
+                    .text_size(px(13.))
+                    .text_color(rgb(palette.text_muted))
+                    .child(div().min_w_0().truncate().child(label.clone()))
+            } else {
                 div()
                     .h(px(120.))
                     .flex()
@@ -800,8 +824,9 @@ impl Render for DataTable {
                     .justify_center()
                     .text_size(px(13.))
                     .text_color(rgb(palette.text_muted))
-                    .child("暂无数据"),
-            );
+                    .child("暂无数据")
+            };
+            body = body.child(empty.debug_selector(|| "table-empty-state".into()));
         }
         let document = self.document;
         for (position, &index) in visible.iter().enumerate() {
@@ -881,6 +906,7 @@ impl Render for DataTable {
             body = body.child(
                 div()
                     .id("table-add-row")
+                    .debug_selector(|| "table-add-row".into())
                     .focusable()
                     .w_full()
                     .h(px(if self.compact { 34. } else { 44. }))
@@ -1020,6 +1046,53 @@ impl Render for DataTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn empty_state_row_matches_data_height_and_keeps_add_action(cx: &mut gpui::TestAppContext) {
+        for compact in [false, true] {
+            let (table, window) = cx.add_window_view(|_, cx| {
+                let table = DataTable::new(cx, [TableColumn::new("名称", 180.).flexible()], [])
+                    .empty_row("暂无 Cookie 字段覆盖。")
+                    .add_row("添加 Cookie 字段覆盖");
+                if compact { table.compact() } else { table }
+            });
+            let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let received = events.clone();
+            let _subscription = window.update(|_, cx| {
+                cx.subscribe(&table, move |_, event, _| {
+                    received.borrow_mut().push(event.clone())
+                })
+            });
+            let empty = window.debug_bounds("table-empty-state").unwrap();
+            let add = window.debug_bounds("table-add-row").unwrap();
+            assert_eq!(empty.size.height, px(if compact { 34. } else { 53. }));
+            assert_eq!(empty.bottom(), add.top());
+            assert_eq!(empty.size.width, add.size.width);
+            window.simulate_click(empty.center(), gpui::Modifiers::default());
+            assert!(
+                events.borrow().is_empty(),
+                "the empty state must not select a data row"
+            );
+            window.simulate_click(add.center(), gpui::Modifiers::default());
+            assert!(matches!(events.borrow().as_slice(), [TableEvent::AddRow]));
+            table.update(window, |table, cx| {
+                assert!(table.rows.is_empty() && table.selected.is_empty());
+                table.set_rows([TableRow::new("cookie", [TableCell::text("session")])], cx);
+            });
+            assert!(window.debug_bounds("table-empty-state").is_none());
+            table.update(window, |table, cx| table.set_rows([], cx));
+            assert!(window.debug_bounds("table-empty-state").is_some());
+            table.update(window, |table, cx| table.set_empty_row(None, cx));
+            assert_eq!(
+                window
+                    .debug_bounds("table-empty-state")
+                    .unwrap()
+                    .size
+                    .height,
+                px(120.)
+            );
+        }
+    }
+
     #[test]
     fn numeric_values_sort_numerically() {
         assert_eq!(

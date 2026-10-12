@@ -2,7 +2,7 @@ use gpui::{
     Context, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window, div,
     px, rgb,
 };
-use gpui_glint::components::{AppLayout, Button};
+use gpui_glint::components::{AppLayout, Button, Separator, TreeList, TreeListNode};
 use gpui_glint::theme::ThemePreset;
 
 use super::common::{backdrop_preview, page, panel};
@@ -10,6 +10,8 @@ use super::common::{backdrop_preview, page, panel};
 pub struct LayoutPage {
     pub theme: ThemePreset,
     blur_enabled: bool,
+    tree_expanded: bool,
+    selected_tree_item: gpui::SharedString,
 }
 
 impl LayoutPage {
@@ -17,6 +19,8 @@ impl LayoutPage {
         Self {
             theme,
             blur_enabled: true,
+            tree_expanded: true,
+            selected_tree_item: "readme".into(),
         }
     }
 }
@@ -57,9 +61,36 @@ impl Render for LayoutPage {
             .border_color(rgb(theme.color(0xdfe4e0)))
             .child(
                 AppLayout::new(topbar, sidebar, content)
+                    .window_controls(false)
                     .theme(self.theme)
                     .render(),
             );
+        let owner = cx.entity().downgrade();
+        let toggle_owner = owner.clone();
+        let tree = TreeList::new([TreeListNode::branch(
+            "project",
+            "项目目录",
+            [
+                TreeListNode::leaf("readme", "README.md"),
+                TreeListNode::leaf("source", "main.rs"),
+            ],
+        )])
+        .collapsed((!self.tree_expanded).then(|| "project".into()))
+        .selected(self.selected_tree_item.clone())
+        .theme(theme)
+        .on_select(move |id, _, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                this.selected_tree_item = id.clone();
+                cx.notify();
+            });
+        })
+        .on_toggle(move |_, _, cx| {
+            let _ = toggle_owner.update(cx, |this, cx| {
+                this.tree_expanded = !this.tree_expanded;
+                cx.notify();
+            });
+        })
+        .render();
         page(
             "03",
             "布局容器",
@@ -83,7 +114,17 @@ impl Render for LayoutPage {
                         cx.notify();
                     })),
                 ))
-                .child(panel(composition, self.theme)),
+                .child(panel(composition, self.theme))
+                .child(panel(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_size(px(13.)).child("通用树列表"))
+                        .child(Separator::horizontal().theme(theme).render())
+                        .child(tree),
+                    theme,
+                )),
             self.theme,
         )
     }

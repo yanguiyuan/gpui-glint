@@ -629,13 +629,20 @@ impl Render for MarkdownWorkspace {
         let workspace = cx.entity();
         let topbar = div()
             .size_full()
-            .pl(px(84.))
+            .pl(px(if cfg!(target_os = "macos") { 84. } else { 16. }))
             .pr_4()
             .flex()
             .items_center()
             .gap_3()
             .text_size(px(12.))
             .text_color(rgb(p.text_muted))
+            .child(div().size(px(8.)).rounded(px(3.)).bg(rgb(p.accent)))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(p.text))
+                    .child("GLINT MARKDOWN"),
+            )
             .child(
                 Tooltip::new(
                     div()
@@ -662,13 +669,6 @@ impl Render for MarkdownWorkspace {
                 )
                 .render(cx),
             )
-            .child(div().size(px(8.)).rounded(px(3.)).bg(rgb(p.accent)))
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(p.text))
-                    .child("GLINT MARKDOWN"),
-            )
             .child(
                 if active_doc.is_some_and(|doc| !doc.path.starts_with(&self.root)) {
                     div()
@@ -686,7 +686,7 @@ impl Render for MarkdownWorkspace {
                     div().child("本机工作区")
                 },
             )
-            .child(div().flex_1())
+            .child(gpui_glint::components::window_drag_region())
             .child(self.theme_selector.clone())
             .when(has_document, |bar| {
                 bar.child(

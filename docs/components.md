@@ -6,9 +6,46 @@
 
 `AppLayout` 填满父容器，顶部栏高 42px，下方为可伸缩的横向布局。导航轨道位于外层表面；侧栏和主内容共享带圆角、高光与柔和阴影的面板。各区域均可接收任意 GPUI 元素。
 
+Windows 下 `AppLayout` 默认在顶栏右侧显示最小化、最大化／还原和关闭按钮，使用原生窗口控制区域（关闭操作会经过宿主的 `on_window_should_close` 回调）。窗口需使用透明标题栏 `TitlebarOptions { appears_transparent: true, ..Default::default() }`；嵌入预览或保留系统标题栏时设置 `.window_controls(false)`。品牌名仅在 macOS 为红绿灯预留左侧空间。把 `window_drag_region()` 放在顶栏控件之间作为可伸缩空白区域，可拖动窗口，双击最大化／还原；不要用拖拽区域包裹搜索框或按钮。
+
 `SegmentedControl` 默认以 `new` 的调用位置区分控件，隔离每个选项的点击状态。在循环或公共工厂函数中创建多组控件时，为每组设置稳定且不同的 `.id(...)`。
 
 `GroupedDropdown` 通过触发按钮展开或收起，支持带标题的分组和可选图标，选择后自动关闭。使用 `on_select` 接收所选标签，并将其连接到应用状态。
+
+`Separator::horizontal()` 和 `Separator::vertical()` 提供随主题变化的 1px 分隔线，不参与拖拽；用于分隔上下或左右相邻区域。
+
+## 通用树列表
+
+`TreeList` 管理整棵树的层级、可见节点和筛选，节点数据使用 `TreeListNode::branch(id, label, children)` / `leaf(id, label)`。通过 `.collapsed(ids)`、`.selected(id)` 传入受控状态；`.on_toggle(...)` / `.on_select(...)` 通知宿主更新状态。`.query(...)` 筛选时保留匹配节点的祖先，临时展开匹配路径，清空查询后恢复原有折叠；节点 `.search_text(...)` 可补充 URL、方法等检索文本。
+
+```rust
+TreeList::new([
+    TreeListNode::branch("api", "用户接口", [
+        TreeListNode::leaf("list", "获取用户列表"),
+        TreeListNode::leaf("create", "创建用户"),
+    ]),
+])
+.selected("list")
+.theme(theme)
+.render();
+```
+
+默认使用 `TreeListItem` 渲染，整棵树可通过 `.draggable(scope)` / `.on_drop(...)` 接收拖拽投放。复杂业务可用 `render_with(|row| ...)` 定制节点（含 `id`、`depth`、`branch`、`expanded`），复用层级与筛选逻辑；侧栏滚动、数据保存和业务移动规则由宿主管理。`glint-api` 请求侧栏已使用这一通用容器。
+
+`TreeListItem` 负责单行树节点的缩进、选中样式、目录开合图标与拖拽反馈，可用于请求列表、目录树等。传入唯一稳定 ID；`.depth(n)` 设置层级，`.branch(expanded)` 设置目录及开合状态，未设置时为叶子。`.content(element)` 自定义内容区域（例如方法与请求名），`.trailing(element)` 放菜单或操作按钮。树结构、筛选、展开状态和点击行为由宿主管理。
+
+```rust
+TreeListItem::new("folder-users", "用户接口")
+    .depth(1)
+    .branch(true)
+    .selected(false)
+    .theme(theme)
+    .render();
+```
+
+`.draggable(cx.entity_id())` 开启同一作用域内的拖拽，不同作用域之间不能投放。`.on_drag_over(...)` 与 `.on_drop(...)` 接收 `TreeDrop { source, target, placement }`；目录中部为 `Inside`、顶部／底部为 `Before`／`After`，叶子仅支持前后插入。组件显示即时插入线，也可由宿主保存当前反馈并通过 `.drop_indicator(...)` 设置标记；投放后由宿主校验循环、重名等规则并更新数据。原生示例见 `glint-api`，基础展开与选中示例见 playground 布局页。
+
+`TextEntry::read_only(true)` 保留拖选、双击选词、全选及复制，阻止键盘和 IME 修改；`.fit_content()` 让控件按完整文本宽度布局，可放在横向滚动单元格中。注册 `bind_text_entry_keys` 后支持 ⌘ / Ctrl + A、C。
 
 ## 可关闭标签页
 
@@ -116,6 +153,8 @@ let headerless = cx.new(|cx| {
 ## 数据表格
 
 `DataTable` 提供资源表格：中性的 35px 表头、53px 资源行、蓝色选中背景、悬停操作和向上展开的操作菜单。固定列可与弹性的资源列组合；窄布局下在表格内部滚动。底栏显示实际行数与选中数量，并提供分页。
+
+空表默认显示居中的“暂无数据”。设置 `.empty_row("暂无 Cookie 字段覆盖。")` 后，改为横跨全部列的单行提示，左侧内边距与单元格一致，高度随普通／紧凑模式使用 53px／34px。提示行不计入数据、选择或分页，可与 `.add_row("添加 Cookie 字段覆盖")` 组合；添加真实数据后自动隐藏，删除到空表后恢复。运行时可通过 `set_empty_row(Some(label.into()), cx)` 更新文字，传入 `None` 恢复默认占位。
 
 `.compact()` 启用紧凑布局：表头 28px、行高至少 34px、单元格水平内边距 8px／垂直内边距 4px。可与 `.document()` 组合用于参数和请求头编辑；较高的单元格内容仍会撑开行高，避免裁切。默认保留标准密度。
 

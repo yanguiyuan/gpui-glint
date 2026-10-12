@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Glint API">
+  <rect x="72" y="72" width="880" height="880" rx="200" fill="#2563eb"/>
+  <g fill="none" stroke="#ffffff" stroke-width="68" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M396 328 276 512 396 696"/>
+    <path d="M628 328 748 512 628 696"/>
+    <path d="M472 472h80M472 552h80" stroke-width="52"/>
+  </g>
+</svg>

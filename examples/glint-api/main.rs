@@ -1,11 +1,13 @@
+mod app_icon;
 mod environment;
 mod environment_ui;
 mod http;
 mod model;
 mod storage;
+mod template;
 
 use environment::EnvironmentVariables;
-use environment_ui::VariableInput;
+use environment_ui::{ProxyInput, VariableInput};
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
     KeyBinding, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
@@ -14,11 +16,11 @@ use gpui::{
 use gpui_glint::{
     components::{
         AppLayout, Button, ButtonKind, ButtonSize, Checkbox, ClosableTab, ClosableTabs, CodeCard,
-        CommandItem, CommandPalette, CommandPaletteEvent, DataTable, GlintAssets, GroupList,
-        GroupListEvent, GroupListGroup, GroupListHeader, GroupListItem, Icon, IconButton, Popover,
-        SearchInput, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption, TableCell,
-        TableColumn, TableEvent, TableRow, TextEntry, TextReferenceResolver, ThemeSelector,
-        ThemeSelectorEvent, bind_code_card_keys, bind_text_entry_keys,
+        CommandItem, CommandPalette, CommandPaletteEvent, DataTable, GlintAssets, Icon, IconButton,
+        Popover, SearchInput, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption,
+        Separator, Switch, TableCell, TableColumn, TableEvent, TableRow, TextEntry,
+        TextReferenceResolver, ThemeSelector, ThemeSelectorEvent, TreeDrop, TreeListItem,
+        bind_code_card_keys, bind_text_entry_keys,
     },
     theme::ThemePreset,
 };
@@ -32,7 +34,7 @@ gpui::actions!(api_workbench, [SendRequest, SaveRequest, SearchCommands]);
 enum GroupEdit {
     CreateCollection,
     CreateEnvironment,
-    Create,
+    Create(String),
     Rename(String),
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -58,10 +60,17 @@ struct Workbench {
     collections: Vec<RequestGroups>,
     current_collection: usize,
     show_collection_menu: bool,
-    request_list: Entity<GroupList>,
+    current_directory: String,
+    collapsed_directories: HashSet<(usize, String)>,
+    hovered_tree_row: Option<String>,
+    tree_drop: Option<(model::TreeNode, model::Placement)>,
+    tree_menu: Option<(usize, String)>,
     group_edit: Option<GroupEdit>,
     group_name: Entity<TextEntry>,
     group_error: Option<String>,
+    request_name: Entity<TextEntry>,
+    editing_request_name: bool,
+    request_name_error: Option<String>,
     active: usize,
     tabs: Vec<usize>,
     config: usize,
@@ -79,15 +88,16 @@ struct Workbench {
     variable_search: Entity<TextEntry>,
     variable_error: Option<String>,
     variable_rows: Vec<Vec<VariableInput>>,
+    proxy_inputs: Vec<ProxyInput>,
     variable_table: Entity<DataTable>,
     next_variable_row: u64,
-    requests_expanded: bool,
     history_filter: usize,
     selected_history: Option<(usize, usize)>,
     current_versions: Vec<usize>,
     filter: Entity<TextEntry>,
     history_search: Entity<TextEntry>,
     authentication: Entity<SelectField>,
+    skip_tls_verification: bool,
     endpoint: Entity<SelectField>,
     theme_selector: Entity<ThemeSelector>,
     environment: Entity<Select>,
@@ -99,6 +109,7 @@ struct Workbench {
     headers_table: Entity<DataTable>,
     response_headers_table: Entity<DataTable>,
     response_headers_scroll: gpui::ScrollHandle,
+    response_header_entries: Vec<[Entity<TextEntry>; 2]>,
     cookies_table: Entity<DataTable>,
     body: Entity<CodeCard>,
     response: Entity<CodeCard>,
@@ -136,8 +147,8 @@ impl Workbench {
         let environment_names = data.environments;
         let environment_inputs = data.variables;
         let environment_count = environment_names.len();
-        let request_list = cx.new(|_| GroupList::new([]));
         let group_name = Self::entry("", "名称", cx);
+        let request_name = Self::entry("", "请求名称", cx);
         let initial = requests
             .first()
             .map(|r| r.draft.clone())
@@ -152,7 +163,7 @@ impl Workbench {
                 cx,
             )
         });
-        let filter = Self::entry("", "筛选集合、分组或请求…", cx);
+        let filter = Self::entry("", "筛选集合、目录或请求…", cx);
         let history_search = Self::entry("", "搜索历史路径…", cx);
         let endpoint = cx.new(|cx| {
             SelectField::new(
@@ -192,33 +203,7 @@ impl Workbench {
                 .read_only(true)
                 .show_header(false)
         });
-        let commands = cx.new(|cx| {
-            CommandPalette::new(
-                requests
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| {
-                        CommandItem::new(i.to_string(), r.name.clone())
-                            .group("请求")
-                            .keywords(format!("{} {}", r.draft.method, r.draft.url))
-                            .icon(Icon::ApiDoc)
-                    })
-                    .chain([
-                        CommandItem::new("send", "发送 HTTP 请求")
-                            .group("操作")
-                            .icon(Icon::Play)
-                            .shortcut("⌘ Enter"),
-                        CommandItem::new("save", "保存请求版本")
-                            .group("操作")
-                            .icon(Icon::Save)
-                            .shortcut("⌘ S"),
-                        CommandItem::new("theme", "切换明暗主题")
-                            .group("操作")
-                            .icon(Icon::HalfCircle),
-                    ]),
-                cx,
-            )
-        });
+        let commands = cx.new(|cx| CommandPalette::new(Self::command_items(&requests), cx));
         let variable_search = Self::entry("", "搜索变量名称…", cx);
         let mut subscriptions = vec![];
         subscriptions.push(cx.observe(&variable_search, |this: &mut Self, _, cx| {
@@ -229,51 +214,7 @@ impl Workbench {
             this.sync_groups(cx);
             cx.notify();
         }));
-        subscriptions.push(cx.subscribe(
-            &request_list,
-            |this: &mut Self, _, event: &GroupListEvent, cx| match event {
-                GroupListEvent::ItemSelected { item, .. } => {
-                    if let Ok(index) = item.parse::<usize>() {
-                        this.choose(index, cx);
-                    }
-                }
-                GroupListEvent::ItemAction { item, .. } => {
-                    if let Ok(index) = item.parse::<usize>() {
-                        this.delete_request(index, cx);
-                    }
-                }
-                GroupListEvent::HeaderAction { group, index } => {
-                    let Some((collection, group)) = group.split_once(':') else {
-                        return;
-                    };
-                    let Ok(collection) = collection.parse::<usize>() else {
-                        return;
-                    };
-                    if collection >= this.collections.len() {
-                        return;
-                    }
-                    this.current_collection = collection;
-                    match index {
-                        0 => {
-                            this.add_request_to(group.to_string(), cx);
-                        }
-                        1 => this.edit_group(Some(group.to_string()), cx),
-                        2 => {
-                            this.collections[this.current_collection]
-                                .remove(group, &mut this.requests);
-                            this.storage_dirty = true;
-                            this.group_edit = None;
-                            this.sync_groups(cx);
-                            this.notice = format!("已删除分组 {group}，请求保留在未分组中");
-                            cx.notify();
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
-        ));
-        for entry in [&history_search, &group_name] {
+        for entry in [&history_search, &group_name, &request_name] {
             subscriptions.push(cx.observe(entry, |_, _, cx| cx.notify()));
         }
         subscriptions.push(cx.observe(&body, |_, _, cx| cx.notify()));
@@ -344,9 +285,13 @@ impl Workbench {
             .compact()
             .add_row("添加空行")
         };
-        let params_table = cx.new(make_table);
-        let headers_table = cx.new(make_table);
-        let cookies_table = cx.new(make_table);
+        let params_table = cx.new(|cx| make_table(cx).empty_row("暂无请求参数。"));
+        let headers_table = cx.new(|cx| make_table(cx).empty_row("暂无请求头。"));
+        let cookies_table = cx.new(|cx| {
+            make_table(cx)
+                .empty_row("暂无 Cookie 字段覆盖。")
+                .add_row("添加 Cookie 字段覆盖")
+        });
         let response_headers_table = cx.new(|cx| {
             DataTable::new(
                 cx,
@@ -358,6 +303,7 @@ impl Workbench {
             )
             .document()
             .compact()
+            .empty_row("暂无响应头。")
         });
         for (kind, table) in [(0, &params_table), (1, &headers_table), (2, &cookies_table)] {
             subscriptions.push(cx.subscribe(
@@ -390,6 +336,7 @@ impl Workbench {
             )
             .document()
             .compact()
+            .empty_row("暂无环境变量。")
             .add_row("添加一行")
         });
         subscriptions.push(cx.subscribe(
@@ -416,10 +363,17 @@ impl Workbench {
             collections,
             current_collection: 0,
             show_collection_menu: false,
-            request_list,
+            current_directory: String::new(),
+            collapsed_directories: HashSet::new(),
+            hovered_tree_row: None,
+            tree_drop: None,
+            tree_menu: None,
             group_name,
             group_edit: None,
             group_error: None,
+            request_name,
+            editing_request_name: false,
+            request_name_error: None,
             active: 0,
             tabs,
             config: 0,
@@ -437,15 +391,16 @@ impl Workbench {
             variable_search,
             variable_error: None,
             variable_rows: vec![vec![]; environment_count],
+            proxy_inputs: vec![],
             variable_table,
             next_variable_row: 0,
-            requests_expanded: true,
             history_filter: 0,
             selected_history: None,
             current_versions,
             filter,
             history_search,
             authentication,
+            skip_tls_verification: false,
             endpoint,
             theme_selector,
             environment,
@@ -457,6 +412,7 @@ impl Workbench {
             headers_table,
             response_headers_table,
             response_headers_scroll: gpui::ScrollHandle::new(),
+            response_header_entries: vec![],
             cookies_table,
             body,
             response,
@@ -483,6 +439,173 @@ impl Workbench {
         this.subscriptions.push(subscription);
         this.set_theme(ThemePreset::Moonstone, cx);
         this
+    }
+    fn command_items(requests: &[Request]) -> Vec<CommandItem> {
+        requests
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                CommandItem::new(i.to_string(), r.name.clone())
+                    .group("请求")
+                    .keywords(format!("{} {}", r.draft.method, r.draft.url))
+                    .icon(Icon::ApiDoc)
+            })
+            .chain([
+                CommandItem::new("send", "发送 HTTP 请求")
+                    .group("操作")
+                    .icon(Icon::Play)
+                    .shortcut("⌘ Enter"),
+                CommandItem::new("save", "保存请求版本")
+                    .group("操作")
+                    .icon(Icon::Save)
+                    .shortcut("⌘ S"),
+                CommandItem::new("theme", "切换明暗主题")
+                    .group("操作")
+                    .icon(Icon::HalfCircle),
+            ])
+            .collect()
+    }
+    fn sync_commands(&mut self, cx: &mut Context<Self>) {
+        let items = Self::command_items(&self.requests);
+        self.commands
+            .update(cx, |commands, cx| commands.set_items(items, cx));
+    }
+    fn edit_request_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(request) = self.requests.get(self.active) else {
+            return;
+        };
+        let name = request.name.clone();
+        self.request_name
+            .update(cx, |entry, cx| entry.set_value(name, cx));
+        self.editing_request_name = true;
+        self.request_name_error = None;
+        window.focus(&self.request_name.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+    fn cancel_request_name(&mut self, cx: &mut Context<Self>) {
+        self.editing_request_name = false;
+        self.request_name_error = None;
+        cx.notify();
+    }
+    fn save_request_name(&mut self, cx: &mut Context<Self>) {
+        if !self.editing_request_name {
+            return;
+        }
+        let name = self.request_name.read(cx).value().trim().to_owned();
+        if name.is_empty() {
+            self.request_name_error = Some("请输入请求名称".into());
+            cx.notify();
+            return;
+        }
+        if let Some(request) = self.requests.get_mut(self.active) {
+            if request.name != name {
+                request.name = name;
+                self.storage_dirty = true;
+            }
+        }
+        self.cancel_request_name(cx);
+        self.sync_groups(cx);
+        self.sync_commands(cx);
+    }
+    fn request_name_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = self.theme.palette();
+        if self.editing_request_name {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    match event.keystroke.key.as_str() {
+                        "enter" => {
+                            this.save_request_name(cx);
+                            cx.stop_propagation();
+                        }
+                        "escape" => {
+                            this.cancel_request_name(cx);
+                            cx.stop_propagation();
+                        }
+                        _ => return,
+                    }
+                    if !this.editing_request_name {
+                        window.focus(&this.focus, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(30.))
+                                .px_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(p.accent))
+                                .child(self.request_name.clone()),
+                        )
+                        .child(
+                            IconButton::new(Icon::CheckCircle, "保存请求名称")
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_request_name(cx);
+                                    if !this.editing_request_name {
+                                        window.focus(&this.focus, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            IconButton::new(Icon::Close, "取消重命名")
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_request_name(cx);
+                                    window.focus(&this.focus, cx);
+                                })),
+                        ),
+                )
+                .when_some(self.request_name_error.clone(), |view, error| {
+                    view.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xd9342b))
+                            .child(error),
+                    )
+                })
+                .into_any_element();
+        }
+        div()
+            .id("edit-request-name")
+            .group("request-name")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|style| style.text_color(rgb(p.accent)))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.requests[self.active].name.clone()),
+            )
+            .child(
+                Icon::Pencil
+                    .render(14.)
+                    .flex_shrink_0()
+                    .opacity(0.)
+                    .group_hover("request-name", |style| style.opacity(1.)),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.edit_request_name(window, cx)))
+            .into_any_element()
     }
     fn environment_name(&self, index: usize) -> &str {
         self.environment_names
@@ -556,6 +679,7 @@ impl Workbench {
             cookies: pairs(&self.cookies),
             token: self.authentication.read(cx).value().text.to_string(),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
+            skip_tls_verification: self.skip_tls_verification,
             environment: self
                 .environment
                 .read(cx)
@@ -566,7 +690,11 @@ impl Workbench {
     }
     fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
         let values = self.environment_inputs[self.selected_environment(cx)].values();
-        std::rc::Rc::new(move |expression| values.resolve(expression))
+        let resolver = template::TemplateResolver::for_request(&values, &self.snapshot(cx));
+        std::rc::Rc::new(move |expression| match &resolver {
+            Ok(resolver) => resolver.resolve(expression),
+            Err(error) => Err(error.clone()),
+        })
     }
     fn sync_reference_inputs(&mut self, cx: &mut Context<Self>) {
         let resolver = self.reference_resolver(cx);
@@ -594,8 +722,16 @@ impl Workbench {
         let note = Self::entry(&pair.note, "说明", cx);
         for entry in [&key, &value, &note] {
             entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
+            let mut previous = entry.read(cx).value().to_string();
             self.row_subscriptions
-                .push(cx.observe(entry, |_, _, cx| cx.notify()));
+                .push(cx.observe(entry, move |this, entry, cx| {
+                    let current = entry.read(cx).value().to_string();
+                    if current != previous {
+                        previous = current;
+                        this.sync_reference_inputs(cx);
+                    }
+                    cx.notify();
+                }));
         }
         let resolver = self.reference_resolver(cx);
         for entry in [&key, &value] {
@@ -611,6 +747,7 @@ impl Workbench {
         }
     }
     fn load(&mut self, draft: &Draft, cx: &mut Context<Self>) {
+        self.skip_tls_verification = draft.skip_tls_verification;
         self.authentication.update(cx, |field, cx| {
             field.set_selected(Some(if draft.auth { "bearer" } else { "none" }.into()), cx);
             field.set_text(draft.token.clone(), cx);
@@ -644,6 +781,8 @@ impl Workbench {
             self.push_trace("切换请求，已取消等待中的请求", cx);
         }
         self.trace_started = None;
+        self.tree_menu = None;
+        self.cancel_request_name(cx);
         self.active = index;
         if let Some(collection) = self
             .collections
@@ -655,7 +794,16 @@ impl Workbench {
                 self.group_error = None;
             }
             self.current_collection = collection;
-            self.requests_expanded = true;
+            self.current_directory = self.requests[index].group.clone();
+            let mut path = self.current_directory.as_str();
+            loop {
+                self.collapsed_directories
+                    .remove(&(collection, path.to_owned()));
+                if path.is_empty() {
+                    break;
+                }
+                path = RequestGroups::parent(path);
+            }
         }
         self.sync_request_preview(cx);
         self.sync_groups(cx);
@@ -678,7 +826,20 @@ impl Workbench {
         }
         let draft = self.snapshot(cx);
         let request = &mut self.requests[self.active];
-        request.draft = draft.clone();
+        if request.draft != draft {
+            request.draft = draft.clone();
+            self.storage_dirty = true;
+        }
+        if request
+            .versions
+            .first()
+            .is_some_and(|record| record.draft == draft)
+        {
+            self.current_versions[self.active] = 0;
+            self.notice = "已保存，内容未修改".into();
+            cx.notify();
+            return;
+        }
         self.storage_dirty = true;
         request.versions.insert(
             0,
@@ -688,6 +849,7 @@ impl Workbench {
                 time: record_time(),
                 detail: "保存请求时生成的快照".into(),
                 elapsed_ms: None,
+                exchange: None,
             },
         );
         self.current_versions[self.active] = 0;
@@ -724,7 +886,9 @@ impl Workbench {
         self.error = None;
         let inputs = &self.environment_inputs[draft.environment];
         let variables = inputs.values();
-        let request = match PreparedRequest::new(&draft, &variables) {
+        let request = match PreparedRequest::new(&draft, &variables)
+            .and_then(|request| request.with_proxy(&inputs.proxy))
+        {
             Ok(request) => request,
             Err(error) => {
                 self.push_trace(format!("校验失败：{error}"), cx);
@@ -774,6 +938,12 @@ impl Workbench {
                         detail,
                         time: record_time(),
                         elapsed_ms: Some(elapsed_ms),
+                        exchange: Some(model::Exchange {
+                            response: result.as_ref().ok().cloned(),
+                            error: result.as_ref().err().cloned(),
+                            preview: this.sent_requests[index].clone(),
+                            traces: vec![],
+                        }),
                     },
                 );
                 this.selected_history = Some((index, 0));
@@ -805,9 +975,19 @@ impl Workbench {
                     Err(error) => {
                         this.push_trace(format!("请求失败：{error}"), cx);
                         this.error = Some(error);
+                        this.responses[index] = None;
+                        this.response_data = None;
+                        this.response_json = None;
+                        this.status = None;
+                        this.update_response(cx);
                         this.notice = "请求失败".into();
                     }
                 }
+                this.requests[index].history[0]
+                    .exchange
+                    .as_mut()
+                    .unwrap()
+                    .traces = this.traces[index].clone();
                 this.trace_started = None;
                 this.sending = None;
                 cx.notify();
@@ -892,34 +1072,50 @@ impl Workbench {
         response.text.clone()
     }
     fn update_response(&mut self, cx: &mut Context<Self>) {
-        let rows = self
+        let headers = self
             .response_data
+            .as_ref()
+            .map(|response| response.headers.clone())
+            .unwrap_or_default();
+        self.response_header_entries = headers
             .iter()
-            .flat_map(|response| {
-                response
-                    .headers
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (key, value))| {
-                        let value = value.clone();
-                        TableRow::new(
-                            format!("response-header-{index}"),
-                            [
-                                TableCell::mono(key.clone()),
-                                TableCell::custom(move || {
-                                    div()
-                                        .id(("response-header-value", index))
-                                        .w_full()
-                                        .min_w_0()
-                                        .overflow_x_scroll()
-                                        .font_family("Menlo")
-                                        .text_size(px(11.))
-                                        .whitespace_nowrap()
-                                        .child(value.clone())
-                                }),
-                            ],
-                        )
+            .map(|(key, value)| {
+                [key, value].map(|text| {
+                    cx.new(|cx| {
+                        TextEntry::new(cx, "", text.clone())
+                            .read_only(true)
+                            .fit_content()
+                            .font_size(11.)
+                            .theme(self.theme)
                     })
+                })
+            })
+            .collect();
+        let rows = self
+            .response_header_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entries)| {
+                TableRow::new(
+                    format!("response-header-{index}"),
+                    entries.iter().enumerate().map(|(column, entry)| {
+                        let entry = entry.clone();
+                        TableCell::custom(move || {
+                            div()
+                                .id(("response-header-cell", index * 2 + column))
+                                .debug_selector(move || {
+                                    format!("response-header-{index}-{column}").into()
+                                })
+                                .w_full()
+                                .min_w_0()
+                                .h(px(26.))
+                                .overflow_x_scroll()
+                                .font_family("Menlo")
+                                .text_size(px(11.))
+                                .child(entry.clone())
+                        })
+                    }),
+                )
             })
             .collect::<Vec<_>>();
         self.response_headers_table
@@ -1008,7 +1204,15 @@ impl Workbench {
         self.sync_pair_tables(cx);
         self.response_headers_table
             .update(cx, |table, cx| table.set_theme(theme, cx));
-        for entry in [&self.filter, &self.history_search, &self.group_name] {
+        for entry in self.response_header_entries.iter().flatten() {
+            entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
+        }
+        for entry in [
+            &self.filter,
+            &self.history_search,
+            &self.group_name,
+            &self.request_name,
+        ] {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }
         self.variable_search
@@ -1018,6 +1222,9 @@ impl Workbench {
             row.value.update(cx, |entry, cx| entry.set_theme(theme, cx));
             row.kind
                 .update(cx, |select, cx| select.set_theme(theme, cx));
+        }
+        for proxy in &self.proxy_inputs {
+            proxy.url.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }
         self.sync_variable_table(cx);
         for row in self
@@ -1052,16 +1259,17 @@ impl Workbench {
         cx.notify();
     }
     fn open_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_commands(cx);
         self.commands
             .update(cx, |commands, cx| commands.open(window, cx));
     }
     fn topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         div()
-            .w_full()
+            .size_full()
             .flex()
             .items_center()
             .gap_3()
-            .pl(px(80.))
+            .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
             .pr_3()
             .text_size(px(12.))
             .child(Icon::ApiDoc.render(18.).text_color(rgb(0x007aff)))
@@ -1078,15 +1286,20 @@ impl Workbench {
                         self.requests
                             .get(self.active)
                             .map(|request| {
-                                format!(
-                                    "个人工作区  ›  {}  ›  {}",
-                                    request.collection, request.group
-                                )
+                                if request.group.is_empty() {
+                                    format!("个人工作区  ›  {}", request.collection)
+                                } else {
+                                    format!(
+                                        "个人工作区  ›  {}  ›  {}",
+                                        request.collection,
+                                        request.group.replace('/', "  ›  ")
+                                    )
+                                }
                             })
                             .unwrap_or_else(|| "个人工作区  ›  暂无请求".into())
                     }),
             )
-            .child(div().flex_1())
+            .child(gpui_glint::components::window_drag_region())
             .child(
                 div()
                     .id("open-command-search")
@@ -1352,119 +1565,32 @@ impl Workbench {
             .id("request-tree")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_scroll()
             .px_2()
             .pb_3();
         if self.show_environments {
             return self.environment_sidebar(cx);
         }
-        {
-            let query = self.filter.read(cx).value().to_lowercase();
-            let mut visible_collections = 0;
-            for (index, collection) in self.collections.iter().enumerate() {
-                let matches_collection = collection.collection.to_lowercase().contains(&query);
-                let has_matches = collection
-                    .names
-                    .iter()
-                    .any(|group| group.to_lowercase().contains(&query))
-                    || self.requests.iter().any(|request| {
-                        request.collection == collection.collection
-                            && format!(
-                                "{} {} {}",
-                                request.name, request.draft.method, request.draft.url
-                            )
-                            .to_lowercase()
-                            .contains(&query)
-                    });
-                if !query.is_empty() && !matches_collection && !has_matches {
-                    continue;
-                }
-                visible_collections += 1;
-                let expanded = self.current_collection == index && self.requests_expanded;
-                let count = self
-                    .requests
-                    .iter()
-                    .filter(|request| request.collection == collection.collection)
-                    .count();
-                tree = tree.child(
-                    div()
-                        .id(("request-collection-toggle", index))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_3()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(p.accent_tint)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.current_collection == index {
-                                this.requests_expanded = !this.requests_expanded;
-                            } else {
-                                this.current_collection = index;
-                                this.requests_expanded = true;
-                            }
-                            this.group_edit = None;
-                            this.sync_groups(cx);
-                            cx.notify();
-                        }))
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(if expanded {
-                            Icon::ChevronDown.render(12.)
-                        } else {
-                            Icon::ChevronRight.render(12.)
-                        })
-                        .child(Icon::Folders.render(14.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(collection.collection.clone()),
-                        )
-                        .child(
-                            IconButton::new(Icon::Plus, "新建分组")
-                                .theme(self.theme)
-                                .render()
-                                .size(px(20.))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.current_collection = index;
-                                    this.edit_group(None, cx);
-                                    this.sync_groups(cx);
-                                    window.focus(&this.group_name.read(cx).focus_handle(cx), cx);
-                                })),
-                        )
-                        .child(div().text_color(rgb(p.text_muted)).child(count.to_string())),
-                );
-                if expanded {
-                    tree = tree.child(self.request_list.clone());
-                    if collection.names.is_empty() {
-                        tree = tree.child(
-                            div()
-                                .px_3()
-                                .pb_3()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child("暂无请求，点击集合旁的 + 创建分组"),
-                        );
-                    }
-                }
-            }
-            if visible_collections == 0 {
-                tree = tree.child(
-                    div()
-                        .p_3()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.text_muted))
-                        .child(if self.collections.is_empty() {
-                            "暂无集合，点击更多菜单创建集合"
-                        } else {
-                            "没有匹配的集合、分组或请求"
-                        }),
-                );
-            }
+        let list = model::tree_list(
+            &self.collections,
+            &self.requests,
+            &self.collapsed_directories,
+            self.filter.read(cx).value(),
+        );
+        if list.visible_rows().is_empty() {
+            tree = tree.child(
+                div()
+                    .p_3()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child(if self.collections.is_empty() {
+                        "先创建一个集合，再添加请求或目录"
+                    } else {
+                        "没有匹配的集合、目录或请求"
+                    }),
+            );
         }
+        tree = tree.child(list.render_with(|row| self.tree_row(model::tree_entry(row), cx)));
         div()
             .size_full()
             .flex()
@@ -1497,7 +1623,7 @@ impl Workbench {
             )
             .child(
                 div().px_3().pb_2().child(
-                    SearchInput::new("筛选集合、分组或请求…")
+                    SearchInput::new("筛选集合、目录或请求…")
                         .control(self.filter.clone())
                         .theme(self.theme)
                         .width(196.)
@@ -1575,6 +1701,7 @@ impl Workbench {
     }
     fn edit_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_collection_menu = false;
+        self.tree_menu = None;
         self.show_environments = false;
         self.group_name
             .update(cx, |entry, cx| entry.set_value("", cx));
@@ -1584,76 +1711,480 @@ impl Workbench {
         cx.notify();
     }
     fn sync_groups(&mut self, cx: &mut Context<Self>) {
-        let mut query = self.filter.read(cx).value().to_lowercase();
-        let Some(collection) = self.collections.get(self.current_collection) else {
-            self.request_list
-                .update(cx, |list, cx| list.set_groups(vec![], cx));
-            return;
-        };
-        if collection.collection.to_lowercase().contains(&query) {
-            query.clear();
+        // Tree rows are derived directly from collections and requests at render time.
+        if !self
+            .collections
+            .get(self.current_collection)
+            .is_some_and(|c| c.contains(&self.current_directory))
+        {
+            self.current_directory.clear();
         }
-        let groups: Vec<_> = collection
-            .names
-            .iter()
-            .filter_map(|name| {
-                let items: Vec<_> = self
-                    .requests
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, request)| {
-                        &request.group == name
-                            && request.collection == collection.collection
-                            && (name.to_lowercase().contains(&query)
-                                || format!(
-                                    "{} {} {}",
-                                    request.name, request.draft.method, request.draft.url
-                                )
-                                .to_lowercase()
-                                .contains(&query))
-                    })
-                    .map(|(i, request)| {
-                        GroupListItem::new(i.to_string(), request.name.clone())
-                            .action(Icon::Trash)
-                            .prefix(request.draft.method.clone())
-                            .prefix_color(self.theme.color(method_color(&request.draft.method)))
-                    })
-                    .collect();
-                if !query.is_empty() && items.is_empty() && !name.to_lowercase().contains(&query) {
-                    return None;
-                }
-                let header = GroupListHeader::new(
-                    format!("{}:{name}", self.current_collection),
-                    name.clone(),
-                )
-                .actions(if name == "未分组" {
-                    vec![Icon::Plus]
-                } else {
-                    vec![Icon::Plus, Icon::Pencil, Icon::Trash]
-                });
-                Some(GroupListGroup { header, items })
-            })
-            .collect();
-        self.request_list.update(cx, |list, cx| {
-            list.set_theme(self.theme, cx);
-            list.set_groups(groups, cx);
-            list.set_selected(
-                (!self.requests.is_empty()).then(|| self.active.to_string().into()),
-                cx,
-            );
-        });
+        cx.notify();
     }
-    fn edit_group(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+    fn edit_directory(
+        &mut self,
+        collection: usize,
+        parent: String,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.current_collection = collection;
+        self.current_directory = parent.clone();
         self.group_name.update(cx, |entry, cx| {
-            entry.set_value(name.clone().unwrap_or_default(), cx)
+            entry.set_value(
+                name.as_deref()
+                    .map(|path| path.rsplit('/').next().unwrap_or(path))
+                    .unwrap_or(""),
+                cx,
+            )
         });
         self.group_edit = Some(match name {
-            Some(name) => GroupEdit::Rename(name),
-            None => GroupEdit::Create,
+            Some(path) => GroupEdit::Rename(path),
+            None => GroupEdit::Create(parent),
         });
         self.group_error = None;
-        self.requests_expanded = true;
+        window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
         cx.notify();
+    }
+    fn drop_tree_node(
+        &mut self,
+        source: &model::TreeNode,
+        target: &model::TreeNode,
+        placement: model::Placement,
+        cx: &mut Context<Self>,
+    ) {
+        use model::{Placement, TreeNode};
+        self.capture_draft(cx);
+        let old_names = self
+            .collections
+            .iter()
+            .map(|c| c.collection.clone())
+            .collect::<Vec<_>>();
+        let selected_name = old_names.get(self.current_collection).cloned();
+        let moved = if let (
+            TreeNode::Directory {
+                collection: from,
+                path,
+            },
+            TreeNode::Directory {
+                collection: to,
+                path: target_path,
+            },
+        ) = (source, target)
+        {
+            if path.is_empty() && target_path.is_empty() && placement != Placement::Inside {
+                let name = old_names[*from].clone();
+                let destination = old_names[*to].clone();
+                if from != to {
+                    let collection = self.collections.remove(*from);
+                    let position = self
+                        .collections
+                        .iter()
+                        .position(|c| c.collection == destination)
+                        .unwrap()
+                        + usize::from(placement == Placement::After);
+                    self.collections.insert(position, collection);
+                }
+                Ok(TreeNode::Directory {
+                    collection: self
+                        .collections
+                        .iter()
+                        .position(|c| c.collection == name)
+                        .unwrap(),
+                    path: String::new(),
+                })
+            } else {
+                model::move_node(
+                    &mut self.collections,
+                    &mut self.requests,
+                    source,
+                    target,
+                    placement,
+                )
+            }
+        } else {
+            model::move_node(
+                &mut self.collections,
+                &mut self.requests,
+                source,
+                target,
+                placement,
+            )
+        };
+        match moved {
+            Ok(moved) => {
+                let remap = |collection: usize, path: String| {
+                    if let (
+                        TreeNode::Directory {
+                            collection: from,
+                            path: old,
+                        },
+                        TreeNode::Directory {
+                            collection: to,
+                            path: next,
+                        },
+                    ) = (source, &moved)
+                    {
+                        if !old.is_empty()
+                            && collection == *from
+                            && (path == *old || path.starts_with(&format!("{old}/")))
+                        {
+                            return (*to, format!("{next}{}", &path[old.len()..]));
+                        }
+                    }
+                    (
+                        self.collections
+                            .iter()
+                            .position(|c| Some(&c.collection) == old_names.get(collection))
+                            .unwrap_or(0),
+                        path,
+                    )
+                };
+                self.collapsed_directories = std::mem::take(&mut self.collapsed_directories)
+                    .into_iter()
+                    .map(|(c, p)| remap(c, p))
+                    .collect();
+                let (c, path) = remap(self.current_collection, self.current_directory.clone());
+                self.current_collection = c;
+                self.current_directory = path;
+                if let Some(name) = selected_name {
+                    if matches!(source, TreeNode::Directory { path, .. } if path.is_empty()) {
+                        self.current_collection = self
+                            .collections
+                            .iter()
+                            .position(|c| c.collection == name)
+                            .unwrap_or(0);
+                    }
+                }
+                let (collection, mut parent) = match moved {
+                    TreeNode::Directory { collection, path } => {
+                        (collection, RequestGroups::parent(&path).to_owned())
+                    }
+                    TreeNode::Request(index) => (
+                        self.collections
+                            .iter()
+                            .position(|c| c.collection == self.requests[index].collection)
+                            .unwrap(),
+                        self.requests[index].group.clone(),
+                    ),
+                };
+                loop {
+                    self.collapsed_directories
+                        .remove(&(collection, parent.clone()));
+                    if parent.is_empty() {
+                        break;
+                    }
+                    parent = RequestGroups::parent(&parent).to_owned();
+                }
+                self.storage_dirty = true;
+                self.tree_menu = None;
+                self.group_edit = None;
+                self.hovered_tree_row = None;
+                self.notice = "已移动节点".into();
+                self.sync_commands(cx);
+                self.persist(cx);
+            }
+            Err(error) => self.notice = error,
+        }
+        self.tree_drop = None;
+        cx.notify();
+    }
+    fn node_key(node: &model::TreeNode) -> String {
+        match node {
+            model::TreeNode::Request(index) => format!("request-leaf:{index}"),
+            model::TreeNode::Directory { collection, path } => {
+                format!("request-directory:{collection}:{path}")
+            }
+        }
+    }
+    fn node_from_key(&self, key: &str) -> Option<model::TreeNode> {
+        if let Some(index) = key
+            .strip_prefix("request-leaf:")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return (index < self.requests.len()).then_some(model::TreeNode::Request(index));
+        }
+        let (collection, path) = key.strip_prefix("request-directory:")?.split_once(':')?;
+        let collection = collection.parse::<usize>().ok()?;
+        self.collections
+            .get(collection)
+            .filter(|c| c.contains(path))?;
+        Some(model::TreeNode::Directory {
+            collection,
+            path: path.into(),
+        })
+    }
+    fn tree_item(
+        &self,
+        node: model::TreeNode,
+        label: String,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> TreeListItem {
+        let owner = cx.entity().downgrade();
+        let drop_owner = owner.clone();
+        let indicator = self
+            .tree_drop
+            .as_ref()
+            .filter(|(target, _)| *target == node)
+            .map(|(_, p)| *p)
+            .filter(|_| cx.has_active_drag());
+        TreeListItem::new(Self::node_key(&node), label)
+            .depth(depth)
+            .theme(self.theme)
+            .draggable(cx.entity_id())
+            .drop_indicator(indicator)
+            .on_drag_over(move |event: &TreeDrop, _, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if let Some(target) = this.node_from_key(&event.target) {
+                        let next = Some((target, event.placement));
+                        if next != this.tree_drop {
+                            this.tree_drop = next;
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .on_drop(move |event: &TreeDrop, _, cx| {
+                let _ = drop_owner.update(cx, |this, cx| {
+                    if let (Some(source), Some(target)) = (
+                        this.node_from_key(&event.source),
+                        this.node_from_key(&event.target),
+                    ) {
+                        this.drop_tree_node(&source, &target, event.placement, cx);
+                    }
+                });
+            })
+    }
+    fn tree_row(&self, entry: model::TreeEntry, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (node, depth, label, expanded) = match entry {
+            model::TreeEntry::Directory {
+                collection,
+                path,
+                depth,
+                expanded,
+            } => {
+                let label = if path.is_empty() {
+                    self.collections[collection].collection.clone()
+                } else {
+                    path.rsplit('/').next().unwrap_or(&path).into()
+                };
+                (
+                    model::TreeNode::Directory { collection, path },
+                    depth,
+                    label,
+                    Some(expanded),
+                )
+            }
+            model::TreeEntry::Request { index, depth } => (
+                model::TreeNode::Request(index),
+                depth,
+                self.requests[index].name.clone(),
+                None,
+            ),
+        };
+        let key = Self::node_key(&node);
+        let debug_key = key.clone();
+        let hovered = self.hovered_tree_row.as_deref() == Some(key.as_str());
+        let mut item = self.tree_item(node.clone(), label.clone(), depth, cx);
+        match node {
+            model::TreeNode::Directory { collection, path } => {
+                item = item.branch(expanded.unwrap()).selected(
+                    self.current_collection == collection && self.current_directory == path,
+                );
+                if path.is_empty() {
+                    item = item.content(
+                        div()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(label),
+                    );
+                }
+                if hovered || self.tree_menu.as_ref() == Some(&(collection, path.clone())) {
+                    item = item.trailing(self.directory_menu(collection, path.clone(), cx));
+                }
+                item.render()
+                    .debug_selector(move || debug_key.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tree_menu = None;
+                        this.current_collection = collection;
+                        this.current_directory = path.clone();
+                        let key = (collection, path.clone());
+                        if !this.collapsed_directories.remove(&key) {
+                            this.collapsed_directories.insert(key);
+                        }
+                        this.group_edit = None;
+                        this.group_error = None;
+                        cx.notify();
+                    }))
+            }
+            model::TreeNode::Request(index) => {
+                let request = &self.requests[index];
+                item = item.selected(index == self.active).content(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .w(px(34.))
+                                .flex_shrink_0()
+                                .text_size(px(9.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(self
+                                    .theme
+                                    .color(method_color(&request.draft.method))))
+                                .child(request.draft.method.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(request.name.clone()),
+                        ),
+                );
+                if hovered {
+                    item = item.trailing(
+                        IconButton::new(Icon::Trash, "删除请求")
+                            .theme(self.theme)
+                            .render()
+                            .size(px(20.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.delete_request(index, cx);
+                            })),
+                    );
+                }
+                item.render()
+                    .debug_selector(move || debug_key.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
+            }
+        }
+        .on_hover(cx.listener(move |this, hover, _, cx| {
+            if *hover {
+                this.hovered_tree_row = Some(key.clone());
+            } else if this.hovered_tree_row.as_deref() == Some(key.as_str()) {
+                this.hovered_tree_row = None;
+            }
+            cx.notify();
+        }))
+        .into_any_element()
+    }
+    fn directory_menu(&self, collection: usize, path: String, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let key = (collection, path.clone());
+        let open = self.tree_menu.as_ref() == Some(&key);
+        let toggle_key = key.clone();
+        let debug_key = format!("directory-menu:{collection}:{path}");
+        let mut trigger = div().relative().flex_shrink_0().child(
+            IconButton::new(Icon::More, "目录操作")
+                .theme(self.theme)
+                .render()
+                .id(format!("directory-menu:{collection}:{path}"))
+                .debug_selector(move || debug_key.clone())
+                .size(px(22.))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tree_menu = if this.tree_menu.as_ref() == Some(&toggle_key) {
+                        None
+                    } else {
+                        Some(toggle_key.clone())
+                    };
+                    this.show_collection_menu = false;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                })),
+        );
+        if open {
+            let mut menu = div()
+                .p_1()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(p.border))
+                .bg(rgb(p.panel))
+                .shadow_md()
+                .text_size(px(12.));
+            for (action, icon, label) in [
+                (0, Icon::Plus, "新建请求"),
+                (1, Icon::Folder, "新建目录"),
+                (2, Icon::Pencil, "重命名目录"),
+                (3, Icon::Trash, "删除目录"),
+            ] {
+                if path.is_empty() && action >= 2 {
+                    continue;
+                }
+                let path = path.clone();
+                let debug_key = format!("directory-menu-action:{collection}:{path}:{action}");
+                menu = menu.child(
+                    div()
+                        .id(format!(
+                            "directory-menu-action:{collection}:{path}:{action}"
+                        ))
+                        .debug_selector(move || debug_key.clone())
+                        .h(px(32.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .when(action == 3, |item| {
+                            item.text_color(rgb(self.theme.color(0xd9342b)))
+                        })
+                        .hover(|style| style.bg(rgb(p.surface_subtle)))
+                        .child(icon.render(14.).flex_shrink_0())
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.tree_menu = None;
+                            this.current_collection = collection;
+                            this.current_directory = path.clone();
+                            match action {
+                                0 => this.add_request_to(path.clone(), cx),
+                                1 => {
+                                    this.edit_directory(collection, path.clone(), None, window, cx)
+                                }
+                                2 => this.edit_directory(
+                                    collection,
+                                    path.clone(),
+                                    Some(path.clone()),
+                                    window,
+                                    cx,
+                                ),
+                                _ => {
+                                    this.collections[collection].remove(&path, &mut this.requests);
+                                    this.collapsed_directories.retain(|(c, folder)| {
+                                        *c != collection
+                                            || (folder != &path
+                                                && !folder.starts_with(&format!("{path}/")))
+                                    });
+                                    this.current_directory =
+                                        RequestGroups::parent(&path).to_owned();
+                                    this.group_edit = None;
+                                    this.storage_dirty = true;
+                                    this.notice = "已删除目录，请求保留在上级目录中".into();
+                                    this.sync_groups(cx);
+                                }
+                            }
+                        })),
+                );
+            }
+            let popup = div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(168.))
+                .pt(px(26.))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.tree_menu = None;
+                    cx.notify();
+                }))
+                .child(menu);
+            trigger = trigger.child(gpui::deferred(popup).with_priority(20));
+        }
+        trigger
     }
     fn save_group(&mut self, cx: &mut Context<Self>) {
         let name = self.group_name.read(cx).value().to_owned();
@@ -1669,6 +2200,7 @@ impl Workbench {
                     self.environment_inputs
                         .push(EnvironmentVariables::default());
                     self.variable_rows.push(vec![]);
+                    self.add_proxy_input(cx);
                     self.editing_environment = self.environment_names.len() - 1;
                     self.environment.update(cx, |select, cx| {
                         select.set_options(
@@ -1687,15 +2219,67 @@ impl Workbench {
                 RequestGroups::create_collection(&name, &self.collections).map(|collection| {
                     self.collections.push(collection);
                     self.current_collection = self.collections.len() - 1;
-                    self.requests_expanded = true;
+                    self.current_directory.clear();
                     self.notice = format!("已创建集合 {}", name.trim());
                 })
             }
-            Some(GroupEdit::Create) => self.collections[self.current_collection]
-                .add(&name)
-                .map(|_| ()),
+            Some(GroupEdit::Create(parent)) => self.collections[self.current_collection]
+                .add_child(parent, &name)
+                .map(|path| {
+                    let node = model::TreeNode::Directory {
+                        collection: self.current_collection,
+                        path: path.clone(),
+                    };
+                    let target = model::TreeNode::Directory {
+                        collection: self.current_collection,
+                        path: parent.clone(),
+                    };
+                    let _ = model::move_node(
+                        &mut self.collections,
+                        &mut self.requests,
+                        &node,
+                        &target,
+                        model::Placement::Inside,
+                    );
+                    self.current_directory = path.clone();
+                    self.collapsed_directories
+                        .remove(&(self.current_collection, path));
+                    let mut path = parent.as_str();
+                    loop {
+                        self.collapsed_directories
+                            .remove(&(self.current_collection, path.to_owned()));
+                        if path.is_empty() {
+                            break;
+                        }
+                        path = RequestGroups::parent(path);
+                    }
+                }),
             Some(GroupEdit::Rename(old)) => {
-                self.collections[self.current_collection].rename(old, &name, &mut self.requests)
+                let parent = RequestGroups::parent(old);
+                let new = if parent.is_empty() {
+                    name.trim().to_owned()
+                } else {
+                    format!("{parent}/{}", name.trim())
+                };
+                self.collections[self.current_collection]
+                    .rename(old, &name, &mut self.requests)
+                    .map(|_| {
+                        let prefix = format!("{old}/");
+                        self.collapsed_directories = self
+                            .collapsed_directories
+                            .iter()
+                            .map(|(collection, path)| {
+                                if *collection == self.current_collection
+                                    && (path == old || path.starts_with(&prefix))
+                                {
+                                    (*collection, format!("{new}{}", &path[old.len()..]))
+                                } else {
+                                    (*collection, path.clone())
+                                }
+                            })
+                            .collect();
+                        self.current_directory = new;
+                    })
             }
             None => return,
         };
@@ -1725,11 +2309,26 @@ impl Workbench {
             .flex_col()
             .gap_2()
             .text_size(px(11.))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" => this.save_group(cx),
+                    "escape" => {
+                        this.group_edit = None;
+                        this.group_error = None;
+                        cx.notify();
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+                if this.group_edit.is_none() {
+                    window.focus(&this.focus, cx);
+                }
+            }))
             .child(match self.group_edit {
                 Some(GroupEdit::CreateCollection) => "创建集合",
                 Some(GroupEdit::CreateEnvironment) => "创建环境",
-                Some(GroupEdit::Create) => "新建分组",
-                _ => "重命名分组",
+                Some(GroupEdit::Create(_)) => "新建目录",
+                _ => "重命名目录",
             })
             .child(
                 div()
@@ -1773,7 +2372,7 @@ impl Workbench {
             )
     }
     fn add_request(&mut self, cx: &mut Context<Self>) {
-        self.add_request_to("自定义".into(), cx);
+        self.add_request_to(self.current_directory.clone(), cx);
     }
     fn add_request_to(&mut self, group: String, cx: &mut Context<Self>) {
         if self.collections.is_empty() {
@@ -1783,15 +2382,13 @@ impl Workbench {
             return;
         }
         let draft = Draft::default();
-        if !self.collections[self.current_collection]
-            .names
-            .contains(&group)
-        {
-            let _ = self.collections[self.current_collection].add(&group);
+        if !self.collections[self.current_collection].contains(&group) {
+            return;
         }
         let i = self.requests.len();
         self.storage_dirty = true;
         self.requests.push(Request {
+            tree_order: 0,
             name: format!("新建请求 {}", i + 1),
             collection: self.collections[self.current_collection].collection.clone(),
             group,
@@ -1802,9 +2399,21 @@ impl Workbench {
                 time: record_time(),
                 detail: "初始版本".into(),
                 elapsed_ms: None,
+                exchange: None,
             }],
             history: vec![],
         });
+        let target = model::TreeNode::Directory {
+            collection: self.current_collection,
+            path: self.requests[i].group.clone(),
+        };
+        let _ = model::move_node(
+            &mut self.collections,
+            &mut self.requests,
+            &model::TreeNode::Request(i),
+            &target,
+            model::Placement::Inside,
+        );
         self.responses.push(None);
         self.traces.push(vec![]);
         self.sent_requests.push(None);
@@ -1818,6 +2427,7 @@ impl Workbench {
         if index >= self.requests.len() {
             return;
         }
+        self.cancel_request_name(cx);
         self.capture_draft(cx);
         // Any removal changes captured indices in a pending response task.
         if self.sending.take().is_some() {
@@ -2011,6 +2621,7 @@ impl Workbench {
                 table.set_rows(rows, cx);
             });
         }
+        self.sync_reference_inputs(cx);
     }
     fn pair_table(&self, headers: bool) -> gpui::Div {
         let p = self.theme.palette();
@@ -2033,8 +2644,54 @@ impl Workbench {
                 }),
         )
     }
+    fn request_setting_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        control: impl IntoElement,
+    ) -> gpui::Div {
+        let p = self.theme.palette();
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_5()
+            .py_3()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(description),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(180.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(control),
+            )
+    }
     fn configuration(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
+        let owner = cx.entity().downgrade();
         let view=match self.config {
             0=>self.pair_table(false),
             2=>div().flex().flex_col().gap_3()
@@ -2048,7 +2705,23 @@ impl Workbench {
                 .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("Bearer 使用 Token 或环境变量引用；请填写实际 Token，或在环境变量中设置 api_token。No Auth 不生成 Authorization。")),
             3=>div().h_full().flex().flex_col().gap_2().child(div().flex().items_center().text_size(px(11.)).child("JSON 请求体").child(div().flex_1()).child(Button::new("格式化 JSON").kind(ButtonKind::Plain).size(ButtonSize::Mini).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx| {let valid=this.body.update(cx,|e,cx|e.format_json(cx));this.notice=if valid {"已格式化 JSON"} else {"JSON 格式有误，请检查后重试"}.into();cx.notify();}))))
                 .child(div().flex_1().min_h_0().child(self.body.clone())),
-            _=>div().p_3().text_size(px(12.)).text_color(rgb(p.text_muted)).child("真实 HTTP / HTTPS 请求。\n连接超时 10 秒，总超时 30 秒；响应内容最多 16 MiB。\n保留 3xx 响应，不自动跟随重定向；TLS 证书正常校验。\n支持 GET / POST / PUT / PATCH / DELETE，参数、请求头与身份验证随版本快照保存。"),
+            _=>div().w_full().flex().flex_col()
+                .child(self.request_setting_row("跳过 TLS 证书校验",
+                    "允许自签名、过期或域名不匹配的证书，仅作用于当前请求。",
+                    Switch::new("")
+                    .theme(self.theme)
+                    .checked(self.skip_tls_verification)
+                    .on_change(move |checked, _, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            this.skip_tls_verification = checked;
+                            cx.notify();
+                        });
+                    })
+                    .render().debug_selector(|| "skip-tls-verification".into())))
+                .child(self.request_setting_row("连接超时", "建立连接时的最长等待时间。", div().text_size(px(12.)).child("10 秒")))
+                .child(self.request_setting_row("请求超时", "包含连接和接收响应的总等待时间。", div().text_size(px(12.)).child("30 秒")))
+                .child(self.request_setting_row("重定向", "保留服务器返回的原始 3xx 响应。", div().text_size(px(12.)).child("不自动跟随")))
+                .child(self.request_setting_row("响应大小上限", "接收响应内容的最大大小。", div().text_size(px(12.)).child("16 MiB"))),
         };
         div()
             .id("configuration")
@@ -2104,7 +2777,11 @@ impl Workbench {
                         status_label(status),
                         self.requests[self.active]
                             .history
-                            .first()
+                            .get(
+                                self.selected_history
+                                    .filter(|(request, _)| *request == self.active)
+                                    .map_or(0, |(_, index)| index)
+                            )
                             .and_then(|r| r.elapsed_ms)
                             .unwrap_or(0),
                         bytes
@@ -2381,15 +3058,7 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.requests[self.active].name.clone()),
-                    )
+                    .child(self.request_name_view(cx))
                     .child(
                         div()
                             .flex()
@@ -2461,18 +3130,7 @@ impl Workbench {
             .child(top)
             .child(config_tabs)
             .child(self.configuration(cx))
-            .child(
-                div()
-                    .h(px(6.))
-                    .flex_shrink_0()
-                    .border_y_1()
-                    .border_color(rgb(p.border))
-                    .bg(rgb(p.panel))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(div().w(px(28.)).h(px(2.)).bg(rgb(p.border)).rounded_full()),
-            )
+            .child(Separator::horizontal().theme(self.theme).render())
             .child(self.response_panel(cx))
             .child(
                 div()
@@ -2577,6 +3235,7 @@ impl Workbench {
                 list = list.child(
                     div()
                         .id(("history-record", i))
+                        .debug_selector(move || format!("history-record-{i}").into())
                         .rounded_md()
                         .p_3()
                         .mb_2()
@@ -2655,11 +3314,24 @@ impl Workbench {
                             this.trace_started = None;
                             this.selected_history = Some((this.active, i));
                             this.load(&record.draft, cx);
-                            this.notice = format!("已恢复 {} 的请求配置", record.label);
-                            this.response_json = None;
-                            this.response_data = None;
-                            this.status = None;
-                            this.error = None;
+                            let exchange = record.exchange.as_ref();
+                            this.response_data = exchange.and_then(|e| e.response.clone());
+                            this.response_json =
+                                this.response_data.as_ref().and_then(|r| r.json.clone());
+                            this.status = this.response_data.as_ref().map(|r| r.status);
+                            this.error = exchange.and_then(|e| e.error.clone());
+                            this.sent_requests[this.active] =
+                                exchange.and_then(|e| e.preview.clone());
+                            this.traces[this.active] =
+                                exchange.map(|e| e.traces.clone()).unwrap_or_default();
+                            this.responses[this.active] = this.response_data.clone();
+                            this.sync_request_preview(cx);
+                            this.update_response(cx);
+                            this.notice = if exchange.is_some() {
+                                format!("已恢复 {} 的请求与响应", record.label)
+                            } else {
+                                "已恢复历史请求配置，此旧记录未保存响应内容".into()
+                            };
                             cx.notify();
                         })),
                 );
@@ -2828,6 +3500,7 @@ impl Workbench {
                         this.response_data = None;
                         this.status = None;
                         this.error = None;
+                        this.update_response(cx);
                         cx.notify();
                     })),
             );
@@ -3007,6 +3680,12 @@ impl Render for Workbench {
             }))
             .on_action(cx.listener(|this, _: &SearchCommands, w, cx| this.open_commands(w, cx)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.tree_menu.is_some() {
+                    this.tree_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if this.show_collection_menu {
                     match event.keystroke.key.as_str() {
                         "escape" => {
@@ -3068,6 +3747,7 @@ fn main() {
     gpui_platform::application()
         .with_assets(GlintAssets)
         .run(|cx: &mut App| {
+            app_icon::install();
             bind_text_entry_keys(cx);
             bind_code_card_keys(cx);
             cx.bind_keys([
@@ -3117,7 +3797,371 @@ fn main() {
 mod persistence_tests {
     use super::*;
     #[gpui::test]
+    fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-drag-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.add_request(cx);
+            host.group_edit = Some(GroupEdit::Create("".into()));
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("Folder", cx));
+            host.save_group(cx);
+            host
+        });
+        let drag = |window: &mut gpui::VisualTestContext,
+                    source: gpui::Point<gpui::Pixels>,
+                    target: gpui::Point<gpui::Pixels>| {
+            window.simulate_event(gpui::MouseDownEvent {
+                position: source,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            for _ in 0..2 {
+                window.simulate_event(gpui::MouseMoveEvent {
+                    position: target,
+                    pressed_button: Some(gpui::MouseButton::Left),
+                    ..Default::default()
+                });
+            }
+            window.simulate_event(gpui::MouseUpEvent {
+                position: target,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+        };
+        let source = window.debug_bounds("request-leaf:0").unwrap();
+        let target = window.debug_bounds("request-leaf:1").unwrap();
+        drag(
+            window,
+            source.center(),
+            point(target.center().x, target.bottom() - px(2.)),
+        );
+        host.update(window, |host, _| {
+            let order = model::siblings(&host.collections, &host.requests, 0, "");
+            assert!(
+                order
+                    .iter()
+                    .position(|node| *node == model::TreeNode::Request(1))
+                    .unwrap()
+                    < order
+                        .iter()
+                        .position(|node| *node == model::TreeNode::Request(0))
+                        .unwrap()
+            );
+            assert_eq!(
+                host.active, 1,
+                "dragging must not switch the active request"
+            );
+            assert_eq!(host.requests[0].versions.len(), 1);
+        });
+        let source = window.debug_bounds("request-leaf:0").unwrap();
+        let folder = window.debug_bounds("request-directory:0:Folder").unwrap();
+        drag(window, source.center(), folder.center());
+        host.update(window, |host, _| {
+            assert_eq!(host.requests[0].group, "Folder")
+        });
+        host.update(window, |host, cx| {
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("Other", cx));
+            host.save_group(cx);
+        });
+        let source = window.debug_bounds("request-directory:0:Folder").unwrap();
+        let target = window.debug_bounds("request-directory:1:").unwrap();
+        drag(window, source.center(), target.center());
+        host.update(window, |host, _| {
+            assert_eq!(host.requests[0].collection, "Other");
+            assert_eq!(host.requests[0].group, "Folder");
+            assert!(host.collections[1].contains("Folder"));
+        });
+        host.update(window, |host, cx| {
+            host.collapsed_directories.insert((1, "Folder".into()));
+            cx.notify();
+        });
+        let source = window.debug_bounds("request-directory:1:").unwrap();
+        let target = window.debug_bounds("request-directory:0:").unwrap();
+        drag(
+            window,
+            source.center(),
+            point(target.center().x, target.top() + px(2.)),
+        );
+        host.update(window, |host, _| {
+            assert_eq!(host.collections[0].collection, "Other");
+            assert!(host.collapsed_directories.contains(&(0, "Folder".into())));
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, _| {
+            assert_eq!(host.requests[0].collection, "Other");
+            assert_eq!(host.requests[0].group, "Folder");
+            assert!(host.requests[0].tree_order > 0);
+            assert_eq!(host.requests[0].versions.len(), 1);
+            assert_eq!(host.collections[0].collection, "Other");
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+    #[gpui::test]
+    fn history_click_restores_matching_response_headers_and_preview(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-history-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            for (status, text) in [(200, "first"), (404, "second")] {
+                let mut record = host.requests[0].versions[0].clone();
+                record.label = status_label(status);
+                record.draft.url = format!("https://example.test/{text}");
+                record.exchange = Some(model::Exchange {
+                    response: Some(HttpResponse {
+                        status,
+                        headers: vec![("x-record".into(), text.into())],
+                        text: text.into(),
+                        bytes: text.len(),
+                        json: None,
+                    }),
+                    error: None,
+                    preview: Some(format!("GET /{text}")),
+                    traces: vec![TraceEntry {
+                        elapsed_ms: 10,
+                        message: text.into(),
+                    }],
+                });
+                host.requests[0].history.push(record);
+            }
+            let legacy = host.requests[0].versions[0].clone();
+            host.requests[0].history.push(legacy);
+            host.show_activity = true;
+            host.activity = 1;
+            host.storage_dirty = true;
+            host.persist(cx);
+            host
+        });
+        for (index, status, text) in [(0, 200, "first"), (1, 404, "second"), (0, 200, "first")] {
+            let bounds = window
+                .debug_bounds(if index == 0 {
+                    "history-record-0"
+                } else {
+                    "history-record-1"
+                })
+                .unwrap();
+            window.simulate_click(bounds.center(), gpui::Modifiers::default());
+            host.update(window, |host, cx| {
+                assert_eq!(host.status, Some(status));
+                assert_eq!(host.response_data.as_ref().unwrap().text, text);
+                assert_eq!(host.response.read(cx).content(), text);
+                assert_eq!(host.response_header_entries[0][1].read(cx).value(), text);
+                assert_eq!(
+                    host.request_preview.read(cx).content(),
+                    format!("GET /{text}")
+                );
+                assert_eq!(host.traces[0][0].message, text);
+            });
+        }
+        let bounds = window.debug_bounds("history-record-2").unwrap();
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert!(
+                host.response_data.is_none()
+                    && host.status.is_none()
+                    && host.response_header_entries.is_empty()
+            );
+            assert!(host.notice.contains("未保存响应"));
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, _| {
+            assert_eq!(
+                host.requests[0].history[1]
+                    .exchange
+                    .as_ref()
+                    .unwrap()
+                    .response
+                    .as_ref()
+                    .unwrap()
+                    .text,
+                "second"
+            )
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+    #[gpui::test]
+    fn tls_setting_click_persists_and_restores_per_request(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-tls-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.config = 4;
+            host
+        });
+        let bounds = window.debug_bounds("skip-tls-verification").unwrap();
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            assert!(host.snapshot(cx).skip_tls_verification);
+            host.save(cx);
+            assert!(host.requests[0].versions[0].draft.skip_tls_verification);
+            host.add_request(cx);
+            assert!(!host.snapshot(cx).skip_tls_verification);
+            host.choose(0, cx);
+            assert!(host.snapshot(cx).skip_tls_verification);
+            let baseline = host.requests[0].versions[1].draft.clone();
+            host.load(&baseline, cx);
+            assert!(!host.snapshot(cx).skip_tls_verification);
+            let saved = host.requests[0].versions[0].draft.clone();
+            host.load(&saved, cx);
+            host.persist(cx);
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, cx| {
+            assert!(host.snapshot(cx).skip_tls_verification)
+        });
+        let mut legacy = serde_json::to_value(Draft::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("skip_tls_verification");
+        assert!(
+            !serde_json::from_value::<Draft>(legacy)
+                .unwrap()
+                .skip_tls_verification
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[gpui::test]
+    fn request_tree_menus_create_root_and_nested_requests_without_toggling_folders(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-tree-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.add_request(cx);
+            assert!(
+                host.requests.is_empty(),
+                "a collection is required before creating a request"
+            );
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("My API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            assert!(host.collections[0].names.is_empty());
+            assert!(host.requests[0].group.is_empty());
+            host.collections[0].add_child("", "目录").unwrap();
+            host.collections[0].add_child("目录", "子目录").unwrap();
+            host.add_request_to("目录/子目录".into(), cx);
+            host
+        });
+        let root = window.debug_bounds("request-directory:0:").unwrap();
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: root.center(),
+            ..Default::default()
+        });
+        let more = window
+            .debug_bounds("directory-menu:0:")
+            .expect("hover reveals a single menu trigger");
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert_eq!(host.tree_menu, Some((0, String::new())));
+            assert!(!host.collapsed_directories.contains(&(0, String::new())));
+        });
+        assert!(window.debug_bounds("directory-menu-action:0::2").is_none());
+        let new_request = window.debug_bounds("directory-menu-action:0::0").unwrap();
+        window.simulate_click(new_request.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert_eq!(host.requests.len(), 3);
+            assert!(host.requests[2].group.is_empty());
+            assert!(host.tree_menu.is_none());
+        });
+        let folder = window
+            .debug_bounds("request-directory:0:目录/子目录")
+            .unwrap();
+        window.simulate_click(folder.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert!(
+                host.collapsed_directories
+                    .contains(&(0, "目录/子目录".into()))
+            )
+        });
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: folder.center(),
+            ..Default::default()
+        });
+        let more = window.debug_bounds("directory-menu:0:目录/子目录").unwrap();
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert!(
+                host.collapsed_directories
+                    .contains(&(0, "目录/子目录".into()))
+            )
+        });
+        window.simulate_keystrokes("escape");
+        host.update(window, |host, _| assert!(host.tree_menu.is_none()));
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        let create_folder = window
+            .debug_bounds("directory-menu-action:0:目录/子目录:1")
+            .unwrap();
+        window.simulate_click(create_folder.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            assert!(matches!(&host.group_edit, Some(GroupEdit::Create(parent)) if parent == "目录/子目录"));
+            host.group_name.update(cx, |entry, cx| entry.set_value("第三层", cx));
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, cx| {
+            assert!(host.collections[0].contains("目录/子目录/第三层"));
+            host.add_request(cx);
+            assert_eq!(host.requests.last().unwrap().group, "目录/子目录/第三层");
+            host.persist(cx);
+        });
+        let saved = storage::Store::open(&path).unwrap().load().unwrap();
+        assert!(saved.requests[0].group.is_empty());
+        assert_eq!(saved.requests.last().unwrap().group, "目录/子目录/第三层");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
     fn many_response_headers_scroll_within_the_panel(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_text_entry_keys);
         struct ResponsePanel(Entity<Workbench>);
         impl Render for ResponsePanel {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3166,12 +4210,193 @@ mod persistence_tests {
         assert!(scroll.bounds().size.width <= px(480.));
         // Every repeated header remains a row, well beyond the viewport.
         assert!(scroll.max_offset().y > px(1800.));
+        let value = window.debug_bounds("response-header-0-1").unwrap();
+        window.simulate_click(value.center(), gpui::Modifiers::default());
+        window.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            format!("cookie-0={}", "x".repeat(600))
+        );
+        window.simulate_keystrokes("backspace");
+        host.update(window, |host, cx| {
+            assert_eq!(
+                host.response_header_entries[0][1].read(cx).value(),
+                format!("cookie-0={}", "x".repeat(600))
+            )
+        });
+        let name = window.debug_bounds("response-header-0-0").unwrap();
+        window.simulate_click(name.center(), gpui::Modifiers::default());
+        window.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "set-cookie"
+        );
         window.simulate_event(gpui::ScrollWheelEvent {
             position: scroll.bounds().center(),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-200.))),
             ..Default::default()
         });
         assert!(scroll.offset().y < px(0.));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAppContext) {
+        struct NamePanel {
+            host: Entity<Workbench>,
+            bounds: std::rc::Rc<std::cell::Cell<Bounds<gpui::Pixels>>>,
+        }
+        impl Render for NamePanel {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let bounds = self.bounds.clone();
+                div()
+                    .w(px(500.))
+                    .h(px(100.))
+                    .child(self.host.update(cx, |host, cx| host.request_name_view(cx)))
+                    .on_children_prepainted(move |children, _, _| bounds.set(children[0]))
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-rename-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let host = cx.new(|cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("My API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.add_request(cx);
+            host.choose(0, cx);
+            host
+        });
+        let bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::default()));
+        let (_, window) = cx.add_window_view(|_, _| NamePanel {
+            host: host.clone(),
+            bounds: bounds.clone(),
+        });
+        let click_title = |window: &mut gpui::VisualTestContext| {
+            window.simulate_click(bounds.get().center(), gpui::Modifiers::default());
+        };
+        click_title(window);
+        host.update(window, |host, cx| {
+            assert!(
+                host.editing_request_name,
+                "clicking the title must enter editing"
+            );
+            host.request_name
+                .update(cx, |entry, cx| entry.set_value("  ", cx));
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, cx| {
+            assert!(host.editing_request_name && host.request_name_error.is_some());
+            assert_eq!(host.requests[0].name, "新建请求 1");
+            host.request_name
+                .update(cx, |entry, cx| entry.set_value("  获取用户 🦀  ", cx));
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, cx| {
+            assert!(!host.editing_request_name);
+            assert_eq!(host.requests[0].name, "获取用户 🦀");
+            assert_eq!(host.requests[0].versions.len(), 1);
+            host.persist(cx);
+        });
+        click_title(window);
+        host.update(window, |host, cx| {
+            host.request_name
+                .update(cx, |entry, cx| entry.set_value("取消的名字", cx));
+        });
+        window.simulate_keystrokes("escape");
+        host.update(window, |host, _| {
+            assert!(!host.editing_request_name);
+            assert_eq!(host.requests[0].name, "获取用户 🦀");
+        });
+        click_title(window);
+        host.update(window, |host, cx| {
+            host.request_name
+                .update(cx, |entry, cx| entry.set_value("切换时未提交", cx));
+            host.choose(1, cx);
+            host.save_request_name(cx);
+            assert_eq!(host.requests[1].name, "新建请求 2");
+            host.persist(cx);
+        });
+        let saved = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(saved.requests[0].name, "获取用户 🦀");
+        assert_eq!(saved.requests[1].name, "新建请求 2");
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, _| {
+            assert_eq!(host.requests[0].name, "获取用户 🦀")
+        });
+        click_title(window);
+        host.update(window, |host, cx| {
+            host.request_name
+                .update(cx, |entry, cx| entry.set_value("删除时未提交", cx));
+            host.delete_request(0, cx);
+            host.save_request_name(cx);
+            assert!(!host.editing_request_name);
+            assert_eq!(host.requests[0].name, "新建请求 2");
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn saving_only_versions_changes_since_latest_snapshot(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "glint-api-save-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let host = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        host.update(cx, |host, cx| {
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            let original = host.requests[0].versions[0].draft.clone();
+            host.save(cx);
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 1);
+            host.endpoint.update(cx, |entry, cx| {
+                entry.set_text("https://example.test/changed", cx)
+            });
+            // Drafts are persisted automatically; the version baseline must stay separate.
+            host.persist(cx);
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 2);
+            assert_eq!(host.requests[0].versions[0].label, "v2");
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 2);
+            host.load(&original, cx);
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 3);
+            assert_eq!(host.requests[0].versions[0].draft, original);
+            // Editing and undoing back to the latest saved content is also unchanged.
+            host.endpoint.update(cx, |entry, cx| {
+                entry.set_text("https://example.test/temporary", cx)
+            });
+            host.load(&original, cx);
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 3);
+            host.persist(cx);
+        });
+        let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(cx, |host, cx| {
+            host.save(cx);
+            assert_eq!(host.requests[0].versions.len(), 3);
+            assert_eq!(host.notice, "已保存，内容未修改");
+        });
+        drop(host);
+        drop(reopened);
         std::fs::remove_file(path).unwrap();
     }
 

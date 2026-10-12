@@ -11,12 +11,15 @@ mod popover;
 mod rich_text;
 mod search_highlight;
 mod select;
+mod separator;
 mod side_tabs;
 mod tabs;
 mod text_entry;
 mod text_reference;
 mod theme_selector;
 mod tooltip;
+mod tree_list;
+mod tree_list_item;
 mod wallpaper;
 
 pub use badge::{
@@ -31,16 +34,19 @@ pub use inputs::{
     Checkbox, InputField, RadioOption, SearchInput, SegmentOption, SegmentedControl, Slider,
     Stepper, Switch, TokenInput, checkbox_control, checkbox_control_themed,
 };
-pub use layout::AppLayout;
+pub use layout::{AppLayout, window_drag_region};
 pub use mermaid::{MermaidDiagram, MermaidEvent, MermaidSvg, render_mermaid};
 pub use popover::Popover;
 pub use select::{Select, SelectEvent, SelectOption};
+pub use separator::Separator;
 pub use side_tabs::{SideTab, SideTabs};
 pub use tabs::{TabOption, Tabs, TabsKind};
 pub use text_entry::{TextEntry, bind_text_entry_keys};
 pub use text_reference::TextReferenceResolver;
 pub use theme_selector::{ThemeSelector, ThemeSelectorEvent};
 pub use tooltip::Tooltip;
+pub use tree_list::{TreeList, TreeListNode, TreeListRow};
+pub use tree_list_item::{TreeDrop, TreeDropPlacement, TreeListItem};
 
 pub use code_card::{CodeCard, CodeCardEvent, CodeColors, bind_code_card_keys};
 

@@ -36,17 +36,41 @@ impl Workspace {
         {
             return Err("工作区数据结构不完整".into());
         }
+        for environment in &self.variables {
+            environment.proxy.validate()?;
+        }
+        if self.variables[0].proxy.enabled {
+            return Err("不使用环境时不能启用环境代理".into());
+        }
+        let mut collection_names = std::collections::HashSet::new();
+        for collection in &self.collections {
+            let mut paths = std::collections::HashSet::new();
+            if collection.collection.trim().is_empty()
+                || !collection_names.insert(&collection.collection)
+            {
+                return Err("集合名称为空或重复".into());
+            }
+            for path in &collection.names {
+                if path.is_empty()
+                    || path.split('/').any(|name| name.trim().is_empty())
+                    || !paths.insert(path)
+                    || !collection.contains(RequestGroups::parent(path))
+                {
+                    return Err("目录树数据不完整".into());
+                }
+            }
+        }
         for request in &self.requests {
             if !self
                 .collections
                 .iter()
-                .any(|c| c.collection == request.collection && c.names.contains(&request.group))
+                .any(|c| c.collection == request.collection && c.contains(&request.group))
                 || std::iter::once(&request.draft)
                     .chain(request.versions.iter().map(|r| &r.draft))
                     .chain(request.history.iter().map(|r| &r.draft))
                     .any(|d| d.environment >= self.environments.len())
             {
-                return Err("请求引用了不存在的集合、分组或环境".into());
+                return Err("请求引用了不存在的集合、目录或环境".into());
             }
         }
         Ok(())
@@ -59,16 +83,40 @@ pub struct Store {
     #[cfg(test)]
     pub(super) serializations: usize,
 }
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_database_path(
+    local_app_data: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let base = local_app_data
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            user_profile
+                .filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(path).join("AppData").join("Local"))
+        })
+        .ok_or("无法确定 Windows 用户数据目录：LOCALAPPDATA 和 USERPROFILE 均未设置")?;
+    Ok(base.join("Glint API").join("workspace.sqlite3"))
+}
+
 impl Store {
     pub fn default_path() -> Result<PathBuf, String> {
         if let Some(path) = std::env::var_os("GLINT_API_DB_PATH") {
             return Ok(path.into());
         }
+        #[cfg(not(target_os = "windows"))]
         let home = std::env::var_os("HOME").ok_or("无法确定用户数据目录")?;
+        #[cfg(target_os = "windows")]
+        let path = windows_database_path(
+            std::env::var_os("LOCALAPPDATA"),
+            std::env::var_os("USERPROFILE"),
+        )?;
         #[cfg(target_os = "macos")]
         let path =
             PathBuf::from(home).join("Library/Application Support/Glint API/workspace.sqlite3");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let path = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(home).join(".local/share"))
@@ -92,10 +140,10 @@ impl Store {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
-        if version > 1 {
+        if version > 2 {
             return Err("数据库版本较新，请使用更新版本的 Glint API".into());
         }
-        connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL); PRAGMA user_version = 1; COMMIT;").map_err(|e| e.to_string())?;
+        connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL); COMMIT;").map_err(|e| e.to_string())?;
         Ok(Self {
             connection,
             last_saved: None,
@@ -109,10 +157,49 @@ impl Store {
             .query_row("SELECT data FROM workspace WHERE id = 1", [], |r| r.get(0))
             .optional()
             .map_err(|e| e.to_string())?;
-        let workspace = match &data {
+        let mut workspace: Workspace = match &data {
             Some(data) => serde_json::from_str(data).map_err(|e| format!("无法读取工作区：{e}"))?,
             None => Workspace::default(),
         };
+        if let Some(data) = &data {
+            let legacy: serde_json::Value =
+                serde_json::from_str(data).map_err(|e| e.to_string())?;
+            if let Some(collections) = legacy.get("collections").and_then(|value| value.as_array())
+            {
+                for (index, value) in collections.iter().enumerate() {
+                    if value.get("names").is_none() {
+                        continue;
+                    }
+                    let collection = &mut workspace.collections[index];
+                    let defaults: Vec<_> = collection
+                        .names
+                        .iter()
+                        .filter(|name| matches!(name.as_str(), "未分组" | "自定义"))
+                        .cloned()
+                        .collect();
+                    for request in workspace
+                        .requests
+                        .iter_mut()
+                        .filter(|r| r.collection == collection.collection)
+                    {
+                        if defaults.contains(&request.group) {
+                            request.group.clear();
+                        }
+                    }
+                    collection.names.retain(|name| !defaults.contains(name));
+                    // Old group names containing slashes become nested paths; retain their requests.
+                    for folder in collection.names.clone() {
+                        let mut parent = RequestGroups::parent(&folder);
+                        while !parent.is_empty() {
+                            if !collection.names.iter().any(|folder| folder == parent) {
+                                collection.names.push(parent.to_owned());
+                            }
+                            parent = RequestGroups::parent(parent);
+                        }
+                    }
+                }
+            }
+        }
         workspace.validate()?;
         self.last_saved = data;
         Ok(workspace)
@@ -129,6 +216,9 @@ impl Store {
         }
         let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO workspace(id, data) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET data = excluded.data", [&data]).map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch("PRAGMA user_version = 2")
+            .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
         self.last_saved = Some(data);
         Ok(())
@@ -139,6 +229,129 @@ impl Store {
 mod tests {
     use super::*;
     use crate::model::{Draft, Record};
+    #[test]
+    fn legacy_groups_migrate_to_directories_and_root_requests() {
+        let mut requests = crate::model::test_requests();
+        requests[0].group = "自定义".into();
+        requests[1].group = "未分组".into();
+        requests[2].group = "用户/详情".into();
+        requests[3].group = "普通目录".into();
+        let data = Workspace {
+            collections: vec![RequestGroups {
+                folder_order: Default::default(),
+                collection: "Test API".into(),
+                names: vec![
+                    "自定义".into(),
+                    "未分组".into(),
+                    "用户/详情".into(),
+                    "普通目录".into(),
+                ],
+            }],
+            traces: vec![vec![]; requests.len()],
+            responses: vec![None; requests.len()],
+            previews: vec![None; requests.len()],
+            requests,
+            ..Default::default()
+        };
+        let mut legacy = serde_json::to_value(&data).unwrap();
+        for request in legacy["requests"].as_array_mut().unwrap() {
+            let folder = request.as_object_mut().unwrap().remove("folder").unwrap();
+            request["group"] = folder;
+        }
+        let folders = legacy["collections"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("folders")
+            .unwrap();
+        legacy["collections"][0]["names"] = folders;
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            last_saved: None,
+            serializations: 0,
+        };
+        store.connection.execute_batch("CREATE TABLE workspace (id INTEGER PRIMARY KEY, data TEXT); PRAGMA user_version = 1;").unwrap();
+        store
+            .connection
+            .execute("INSERT INTO workspace VALUES (1, ?1)", [legacy.to_string()])
+            .unwrap();
+        let migrated = store.load().unwrap();
+        assert!(migrated.requests[0].group.is_empty() && migrated.requests[1].group.is_empty());
+        assert_eq!(migrated.requests[2].group, "用户/详情");
+        assert!(migrated.collections[0].contains("用户"));
+        assert!(!migrated.collections[0].contains("自定义"));
+        assert_eq!(migrated.requests[2].draft, data.requests[2].draft);
+        store.save(&migrated).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let saved: String = store
+            .connection
+            .query_row("SELECT data FROM workspace", [], |row| row.get(0))
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(saved["collections"][0].get("folders").is_some());
+        assert!(saved["requests"][0].get("group").is_none());
+        assert_eq!(store.load().unwrap().requests[2].group, "用户/详情");
+    }
+
+    #[test]
+    fn invalid_folder_references_and_missing_parents_are_rejected() {
+        let mut data = Workspace {
+            collections: vec![RequestGroups {
+                folder_order: Default::default(),
+                collection: "Test API".into(),
+                names: vec![],
+            }],
+            requests: crate::model::test_requests()[..1].to_vec(),
+            traces: vec![vec![]],
+            responses: vec![None],
+            previews: vec![None],
+            ..Default::default()
+        };
+        assert!(data.validate().is_err());
+        data.requests[0].group.clear();
+        assert!(data.validate().is_ok());
+        data.collections[0].names.push("a/b".into());
+        assert!(data.validate().is_err());
+        data.collections[0].names.push("a".into());
+        assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn windows_path_uses_local_app_data_without_home() {
+        let base = PathBuf::from("C:\\Users\\测试 用户\\AppData\\Local");
+        let expected = base.join("Glint API").join("workspace.sqlite3");
+        assert_eq!(
+            windows_database_path(Some(base.clone().into_os_string()), None).unwrap(),
+            expected
+        );
+        assert_eq!(
+            windows_database_path(Some(base.into_os_string()), Some("D:\\Other".into())).unwrap(),
+            expected
+        );
+    }
+    #[test]
+    fn windows_path_falls_back_to_profile_or_reports_missing_directory() {
+        let profile = PathBuf::from("C:\\Users\\测试 用户");
+        let expected = profile
+            .join("AppData")
+            .join("Local")
+            .join("Glint API")
+            .join("workspace.sqlite3");
+        for local_app_data in [None, Some("".into())] {
+            assert_eq!(
+                windows_database_path(local_app_data, Some(profile.clone().into_os_string()))
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(windows_database_path(None, None).is_err());
+        assert!(windows_database_path(Some("".into()), Some("".into())).is_err());
+    }
     #[test]
     fn sqlite_reopen_preserves_workspace_and_deletion_without_seeding() {
         let path = std::env::temp_dir().join(format!(
@@ -155,6 +368,7 @@ mod tests {
             assert!(data.requests.is_empty() && data.collections.is_empty());
             assert_eq!(data.environments.len(), 1);
             data.collections.push(RequestGroups {
+                folder_order: Default::default(),
                 collection: "My API".into(),
                 names: vec!["未分组".into()],
             });
@@ -173,8 +387,10 @@ mod tests {
                 time: "now".into(),
                 detail: String::new(),
                 elapsed_ms: Some(42),
+                exchange: None,
             };
             data.requests.push(Request {
+                tree_order: 0,
                 name: "Request".into(),
                 collection: "My API".into(),
                 group: "未分组".into(),

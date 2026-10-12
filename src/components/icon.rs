@@ -31,6 +31,8 @@ pub enum Icon {
     Pulse,
     Key,
     Folders,
+    Folder,
+    FolderOpen,
     Compass,
     Clock,
     User,
@@ -101,6 +103,8 @@ impl Icon {
             Self::Pulse => "pulse",
             Self::Key => "key",
             Self::Folders => "folders",
+            Self::Folder => "folder",
+            Self::FolderOpen => "folder-open",
             Self::Compass => "compass",
             Self::Clock => "clock",
             Self::User => "user",
@@ -374,6 +378,14 @@ impl AssetSource for GlintAssets {
 
 fn icon_svg(name: &str) -> Option<String> {
     let (body, _fill) = match name {
+        "folder" => (
+            "<path d='M3 7V5.5A1.5 1.5 0 0 1 4.5 4H9l2.5 3H19.5A1.5 1.5 0 0 1 21 8.5v10A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5V7Z'/><path d='M3 9h18'/>",
+            "none",
+        ),
+        "folder-open" => (
+            "<path d='M3 17V5.5A1.5 1.5 0 0 1 4.5 4H9l2.5 3H19.5A1.5 1.5 0 0 1 21 8.5V10'/><path d='M5.5 10h15a1.5 1.5 0 0 1 1.4 2L19.5 19a1.5 1.5 0 0 1-1.4 1H4.5a1.5 1.5 0 0 1-1.4-2l2.4-7a1.5 1.5 0 0 1 1.4-1Z'/>",
+            "none",
+        ),
         "sidebar" => (
             "<rect x='3' y='3' width='18' height='18' rx='4'/><path d='M9 3v18'/>",
             "none",
@@ -618,6 +630,22 @@ mod tests {
         let mut pixels = resvg::tiny_skia::Pixmap::new(24, 24).unwrap();
         resvg::render(&tree, Default::default(), &mut pixels.as_mut());
         assert!(pixels.pixels().iter().any(|pixel| pixel.alpha() > 0));
+    }
+
+    #[test]
+    fn open_and_closed_folder_icons_have_distinct_renderable_silhouettes() {
+        let render = |icon: Icon| {
+            let asset = GlintAssets
+                .load(&format!("glint-ui/icons/{}.svg", icon.name()))
+                .unwrap()
+                .unwrap();
+            let tree = resvg::usvg::Tree::from_data(&asset, &Default::default()).unwrap();
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(24, 24).unwrap();
+            resvg::render(&tree, Default::default(), &mut pixmap.as_mut());
+            assert!(pixmap.pixels().iter().any(|pixel| pixel.alpha() > 0));
+            pixmap.data().to_vec()
+        };
+        assert_ne!(render(Icon::Folder), render(Icon::FolderOpen));
     }
 
     #[test]

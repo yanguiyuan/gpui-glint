@@ -1,6 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProxySettings {
+    pub enabled: bool,
+    pub url: String,
+    pub skip_tls_verification: bool,
+}
+impl ProxySettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(self.url.trim())
+            .map_err(|_| "请输入完整的代理地址，例如 http://127.0.0.1:7890")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/" && !url.path().is_empty()
+        {
+            return Err("代理地址须为 HTTP / HTTPS 地址，不包含路径、查询参数或片段".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Variable {
     pub id: u64,
@@ -11,6 +35,8 @@ pub struct Variable {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EnvironmentVariables {
     pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub proxy: ProxySettings,
     next_id: u64,
 }
 impl EnvironmentVariables {
@@ -18,6 +44,7 @@ impl EnvironmentVariables {
     pub fn replace(&mut self, rows: &[(String, String, bool)]) -> Result<(), String> {
         let mut replacement = Self {
             variables: vec![],
+            proxy: self.proxy.clone(),
             next_id: 0,
         };
         for (name, value, secret) in rows {
@@ -30,6 +57,7 @@ impl EnvironmentVariables {
     pub fn new(base_url: &str) -> Self {
         let mut environment = Self {
             variables: vec![],
+            proxy: ProxySettings::default(),
             next_id: 0,
         };
         for (name, value, secret) in [
@@ -105,39 +133,12 @@ impl EnvironmentVariables {
 #[derive(Clone)]
 pub struct EnvironmentValues(pub BTreeMap<String, String>);
 impl EnvironmentValues {
+    #[cfg(test)]
     pub fn resolve(&self, input: &str) -> Result<String, String> {
-        self.resolve_inner(input, &mut vec![])
-    }
-    fn resolve_inner(&self, input: &str, stack: &mut Vec<String>) -> Result<String, String> {
-        let mut output = String::new();
-        let mut rest = input;
-        while let Some(start) = rest.find("{{") {
-            output.push_str(&rest[..start]);
-            let variable = &rest[start + 2..];
-            let end = variable.find("}}").ok_or("环境变量缺少结束符 }}")?;
-            let name = variable[..end].trim();
-            let value = self
-                .0
-                .get(name)
-                .ok_or_else(|| format!("未定义环境变量：{name}"))?;
-            if value.is_empty() {
-                return Err(format!("请在环境变量中填写 {name}"));
-            }
-            if stack.iter().any(|active| active == name) {
-                return Err(format!("环境变量存在循环引用：{name}"));
-            }
-            if stack.len() >= 32 {
-                return Err("环境变量嵌套超过 32 层".into());
-            }
-            stack.push(name.into());
-            output.push_str(&self.resolve_inner(value, stack)?);
-            stack.pop();
-            rest = &variable[end + 2..];
-        }
-        output.push_str(rest);
-        Ok(output)
+        super::template::TemplateResolver::new(self).resolve(input)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,14 +16,14 @@ Glint UI（`gpui-glint`）是基于 GPUI-CE 的 Rust UI 组件库，提供统一
 
 ```toml
 [dependencies]
-gpui-glint = "0.1.0"
+gpui-glint = "0.1.3"
 gpui = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11"] }
 ```
 
 `gpui` 是 `gpui-ce` 的导入别名。`gpui_platform` 由宿主应用添加，用于启动原生应用；它在组件库仓库中仅作为开发依赖。
 
-需要原生网页渲染时，使用 `gpui-glint = { version = "0.1.0", features = ["webview"] }`；该功能目前适配 macOS 和 Windows。开发库本身时可使用 `gpui-glint = { path = "../gpui-glint" }`。
+需要原生网页渲染时，使用 `gpui-glint = { version = "0.1.3", features = ["webview"] }`；该功能目前适配 macOS 和 Windows。开发库本身时可使用 `gpui-glint = { path = "../gpui-glint" }`。
 
 ### 最小应用
 

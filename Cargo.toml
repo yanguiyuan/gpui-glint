@@ -1,6 +1,6 @@
 [package]
 name = "gpui-glint"
-version = "0.1.0"
+version = "0.1.3"
 description = "A refined component library for GPUI-CE."
 edition = "2024"
 rust-version = "1.95"
@@ -46,9 +46,12 @@ chrono = "0.4"
 unicode-segmentation = "1.13"
 
 [dev-dependencies]
+rand = "0.9"
+uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "brotli", "deflate"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
 encoding_rs = "0.8"
 gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
