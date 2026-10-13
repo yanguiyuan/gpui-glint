@@ -155,6 +155,8 @@ pub struct CodeCard {
     line_cache: Option<LineCache>,
     search_cache: Option<(SharedString, SharedString, Rc<Vec<Range<usize>>>)>,
     search_query: SharedString,
+    active_search_match: Option<Range<usize>>,
+    pending_search_reveal: Option<Range<usize>>,
     focus_handle: FocusHandle,
     content: SharedString,
     language: SharedString,
@@ -198,8 +200,47 @@ impl CodeCard {
         let query = query.into();
         if self.search_query != query {
             self.search_query = query;
+            self.active_search_match = None;
+            self.pending_search_reveal = None;
             cx.notify();
         }
+    }
+
+    fn cached_search_matches(&mut self) -> Rc<Vec<Range<usize>>> {
+        if self
+            .search_cache
+            .as_ref()
+            .is_none_or(|(content, query, _)| {
+                content != &self.content || query != &self.search_query
+            })
+        {
+            self.search_cache = Some((
+                self.content.clone(),
+                self.search_query.clone(),
+                Rc::new(super::search_highlight::match_ranges(
+                    &self.content,
+                    &self.search_query,
+                )),
+            ));
+        }
+        self.search_cache.as_ref().unwrap().2.clone()
+    }
+
+    /// Number of case-insensitive matches in the current content.
+    pub fn search_match_count(&mut self) -> usize {
+        self.cached_search_matches().len()
+    }
+
+    /// Highlight a zero-based match and reveal it in a viewport card, without
+    /// moving keyboard focus or changing the text selection.
+    pub fn reveal_search_match(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(range) = self.cached_search_matches().get(index).cloned() else {
+            return false;
+        };
+        self.active_search_match = Some(range.clone());
+        self.pending_search_reveal = Some(range);
+        cx.notify();
+        true
     }
 
     pub fn new(
@@ -219,6 +260,8 @@ impl CodeCard {
             line_cache: None,
             search_cache: None,
             search_query: "".into(),
+            active_search_match: None,
+            pending_search_reveal: None,
             focus_handle: cx.focus_handle(),
             content,
             language: language.into(),
@@ -345,6 +388,8 @@ impl CodeCard {
     /// Replace from document history without emitting a new edit event.
     pub fn sync_content(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = value.into();
+        self.active_search_match = None;
+        self.pending_search_reveal = None;
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
         self.history.clear();
@@ -507,6 +552,8 @@ impl CodeCard {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.active_search_match = None;
+        self.pending_search_reveal = None;
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.reveal_cursor = true;
         let value = if let Some(rich) = &mut self.rich {
@@ -1900,7 +1947,19 @@ impl Element for CodeLine {
                             bounds.bottom(),
                         ),
                     ),
-                    super::search_highlight::color(input.dark),
+                    if input
+                        .active_search_match
+                        .as_ref()
+                        .is_some_and(|active| active.start < hit.end && hit.start < active.end)
+                    {
+                        gpui::rgb_to_hsla(gpui::rgba(if input.dark {
+                            0xffa733aa
+                        } else {
+                            0xffa733bb
+                        }))
+                    } else {
+                        super::search_highlight::color(input.dark)
+                    },
                 )
             })
             .collect();
@@ -2051,24 +2110,33 @@ impl CodeCard {
             }
         }
         self.last_lines.clear();
-        if self
-            .search_cache
-            .as_ref()
-            .is_none_or(|(content, query, _)| {
-                content != &self.content || query != &self.search_query
-            })
-        {
-            self.search_cache = Some((
-                self.content.clone(),
-                self.search_query.clone(),
-                Rc::new(super::search_highlight::match_ranges(
-                    &self.content,
-                    &self.search_query,
-                )),
-            ));
-        }
-        let search_matches = self.search_cache.as_ref().unwrap().2.clone();
+        let search_matches = self.cached_search_matches();
         let count = self.viewport_cache.as_ref().unwrap().ranges.len();
+        if let Some(hit) = self.pending_search_reveal.take() {
+            let cache = self.viewport_cache.as_mut().unwrap();
+            let index = cache
+                .ranges
+                .partition_point(|line| line.start <= hit.start)
+                .saturating_sub(1);
+            let range = cache.ranges[index].clone();
+            let text: SharedString = self.content[range.clone()].to_owned().into();
+            let runs = [TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color: gpui::rgb_to_hsla(rgb(colors.text)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            }];
+            let line = EditorLine::shape(window, false, text, font_size, &runs, None);
+            cache.width = cache.width.max(line.width);
+            let x = line.x_for_index(hit.start - range.start);
+            self.scroll
+                .set_offset(point(-(x - px(40.)).max(px(0.)), px(0.)));
+            self.viewport_scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Top);
+        }
         let gutter_width = viewport_gutter_width(count);
         let list = gpui::uniform_list(
             "code-card-viewport-lines",
@@ -2390,23 +2458,7 @@ impl Render for CodeCard {
             .map_or(px(0.), |(start, line)| {
                 line.x_for_index(self.cursor_offset() - *start)
             });
-        if !self
-            .search_cache
-            .as_ref()
-            .is_some_and(|(content, query, _)| {
-                content == &self.content && query == &self.search_query
-            })
-        {
-            self.search_cache = Some((
-                self.content.clone(),
-                self.search_query.clone(),
-                Rc::new(super::search_highlight::match_ranges(
-                    &self.content,
-                    &self.search_query,
-                )),
-            ));
-        }
-        let search_matches = self.search_cache.as_ref().unwrap().2.clone();
+        let search_matches = self.cached_search_matches();
         if self.reveal_cursor && focused && self.scroll.bounds().size.width > px(0.) {
             let viewport = self.scroll.bounds().size.width;
             let offset = self.scroll.offset().x;
@@ -2751,6 +2803,41 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn viewport_search_reveals_distant_unicode_matches_without_changing_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let content = format!(
+            "Rust 关键词\n{}{}关键词 RUST",
+            "plain\n".repeat(500),
+            "x".repeat(300)
+        );
+        let (editor, window) = cx.add_window_view(|_, cx| {
+            CodeCard::new(cx, "text", content.clone())
+                .read_only(true)
+                .viewport()
+        });
+        editor.update(window, |editor, cx| {
+            editor.set_search_query("关键词", cx);
+            assert_eq!(editor.search_match_count(), 2);
+            assert!(editor.reveal_search_match(1, cx));
+            assert!(!editor.reveal_search_match(2, cx));
+        });
+        window.run_until_parked();
+        editor.update(window, |editor, cx| {
+            assert!(editor.viewport_scroll.0.borrow().base_handle.offset().y < px(-1000.));
+            assert!(editor.scroll.offset().x < px(-1000.));
+            assert_eq!(editor.selected_range, content.len()..content.len());
+            assert_eq!(editor.content(), content);
+            editor.set_search_query("rust", cx);
+            assert_eq!(editor.search_match_count(), 2);
+            assert!(editor.active_search_match.is_none());
+            editor.set_content("RUST 新响应", cx);
+            assert_eq!(editor.search_match_count(), 1);
+            editor.set_search_query("", cx);
+            assert_eq!(editor.search_match_count(), 0);
+        });
+    }
     #[test]
     fn html_highlights_multiline_markup_raw_text_and_preserves_unicode() {
         let source = "<!-- 注释\n中文 -->\n<DIV data-name=\"多行\n属性 >\">雾 &amp; 夜</DIV><style>p { color: #fff; margin: 12px; }</style><script>const text = '<div>'; // 中文\n</script>";

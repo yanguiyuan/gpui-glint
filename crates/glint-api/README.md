@@ -1,12 +1,41 @@
 # Glint API
 
-参考 `design/api-workbench.html` 实现的 GPUI 原生 API 工作台。复用 Glint 的 `AppLayout`、`TextEntry`、`SelectField`、`Select`、`CodeCard`、`ClosableTabs`、`CommandPalette` 和按钮组件。
+独立的 GPUI 原生 API 工作台，位于 workspace 的 `crates/glint-api`，通过路径依赖使用根目录的 `gpui-glint` 组件库。应用版本与库版本独立管理，不发布到 crates.io。
 
 在仓库根目录运行：
 
 ```sh
-cargo run --example glint-api
+cargo run -p glint-api
 ```
+
+默认启用 HTML 预览；需要关闭时使用 `cargo run -p glint-api --no-default-features`。
+
+## Windows 安装包与发布
+
+Windows 10/11 x64 的安装包由 Inno Setup 6 生成，安装到 `%LOCALAPPDATA%\Programs\Glint API`，无需管理员权限。安装自动创建桌面和开始菜单快捷方式，EXE、安装包和快捷方式使用应用图标；卸载移除程序与快捷方式，保留工作区数据库。缺少 WebView2 时安装包会通过微软签名的 bootstrapper 下载并安装运行时，此步骤需要联网。
+
+安装 Rust MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）和 Inno Setup 6 后，在仓库根目录使用 PowerShell 7：
+
+```powershell
+pwsh -File crates/glint-api/packaging/windows/build-windows.ps1
+```
+
+输出为 `target/windows-installer/output/Glint-API-<版本>-windows-x64-setup.exe` 及 `.sha256` 校验文件。脚本使用 release 构建和静态 MSVC 运行时；发布版不弹出控制台。安装包目前未做代码签名。
+
+静默安装：
+
+```powershell
+.\Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+更新本应用 `Cargo.toml` 的版本后，推送对应标签自动构建、验证静默安装／重装升级／快捷方式／图标／卸载，再发布到 GitHub Releases：
+
+```sh
+git tag glint-api-v0.1.0
+git push origin glint-api-v0.1.0
+```
+
+手动运行 `Glint API Windows Release` workflow 只构建并上传 Actions artifact，不发布 Release。发布 workflow 检查标签与应用版本一致；库使用原来的 `v…` 标签，应用使用 `glint-api-v…` 标签。Windows CI 的安装测试不验证实际 GPU 窗口和 HTML 预览渲染。
 
 应用图标位于 [`assets/glint-api-icon.png`](assets/glint-api-icon.png)：纯蓝圆角底座、白色代码括号与请求／响应连接线，采用简约平面设计。可编辑 SVG 源文件为 [`assets/glint-api-icon.svg`](assets/glint-api-icon.svg)，PNG 外围透明；macOS 直接使用 Cargo 启动时会自动设置 Dock 图标。设计说明见 [`assets/icon-design.md`](assets/icon-design.md)。
 
@@ -31,7 +60,7 @@ cargo run --example glint-api
 - 响应栏提供独立的“请求”Tab，使用只读代码面板展示最近一次发送时的HTTP 请求快照：最终 URL、启用的请求头、身份验证生成的 Authorization、合并后的 Cookie 和实际参与发送的请求体，支持复制。快照按请求保留，后续编辑草稿不会改变快照；快照使用已解析的环境变量，与本次发送配置一致。
 - 响应栏提供独立的“轨迹”Tab，可在发送中实时查看并独立滚动。每个请求保留最近一次的准备、校验、等待、响应、失败和取消记录，时间为相对本次发送的实际耗时；不模拟 DNS／TLS 等网络阶段。
 - 响应代码使用 `CodeCard::viewport()` 虚拟列表，仅排版可见行；源码 / 原始切换复用相同内容的缓存，预览 / 源码切换复用原生 WebView，纯 UI 通知不再序列化 SQLite 工作区。
-- 响应支持 JSON / HTML / CSS / JavaScript / XML 高亮、源码 / 原始视图、响应头、内置检查结果及复制。HTML 响应增加“预览”，运行 `cargo run --example glint-api --features webview` 启用 Wry 原生渲染（macOS / Windows 适配，macOS 验证）。预览使用实际响应正文，展示静态 HTML / CSS，不执行脚本；未启用 feature 时提供运行命令提示。
+- 响应支持 JSON / HTML / CSS / JavaScript / XML 高亮、源码 / 原始视图、响应头、内置检查结果及复制。HTML 响应增加“预览”，运行 `cargo run -p glint-api --features webview` 启用 Wry 原生渲染（macOS / Windows 适配，macOS 验证）。预览使用实际响应正文，展示静态 HTML / CSS，不执行脚本；未启用 feature 时提供运行命令提示。
 - 环境管理使用独立详情页，变量复用 `DataTable` 展示；表格内直接编辑名称、值和类型，支持添加行、名称搜索、复制引用和删除确认。通过“保存更改”统一校验并提交，“放弃更改”恢复已保存配置；未保存的编辑不参与请求。每个环境保留独立草稿。敏感值默认隐藏，点击眼睛后编辑。名称须以英文字母或下划线开头，只含英文字母、数字、下划线，同一环境不能重名。浏览环境不会更改当前请求，点击“用于当前请求”应用。支持明暗主题。
 
 | 快捷键 | 操作 |
@@ -45,6 +74,8 @@ cargo run --example glint-api
 HTTP 客户端使用 reqwest + Tokio，网络执行在独立运行时中，不阻塞 GPUI。连接超时 10 秒、总超时 30 秒，响应内容最多 16 MiB；保持正常 TLS 校验，3xx 响应直接展示，不自动跳转。取消、切换请求、删除请求或恢复配置会中断正在执行的请求和响应读取；服务端已经收到的操作无法撤回。
 
 响应展示真实状态码、响应头（保留重复项）、耗时和解压后字节数。JSON 支持格式化；原始视图保留响应文本，纯文本、HTML 和空响应也可查看。文本按 Content-Type 的 charset 解码，未指定时使用 UTF-8；二进制响应暂以文本显示，不提供文件保存。4xx / 5xx 仍展示服务端响应体，连接失败和超时进入失败历史。检查页使用实际状态码和 JSON 解析结果，不执行用户脚本。轨迹记录准备、校验、发送、完成、失败和取消，不生成虚构的 DNS / TLS 阶段。
+
+响应体复制按钮旁的搜索图标展开搜索栏，不区分大小写，显示当前匹配序号与总数。上一处／下一处按钮或 Shift+Enter／Enter 循环跳转并滚动到匹配位置，Esc 关闭并清除高亮。搜索使用当前源码或格式化／原始文本；从 HTML 预览打开搜索会切回源码。切换响应或显示格式后自动刷新匹配结果。
 数据使用本机 SQLite 存储，包含集合、嵌套目录、请求草稿、版本、发送历史、最近响应、请求快照、执行轨迹和已保存的环境变量。请求编辑自动保存；环境变量仍通过“保存更改”提交，未保存编辑不落盘。环境侧栏支持创建具名空环境；“不使用环境”是空变量上下文，不是预置环境。数据库使用事务写入，数据库读取或版本校验失败会停止启动并保留原文件，写入失败在界面显示错误。
 
 URL、Token、参数、请求头和 Cookie 的键值输入在失焦时以徽标显示已保存环境变量的解析值；点击徽标编辑原始 `{{变量名}}` 表达式。未定义、空值、循环引用及未闭合表达式使用警告色，悬停查看表达式和失败原因。切换请求环境或保存环境变量后即时刷新；保存和发送仍使用原始表达式及相同的环境解析规则。请求体保持源码编辑。
@@ -60,8 +91,8 @@ $env:GLINT_API_DB_PATH = "$env:LOCALAPPDATA\Glint API\workspace.sqlite3"
 验证：
 
 ```sh
-cargo check --examples --tests
-cargo test --example glint-api
+cargo check --workspace --all-targets --all-features
+cargo test -p glint-api
 ```
 
 模板方法可用于 URL、参数、请求头、Cookie 覆盖、Bearer Token、请求体和环境变量值。环境设置页提供点击复制的示例；不使用环境也能使用内置方法。

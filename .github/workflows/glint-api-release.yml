@@ -1,0 +1,75 @@
+name: Glint API Windows Release
+
+on:
+  push:
+    tags: ["glint-api-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glint-api-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content crates/glint-api/Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "glint-api-v$version") {
+            throw 'Tag does not match crates/glint-api/Cargo.toml version.'
+          }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Build Windows installer
+        shell: pwsh
+        run: ./crates/glint-api/packaging/windows/build-windows.ps1 -Version $env:APP_VERSION
+      - name: Test installation, upgrade and uninstall
+        shell: pwsh
+        run: |
+          ./crates/glint-api/packaging/windows/test-installer.ps1 -Installer "$env:GITHUB_WORKSPACE/target/windows-installer/output/Glint-API-$env:APP_VERSION-windows-x64-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glint-api-windows-setup
+          path: target/windows-installer/output/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: glint-api-windows-setup
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Glint API native API workbench for Windows 10/11 x64.
+
+          Download the `windows-x64-setup.exe` asset and run it to install for the current user. Setup automatically creates desktop and Start menu shortcuts. The application, installer and shortcuts use the Glint API icon.
+
+          The installer includes HTML preview support and installs Microsoft Edge WebView2 Runtime if missing (internet connection required for that runtime installation). Existing workspace data is preserved during upgrades and uninstall.
+
+          Silent installation: `Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
+
+          The installer is not code-signed. The accompanying `.sha256` file contains its SHA-256 checksum.
+          NOTES
+          sed -i "s/Glint-API-0.1.0/Glint-API-${RELEASE_TAG#glint-api-v}/g" release-notes.md
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Glint API ${RELEASE_TAG#glint-api-v}" --notes-file release-notes.md --latest=false

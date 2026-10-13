@@ -151,7 +151,7 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 | 命令 | 内容 |
 | --- | --- |
 | `cargo run --example playground` | 全部组件的展示与交互入口 |
-| `cargo run --example glint-api` | API 工作台、请求草稿、真实 HTTP 响应与版本历史 |
+| `cargo run -p glint-api` | API 工作台、请求草稿、真实 HTTP 响应与版本历史 |
 | `cargo run --example webview --features webview` | HTML 源码高亮与 Wry 原生网页渲染（macOS / Windows 适配） |
 | `cargo run --example mdeditor` | 本地 Markdown 工作区、文档库和保存恢复 |
 | `cargo run --example mermaid` | Mermaid 图表与错误状态 |
@@ -159,7 +159,7 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 | `cargo run --example feedback` | 通知与日期选择器 |
 | `cargo run --example temporal` | 时间、日期时间与范围选择器 |
 
-Playground 的入口和页面位于 [`examples/playground`](examples/playground)。API 工作台的运行方式、快捷键与 HTTP 请求配置见 [示例指南](examples/glint-api/README.md)。Markdown 应用的快捷键、文件存储与打包方式见 [示例指南](examples/mdeditor/README.md)。
+Playground 的入口和页面位于 [`examples/playground`](examples/playground)。API 工作台是独立的 workspace 应用，运行方式、Windows 安装包、发布流程与 HTTP 请求配置见 [应用指南](crates/glint-api/README.md)。Markdown 应用的快捷键、文件存储与打包方式见 [示例指南](examples/mdeditor/README.md)。
 
 Playground 将主题选择写入 `gpui-glint/theme`，兼容读取旧的 `gpui-glass/theme`；演示文档保存在主题配置旁的 `document.md`。这些是示例应用的行为，不是组件库的默认行为。
 
@@ -196,8 +196,9 @@ src/
 examples/
   playground/        组件展示程序
   mdeditor/          Markdown 工作区示例
-  glint-api/         API 工作台示例
   ...                独立组件示例
+crates/
+  glint-api/         可独立打包发布的 API 工作台
 docs/
   components.md      详细组件用法
 tests/               集成测试与性能基准

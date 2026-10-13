@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app_icon;
 mod environment;
 mod environment_ui;
@@ -113,6 +118,10 @@ struct Workbench {
     cookies_table: Entity<DataTable>,
     body: Entity<CodeCard>,
     response: Entity<CodeCard>,
+    response_search: Entity<TextEntry>,
+    show_response_search: bool,
+    response_search_index: Option<usize>,
+    response_search_count: usize,
     commands: Entity<CommandPalette>,
     response_json: Option<serde_json::Value>,
     response_data: Option<HttpResponse>,
@@ -205,7 +214,11 @@ impl Workbench {
         });
         let commands = cx.new(|cx| CommandPalette::new(Self::command_items(&requests), cx));
         let variable_search = Self::entry("", "搜索变量名称…", cx);
+        let response_search = Self::entry("", "搜索响应体…", cx);
         let mut subscriptions = vec![];
+        subscriptions.push(cx.observe(&response_search, |this: &mut Self, _, cx| {
+            this.sync_response_search(false, cx);
+        }));
         subscriptions.push(cx.observe(&variable_search, |this: &mut Self, _, cx| {
             this.sync_variable_table(cx);
             cx.notify();
@@ -416,6 +429,10 @@ impl Workbench {
             cookies_table,
             body,
             response,
+            response_search,
+            show_response_search: false,
+            response_search_index: None,
+            response_search_count: 0,
             commands,
             response_json: None,
             response_data: None,
@@ -1071,6 +1088,53 @@ impl Workbench {
         }
         response.text.clone()
     }
+    fn sync_response_search(&mut self, force: bool, cx: &mut Context<Self>) {
+        let query = if self.show_response_search {
+            self.response_search.read(cx).value().to_owned()
+        } else {
+            String::new()
+        };
+        if !force && self.response.read(cx).search_query() == query {
+            return;
+        }
+        self.response_search_count = self.response.update(cx, |editor, cx| {
+            editor.set_search_query(query, cx);
+            let count = editor.search_match_count();
+            if count > 0 {
+                editor.reveal_search_match(0, cx);
+            }
+            count
+        });
+        self.response_search_index = (self.response_search_count > 0).then_some(0);
+        cx.notify();
+    }
+    fn step_response_search(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let count = self.response_search_count;
+        if count == 0 {
+            return;
+        }
+        let current = self.response_search_index.unwrap_or(0);
+        let index = if previous {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        };
+        self.response_search_index = Some(index);
+        self.response.update(cx, |editor, cx| {
+            editor.reveal_search_match(index, cx);
+        });
+        cx.notify();
+    }
+    fn toggle_response_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_response_search = !self.show_response_search;
+        if self.show_response_search {
+            self.html_preview = false;
+            window.focus(&self.response_search.focus_handle(cx), cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        self.sync_response_search(true, cx);
+    }
     fn update_response(&mut self, cx: &mut Context<Self>) {
         let headers = self
             .response_data
@@ -1133,6 +1197,7 @@ impl Workbench {
             editor.set_language(language, cx);
             editor.set_content(content, cx);
         });
+        self.sync_response_search(true, cx);
     }
     fn preview_html(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -1148,6 +1213,8 @@ impl Workbench {
                 && self.html_webview.is_some()
             {
                 self.html_preview = true;
+                self.show_response_search = false;
+                self.sync_response_search(true, cx);
                 cx.notify();
                 return;
             }
@@ -1184,7 +1251,13 @@ impl Workbench {
         #[cfg(not(all(feature = "webview", any(target_os = "macos", target_os = "windows"))))]
         {
             let _ = window;
-            self.notice = "HTML 预览需运行 cargo run --example glint-api --features webview（macOS / Windows）".into();
+            self.notice =
+                "HTML 预览需运行 cargo run -p glint-api --features webview（macOS / Windows）"
+                    .into();
+        }
+        if self.html_preview {
+            self.show_response_search = false;
+            self.sync_response_search(true, cx);
         }
         cx.notify();
     }
@@ -1210,6 +1283,7 @@ impl Workbench {
         for entry in [
             &self.filter,
             &self.history_search,
+            &self.response_search,
             &self.group_name,
             &self.request_name,
         ] {
@@ -2938,6 +3012,16 @@ impl Workbench {
                         )
                         .child(div().flex_1())
                         .child(
+                            IconButton::new(Icon::Search, "搜索响应体")
+                                .theme(self.theme)
+                                .render()
+                                .id("response-search-toggle")
+                                .debug_selector(|| "response-search-toggle".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_response_search(window, cx);
+                                })),
+                        )
+                        .child(
                             IconButton::new(Icon::Copy, "复制响应")
                                 .theme(self.theme)
                                 .render()
@@ -2952,6 +3036,81 @@ impl Workbench {
                                 })),
                         ),
                 )
+                .when(self.show_response_search, |el| {
+                    el.child(
+                        div()
+                            .id("response-search-bar")
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_5()
+                            .py_1()
+                            .child(
+                                SearchInput::new("搜索响应体…")
+                                    .theme(self.theme)
+                                    .width(220.)
+                                    .control(self.response_search.clone())
+                                    .render()
+                                    .on_key_down(cx.listener(
+                                        |this, event: &gpui::KeyDownEvent, window, cx| {
+                                            if this.response_search.read(cx).is_composing() {
+                                                return;
+                                            }
+                                            match event.keystroke.key.as_str() {
+                                                "enter" => {
+                                                    this.step_response_search(
+                                                        event.keystroke.modifiers.shift,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                                "escape" => {
+                                                    this.toggle_response_search(window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                                _ => {}
+                                            }
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(format!(
+                                        "{}/{}",
+                                        self.response_search_index.map_or(0, |i| i + 1),
+                                        self.response_search_count
+                                    )),
+                            )
+                            .child(
+                                IconButton::new(Icon::ArrowUp, "上一处（Shift+Enter）")
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.step_response_search(true, cx)
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(Icon::ChevronDown, "下一处（Enter）")
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.step_response_search(false, cx)
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                IconButton::new(Icon::Close, "关闭搜索（Esc）")
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_response_search(window, cx)
+                                    })),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .id("response-scroll")
@@ -4156,6 +4315,80 @@ mod persistence_tests {
         let saved = storage::Store::open(&path).unwrap().load().unwrap();
         assert!(saved.requests[0].group.is_empty());
         assert_eq!(saved.requests.last().unwrap().group, "目录/子目录/第三层");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn response_search_opens_cycles_refreshes_and_closes(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_text_entry_keys);
+        struct ResponsePanel(Entity<Workbench>);
+        impl Render for ResponsePanel {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(850.))
+                    .h(px(300.))
+                    .flex()
+                    .flex_col()
+                    .child(self.0.update(cx, |host, cx| host.response_panel(cx)))
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("glint-api-search-{}.sqlite3", uuid::Uuid::new_v4()));
+        let host = cx.new(|cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.response_data = Some(HttpResponse {
+                status: 200,
+                headers: vec![],
+                text: "Rust 中文\nRUST 中文".into(),
+                bytes: 25,
+                json: None,
+            });
+            host.update_response(cx);
+            host
+        });
+        let (_, window) = cx.add_window_view(|_, _| ResponsePanel(host.clone()));
+        let toggle = window.debug_bounds("response-search-toggle").unwrap();
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        let focus = host.update(window, |host, cx| {
+            assert!(host.show_response_search);
+            host.response_search.focus_handle(cx)
+        });
+        window.update(|window, _| assert!(focus.is_focused(window)));
+        window.simulate_input("rust");
+        host.update(window, |host, _| {
+            assert_eq!(host.response_search_count, 2);
+            assert_eq!(host.response_search_index, Some(0));
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, _| {
+            assert_eq!(host.response_search_index, Some(1))
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, _| {
+            assert_eq!(host.response_search_index, Some(0))
+        });
+        window.simulate_keystrokes("shift-enter");
+        host.update(window, |host, cx| {
+            assert_eq!(host.response_search_index, Some(1));
+            host.response_data.as_mut().unwrap().text = "RUST 新响应".into();
+            host.update_response(cx);
+            assert_eq!(host.response_search_count, 1);
+            assert_eq!(host.response_search_index, Some(0));
+            host.response_search
+                .update(cx, |entry, cx| entry.set_value("不存在", cx));
+        });
+        window.run_until_parked();
+        host.update(window, |host, _| {
+            assert_eq!(host.response_search_count, 0);
+            assert_eq!(host.response_search_index, None);
+        });
+        window.simulate_keystrokes("escape");
+        host.update(window, |host, cx| {
+            assert!(!host.show_response_search);
+            assert_eq!(host.response.read(cx).search_query(), "");
+            assert_eq!(host.response_content(), "RUST 新响应");
+        });
+        drop(host);
         std::fs::remove_file(path).unwrap();
     }
 

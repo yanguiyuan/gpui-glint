@@ -198,6 +198,8 @@ CommonMark / GFM 渲染支持标题、粗体、斜体、删除线、行内代码
 
 `DocumentEditor::set_search_query(query, cx)` 为文档标题、正文、代码文本和表格单元格中的所有匹配词添加背景高亮，不区分大小写，编辑与预览模式均支持。传入空字符串清除高亮，`search_query()` 读取当前关键词。高亮仅影响显示，保留 Markdown 格式、链接和选区，不修改文档、不产生 `Changed` 事件，也不进入撤销历史；新建或重新加载的文本块继承当前关键词。独立的源码编辑器可使用 `CodeCard::set_search_query(query, cx)`。
 
+`CodeCard::search_match_count()` 返回当前文本的匹配数量，`reveal_search_match(index, cx)` 加深指定匹配的高亮，索引从 0 开始，越界返回 `false`。使用 `.viewport()` 的代码卡会同时纵向、横向滚动到该匹配，不改变键盘焦点、文本选区或撤销历史，适合由宿主组合长响应的搜索栏。
+
 ```rust
 document.update(cx, |editor, cx| editor.set_search_query("关键词", cx));
 // 清除：editor.set_search_query("", cx)
@@ -265,7 +267,7 @@ let browser = cx.new(|cx| {
 
 给 WebView 分配明确的布局区域。组件在 GPUI prepaint 中同步逻辑坐标和尺寸，支持窗口调整大小。原生视图会覆盖同区域的 GPUI 弹窗和菜单；宿主移除它的布局节点、切换页面或展示重叠弹窗时，应先 `set_visible(false, cx)`，回到页面再设为 `true`。实体释放时隐藏并释放原生视图。原生区域不支持 GPUI 圆角或任意内容裁剪；放在完全可见的矩形区域内。Windows 使用此子视图方案时可能需要宿主在 GPUI 启动前禁用 DirectComposition，不能视为已验证跨平台支持。
 
-运行 `cargo run --example webview --features webview` 查看源码和原生预览的对照示例；运行 `cargo run --example glint-api --features webview` 使用 HTML 响应“预览”。响应源码按 Content-Type 识别 HTML，也支持缺少 Content-Type 时识别 `<!doctype html>` / `<html`；预览渲染收到的正文，不重新发送原请求。`with_html` 文档没有原请求的 URL 基址，相对路径资源可能无法加载。
+运行 `cargo run --example webview --features webview` 查看源码和原生预览的对照示例；运行 `cargo run -p glint-api --features webview` 使用 HTML 响应“预览”。响应源码按 Content-Type 识别 HTML，也支持缺少 Content-Type 时识别 `<!doctype html>` / `<html`；预览渲染收到的正文，不重新发送原请求。`with_html` 文档没有原请求的 URL 基址，相对路径资源可能无法加载。
 
 ## Popover
 

@@ -6,7 +6,7 @@ pub fn install() {
         runtime::{AnyClass, AnyObject},
     };
 
-    let bytes = include_bytes!("assets/glint-api-icon.png");
+    let bytes = include_bytes!("../assets/glint-api-icon.png");
     // Application::run invokes this on the AppKit main thread. NSData copies
     // the bytes; NSApplication retains the decoded image after assignment.
     unsafe {

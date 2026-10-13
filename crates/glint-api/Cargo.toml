@@ -1,0 +1,37 @@
+[package]
+name = "glint-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A native API workbench built with Glint and GPUI-CE."
+license = "MIT"
+publish = false
+
+[features]
+default = ["webview"]
+webview = ["gpui-glint/webview"]
+
+[dependencies]
+gpui-glint = { path = "../.." }
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11"] }
+chrono = "0.4"
+encoding_rs = "0.8"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "brotli", "deflate"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["test-support"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
