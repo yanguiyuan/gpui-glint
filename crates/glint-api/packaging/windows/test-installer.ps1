@@ -1,4 +1,8 @@
-param([Parameter(Mandatory)][string]$Installer)
+param(
+    [Parameter(Mandatory)][string]$Installer,
+    [string]$PreviousInstaller,
+    [string]$Version
+)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $installDir = "$env:LOCALAPPDATA\Programs\Glint API"
@@ -40,6 +44,9 @@ try {
         throw 'The application icon is not embedded in the executable.'
     }
 } finally { if ($module -ne [IntPtr]::Zero) { [void][ResourceProbe]::FreeLibrary($module) } }
+if ($PreviousInstaller) {
+    & "$PSScriptRoot\test-updater.ps1" -Installer $Installer -PreviousInstaller $PreviousInstaller -Version $Version
+}
 $uninstall = Start-Process "$installDir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
 if ($uninstall.ExitCode -ne 0) { throw "Uninstall exited with $($uninstall.ExitCode)." }
 foreach ($path in @($desktop, $startMenu, $exe)) {

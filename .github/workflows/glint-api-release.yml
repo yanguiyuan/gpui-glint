@@ -15,6 +15,7 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,8 +36,16 @@ jobs:
         run: ./crates/glint-api/packaging/windows/build-windows.ps1 -Version $env:APP_VERSION
       - name: Test installation, upgrade and uninstall
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ./crates/glint-api/packaging/windows/test-installer.ps1 -Installer "$env:GITHUB_WORKSPACE/target/windows-installer/output/Glint-API-$env:APP_VERSION-windows-x64-setup.exe"
+          $previousDir = "$env:RUNNER_TEMP/glint-api-previous"
+          gh release download glint-api-v0.1.0 --repo $env:GITHUB_REPOSITORY --pattern '*.exe' --dir $previousDir
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous release for updater testing.' }
+          $previous = "$previousDir/Glint-API-0.1.0-windows-x64-setup.exe"
+          $digest = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/glint-api-v0.1.0" --jq '.assets[] | select(.name == "Glint-API-0.1.0-windows-x64-setup.exe") | .digest'
+          if ($LASTEXITCODE -ne 0 -or $digest -ne "sha256:$((Get-FileHash $previous -Algorithm SHA256).Hash.ToLowerInvariant())") { throw 'Previous release checksum verification failed.' }
+          ./crates/glint-api/packaging/windows/test-installer.ps1 -Installer "$env:GITHUB_WORKSPACE/target/windows-installer/output/Glint-API-$env:APP_VERSION-windows-x64-setup.exe" -PreviousInstaller $previous -Version $env:APP_VERSION
       - uses: actions/upload-artifact@v4
         with:
           name: glint-api-windows-setup
@@ -66,6 +75,8 @@ jobs:
           Download the `windows-x64-setup.exe` asset and run it to install for the current user. Setup automatically creates desktop and Start menu shortcuts. The application, installer and shortcuts use the Glint API icon.
 
           The installer includes HTML preview support and installs Microsoft Edge WebView2 Runtime if missing (internet connection required for that runtime installation). Existing workspace data is preserved during upgrades and uninstall.
+
+          Installed Windows builds automatically check for stable Glint API releases on startup. Click the update icon or **更新并重启** to download, verify the GitHub SHA-256 digest, silently install and restart. Version 0.1.0 needs one manual installation of this version to enable in-app updates.
 
           Silent installation: `Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 

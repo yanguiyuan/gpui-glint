@@ -147,6 +147,36 @@ impl Workbench {
         self.variable_draft(cx) != saved
             || self.proxy_draft(cx) != self.environment_inputs[self.editing_environment].proxy
     }
+    pub(super) fn has_unsaved_environment(&self, cx: &App) -> bool {
+        self.environment_inputs
+            .iter()
+            .enumerate()
+            .any(|(index, saved)| {
+                let rows: Vec<_> = self.variable_rows[index]
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.name.read(cx).value().to_owned(),
+                            row.value.read(cx).value().to_owned(),
+                            row.kind
+                                .read(cx)
+                                .value()
+                                .is_some_and(|value| value.as_ref() == "secret"),
+                        )
+                    })
+                    .collect();
+                let variables: Vec<_> = saved
+                    .variables
+                    .iter()
+                    .map(|v| (v.name.clone(), v.value.clone(), v.secret))
+                    .collect();
+                let proxy = &self.proxy_inputs[index];
+                rows != variables
+                    || proxy.enabled != saved.proxy.enabled
+                    || proxy.skip_tls_verification != saved.proxy.skip_tls_verification
+                    || proxy.url.read(cx).value().trim() != saved.proxy.url
+            })
+    }
     pub(super) fn add_variable(&mut self, cx: &mut Context<Self>) {
         if self.editing_environment == 0 {
             return;

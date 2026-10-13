@@ -25,7 +25,7 @@ try {
     Copy-Item "$repo\target\x86_64-pc-windows-msvc\release\glint-api.exe" $stage
     Copy-Item "$repo\crates\glint-api\assets\glint-api-icon.ico" $stage
     $bootstrapper = "$stage\MicrosoftEdgeWebview2Setup.exe"
-    Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bootstrapper
+    Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bootstrapper -TimeoutSec 120
     $signature = Get-AuthenticodeSignature $bootstrapper
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
         throw 'WebView2 bootstrapper signature validation failed.'

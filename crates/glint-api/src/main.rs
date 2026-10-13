@@ -10,6 +10,8 @@ mod http;
 mod model;
 mod storage;
 mod template;
+mod update_ui;
+mod updater;
 
 use environment::EnvironmentVariables;
 use environment_ui::{ProxyInput, VariableInput};
@@ -54,6 +56,10 @@ struct PairInput {
     note: Entity<TextEntry>,
 }
 struct Workbench {
+    update_state: update_ui::UpdateState,
+    update_task: Option<Task<()>>,
+    show_update_details: bool,
+    update_error: Option<String>,
     storage: storage::Store,
     environment_names: Vec<String>,
     responses: Vec<Option<HttpResponse>>,
@@ -145,7 +151,23 @@ impl Workbench {
     fn new(cx: &mut Context<Self>) -> Self {
         let path = storage::Store::default_path().expect("无法确定 SQLite 数据目录");
         let storage = storage::Store::open(&path).expect("无法打开 SQLite 数据库");
-        Self::with_store(storage, cx)
+        let mut this = Self::with_store(storage, cx);
+        let report = updater::take_report();
+        if let Some(report) = report {
+            this.show_update_details = true;
+            this.update_state = if report.success && report.version == updater::VERSION {
+                update_ui::UpdateState::Current
+            } else {
+                update_ui::UpdateState::Failed(if report.success {
+                    "安装后版本与目标版本不符".into()
+                } else {
+                    report.message
+                })
+            };
+        } else if cfg!(target_os = "windows") && !cfg!(debug_assertions) {
+            this.check_for_updates(false, cx);
+        }
+        this
     }
     fn with_store(mut storage: storage::Store, cx: &mut Context<Self>) -> Self {
         let data = storage
@@ -365,6 +387,10 @@ impl Workbench {
         let current_versions = vec![0; requests.len()];
         let sent_requests = data.previews;
         let mut this = Self {
+            update_state: update_ui::UpdateState::Idle,
+            update_task: None,
+            show_update_details: false,
+            update_error: None,
             storage,
             storage_error: None,
             storage_dirty: true,
@@ -1404,6 +1430,7 @@ impl Workbench {
                     .on_click(cx.listener(|this, _, window, cx| this.open_commands(window, cx))),
             )
             .child(self.theme_selector.clone())
+            .child(self.update_button(cx))
             .when(!self.show_environments, |bar| {
                 bar.child(
                     IconButton::new(Icon::Sidebar, "展开或收起记录")
@@ -3792,7 +3819,10 @@ impl Render for Workbench {
         }
         let _ = &self.subscriptions;
         let content = div()
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
             .flex()
             .child(if self.show_environments {
                 self.environment_workspace(cx)
@@ -3813,6 +3843,9 @@ impl Render for Workbench {
                         .text_color(rgb(0xd9342b))
                         .child(format!("SQLite 保存失败：{error}。修改尚未写入磁盘。")),
                 )
+            })
+            .when(self.show_update_details, |el| {
+                el.child(self.update_banner(cx))
             })
             .child(content);
         let shell = AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
@@ -3903,6 +3936,40 @@ fn record_time() -> String {
         .to_string()
 }
 fn main() {
+    let mut args = std::env::args_os().skip(1);
+    let action = args.next();
+    if action.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("Glint API {}", updater::VERSION);
+        return;
+    }
+    if action.as_deref() == Some(std::ffi::OsStr::new("--check-update")) {
+        match updater::check_blocking() {
+            Ok(update) => println!(
+                "{}",
+                serde_json::json!({
+                    "currentVersion": updater::VERSION,
+                    "availableVersion": update.as_ref().map(|update| update.version.to_string()),
+                    "releaseUrl": update.as_ref().map(updater::Update::release_url),
+                })
+            ),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if action.as_deref() == Some(std::ffi::OsStr::new("--apply-update")) {
+        let result = args
+            .next()
+            .ok_or("缺少更新任务路径".to_owned())
+            .and_then(|path| updater::run_helper(std::path::Path::new(&path)));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     gpui_platform::application()
         .with_assets(GlintAssets)
         .run(|cx: &mut App| {
