@@ -25,17 +25,37 @@ pwsh -File crates/glint-api/packaging/windows/build-windows.ps1
 静默安装：
 
 ```powershell
-.\Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+.\Glint-API-0.1.1-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ```
 
 更新本应用 `Cargo.toml` 的版本后，推送对应标签自动构建、验证静默安装／重装升级／快捷方式／图标／卸载，再发布到 GitHub Releases：
 
 ```sh
-git tag glint-api-v0.1.0
-git push origin glint-api-v0.1.0
+git tag glint-api-v0.1.1
+git push origin glint-api-v0.1.1
 ```
 
 手动运行 `Glint API Windows Release` workflow 只构建并上传 Actions artifact，不发布 Release。发布 workflow 检查标签与应用版本一致；库使用原来的 `v…` 标签，应用使用 `glint-api-v…` 标签。Windows CI 的安装测试不验证实际 GPU 窗口和 HTML 预览渲染。
+
+## 更新检查与自动更新
+
+Windows 发布版启动时自动检查稳定的 `glint-api-v…` Release；标题栏更新图标也可手动检查。只按应用的语义版本比较，排除库版本、草稿和预发布版本，不降级。发现新版后点击“更新并重启”：后台下载并显示进度，核对 GitHub 资产 API 提供的文件大小和 SHA-256，再保存请求工作区、退出旧进程、静默安装到当前目录并重新打开。下载可以取消；网络失败、限流或校验失败可以重试。临时下载和超过一天的旧更新缓存会清理。
+
+自动安装适用于通过 setup 安装的 Windows x64 发布版。其他平台和开发构建提供“查看发布”。执行中的请求、未保存的环境设置、未完成的名称编辑或 SQLite 保存错误会阻止重启，处理后可继续安装已下载的更新。更新助手在安装前再次校验安装包，安装失败时会尝试重新打开原应用并显示错误。
+
+`0.1.0` 尚无更新器，首次需要手动安装带更新器的版本；之后可应用内更新。当前发布源是私有的 `yanguiyuan/gpui-glint`，客户端访问需要具有该仓库 Contents 读取权限的 GitHub 令牌，通过进程环境变量 `GLINT_API_UPDATE_TOKEN` 提供。令牌不存入数据库、不内嵌到安装包，仅用于 GitHub API；源码仓库可见性不会被应用更改。
+
+命令行检查（不打开 UI）：
+
+```sh
+cargo run -p glint-api -- --check-update
+```
+
+Windows CI 验证从 `0.1.0` 升级到当前版本、拒绝错误校验值、等待旧进程退出及数据保留，不验证实际 GPU 窗口的重启渲染。联网下载测试独立于默认测试，需要访问发布源：
+
+```sh
+cargo test -p glint-api downloads_published_installer_using_the_asset_api -- --ignored
+```
 
 应用图标位于 [`assets/glint-api-icon.png`](assets/glint-api-icon.png)：纯蓝圆角底座、白色代码括号与请求／响应连接线，采用简约平面设计。可编辑 SVG 源文件为 [`assets/glint-api-icon.svg`](assets/glint-api-icon.svg)，PNG 外围透明；macOS 直接使用 Cargo 启动时会自动设置 Dock 图标。设计说明见 [`assets/icon-design.md`](assets/icon-design.md)。
 

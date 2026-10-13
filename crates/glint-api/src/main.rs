@@ -3959,6 +3959,27 @@ fn main() {
         }
         return;
     }
+    if action.as_deref() == Some(std::ffi::OsStr::new("--download-release")) {
+        let result = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or("缺少发布版本".to_owned())
+            .and_then(|version| {
+                args.next()
+                    .ok_or("缺少下载目录".to_owned())
+                    .and_then(|directory| {
+                        updater::download_release(&version, std::path::Path::new(&directory))
+                    })
+            });
+        match result {
+            Ok(path) => println!("{}", path.display()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if action.as_deref() == Some(std::ffi::OsStr::new("--apply-update")) {
         let result = args
             .next()

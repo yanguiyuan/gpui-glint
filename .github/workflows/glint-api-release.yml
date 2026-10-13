@@ -38,10 +38,11 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GLINT_API_UPDATE_TOKEN: ${{ github.token }}
         run: |
           $previousDir = "$env:RUNNER_TEMP/glint-api-previous"
-          gh release download glint-api-v0.1.0 --repo $env:GITHUB_REPOSITORY --pattern '*.exe' --dir $previousDir
-          if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous release for updater testing.' }
+          $downloader = Start-Process "$env:GITHUB_WORKSPACE/target/windows-installer/stage/glint-api.exe" -ArgumentList '--download-release', '0.1.0', ('"' + $previousDir + '"') -Wait -PassThru
+          if ($downloader.ExitCode -ne 0) { throw 'The app updater could not download the previous release.' }
           $previous = "$previousDir/Glint-API-0.1.0-windows-x64-setup.exe"
           $digest = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/glint-api-v0.1.0" --jq '.assets[] | select(.name == "Glint-API-0.1.0-windows-x64-setup.exe") | .digest'
           if ($LASTEXITCODE -ne 0 -or $digest -ne "sha256:$((Get-FileHash $previous -Algorithm SHA256).Hash.ToLowerInvariant())") { throw 'Previous release checksum verification failed.' }
@@ -77,6 +78,8 @@ jobs:
           The installer includes HTML preview support and installs Microsoft Edge WebView2 Runtime if missing (internet connection required for that runtime installation). Existing workspace data is preserved during upgrades and uninstall.
 
           Installed Windows builds automatically check for stable Glint API releases on startup. Click the update icon or **更新并重启** to download, verify the GitHub SHA-256 digest, silently install and restart. Version 0.1.0 needs one manual installation of this version to enable in-app updates.
+
+          This release source is private. Client update checks/downloads require a GitHub token with read access to this repository, supplied through the `GLINT_API_UPDATE_TOKEN` process environment variable. No token is embedded in the installer.
 
           Silent installation: `Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 

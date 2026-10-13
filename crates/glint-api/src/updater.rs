@@ -46,6 +46,7 @@ struct Release {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+    url: String,
     browser_download_url: String,
     size: u64,
     digest: Option<String>,
@@ -76,6 +77,12 @@ fn select_update(releases: &[Release], current: &Version) -> Result<Option<Updat
     if asset.browser_download_url != format!("{DOWNLOADS}glint-api-v{version}/{name}") {
         return Err("更新安装包地址不属于官方发布仓库".into());
     }
+    asset
+        .url
+        .strip_prefix("https://api.github.com/repos/yanguiyuan/gpui-glint/releases/assets/")
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or("更新安装包 API 地址无效")?;
     if asset.size == 0 || asset.size > MAX_INSTALLER_SIZE {
         return Err("更新安装包大小无效".into());
     }
@@ -88,7 +95,7 @@ fn select_update(releases: &[Release], current: &Version) -> Result<Option<Updat
         .to_ascii_lowercase();
     Ok(Some(Update {
         version,
-        url: asset.browser_download_url.clone(),
+        url: asset.url.clone(),
         size: asset.size,
         sha256,
     }))
@@ -99,9 +106,25 @@ fn client() -> Result<Client, String> {
         .https_only(true)
         .user_agent(format!("glint-api/{VERSION}"))
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(180))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
         .build()
         .map_err(|error| format!("无法初始化更新客户端：{error}"))
+}
+
+fn authenticate(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, String> {
+    let token = std::env::var("GLINT_API_UPDATE_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(token) = token {
+        let mut header =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+                .map_err(|_| "GitHub 更新令牌格式无效")?;
+        header.set_sensitive(true);
+        Ok(request.header(reqwest::header::AUTHORIZATION, header))
+    } else {
+        Ok(request)
+    }
 }
 
 static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
@@ -126,25 +149,33 @@ pub async fn check() -> Result<Option<Update>, String> {
             // App and library releases share this repository. Do not use /latest,
             // and do not assume release creation order is semantic version order.
             for page in 1..=10 {
-                let mut response = client
+                let request = client
                     .get(RELEASES)
                     .query(&[("per_page", 100), ("page", page)])
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
-                    .timeout(Duration::from_secs(20))
+                    .timeout(Duration::from_secs(20));
+                let mut response = authenticate(request)?
                     .send()
                     .await
-                    .map_err(|error| format!("无法连接 GitHub：{error}"))?;
+                    .map_err(|error| format!("无法连接 GitHub：{}", error.without_url()))?;
                 if response.status() == reqwest::StatusCode::FORBIDDEN
                     || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
                 {
                     return Err("GitHub 更新检查暂时限流，请稍后重试".into());
                 }
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err("更新源无法访问；私有发布源需要设置 GLINT_API_UPDATE_TOKEN".into());
+                }
                 if !response.status().is_success() {
                     return Err(format!("GitHub 更新检查失败：HTTP {}", response.status()));
                 }
                 let mut bytes = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|error| error.without_url().to_string())?
+                {
                     if bytes.len() + chunk.len() > MAX_METADATA_SIZE {
                         return Err("GitHub 更新信息过大".into());
                     }
@@ -166,6 +197,59 @@ pub async fn check() -> Result<Option<Update>, String> {
 
 pub fn check_blocking() -> Result<Option<Update>, String> {
     runtime()?.block_on(check())
+}
+
+/// Download an explicitly requested release for diagnostics/CI without installing it.
+pub fn download_release(version: &str, directory: &Path) -> Result<PathBuf, String> {
+    let version = Version::parse(version).map_err(|_| "发布版本无效")?;
+    if !version.pre.is_empty() || !version.build.is_empty() {
+        return Err("仅支持稳定版本".into());
+    }
+    runtime()?.block_on(async {
+        let client = client()?;
+        let mut response = authenticate(
+            client
+                .get(format!("{RELEASES}/tags/glint-api-v{version}"))
+                .header("Accept", "application/vnd.github+json")
+                .timeout(Duration::from_secs(20)),
+        )?
+        .send()
+        .await
+        .map_err(|error| error.without_url().to_string())?
+        .error_for_status()
+        .map_err(|error| error.without_url().to_string())?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| error.without_url().to_string())?
+        {
+            if bytes.len() + chunk.len() > MAX_METADATA_SIZE {
+                return Err("GitHub 更新信息过大".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let release: Release =
+            serde_json::from_slice(&bytes).map_err(|_| "GitHub 发布信息格式无效")?;
+        if release.tag_name != format!("glint-api-v{version}") {
+            return Err("发布版本不符".into());
+        }
+        let update = select_update(&[release], &Version::parse("0.0.0").unwrap())?
+            .ok_or("未找到可下载的稳定版本")?;
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let path = directory.join(format!("Glint-API-{version}-windows-x64-setup.exe"));
+        let response = authenticate(
+            client
+                .get(&update.url)
+                .header("Accept", "application/octet-stream"),
+        )?
+        .send()
+        .await
+        .map_err(|error| error.without_url().to_string())?;
+        let (sender, _) = async_channel::bounded(32);
+        save_download(response, &path, &update, &sender).await?;
+        Ok(path)
+    })
 }
 
 pub enum DownloadEvent {
@@ -193,11 +277,14 @@ pub fn start_download(
                 "Glint-API-{}-windows-x64-setup.exe",
                 update.version
             ));
-            let response = client()?
-                .get(&update.url)
-                .send()
-                .await
-                .map_err(|error| format!("下载更新失败：{error}"))?;
+            let response = authenticate(
+                client()?
+                    .get(&update.url)
+                    .header("Accept", "application/octet-stream"),
+            )?
+            .send()
+            .await
+            .map_err(|error| format!("下载更新失败：{}", error.without_url()))?;
             save_download(response, &path, &update, &sender).await?;
             Ok(path)
         }
@@ -235,7 +322,7 @@ async fn save_download(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("下载更新中断：{error}"))?
+        .map_err(|error| format!("下载更新中断，请重试：{}", error.without_url()))?
     {
         received += chunk.len() as u64;
         if received > update.size || received > MAX_INSTALLER_SIZE {
@@ -486,6 +573,8 @@ mod tests {
             prerelease: false,
             assets: vec![Asset {
                 name: name.clone(),
+                url: "https://api.github.com/repos/yanguiyuan/gpui-glint/releases/assets/123"
+                    .into(),
                 browser_download_url: format!("{DOWNLOADS}glint-api-v{version}/{name}"),
                 size: 3,
                 digest: Some(format!("sha256:{}", "a".repeat(64))),
@@ -636,5 +725,46 @@ mod tests {
         verify_file(&job).unwrap();
         fs::write(&installer, b"xyz").unwrap();
         assert!(verify_file(&job).is_err());
+    }
+
+    #[test]
+    #[ignore = "Connects to the release repository; private sources require GLINT_API_UPDATE_TOKEN"]
+    fn downloads_published_installer_using_the_asset_api() {
+        let directory = tempfile::tempdir().unwrap();
+        runtime().unwrap().block_on(async {
+            let client = client().unwrap();
+            let response = authenticate(
+                client
+                    .get(RELEASES)
+                    .header("Accept", "application/vnd.github+json"),
+            )
+            .unwrap()
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+            let bytes = response.bytes().await.unwrap();
+            assert!(bytes.len() < MAX_METADATA_SIZE);
+            let releases: Vec<Release> = serde_json::from_slice(&bytes).unwrap();
+            let update = select_update(&releases, &Version::parse("0.0.0").unwrap())
+                .unwrap()
+                .unwrap();
+            let response = authenticate(
+                client
+                    .get(&update.url)
+                    .header("Accept", "application/octet-stream"),
+            )
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+            let path = directory.path().join("setup.exe");
+            let (sender, _) = async_channel::bounded(32);
+            save_download(response, &path, &update, &sender)
+                .await
+                .unwrap();
+            assert_eq!(fs::metadata(path).unwrap().len(), update.size);
+        });
     }
 }
