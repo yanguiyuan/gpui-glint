@@ -79,7 +79,7 @@ jobs:
 
           Installed Windows builds automatically check for stable Glint API releases on startup. Click the update icon or **更新并重启** to download, verify the GitHub SHA-256 digest, silently install and restart. Version 0.1.0 needs one manual installation of this version to enable in-app updates.
 
-          This release source is private. Client update checks/downloads require a GitHub token with read access to this repository, supplied through the `GLINT_API_UPDATE_TOKEN` process environment variable. No token is embedded in the installer.
+          This release source is public. Client update checks and downloads work without GitHub sign-in or a token. An optional `GLINT_API_UPDATE_TOKEN` process environment variable can increase the GitHub API rate limit; no token is embedded in the installer.
 
           Silent installation: `Glint-API-0.1.0-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 
