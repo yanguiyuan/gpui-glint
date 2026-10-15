@@ -37,6 +37,80 @@ pub struct PreparedRequest {
     pub preview: String,
 }
 impl PreparedRequest {
+    pub fn plugin_payload(&self) -> Result<serde_json::Value, String> {
+        let mut headers = serde_json::Map::new();
+        for (name, value) in &self.headers {
+            if headers.contains_key(name.as_str()) {
+                return Err("启用签名插件时，请合并重复的请求头".into());
+            }
+            headers.insert(
+                name.to_string(),
+                value.to_str().map_err(|_| "请求头不是文本")?.into(),
+            );
+        }
+        let uri = match self.url.query() {
+            Some(query) => format!("{}?{}", self.url.path(), query),
+            None => self.url.path().to_owned(),
+        };
+        Ok(
+            serde_json::json!({"method":self.method.as_str(), "uri":uri, "body":self.body, "headers":headers}),
+        )
+    }
+    /// Validate the complete patch before changing the request; scripts cannot mutate body/URL.
+    pub fn apply_plugin_headers(
+        &mut self,
+        output: &serde_json::Value,
+        grants: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        let object = output
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .ok_or("插件应返回 setHeaders 对象")?;
+        let patch = object
+            .get("setHeaders")
+            .and_then(serde_json::Value::as_object)
+            .filter(|p| p.len() <= 32)
+            .ok_or("插件请求头输出无效")?;
+        let mut changes = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, value) in patch {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| "插件请求头名称无效")?;
+            if !grants.contains(&format!("request.header.{name}"))
+                || !seen.insert(name.to_string())
+                || matches!(
+                    name.as_str(),
+                    "host" | "content-length" | "transfer-encoding" | "connection"
+                )
+            {
+                return Err("插件修改了未授权的请求头".into());
+            }
+            let value = value
+                .as_str()
+                .filter(|v| v.len() <= 8192)
+                .ok_or("插件请求头的值无效")?;
+            let parsed = HeaderValue::from_str(value).map_err(|_| "插件请求头的值无效")?;
+            changes.push((name, parsed));
+        }
+        for (name, value) in changes {
+            self.headers.retain(|(existing, _)| existing != &name);
+            self.headers.push((name, value));
+        }
+        self.preview = format!("{} {}", self.method, self.url);
+        for (name, value) in &self.headers {
+            let shown = if matches!(
+                name.as_str(),
+                "authorization" | "x-kso-authorization" | "cookie"
+            ) {
+                "[已隐藏]"
+            } else {
+                value.to_str().unwrap_or("[二进制]")
+            };
+            self.preview.push_str(&format!("\n{name}: {shown}"));
+        }
+        self.preview.push_str("\n\n");
+        self.preview.push_str(&self.body);
+        Ok(())
+    }
     pub fn with_proxy(mut self, proxy: &ProxySettings) -> Result<Self, String> {
         proxy.validate()?;
         if proxy.enabled {

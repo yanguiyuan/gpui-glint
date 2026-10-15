@@ -6,3 +6,6 @@ design/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Local plugin registry data includes its signing key.
+/registry-data/

@@ -14,3 +14,11 @@
 //! and Windows.
 pub mod components;
 pub mod theme;
+
+/// Application-independent plugin contracts and optional JavaScript runtime.
+#[cfg(feature = "plugins")]
+pub use glint_plugin as plugins;
+
+/// Optional signed-source and installation SDK; does not require the JavaScript runtime.
+#[cfg(feature = "plugin-registry")]
+pub use glint_plugin_registry as plugin_registry;

@@ -1,6 +1,6 @@
 [package]
 name = "glint-api"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 description = "A native API workbench built with Glint and GPUI-CE."
@@ -12,13 +12,15 @@ default = ["webview"]
 webview = ["gpui-glint/webview"]
 
 [dependencies]
-gpui-glint = { path = "../.." }
+gpui-glint = { path = "../..", features = ["plugins"] }
+glint-plugin-registry = { path = "../glint-plugin-registry" }
 gpui = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11"] }
 chrono = "0.4"
 async-channel = "2"
 semver = "1"
 sha2 = "0.10"
+wait-timeout = "0.2"
 encoding_rs = "0.8"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "brotli", "deflate"] }

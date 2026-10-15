@@ -1,0 +1,20 @@
+{
+    admin off
+    auto_https disable_redirects
+}
+gateway.yanguiyuan.cn {
+    tls {
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+    handle_path /plugins/* {
+        request_body {
+            max_size 2MB
+        }
+        reverse_proxy registry:8787
+    }
+    handle {
+        reverse_proxy api-gateway-gateway-1:80
+    }
+}

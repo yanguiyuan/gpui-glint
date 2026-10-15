@@ -1,0 +1,28 @@
+services:
+  registry:
+    image: glint-plugin-registry:gateway
+    restart: unless-stopped
+    env_file: ./registry.env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data:/data
+    networks: [registry]
+    security_opt: [no-new-privileges:true]
+  https:
+    image: public.ecr.aws/docker/library/caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    networks: [registry, gateway]
+    security_opt: [no-new-privileges:true]
+networks:
+  registry: {}
+  gateway:
+    external: true
+    name: api-gateway_internal

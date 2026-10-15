@@ -203,3 +203,5 @@ docs/
   components.md      详细组件用法
 tests/               集成测试与性能基准
 ```
+
+可选插件体系：启用 `plugins` feature 后，可使用通用 JS 插件契约与原生 `PluginPage` 页面组件。默认 UI 库不加载 JS 引擎。详见 [插件集成](docs/plugins.md)。

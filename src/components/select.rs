@@ -128,6 +128,10 @@ impl Select {
         self.width = width.max(0.);
         self
     }
+    pub fn set_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.width = width.max(0.);
+        cx.notify();
+    }
     /// Minimum trigger width in pixels (100 by default). Can be lowered for table cells.
     /// Applied independently of builder order; the popup follows the effective width.
     pub fn min_width(mut self, width: f32) -> Self {
@@ -334,11 +338,13 @@ impl Render for Select {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
+                    .whitespace_nowrap()
                     .text_ellipsis()
                     .child(label),
             )
-            .child(Icon::ChevronDown.render(12.));
+            .child(div().flex_shrink_0().child(Icon::ChevronDown.render(12.)));
         if self.embedded {
             trigger = trigger
                 .border_0()

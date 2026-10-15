@@ -1,0 +1,15 @@
+services:
+  registry:
+    build:
+      context: ../..
+      dockerfile: deployment/plugin-registry/Dockerfile
+    image: glint-plugin-registry:local
+    restart: unless-stopped
+    env_file:
+      - ./registry.env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - registry-data:/data
+volumes:
+  registry-data:

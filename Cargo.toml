@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/glint-api"]
+members = [".", "crates/glint-api", "crates/glint-plugin", "crates/glint-plugin-registry", "crates/glint-plugin-server", "crates/glint-plugin-cli"]
 default-members = ["."]
 resolver = "3"
 
@@ -36,11 +36,15 @@ all-features = true
 [features]
 default = []
 webview = ["dep:wry"]
+plugins = ["dep:glint-plugin"]
+plugin-registry = ["dep:glint-plugin-registry"]
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 wry = { version = "0.55", optional = true }
 
 [dependencies]
+glint-plugin = { path = "crates/glint-plugin", version = "0.1.0", optional = true }
+glint-plugin-registry = { path = "crates/glint-plugin-registry", version = "0.1.0", optional = true }
 gpui = { package = "gpui-ce", version = "=0.2.2" }
 pulldown-cmark = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }

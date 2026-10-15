@@ -17,8 +17,29 @@ impl Pair {
         }
     }
 }
+/// Request-local action binding; flattened approval preserves older workspace data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BeforeAction {
+    #[serde(flatten)]
+    pub approval: gpui_glint::plugins::Approval,
+    #[serde(default)]
+    pub action_id: String,
+    #[serde(default = "action_enabled")]
+    pub enabled: bool,
+}
+fn action_enabled() -> bool {
+    true
+}
+impl std::ops::Deref for BeforeAction {
+    type Target = gpui_glint::plugins::Approval;
+    fn deref(&self) -> &Self::Target {
+        &self.approval
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub plugins: Vec<BeforeAction>,
     pub method: String,
     pub url: String,
     pub body: String,
@@ -522,6 +543,7 @@ fn encode(value: &str) -> String {
 impl Default for Draft {
     fn default() -> Self {
         Self {
+            plugins: vec![],
             method: "GET".into(),
             url: String::new(),
             body: String::new(),

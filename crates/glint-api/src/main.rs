@@ -8,6 +8,9 @@ mod environment;
 mod environment_ui;
 mod http;
 mod model;
+mod plugin_ui;
+mod plugins;
+mod registry_ui;
 mod storage;
 mod template;
 mod update_ui;
@@ -85,6 +88,21 @@ struct Workbench {
     active: usize,
     tabs: Vec<usize>,
     config: usize,
+    plugin_catalog: Vec<gpui_glint::plugins::Plugin>,
+    plugin_errors: Vec<String>,
+    registry_name: Entity<TextEntry>,
+    registry_url: Entity<TextEntry>,
+    registry_key: Entity<TextEntry>,
+    registry_filter: Entity<TextEntry>,
+    registry_sources: Vec<glint_plugin_registry::Source>,
+    registry_releases: Vec<(
+        glint_plugin_registry::Source,
+        glint_plugin_registry::Release,
+    )>,
+    registry_task: Option<Task<()>>,
+    registry_message: Option<String>,
+    show_registry_dialog: bool,
+    registry_adding_source: bool,
     response_tab: usize,
     traces: Vec<Vec<TraceEntry>>,
     sent_requests: Vec<Option<String>>,
@@ -93,6 +111,8 @@ struct Workbench {
     activity: usize,
     show_activity: bool,
     show_environments: bool,
+    show_plugins: bool,
+    plugin_manager_tab: usize,
     editing_environment: usize,
     revealed_variables: HashSet<(usize, u64)>,
     variable_delete: Option<(usize, u64)>,
@@ -193,6 +213,7 @@ impl Workbench {
                 "Token 或 {{api_token}}",
                 cx,
             )
+            .select_width(112., cx)
         });
         let filter = Self::entry("", "筛选集合、目录或请求…", cx);
         let history_search = Self::entry("", "搜索历史路径…", cx);
@@ -386,6 +407,15 @@ impl Workbench {
         let traces = data.traces;
         let current_versions = vec![0; requests.len()];
         let sent_requests = data.previews;
+        let (plugin_catalog, plugin_errors) = plugins::catalog();
+        let registry_name = Self::entry("", "源名称，如 company", cx);
+        let registry_url = Self::entry("", "https://plugins.example.com", cx);
+        let registry_key = Self::entry("", "服务公钥（Base64，需从可信渠道确认）", cx);
+        let registry_filter = Self::entry("", "筛选远程插件：名称、ID、源或版本", cx);
+        subscriptions.push(cx.observe(&registry_filter, |_, _, cx| cx.notify()));
+        let registry_sources = plugins::registry_store()
+            .and_then(|store| store.sources())
+            .unwrap_or_default();
         let mut this = Self {
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
@@ -416,6 +446,18 @@ impl Workbench {
             active: 0,
             tabs,
             config: 0,
+            plugin_catalog,
+            plugin_errors,
+            registry_name,
+            registry_url,
+            registry_key,
+            registry_filter,
+            registry_sources,
+            registry_releases: vec![],
+            registry_task: None,
+            registry_message: None,
+            show_registry_dialog: false,
+            registry_adding_source: false,
             response_tab: 0,
             traces,
             sent_requests,
@@ -424,6 +466,8 @@ impl Workbench {
             activity: 0,
             show_activity: true,
             show_environments: false,
+            show_plugins: false,
+            plugin_manager_tab: 0,
             editing_environment: 0,
             revealed_variables: HashSet::new(),
             variable_delete: None,
@@ -707,6 +751,11 @@ impl Workbench {
                 .collect()
         };
         Draft {
+            plugins: self
+                .requests
+                .get(self.active)
+                .map(|r| r.draft.plugins.clone())
+                .unwrap_or_default(),
             method: self
                 .endpoint
                 .read(cx)
@@ -790,6 +839,9 @@ impl Workbench {
         }
     }
     fn load(&mut self, draft: &Draft, cx: &mut Context<Self>) {
+        if let Some(request) = self.requests.get_mut(self.active) {
+            request.draft.plugins = draft.plugins.clone();
+        }
         self.skip_tls_verification = draft.skip_tls_verification;
         self.authentication.update(cx, |field, cx| {
             field.set_selected(Some(if draft.auth { "bearer" } else { "none" }.into()), cx);
@@ -814,6 +866,8 @@ impl Workbench {
         cx.notify();
     }
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.show_plugins = false;
+        self.show_environments = false;
         if index >= self.requests.len() {
             return;
         }
@@ -957,8 +1011,29 @@ impl Workbench {
         self.notice = "正在发送 HTTP 请求".into();
         let index = self.active;
         let started = Instant::now();
+        let plugin_ids = draft.plugins.clone();
+        let plugin_catalog = self.plugin_catalog.clone();
+        let plugin_variables = variables.clone();
         self.sending = Some(cx.spawn(async move |this, cx| {
-            let result = http::execute(request).await;
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    plugins::apply(request, &plugin_ids, &plugin_catalog, &plugin_variables)
+                })
+                .await;
+            let result = match prepared {
+                Ok(request) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.sent_requests[index] = Some(request.preview.clone());
+                        if this.active == index {
+                            this.sync_request_preview(cx);
+                        }
+                        cx.notify();
+                    });
+                    http::execute(request).await
+                }
+                Err(error) => Err(error),
+            };
             let elapsed_ms = started.elapsed().as_millis();
             let _ = this.update(cx, |this, cx| {
                 let (label, detail) = match &result {
@@ -1377,7 +1452,9 @@ impl Workbench {
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
-                    .child(if self.show_environments {
+                    .child(if self.show_plugins {
+                        "个人工作区  ›  插件管理".into()
+                    } else if self.show_environments {
                         format!(
                             "个人工作区  ›  环境管理  ›  {}",
                             self.environment_name(self.editing_environment)
@@ -1431,7 +1508,7 @@ impl Workbench {
             )
             .child(self.theme_selector.clone())
             .child(self.update_button(cx))
-            .when(!self.show_environments, |bar| {
+            .when(!self.show_environments && !self.show_plugins, |bar| {
                 bar.child(
                     IconButton::new(Icon::Sidebar, "展开或收起记录")
                         .theme(self.theme)
@@ -1467,6 +1544,7 @@ impl Workbench {
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_environments = false;
+                        this.show_plugins = false;
                         this.show_collection_menu = false;
                         cx.notify();
                     })),
@@ -1476,6 +1554,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_plugins = false;
                         this.show_environments = true;
                         this.editing_environment = this.selected_environment(cx);
                         this.revealed_variables.clear();
@@ -1488,10 +1567,19 @@ impl Workbench {
                     })),
             )
             .child(
+                IconButton::new(Icon::Script, "插件管理")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "open-plugin-manager".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.open_plugin_manager(cx))),
+            )
+            .child(
                 IconButton::new(Icon::Clock, "请求历史")
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_plugins = false;
+                        this.show_environments = false;
                         this.activity = 1;
                         this.show_activity = true;
                         cx.notify();
@@ -1661,6 +1749,9 @@ impl Workbench {
             )
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.show_plugins {
+            return self.plugin_sidebar(cx);
+        }
         let p = self.theme.palette();
         let mut tree = div()
             .id("request-tree")
@@ -1804,6 +1895,7 @@ impl Workbench {
         self.show_collection_menu = false;
         self.tree_menu = None;
         self.show_environments = false;
+        self.show_plugins = false;
         self.group_name
             .update(cx, |entry, cx| entry.set_value("", cx));
         self.group_edit = Some(GroupEdit::CreateCollection);
@@ -2804,6 +2896,7 @@ impl Workbench {
                 .child(div().text_size(px(11.)).child("验证方式 / Token"))
                 .child(self.authentication.clone())
                 .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("Bearer 使用 Token 或环境变量引用；请填写实际 Token，或在环境变量中设置 api_token。No Auth 不生成 Authorization。")),
+            5=>self.plugin_configuration(cx),
             3=>div().h_full().flex().flex_col().gap_2().child(div().flex().items_center().text_size(px(11.)).child("JSON 请求体").child(div().flex_1()).child(Button::new("格式化 JSON").kind(ButtonKind::Plain).size(ButtonSize::Mini).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx| {let valid=this.body.update(cx,|e,cx|e.format_json(cx));this.notice=if valid {"已格式化 JSON"} else {"JSON 格式有误，请检查后重试"}.into();cx.notify();}))))
                 .child(div().flex_1().min_h_0().child(self.body.clone())),
             _=>div().w_full().flex().flex_col()
@@ -2826,7 +2919,7 @@ impl Workbench {
         };
         div()
             .id("configuration")
-            .h(px(218.))
+            .h(px(if self.config == 5 { 360. } else { 218. }))
             .flex_shrink_0()
             .overflow_y_scroll()
             .px_5()
@@ -3294,9 +3387,16 @@ impl Workbench {
             .gap_5()
             .border_b_1()
             .border_color(rgb(p.border));
-        for (i, label) in ["参数", "身份验证", "请求头", "请求体", "请求设置"]
-            .iter()
-            .enumerate()
+        for (i, label) in [
+            "参数",
+            "身份验证",
+            "请求头",
+            "请求体",
+            "请求设置",
+            "前置动作",
+        ]
+        .iter()
+        .enumerate()
         {
             config_tabs =
                 config_tabs.child(tab_button(label, self.config == i, self.theme).on_click(
@@ -3803,7 +3903,14 @@ impl Workbench {
     }
 }
 impl Render for Workbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.show_registry_dialog
+            && [&self.registry_name, &self.registry_url, &self.registry_key]
+                .iter()
+                .any(|e| e.read(cx).focus_handle(cx).is_focused(window))
+        {
+            window.focus(&self.focus, cx);
+        }
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         if let Some(view) = &self.html_webview {
             let visible = self.html_preview
@@ -3811,6 +3918,7 @@ impl Render for Workbench {
                 && self.error.is_none()
                 && self.response_data.is_some()
                 && !self.show_environments
+                && !self.show_plugins
                 && self.response_tab == 0
                 && !self.commands.read(cx).is_open();
             if let Err(error) = view.update(cx, |view, cx| view.set_visible(visible, cx)) {
@@ -3824,14 +3932,17 @@ impl Render for Workbench {
             .min_h_0()
             .min_w_0()
             .flex()
-            .child(if self.show_environments {
+            .child(if self.show_plugins {
+                self.plugin_workspace(cx)
+            } else if self.show_environments {
                 self.environment_workspace(cx)
             } else {
                 self.workspace(cx)
             })
-            .when(self.show_activity && !self.show_environments, |s| {
-                s.child(self.activity_panel(cx))
-            });
+            .when(
+                self.show_activity && !self.show_environments && !self.show_plugins,
+                |s| s.child(self.activity_panel(cx)),
+            );
         let content = div()
             .size_full()
             .flex()
@@ -3862,16 +3973,51 @@ impl Render for Workbench {
             .relative()
             .size_full()
             .text_size(px(12.))
-            .on_action(cx.listener(|this, _: &SendRequest, _, cx| this.send(cx)))
+            .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
+                if !this.show_plugins && !this.show_environments {
+                    this.send(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
-                if this.show_environments {
+                if this.show_plugins {
+                    return;
+                } else if this.show_environments {
                     this.save_environment_variables(cx);
                 } else {
                     this.save(cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &SearchCommands, w, cx| this.open_commands(w, cx)))
+            .on_action(cx.listener(|this, _: &SearchCommands, w, cx| {
+                if !this.show_registry_dialog {
+                    this.open_commands(w, cx);
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.show_registry_dialog {
+                    if event.keystroke.key == "tab" {
+                        let fields = [&this.registry_name, &this.registry_url, &this.registry_key];
+                        let current = fields
+                            .iter()
+                            .position(|e| e.read(cx).focus_handle(cx).is_focused(window))
+                            .unwrap_or(0);
+                        let next = if event.keystroke.modifiers.shift {
+                            (current + 2) % 3
+                        } else {
+                            (current + 1) % 3
+                        };
+                        window.focus(&fields[next].read(cx).focus_handle(cx), cx);
+                        cx.stop_propagation();
+                    }
+                    if event.keystroke.key == "escape" {
+                        if !this.registry_adding_source {
+                            this.show_registry_dialog = false;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.tree_menu.is_some() {
                     this.tree_menu = None;
                     cx.stop_propagation();
@@ -3895,6 +4041,7 @@ impl Render for Workbench {
             }))
             .child(shell)
             .children(overlay)
+            .children(self.registry_dialog(cx))
     }
 }
 fn tab_button(label: &str, selected: bool, theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
@@ -3936,6 +4083,12 @@ fn record_time() -> String {
         .to_string()
 }
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-worker")) {
+        if !plugins::worker() {
+            std::process::exit(1);
+        }
+        return;
+    }
     let mut args = std::env::args_os().skip(1);
     let action = args.next();
     if action.as_deref() == Some(std::ffi::OsStr::new("--version")) {

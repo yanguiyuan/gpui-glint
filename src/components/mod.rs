@@ -108,3 +108,8 @@ pub use diff_card::{DiffCard, DiffColors, DiffLine, DiffLineKind};
 mod webview;
 #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
 pub use webview::{WebView, wry};
+
+#[cfg(feature = "plugins")]
+mod plugin_page;
+#[cfg(feature = "plugins")]
+pub use plugin_page::{PluginPage, PluginPageEvent};

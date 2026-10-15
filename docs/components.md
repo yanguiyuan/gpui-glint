@@ -394,7 +394,7 @@ let subscription = cx.subscribe(&commands, |_, _, event: &CommandPaletteEvent, _
 ## 选择输入框
 
 `SelectField` 将现有
-`Select` 与 `TextEntry` 组合为一个 32px 高的输入框。选择器固定宽 92px，
+`Select` 与 `TextEntry` 组合为一个 32px 高的输入框。选择器默认宽 92px，可通过 `.select_width(width, cx)` 调整，
 文本输入占据剩余空间，两个字段共用边界与焦点环。下拉仍使用 `Select` 的选项、
 搜索基础设施和键盘行为，发送按钮由宿主单独组合，使用标准的 30px `Button`。
 

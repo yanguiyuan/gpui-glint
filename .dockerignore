@@ -1,0 +1,7 @@
+.git
+**/target
+**/node_modules
+**/.DS_Store
+deployment/plugin-registry/registry-admin-token.txt
+**/registry-data
+deployment/plugin-registry/registry.env

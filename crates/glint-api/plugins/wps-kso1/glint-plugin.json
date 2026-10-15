@@ -1,0 +1,10 @@
+{
+  "id": "com.wps.kso1",
+  "name": "WPS KSO-1 签名",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": ["crypto", "request.read", "environment.read.wps_app_id", "environment.read.wps_app_key", "request.header.content-type", "request.header.x-kso-date", "request.header.x-kso-authorization"],
+  "hooks": ["request.before-send"],
+  "contributions": [{"id":"sign-request","kind":"request.before-send","title":"WPS KSO-1 签名","hook":"request.before-send"}]
+}

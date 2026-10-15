@@ -1,0 +1,19 @@
+[package]
+name = "glint-plugin-registry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Signed plugin registry protocol and reusable source/install client."
+[dependencies]
+glint-plugin = { path = "../glint-plugin", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tempfile = "3"
+fs2 = "0.4"
+[dev-dependencies]

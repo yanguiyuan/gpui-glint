@@ -97,6 +97,13 @@ impl SelectField {
     pub fn value(&self) -> &SelectFieldValue {
         &self.value
     }
+    /// Set the dropdown width (92px by default), preserving space for longer labels.
+    pub fn select_width(self, width: f32, cx: &mut Context<Self>) -> Self {
+        self.select.update(cx, |select, cx| {
+            select.set_width(width, cx);
+        });
+        self
+    }
     pub fn set_selected(&mut self, value: Option<SharedString>, cx: &mut Context<Self>) {
         self.value.selected = value.clone();
         self.select
