@@ -18,6 +18,7 @@ pub struct Popover {
     width: f32,
     trigger_height: f32,
     gap: f32,
+    padding: f32,
     right_trigger_width: Option<f32>,
     theme: ThemePreset,
     on_open_change: Option<OpenHandler>,
@@ -36,6 +37,7 @@ impl Popover {
             width: 280.,
             trigger_height: 30.,
             gap: 6.,
+            padding: 16.,
             right_trigger_width: None,
             theme: ThemePreset::default(),
             on_open_change: None,
@@ -61,6 +63,11 @@ impl Popover {
     /// Open to the right of a trigger of this width, with aligned bottom edges.
     pub fn right_of_trigger(mut self, width: f32) -> Self {
         self.right_trigger_width = Some(width.max(0.));
+        self
+    }
+    /// Content inset in pixels. Defaults to 16; compact menus can use 4.
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = padding.max(0.);
         self
     }
     pub fn theme(mut self, theme: ThemePreset) -> Self {
@@ -130,7 +137,7 @@ impl Popover {
                 .child(
                     div()
                         .id("popover-content")
-                        .p_4()
+                        .p(px(self.padding))
                         .rounded(px(9.))
                         .border_1()
                         .border_color(rgb(p.border))

@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pair {
+    #[serde(default = "action_enabled")]
     pub enabled: bool,
     pub key: String,
     pub value: String,
+    #[serde(default)]
     pub note: String,
 }
 impl Pair {
@@ -61,6 +63,8 @@ pub struct Draft {
     pub cookies: Vec<Pair>,
     pub token: String,
     pub auth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<super::oauth::Config>,
     #[serde(default)]
     pub skip_tls_verification: bool,
 }
@@ -73,8 +77,14 @@ pub struct Exchange {
     pub preview: Option<String>,
     pub traces: Vec<super::TraceEntry>,
 }
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default = "new_id")]
+    pub id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
     #[serde(default)]
@@ -89,6 +99,8 @@ pub struct Record {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default = "new_id")]
+    pub id: String,
     #[serde(default)]
     pub tree_order: u64,
     pub name: String,
@@ -145,6 +157,7 @@ impl DefaultSection {
                 to.method = from.method.clone();
             }
             Self::Auth => {
+                to.oauth = from.oauth.clone();
                 to.auth = from.auth;
                 to.token = from.token.clone();
             }
@@ -176,6 +189,10 @@ impl DirectoryDefaults {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RequestGroups {
+    #[serde(default = "new_id")]
+    pub id: String,
+    #[serde(default)]
+    pub environments: std::collections::BTreeMap<String, super::environment::EnvironmentVariables>,
     #[serde(default)]
     pub defaults: std::collections::BTreeMap<String, DirectoryDefaults>,
     #[serde(default)]
@@ -197,6 +214,8 @@ impl RequestGroups {
             }
         }
         Self {
+            id: new_id(),
+            environments: Default::default(),
             collection: "Test API".into(),
             folder_order: Default::default(),
             defaults: Default::default(),
@@ -215,11 +234,44 @@ impl RequestGroups {
             return Err("集合名称已存在".into());
         }
         Ok(Self {
+            id: new_id(),
+            environments: Default::default(),
             collection: name.into(),
             folder_order: Default::default(),
             defaults: Default::default(),
             names: vec![],
         })
+    }
+    pub fn rename_collection(
+        index: usize,
+        name: &str,
+        collections: &mut [Self],
+        requests: &mut [Request],
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("请输入集合名称".into());
+        }
+        let old = collections
+            .get(index)
+            .ok_or("集合不存在")?
+            .collection
+            .clone();
+        if collections
+            .iter()
+            .enumerate()
+            .any(|(i, collection)| i != index && collection.collection == name)
+        {
+            return Err("集合名称已存在".into());
+        }
+        collections[index].collection = name.into();
+        for request in requests
+            .iter_mut()
+            .filter(|request| request.collection == old)
+        {
+            request.collection = name.into();
+        }
+        Ok(())
     }
     pub fn request_defaults(&self, path: &str) -> Draft {
         let mut ancestors = vec![path];
@@ -647,6 +699,7 @@ pub fn test_requests() -> Vec<Request> {
                 ..Draft::default()
             };
             Request {
+                id: new_id(),
                 tree_order: 0,
                 name: format!("Test request {i}"),
                 collection: "Test API".into(),
@@ -684,6 +737,7 @@ impl Default for Draft {
             cookies: vec![],
             token: String::new(),
             auth: false,
+            oauth: None,
             skip_tls_verification: false,
         }
     }
@@ -733,7 +787,7 @@ impl Draft {
                 "合并后的 Cookie",
             ));
         }
-        if self.auth {
+        if self.auth && self.oauth.is_none() {
             headers.retain(|p| !p.key.trim().eq_ignore_ascii_case("authorization"));
             headers.push(Pair::new(
                 "Authorization",
@@ -746,7 +800,9 @@ impl Draft {
 
     pub fn resolved_url(&self) -> Result<String, String> {
         let mut url = self.url.trim().to_owned();
-        if !(url.starts_with("https://") || url.starts_with("http://"))
+        if !(url.starts_with("https://")
+            || url.starts_with("http://")
+            || self.method == "WS" && (url.starts_with("ws://") || url.starts_with("wss://")))
             || url.contains("{{")
             || url.contains(char::is_whitespace)
         {

@@ -11,7 +11,7 @@ fn metadata_badge(label: impl Into<gpui::SharedString>, theme: ThemePreset) -> g
 fn origin_label(plugin: &gpui_glint::plugins::Plugin) -> &'static str {
     if plugin.origin.is_some() {
         "远程"
-    } else if plugin.manifest.id == "com.wps.kso1" {
+    } else if plugins::is_bundled(plugin) {
         "内置"
     } else {
         "本地"
@@ -501,6 +501,7 @@ mod action_tests {
                     kind: plugins::HOOK.into(),
                     title: "第二个动作".into(),
                     hook: plugins::HOOK.into(),
+                    data: None,
                 });
             host.plugin_catalog = vec![plugin];
             host
@@ -624,6 +625,7 @@ mod remote_tests {
 
 impl Workbench {
     pub(super) fn open_plugin_manager(&mut self, cx: &mut Context<Self>) {
+        self.show_mcp = false;
         self.show_plugins = true;
         self.show_environments = false;
         self.show_collection_menu = false;
@@ -696,7 +698,7 @@ impl Workbench {
                         .text_size(px(11.))
                         .text_color(rgb(p.text_muted))
                         .child(
-                            "安装不会自动启用。在请求的“前置动作”中选择版本、授权并调整执行顺序。",
+                            "请求动作需在“前置动作”中启用；授权预设在“身份验证 → OAuth 2.0”中选择。",
                         ),
                 );
             for plugin in &self.plugin_catalog {
@@ -727,7 +729,28 @@ impl Workbench {
                                 self.theme,
                             ))
                             .child(metadata_badge(origin_label(plugin), self.theme))
-                            .child(metadata_badge(format!("绑定 {uses} 个请求"), self.theme)),
+                            .when(
+                                plugin.manifest.contributions.is_empty()
+                                    || plugin
+                                        .manifest
+                                        .contributions
+                                        .iter()
+                                        .any(|c| c.kind == plugins::HOOK),
+                                |row| {
+                                    row.child(metadata_badge(
+                                        format!("绑定 {uses} 个请求"),
+                                        self.theme,
+                                    ))
+                                },
+                            )
+                            .when(
+                                plugin
+                                    .manifest
+                                    .contributions
+                                    .iter()
+                                    .any(|c| c.kind == plugins::OAUTH_PRESET),
+                                |row| row.child(metadata_badge("授权预设", self.theme)),
+                            ),
                     )
                     .child(
                         div()
@@ -741,13 +764,19 @@ impl Workbench {
                             .text_color(rgb(p.text_muted))
                             .child(format!(
                                 "扩展点：{}",
-                                plugin
-                                    .manifest
-                                    .hooks
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(" · ")
+                                if plugin.manifest.contributions.is_empty() {
+                                    plugin.manifest.hooks.iter().cloned().collect::<Vec<_>>()
+                                } else {
+                                    plugin
+                                        .manifest
+                                        .contributions
+                                        .iter()
+                                        .map(|c| c.kind.clone())
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                        .into_iter()
+                                        .collect()
+                                }
+                                .join(" · ")
                             )),
                     )
                     .child(
@@ -756,13 +785,17 @@ impl Workbench {
                             .text_color(rgb(p.text_muted))
                             .child(format!(
                                 "权限：{}",
-                                plugin
-                                    .manifest
-                                    .capabilities
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(" · ")
+                                if plugin.manifest.capabilities.is_empty() {
+                                    "无".to_owned()
+                                } else {
+                                    plugin
+                                        .manifest
+                                        .capabilities
+                                        .iter()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                }
                             )),
                     );
                 if let Some(origin) = &plugin.origin {
@@ -808,7 +841,7 @@ impl Workbench {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(p.text_muted))
-                            .child(if plugin.manifest.id == "com.wps.kso1" {
+                            .child(if plugins::is_bundled(plugin) {
                                 "内置插件"
                             } else {
                                 "本地开发插件 · 通过插件目录管理"

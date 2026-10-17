@@ -22,6 +22,39 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn custom_update_source_is_validated_persisted_and_reset(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let host = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        let source = updater::UpdateSource {
+            url: "https://gateway.yanguiyuan.cn/plugins".into(),
+            public_key: "x1+OcqKIYuboSgnxFik6ApNpjOU4HeJiD6nMgQSYIeQ=".into(),
+            minimum_sequence: 7,
+        };
+        host.update(cx, |host, cx| {
+            assert!(host.apply_update_source(Some(source.clone()), cx));
+            let mut same = source.clone();
+            same.minimum_sequence = 0;
+            assert!(host.apply_update_source(Some(same), cx));
+            assert_eq!(host.update_source.as_ref().unwrap().minimum_sequence, 7);
+            let mut bad = source.clone();
+            bad.url = "http://example.com".into();
+            assert!(!host.apply_update_source(Some(bad), cx));
+            assert_eq!(host.update_source.as_ref(), Some(&source));
+            host.update_state = UpdateState::Checking;
+            assert!(!host.apply_update_source(None, cx));
+            host.update_state = UpdateState::Idle;
+        });
+        let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(cx, |host, cx| {
+            assert_eq!(host.update_source.as_ref(), Some(&source));
+            assert_eq!(host.update_source_url.read(cx).value(), source.url);
+            assert!(host.apply_update_source(None, cx));
+        });
+        let reset = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reset.update(cx, |host, _| assert!(host.update_source.is_none()));
+    }
+    #[gpui::test]
     fn restart_guard_checks_unsaved_environment_drafts_and_name_edits(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -110,6 +143,46 @@ impl UpdateState {
 }
 
 impl Workbench {
+    fn apply_update_source(
+        &mut self,
+        mut source: Option<updater::UpdateSource>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.update_state.busy() || matches!(self.update_state, UpdateState::Ready { .. }) {
+            self.update_error = Some("请先完成或取消当前更新操作".into());
+            cx.notify();
+            return false;
+        }
+        if let Some(s) = &mut source {
+            if let Err(error) = s.validate() {
+                self.update_error = Some(format!("更新源无效：{error}"));
+                cx.notify();
+                return false;
+            }
+            if let Some(old) = self
+                .update_source
+                .as_ref()
+                .filter(|old| old.url == s.url && old.public_key == s.public_key)
+            {
+                s.minimum_sequence = old.minimum_sequence;
+            }
+        }
+        let previous = self.update_source.clone();
+        self.update_source = source;
+        self.storage_dirty = true;
+        self.persist(cx);
+        if let Some(error) = &self.storage_error {
+            self.update_source = previous;
+            self.storage_dirty = true;
+            self.update_error = Some(format!("保存更新源失败：{error}"));
+            cx.notify();
+            return false;
+        }
+        self.update_error = None;
+        self.update_state = UpdateState::Idle;
+        cx.notify();
+        true
+    }
     pub(super) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         if self.update_state.busy() || matches!(self.update_state, UpdateState::Ready { .. }) {
             return;
@@ -117,15 +190,36 @@ impl Workbench {
         self.show_update_details |= manual;
         self.update_error = None;
         self.update_state = UpdateState::Checking;
+        let source = self.update_source.clone();
         self.update_task = Some(cx.spawn(async move |this, cx| {
-            let result = updater::check().await;
+            let result = if let Some(source) = source {
+                updater::check_custom(source, &semver::Version::parse(updater::VERSION).unwrap())
+                    .await
+                    .map(|(update, sequence)| (update, Some(sequence)))
+            } else {
+                updater::check().await.map(|update| (update, None))
+            };
             let _ = this.update(cx, |this, cx| {
                 this.update_state = match result {
-                    Ok(Some(update)) => {
+                    Ok((Some(update), sequence)) => {
+                        if let (Some(source), Some(sequence)) = (&mut this.update_source, sequence)
+                        {
+                            source.minimum_sequence = sequence;
+                            this.storage_dirty = true;
+                            this.persist(cx);
+                        }
                         this.show_update_details = true;
                         UpdateState::Available(update)
                     }
-                    Ok(None) => UpdateState::Current,
+                    Ok((None, sequence)) => {
+                        if let (Some(source), Some(sequence)) = (&mut this.update_source, sequence)
+                        {
+                            source.minimum_sequence = sequence;
+                            this.storage_dirty = true;
+                            this.persist(cx);
+                        }
+                        UpdateState::Current
+                    }
                     Err(error) => UpdateState::Failed(error),
                 };
                 this.update_task = None;
@@ -152,7 +246,7 @@ impl Workbench {
         self.update_error.is_none()
     }
 
-    fn download_update(&mut self, update: updater::Update, cx: &mut Context<Self>) {
+    pub(super) fn download_update(&mut self, update: updater::Update, cx: &mut Context<Self>) {
         if !updater::can_install() {
             cx.open_url(&update.release_url());
             return;
@@ -215,7 +309,7 @@ impl Workbench {
         cx.notify();
     }
 
-    fn install_update(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn install_update(&mut self, cx: &mut Context<Self>) {
         if !self.update_can_restart(cx) {
             return;
         }
@@ -247,7 +341,11 @@ impl Workbench {
         .debug_selector(|| "app-update-trigger".into());
         Popover::new("app-update-popover", trigger, self.update_details(cx))
             .theme(self.theme)
-            .width(340.)
+            .width(if self.show_update_source_settings {
+                420.
+            } else {
+                340.
+            })
             .right_of_trigger(30.)
             .open(self.show_update_details)
             .on_open_change(move |open, _, cx| {
@@ -382,6 +480,57 @@ impl Workbench {
                 );
             }
             _ => {}
+        }
+        panel = panel.child(
+            div()
+                .border_t_1()
+                .border_color(rgb(p.border))
+                .pt_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted))
+                        .child(format!(
+                            "当前更新源：{}",
+                            self.update_source
+                                .as_ref()
+                                .map(|s| s.url.as_str())
+                                .unwrap_or("GitHub（默认）")
+                        )),
+                )
+                .child(
+                    Button::new(if self.show_update_source_settings {
+                        "收起更新源设置"
+                    } else {
+                        "更新源设置"
+                    })
+                    .kind(ButtonKind::Plain)
+                    .size(ButtonSize::Mini)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "update-source-settings".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_update_source_settings = !this.show_update_source_settings;
+                        cx.notify();
+                    })),
+                ),
+        );
+        if self.show_update_source_settings {
+            panel = panel.child(div().flex().flex_col().gap_2()
+                .child("分发源地址").child(self.update_source_url.clone()).child("可信 Ed25519 公钥").child(self.update_source_key.clone())
+                .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("自定义源覆盖 GitHub。请从可信渠道确认公钥；安装前仍会校验签名目录与文件摘要。"))
+                .child(Button::new("填入 gateway 分发源").kind(ButtonKind::Plain).size(ButtonSize::Mini).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|{
+                    this.update_source_url.update(cx,|e,cx|e.set_value("https://gateway.yanguiyuan.cn/plugins",cx));this.update_source_key.update(cx,|e,cx|e.set_value("x1+OcqKIYuboSgnxFik6ApNpjOU4HeJiD6nMgQSYIeQ=",cx));
+                })))
+                .child(div().flex().gap_2()
+                    .child(Button::new("保存并检查").size(ButtonSize::Mini).theme(self.theme).render().debug_selector(||"save-update-source".into()).on_click(cx.listener(|this,_,_,cx| {
+                        let url=this.update_source_url.read(cx).value().trim().trim_end_matches('/').to_owned();let key=this.update_source_key.read(cx).value().trim().to_owned();
+                        let source=(!url.is_empty()).then_some(updater::UpdateSource{url,public_key:key,minimum_sequence:0});if this.apply_update_source(source,cx){this.show_update_source_settings=false;this.check_for_updates(true,cx);}
+                    })))
+                    .child(Button::new("恢复 GitHub").kind(ButtonKind::Plain).size(ButtonSize::Mini).theme(self.theme).render().debug_selector(||"reset-update-source".into()).on_click(cx.listener(|this,_,_,cx|{if this.apply_update_source(None,cx){this.update_source_url.update(cx,|e,cx|e.set_value("",cx));this.update_source_key.update(cx,|e,cx|e.set_value("",cx));cx.notify();}})))));
         }
         panel
     }

@@ -36,3 +36,11 @@ The service image is `glint-plugin-registry:gateway`, runs as `10001:10001`, and
 ## Verified
 
 HTTPS certificate validation; public health/info; server-key comparison; authenticated publish and immutable-version rejection; unauthenticated publish returns 401; pinned CLI signature verification and package installation; service stop/start preserves the public key, index sequence and package SHA-256; original HTTP gateway and HTTPS fallback return the same page.
+
+## Public web directory (2026-10-17)
+
+The edge-to-edge web catalogue is served at `https://gateway.yanguiyuan.cn/plugins/`; `/plugins` redirects to it. The page supports search, host filtering, version details, package downloads and copying source configuration. Its independent developer view (`#develop`) provides `glint-plugin-dev` Skill installation commands and the downloadable file at `https://gateway.yanguiyuan.cn/plugins/skills/glint-plugin-dev/SKILL.md`.
+
+The registry includes support for declarative contribution `data` and inert OAuth preset manifests. Existing signing identity and published package bytes are preserved. `glint-plugin-registry:before-web` is the previous runtime image, and `backups/pre-web-data.tar.gz` is the consistent data snapshot taken during this upgrade. The directory remains public read-only; management still requires the private token.
+
+The catalogue and developer guide are independent sidebar views. Branding reuses the Glint API software icon, including the favicon. The full-viewport shell has no clipping scroll ancestor, so its header and sidebar stay aligned during scrolling. The current service build context is `build-source/`; `source/` is the initial upload snapshot.

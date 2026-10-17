@@ -1,6 +1,6 @@
 # Self-hosted plugin repositories
 
-Implemented: a portable registry server, publishing CLI, reusable signed-source SDK and Glint API source/installation UI. No domain or cloud vendor is hard-coded. The SDK can be used directly or through `gpui_glint::plugin_registry` with the optional `plugin-registry` feature; this feature alone does not enable Boa. Its blocking HTTP/install methods belong on a background worker, not the UI or Tokio executor thread. The server validates source as data; it neither links Boa nor executes uploaded plugins.
+Implemented: a portable registry server, public browser catalogue, publishing CLI, reusable signed-source SDK and Glint API source/installation UI. No domain or cloud vendor is hard-coded. The SDK can be used directly or through `gpui_glint::plugin_registry` with the optional `plugin-registry` feature; this feature alone does not enable Boa. Its blocking HTTP/install methods belong on a background worker, not the UI or Tokio executor thread. The server validates source as data; it neither links Boa nor executes uploaded plugins.
 
 | Package | Responsibility |
 | --- | --- |
@@ -87,3 +87,41 @@ Reads are public; one management token owns all publishing/withdrawal operations
 ## Deployed source
 
 The verified `gateway` deployment is available at `https://gateway.yanguiyuan.cn/plugins`. Connection parameters and operational notes are in [the gateway deployment record](../deployment/plugin-registry/gateway/README.md).
+
+## Public web catalogue and development Skill
+
+The server embeds a public, read-only catalogue at `/`. The gateway mounts it at [https://gateway.yanguiyuan.cn/plugins/](https://gateway.yanguiyuan.cn/plugins/) and redirects `/plugins` to the trailing-slash URL. Assets and API requests use paths relative to the mount point. No CDN or frontend build is required.
+
+The page searches plugin names, IDs, release notes and versions; filters by target application; shows compatible host versions, capabilities, contributions, declaration `data` and package hashes; and offers versioned package downloads. Withdrawn-only plugins are omitted from the default catalogue. Browser-supported Ed25519 verification checks the index against the public key displayed by this source; clients must still obtain a trusted key through an independent channel when configuring the source.
+
+The separate developer view (`#develop`) offers a self-contained `glint-plugin-dev/SKILL.md`, preview/download links, and macOS/Linux or Windows PowerShell commands for installing it into the user's Codex skills directory. It covers synchronous request actions, inert `data`, `oauth.preset` configuration, permissions, testing and token-authenticated CLI publishing. OAuth presets require a host and registry protocol implementation supporting declaration data; the Skill distinguishes the 0.1.2 action interface from the current 0.1.3 source interface.
+
+Public routes include `/catalog.css`, `/catalog.js` and `/skills/glint-plugin-dev/SKILL.md` (add `?download=1` for an attachment). The web page neither accepts management tokens nor publishes or executes plugins. Existing publishing and withdrawal APIs retain their token requirement.
+
+## Software distribution
+
+The same server publishes application installers at the independent `#software` web view. Software releases and plugin indexes keep separate sequence counters, sharing the persistent Ed25519 identity. Installers never execute on the server.
+
+- `GET /v1/apps` lists applications; `GET /v1/apps/{app}/releases` returns a signed feed.
+- Authenticated `POST /v1/apps/{app}/assets/{name}?target={triple}` streams an installer (maximum 200 MiB) and returns its size and SHA-256.
+- Authenticated `POST /v1/apps/{app}/releases` commits immutable release metadata after rehashing every uploaded artifact.
+- `GET /v1/apps/{app}/assets/{sha256}/{name}` downloads a published artifact.
+- Authenticated `POST /v1/apps/{app}/releases/{version}/yank` or `/restore` withdraws or restores update eligibility. Existing pinned downloads remain accessible.
+
+```sh
+# Configure the source as above. GLINT_PLUGIN_TOKEN belongs only in the publisher environment.
+glint-pluginctl software publish --source company --app glint-api --version 0.1.4 \
+  --artifact x86_64-pc-windows-msvc=dist/Glint-API-0.1.4-windows-x64-setup.exe \
+  --artifact aarch64-apple-darwin=dist/Glint-API-0.1.4-macos-arm64.dmg \
+  --artifact x86_64-apple-darwin=dist/Glint-API-0.1.4-macos-x86_64.dmg \
+  --notes-file crates/glint-api/RELEASE_NOTES.md
+glint-pluginctl software list --source company --app glint-api
+glint-pluginctl software yank --source company --app glint-api 0.1.4
+glint-pluginctl software restore --source company --app glint-api 0.1.4
+```
+
+Publish all platform artifacts together; published versions cannot be amended. Publishing a GitHub Release does not automatically mirror it: run the CLI against the chosen distribution source after the release artifacts are verified. Authentication protects uploads and publishing; catalogue and downloads are public. Keep the data directory, signing key and SQLite database in private backups.
+
+Glint API 0.1.4 defaults to GitHub. In **软件更新 → 更新源设置**, save an HTTPS base URL and trusted public key, or fill in the gateway preset. A saved custom source fully replaces GitHub for checks and installer downloads; failures remain visible without falling back. The client rejects invalid signatures, expired/rolled-back feeds and invalid installer sizes/hashes. No GitHub credential is sent to custom sources, and redirects are refused. **恢复 GitHub** removes the override. Windows supports automatic installation and restart; macOS currently uses the download page for manual DMG upgrades.
+
+Reverse proxies must allow installer-size bodies on the asset upload route while keeping JSON management routes limited to 2 MiB. The included Caddy and Nginx configurations cover these limits. A generic server deployment needs no GitHub access for read/check/download operations once releases have been uploaded.

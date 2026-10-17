@@ -12,6 +12,7 @@ use std::{
 use wait_timeout::ChildExt;
 
 pub const HOOK: &str = "request.before-send";
+pub const OAUTH_PRESET: &str = "oauth.preset";
 const MAX_JOB: u64 = 12 * 1024 * 1024;
 const MAX_OUTPUT: u64 = 64 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -41,7 +42,17 @@ pub fn catalog() -> (Vec<Plugin>, Vec<String>) {
         include_str!("../plugins/wps-kso1/main.js"),
     )
     .expect("valid bundled plugin");
-    let mut plugins = vec![builtin];
+    let oauth = Plugin::from_source(
+        include_str!("../plugins/wps-oauth/glint-plugin.json"),
+        include_str!("../plugins/wps-oauth/main.js"),
+    )
+    .expect("valid bundled OAuth plugin");
+    let feishu = Plugin::from_source(
+        include_str!("../plugins/feishu-oauth/glint-plugin.json"),
+        include_str!("../plugins/feishu-oauth/main.js"),
+    )
+    .expect("valid bundled Feishu OAuth plugin");
+    let mut plugins = vec![builtin, oauth, feishu];
     let mut errors = vec![];
     if let Ok(directory) = directory() {
         if let Ok(entries) = std::fs::read_dir(directory) {
@@ -85,15 +96,37 @@ pub fn catalog() -> (Vec<Plugin>, Vec<String>) {
     (plugins, errors)
 }
 fn validate(plugin: &Plugin) -> Result<(), PluginError> {
-    plugin.manifest.validate()?;
-    if !plugin.manifest.capabilities.contains("request.read")
-        || (plugin.manifest.contributions.is_empty()
-            && plugin.manifest.hooks != BTreeSet::from([HOOK.into()]))
-        || plugin.manifest.contributions.iter().any(|c| c.kind != HOOK)
+    validate_manifest(&plugin.manifest)
+}
+pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(), PluginError> {
+    manifest.validate()?;
+    let actions =
+        manifest.contributions.iter().any(|c| c.kind == HOOK) || manifest.contributions.is_empty();
+    if (actions && !manifest.capabilities.contains("request.read"))
+        || (manifest.contributions.is_empty() && manifest.hooks != BTreeSet::from([HOOK.into()]))
+        || (!actions && (!manifest.hooks.is_empty() || !manifest.capabilities.is_empty()))
     {
         return Err(PluginError("Unsupported API plugin extension".into()));
     }
-    for c in &plugin.manifest.capabilities {
+    for contribution in &manifest.contributions {
+        match contribution.kind.as_str() {
+            HOOK if !contribution.hook.is_empty() && contribution.data.is_none() => {}
+            OAUTH_PRESET if contribution.hook.is_empty() => {
+                let preset: OAuthPreset = serde_json::from_value(
+                    contribution
+                        .data
+                        .clone()
+                        .ok_or_else(|| PluginError("Missing OAuth preset configuration".into()))?,
+                )
+                .map_err(|_| PluginError("Invalid OAuth preset configuration".into()))?;
+                preset
+                    .config()
+                    .map_err(|_| PluginError("Invalid OAuth preset configuration".into()))?;
+            }
+            _ => return Err(PluginError("Unsupported API plugin contribution".into())),
+        }
+    }
+    for c in &manifest.capabilities {
         if c == "crypto" || c == "request.read" {
             continue;
         }
@@ -117,8 +150,118 @@ fn validate(plugin: &Plugin) -> Result<(), PluginError> {
     }
     Ok(())
 }
+fn action_hook<'a>(plugin: &'a Plugin, action_id: &str) -> Result<&'a str, String> {
+    if action_id.is_empty() && plugin.manifest.hooks.contains(HOOK) {
+        return Ok(HOOK);
+    }
+    plugin
+        .manifest
+        .contributions
+        .iter()
+        .find(|c| c.id == action_id && c.kind == HOOK)
+        .map(|c| c.hook.as_str())
+        .ok_or("前置动作不可用".into())
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthPreset {
+    pub authorization_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default = "pkce_default")]
+    pub pkce: bool,
+    #[serde(default)]
+    pub basic_auth: bool,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub manual_callback: bool,
+    #[serde(default)]
+    pub rolling_refresh_expiry: bool,
+}
+fn pkce_default() -> bool {
+    true
+}
+impl OAuthPreset {
+    pub fn config(&self) -> Result<super::oauth::Config, String> {
+        let mut config = super::oauth::Config {
+            authorization_url: self.authorization_url.clone(),
+            token_url: self.token_url.clone(),
+            scope: self.scope.clone(),
+            pkce: self.pkce,
+            basic_auth: self.basic_auth,
+            manual_callback: self.manual_callback,
+            rolling_refresh_expiry: self.rolling_refresh_expiry,
+            ..Default::default()
+        };
+        if let Some(redirect) = &self.redirect_uri {
+            config.redirect_uri = redirect.clone();
+        }
+        config.client_id = "preset-validation".into();
+        config.validate()?;
+        config.client_id.clear();
+        Ok(config)
+    }
+}
+#[derive(Clone)]
+pub struct PresetEntry {
+    pub key: String,
+    pub title: String,
+    pub preset: OAuthPreset,
+}
+pub fn oauth_presets(catalog: &[Plugin]) -> Vec<PresetEntry> {
+    let mut result = vec![];
+    for plugin in catalog {
+        if catalog.iter().any(|other| {
+            other.family_identity() == plugin.family_identity()
+                && semver::Version::parse(&other.manifest.version).ok()
+                    > semver::Version::parse(&plugin.manifest.version).ok()
+        }) {
+            continue;
+        }
+        if validate(plugin).is_err() {
+            continue;
+        }
+        for contribution in plugin
+            .manifest
+            .contributions
+            .iter()
+            .filter(|c| c.kind == OAUTH_PRESET)
+        {
+            if let Some(preset) = contribution
+                .data
+                .clone()
+                .and_then(|data| serde_json::from_value(data).ok())
+            {
+                result.push(PresetEntry {
+                    key: format!("{}::{}", plugin.identity(), contribution.id),
+                    title: contribution.title.clone(),
+                    preset,
+                });
+            }
+        }
+    }
+    result
+}
+pub fn is_bundled(plugin: &Plugin) -> bool {
+    plugin.origin.is_none()
+        && ["com.wps.kso1", "com.wps.oauth", "com.feishu.oauth"]
+            .contains(&plugin.manifest.id.as_str())
+}
+#[cfg(test)]
+pub fn test_oauth_config() -> super::oauth::Config {
+    let plugin = Plugin::from_source(
+        include_str!("../plugins/wps-oauth/glint-plugin.json"),
+        include_str!("../plugins/wps-oauth/main.js"),
+    )
+    .unwrap();
+    oauth_presets(&[plugin])[0].preset.config().unwrap()
+}
 pub fn run_job(job: Job) -> Result<Value, String> {
     validate(&job.plugin).map_err(|e| e.to_string())?;
+    let hook = action_hook(&job.plugin, &job.action_id)?;
     let allowed: BTreeSet<String> = job
         .plugin
         .manifest
@@ -147,17 +290,6 @@ pub fn run_job(job: Job) -> Result<Value, String> {
     let grants = job.plugin.manifest.capabilities.clone();
     let mut runtime = PluginRuntime::activate(&job.plugin, host, grants, Limits::default())
         .map_err(|e| e.to_string())?;
-    let hook = if job.action_id.is_empty() {
-        HOOK
-    } else {
-        &job.plugin
-            .manifest
-            .contributions
-            .iter()
-            .find(|c| c.id == job.action_id && c.kind == HOOK)
-            .ok_or("前置动作不可用")?
-            .hook
-    };
     runtime
         .invoke(hook, &job.request)
         .map_err(|e| e.to_string())
@@ -273,6 +405,7 @@ pub fn validate_variables(
             .iter()
             .find(|plugin| plugin.identity() == approval.id)
             .ok_or("启用的前置动作所属插件已被移除，请重新选择动作")?;
+        action_hook(plugin, &approval.action_id)?;
         let title = plugin
             .manifest
             .contributions
@@ -418,6 +551,7 @@ mod tests {
                 kind: HOOK.into(),
                 title: "Second".into(),
                 hook: "request.second".into(),
+                data: None,
             });
         plugin.source="glint.on('request.before-send',()=>({setHeaders:{first:'yes'}})); glint.on('request.second',()=>({setHeaders:{second:'yes'}}));".into();
         let mut job = Job {
@@ -563,5 +697,96 @@ mod process_tests {
         let error = isolated_at(&job, &executable, Duration::from_millis(300)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(error.contains("超时"));
+    }
+}
+
+#[cfg(test)]
+mod oauth_preset_tests {
+    use super::*;
+    fn plugin() -> Plugin {
+        Plugin::from_source(
+            include_str!("../plugins/wps-oauth/glint-plugin.json"),
+            "throw new Error('never-execute-preset')",
+        )
+        .unwrap()
+    }
+    #[test]
+    fn oauth_preset_is_inert_validated_and_cannot_run_as_a_request_action() {
+        let plugin = plugin();
+        validate(&plugin).unwrap();
+        let presets = oauth_presets(std::slice::from_ref(&plugin));
+        assert_eq!(presets.len(), 1);
+        let config = presets[0].preset.config().unwrap();
+        assert_eq!(
+            config.authorization_url,
+            "https://openapi.wps.cn/oauth2/auth"
+        );
+        assert!(!config.pkce);
+        assert_eq!(config.scope, "kso.user_base.read");
+        assert!(config.client_id.is_empty());
+        assert_ne!(config.id, presets[0].preset.config().unwrap().id);
+        let error = run_job(Job {
+            plugin: plugin.clone(),
+            action_id: "user-authorization".into(),
+            request: json!({}),
+            variables: BTreeMap::new(),
+        })
+        .unwrap_err();
+        assert_eq!(error, "前置动作不可用");
+        let binding = super::super::model::BeforeAction {
+            approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
+            action_id: "user-authorization".into(),
+            enabled: true,
+        };
+        assert!(
+            validate_variables(
+                &[binding],
+                &[plugin],
+                &super::super::environment::EnvironmentValues(BTreeMap::new())
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn oauth_preset_rejects_secrets_untrusted_urls_hooks_and_permissions() {
+        for (field, value) in [
+            ("client_secret", json!("secret")),
+            ("client_id", json!("app")),
+            ("access_token", json!("secret")),
+            ("token_url", json!("http://evil.test/token")),
+        ] {
+            let mut plugin = plugin();
+            plugin.manifest.contributions[0].data.as_mut().unwrap()[field] = value;
+            assert!(validate(&plugin).is_err());
+            assert!(oauth_presets(&[plugin]).is_empty());
+        }
+        let mut bad = plugin();
+        bad.manifest.hooks.insert(HOOK.into());
+        bad.manifest.contributions[0].hook = HOOK.into();
+        assert!(validate(&bad).is_err());
+        let mut bad = plugin();
+        bad.manifest
+            .capabilities
+            .insert("environment.read.wps_app_key".into());
+        assert!(validate(&bad).is_err());
+    }
+    #[test]
+    fn oauth_presets_follow_latest_version_and_removal_does_not_change_copied_config() {
+        let old = plugin();
+        let mut new = old.clone();
+        new.manifest.version = "2.0.0".into();
+        new.manifest.contributions[0].title = "Updated preset".into();
+        new.manifest.contributions[0].data.as_mut().unwrap()["scope"] = json!("new.scope");
+        let copied = oauth_presets(std::slice::from_ref(&old))[0]
+            .preset
+            .config()
+            .unwrap();
+        let presets = oauth_presets(&[old, new]);
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].title, "Updated preset");
+        assert_eq!(presets[0].preset.scope, "new.scope");
+        assert_eq!(copied.scope, "kso.user_base.read");
+        assert!(oauth_presets(&[]).is_empty());
+        assert_eq!(copied.scope, "kso.user_base.read");
     }
 }

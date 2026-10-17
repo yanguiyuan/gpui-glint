@@ -12,17 +12,27 @@ mod environment_ui;
 mod history_ui;
 mod http;
 mod json_picker;
+mod mcp;
+mod mcp_history;
+mod mcp_history_ui;
+mod mcp_tools;
+mod mcp_ui;
 mod model;
+mod oauth;
+mod oauth_ui;
 mod plugin_ui;
 mod plugins;
 mod post_actions;
 mod registry_ui;
+mod sse;
 mod storage;
 mod template;
 mod tree_delete_ui;
 mod update_ui;
 mod updater;
 mod version_tags;
+mod websocket;
+mod websocket_ui;
 
 use environment::EnvironmentVariables;
 use environment_ui::{ProxyInput, VariableInput};
@@ -54,6 +64,7 @@ gpui::actions!(
 
 enum GroupEdit {
     CreateCollection,
+    RenameCollection(String),
     CreateEnvironment,
     Create(String),
     Rename(String),
@@ -79,6 +90,10 @@ struct Workbench {
     update_task: Option<Task<()>>,
     show_update_details: bool,
     update_error: Option<String>,
+    update_source: Option<updater::UpdateSource>,
+    update_source_url: Entity<TextEntry>,
+    update_source_key: Entity<TextEntry>,
+    show_update_source_settings: bool,
     storage: storage::Store,
     environment_names: Vec<String>,
     responses: Vec<Option<HttpResponse>>,
@@ -138,6 +153,7 @@ struct Workbench {
     show_plugins: bool,
     plugin_manager_tab: usize,
     editing_environment: usize,
+    editing_variable_collection: Option<String>,
     revealed_variables: HashSet<(usize, u64)>,
     variable_delete: Option<(usize, u64)>,
     variable_search: Entity<TextEntry>,
@@ -153,6 +169,8 @@ struct Workbench {
     filter: Entity<TextEntry>,
     history_search: Entity<TextEntry>,
     authentication: Entity<SelectField>,
+    oauth: oauth_ui::Inputs,
+    oauth_namespace: String,
     skip_tls_verification: bool,
     endpoint: Entity<SelectField>,
     environment: Entity<Select>,
@@ -192,6 +210,27 @@ struct Workbench {
     html_webview: Option<Entity<gpui_glint::components::WebView>>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     html_webview_source: Option<String>,
+    show_mcp: bool,
+    mcp_history_search: Entity<TextEntry>,
+    mcp_history_filter: usize,
+    mcp_history_rows: Vec<mcp_history::Summary>,
+    mcp_history_total: usize,
+    mcp_history_has_more: bool,
+    mcp_history_before: Option<i64>,
+    mcp_history_pages: Vec<Option<i64>>,
+    mcp_history_selected: Option<mcp_history::Record>,
+    mcp_history_detail: Entity<CodeCard>,
+    mcp_history_tab: usize,
+    mcp_history_error: Option<String>,
+    mcp_server: Option<mcp::Server>,
+    mcp_task: Option<Task<()>>,
+    mcp_error: Option<String>,
+    ws_sequence: u64,
+    ws_commands: Option<async_channel::Sender<websocket::Command>>,
+    ws_connected: bool,
+    ws_active: bool,
+    ws_log: std::collections::VecDeque<String>,
+    ws_output: Entity<CodeCard>,
     sending: Option<Task<()>>,
     notice: String,
     error: Option<String>,
@@ -206,6 +245,7 @@ impl Workbench {
         let path = storage::Store::default_path().expect("无法确定 SQLite 数据目录");
         let storage = storage::Store::open(&path).expect("无法打开 SQLite 数据库");
         let mut this = Self::with_store(storage, cx);
+        this.start_mcp(cx);
         let report = updater::take_report();
         if let Some(report) = report {
             this.show_update_details = true;
@@ -227,6 +267,20 @@ impl Workbench {
         let data = storage
             .load()
             .expect("无法加载 SQLite 工作区，已保留原文件");
+        let update_source = data.update_source;
+        let update_source_url = Self::entry(
+            update_source.as_ref().map(|s| s.url.as_str()).unwrap_or(""),
+            "留空使用默认 GitHub 源",
+            cx,
+        );
+        let update_source_key = Self::entry(
+            update_source
+                .as_ref()
+                .map(|s| s.public_key.as_str())
+                .unwrap_or(""),
+            "分发服务的可信公钥",
+            cx,
+        );
         let selected_environment = data.selected_environment;
         let requests = data.requests;
         let collections = data.collections;
@@ -239,11 +293,19 @@ impl Workbench {
             .first()
             .map(|r| r.draft.clone())
             .unwrap_or_default();
+        let oauth_namespace = storage
+            .connection
+            .path()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let oauth = oauth_ui::Inputs::new(cx);
         let authentication = cx.new(|cx| {
             SelectField::new(
                 [
                     SelectOption::new("bearer", "Bearer"),
                     SelectOption::new("none", "No Auth"),
+                    SelectOption::new("oauth2", "OAuth 2.0"),
                 ],
                 "Token 或 {{api_token}}",
                 cx,
@@ -254,8 +316,10 @@ impl Workbench {
         let history_search = Self::entry("", "搜索历史路径…", cx);
         let endpoint = cx.new(|cx| {
             SelectField::new(
-                ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-                    .map(|s| SelectOption::new(s, s).color(method_color(s))),
+                [
+                    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WS",
+                ]
+                .map(|s| SelectOption::new(s, s).color(method_color(s))),
                 "https://",
                 cx,
             )
@@ -304,12 +368,22 @@ impl Workbench {
         subscriptions.push(cx.observe(&body, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&commands, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&endpoint, |_, _, cx| cx.notify()));
+        for field in &oauth.fields {
+            subscriptions.push(cx.observe(field, |this: &mut Self, _, cx| {
+                this.oauth.cancel();
+                this.oauth.ready = None;
+                this.oauth.error = None;
+                cx.notify();
+            }));
+        }
         subscriptions.push(cx.observe(&authentication, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(
             &authentication,
-            |_: &mut Self, field, event: &SelectFieldEvent, cx| {
+            |this: &mut Self, field, event: &SelectFieldEvent, cx| {
+                this.oauth.cancel();
+                this.oauth.ready = None;
                 let SelectFieldEvent::Changed(value) = event;
-                let disabled = value.selected.as_deref() == Some("none");
+                let disabled = value.selected.as_deref() != Some("bearer");
                 field.update(cx, |field, cx| field.set_input_disabled(disabled, cx));
                 cx.notify();
             },
@@ -318,6 +392,9 @@ impl Workbench {
             &environment,
             |this: &mut Self, _, event: &SelectEvent, cx| {
                 let SelectEvent::Changed(value) = event;
+                this.oauth.cancel();
+                this.oauth.ready = None;
+                this.oauth.message = "环境已切换，发送时检查该环境的授权".into();
                 this.environment.update(cx, |select, cx| {
                     select.set_selected(Some(value.clone()), cx)
                 });
@@ -335,6 +412,19 @@ impl Workbench {
                 if let CommandPaletteEvent::Executed(id) = event {
                     match id.as_ref() {
                         "import-curl" => this.open_curl_import(cx),
+                        "mcp-config" => match mcp::configuration() {
+                            Ok(config) => {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    serde_json::to_string_pretty(&config).unwrap(),
+                                ));
+                                this.notice = "已复制 MCP 配置，可粘贴到 agent 客户端".into();
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                this.notice = error;
+                                cx.notify();
+                            }
+                        },
                         "send" => this.send(cx),
                         "save" => this.save(cx),
                         "theme" => this.toggle_theme(cx),
@@ -478,6 +568,10 @@ impl Workbench {
             update_task: None,
             show_update_details: false,
             update_error: None,
+            update_source,
+            update_source_url,
+            update_source_key,
+            show_update_source_settings: false,
             storage,
             storage_error: None,
             storage_dirty: true,
@@ -537,6 +631,7 @@ impl Workbench {
             show_environments: false,
             show_plugins: false,
             plugin_manager_tab: 0,
+            editing_variable_collection: None,
             editing_environment: 0,
             revealed_variables: HashSet::new(),
             variable_delete: None,
@@ -553,6 +648,8 @@ impl Workbench {
             filter,
             history_search,
             authentication,
+            oauth,
+            oauth_namespace,
             skip_tls_verification: false,
             endpoint,
             environment,
@@ -592,12 +689,55 @@ impl Workbench {
             html_webview: None,
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             html_webview_source: None,
+            show_mcp: false,
+            mcp_history_search: Self::entry("", "搜索工具、客户端或错误…", cx),
+            mcp_history_filter: 0,
+            mcp_history_rows: vec![],
+            mcp_history_total: 0,
+            mcp_history_has_more: false,
+            mcp_history_before: None,
+            mcp_history_pages: vec![],
+            mcp_history_selected: None,
+            mcp_history_detail: cx.new(|cx| {
+                CodeCard::new(cx, "json", "")
+                    .read_only(true)
+                    .show_header(false)
+                    .viewport()
+            }),
+            mcp_history_tab: 0,
+            mcp_history_error: None,
+            mcp_server: None,
+            mcp_task: None,
+            mcp_error: None,
+            ws_sequence: 0,
+            ws_commands: None,
+            ws_connected: false,
+            ws_active: false,
+            ws_log: Default::default(),
+            ws_output: cx.new(|cx| {
+                CodeCard::new(cx, "text", "")
+                    .read_only(true)
+                    .show_header(false)
+                    .viewport()
+            }),
             sending: None,
-            notice: "HTTP 请求 · 请求与版本自动保存到 SQLite".into(),
+            notice: "HTTP / WebSocket · 请求与版本自动保存到 SQLite".into(),
             error: None,
             subscriptions,
             row_subscriptions: vec![],
         };
+        let mut history_query = String::new();
+        this.subscriptions.push(
+            cx.observe(&this.mcp_history_search, move |this, entry, cx| {
+                let query = entry.read(cx).value().to_owned();
+                if query != history_query {
+                    history_query = query;
+                    this.mcp_history_before = None;
+                    this.mcp_history_pages.clear();
+                    this.reload_mcp_history(cx);
+                }
+            }),
+        );
         this.reset_variable_rows(cx);
         this.load(&initial, cx);
         this.restore_response(cx);
@@ -621,6 +761,10 @@ impl Workbench {
                     .group("操作")
                     .keywords("import curl 导入 粘贴")
                     .icon(Icon::Download),
+                CommandItem::new("mcp-config", "复制 MCP 连接配置")
+                    .group("操作")
+                    .keywords("agent mcp stdio 连接 配置")
+                    .icon(Icon::Copy),
                 CommandItem::new("send", "发送 HTTP 请求")
                     .group("操作")
                     .icon(Icon::Play)
@@ -799,6 +943,7 @@ impl Workbench {
             return;
         }
         let workspace = storage::Workspace {
+            update_source: self.update_source.clone(),
             selected_environment: self.selected_environment(cx),
             requests: self.requests.clone(),
             collections: self.collections.clone(),
@@ -859,13 +1004,15 @@ impl Workbench {
             headers: pairs(&self.headers),
             cookies: pairs(&self.cookies),
             extractors: pairs(&self.extractors),
+            oauth: (self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"))
+                .then(|| self.oauth.snapshot(cx)),
             token: self.authentication.read(cx).value().text.to_string(),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
             skip_tls_verification: self.skip_tls_verification,
         }
     }
     fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
-        let values = self.environment_inputs[self.selected_environment(cx)].values();
+        let values = self.active_environment_values(cx);
         let resolver = template::TemplateResolver::for_request(&values, &self.snapshot(cx));
         std::rc::Rc::new(move |expression| match &resolver {
             Ok(resolver) => resolver.resolve(expression),
@@ -874,20 +1021,8 @@ impl Workbench {
     }
     fn sync_reference_inputs(&mut self, cx: &mut Context<Self>) {
         let resolver = self.reference_resolver(cx);
-        let mut completions: Vec<_> = self.environment_inputs[self.selected_environment(cx)]
-            .variables
-            .iter()
-            .map(|variable| {
-                TextCompletion::new(
-                    &variable.name,
-                    if variable.secret {
-                        "环境变量 · 敏感"
-                    } else {
-                        "环境变量"
-                    },
-                )
-            })
-            .collect();
+        let mut completions = self.environment_completions(cx);
+        let oauth_completions = completions.clone();
         completions.extend(
             [
                 ("uuid()", "生成 UUID"),
@@ -930,6 +1065,20 @@ impl Workbench {
                 });
             }
         }
+        let oauth_resolver = template::TemplateResolver::new(&self.active_environment_values(cx));
+        let oauth_resolver: TextReferenceResolver =
+            std::rc::Rc::new(move |expression| oauth_resolver.resolve(expression));
+        for entry in self
+            .oauth
+            .fields
+            .iter()
+            .chain(std::iter::once(&self.oauth.secret))
+        {
+            entry.update(cx, |entry, cx| {
+                entry.set_reference_resolver(Some(oauth_resolver.clone()), cx);
+                entry.set_completions(oauth_completions.clone(), cx)
+            });
+        }
         for field in [&self.endpoint, &self.authentication] {
             field.update(cx, |field, cx| {
                 field.set_reference_resolver(Some(resolver.clone()), cx);
@@ -939,6 +1088,11 @@ impl Workbench {
         self.body
             .update(cx, |body, cx| body.set_completions(completions.clone(), cx));
         if let Some(editor) = &self.directory_settings {
+            let collection = self
+                .collections
+                .get(editor.read(cx).collection)
+                .map(|c| c.collection.as_str());
+            let completions = self.environment_completions_for(cx, collection);
             editor.update(cx, |editor, cx| {
                 editor.set_context(self.theme, completions, cx)
             });
@@ -975,12 +1129,34 @@ impl Workbench {
         }
     }
     fn load(&mut self, draft: &Draft, cx: &mut Context<Self>) {
+        if self.ws_active || self.ws_commands.is_some() {
+            self.sending = None;
+            self.ws_commands = None;
+            self.ws_active = false;
+        }
+        self.ws_connected = false;
+        self.ws_log.clear();
+        self.ws_output
+            .update(cx, |output, cx| output.set_content("", cx));
         if let Some(request) = self.requests.get_mut(self.active) {
             request.draft.plugins = draft.plugins.clone();
         }
+        self.oauth.load(draft.oauth.clone().unwrap_or_default(), cx);
         self.skip_tls_verification = draft.skip_tls_verification;
         self.authentication.update(cx, |field, cx| {
-            field.set_selected(Some(if draft.auth { "bearer" } else { "none" }.into()), cx);
+            field.set_selected(
+                Some(
+                    if draft.oauth.is_some() {
+                        "oauth2"
+                    } else if draft.auth {
+                        "bearer"
+                    } else {
+                        "none"
+                    }
+                    .into(),
+                ),
+                cx,
+            );
             field.set_text(draft.token.clone(), cx);
             field.set_input_disabled(!draft.auth, cx);
         });
@@ -1010,6 +1186,7 @@ impl Workbench {
         self.version_tag_edit = None;
         self.directory_settings = None;
         self.tree_delete = None;
+        self.show_mcp = false;
         self.show_plugins = false;
         self.show_environments = false;
         if index >= self.requests.len() {
@@ -1052,7 +1229,7 @@ impl Workbench {
             self.tabs.push(index);
         }
         let draft = self.requests[index].draft.clone();
-        self.config = if matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH") {
+        self.config = if matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH" | "WS") {
             3
         } else {
             0
@@ -1096,6 +1273,7 @@ impl Workbench {
         request.versions.insert(
             0,
             Record {
+                id: crate::model::new_id(),
                 tag: String::new(),
                 environment_name: None,
                 draft,
@@ -1122,6 +1300,10 @@ impl Workbench {
         if self.requests.is_empty() {
             return;
         }
+        if self.ws_active {
+            self.disconnect_websocket(cx);
+            return;
+        }
         if self.sending.take().is_some() {
             self.push_trace("已取消请求", cx);
             self.trace_started = None;
@@ -1129,8 +1311,21 @@ impl Workbench {
             cx.notify();
             return;
         }
+        if self.oauth_before_send(cx) {
+            return;
+        }
+        if self.snapshot(cx).method == "WS" {
+            self.connect_websocket(cx);
+            return;
+        }
         self.sent_curls[self.active] = None;
         let draft = self.snapshot(cx);
+        let extraction_collection = self
+            .collections
+            .iter()
+            .find(|c| c.collection == self.requests[self.active].collection)
+            .map(|c| c.id.clone())
+            .unwrap_or_default();
         let environment_index = self.selected_environment(cx);
         let environment_name = self.environment_name(environment_index).to_owned();
         self.trace_started = Some(Instant::now());
@@ -1147,8 +1342,9 @@ impl Workbench {
         self.status = None;
         self.error = None;
         let inputs = &self.environment_inputs[environment_index];
-        let variables = inputs.values();
+        let variables = self.active_environment_values(cx);
         let request = match PreparedRequest::new(&draft, &variables)
+            .and_then(|request| self.oauth_attach(request, &draft, cx))
             .and_then(|request| request.with_proxy(&inputs.proxy))
             .and_then(|request| {
                 plugins::validate_variables(&draft.plugins, &self.plugin_catalog, &variables)?;
@@ -1213,7 +1409,21 @@ impl Workbench {
                         }
                         cx.notify();
                     });
-                    http::execute(request).await
+                    let (progress, updates) = async_channel::bounded(1);
+                    let execution = cx
+                        .background_executor()
+                        .spawn(http::execute_stream(request, Some(progress)));
+                    while let Ok(response) = updates.recv().await {
+                        if this
+                            .update(cx, |this, cx| {
+                                this.apply_stream_response(index, response, cx)
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    execution.await
                 }
                 Err(error) => Err(error),
             };
@@ -1242,11 +1452,21 @@ impl Workbench {
                 let extraction = result
                     .as_ref()
                     .ok()
-                    .map(|response| this.apply_extractors(&draft, environment_index, response, cx));
+                    .filter(|response| !response.is_event_stream())
+                    .map(|response| {
+                        this.apply_extractors_for_id(
+                            &draft,
+                            environment_index,
+                            &extraction_collection,
+                            response,
+                            cx,
+                        )
+                    });
                 this.storage_dirty = true;
                 this.prepend_history(
                     index,
                     Record {
+                        id: crate::model::new_id(),
                         tag: String::new(),
                         environment_name: Some(environment_name),
                         draft,
@@ -1256,7 +1476,11 @@ impl Workbench {
                         elapsed_ms: Some(elapsed_ms),
                         exchange: Some(model::Exchange {
                             curl: this.sent_curls[index].clone(),
-                            response: result.as_ref().ok().cloned(),
+                            response: result.as_ref().ok().cloned().or_else(|| {
+                                this.response_data
+                                    .clone()
+                                    .filter(HttpResponse::is_event_stream)
+                            }),
                             error: result.as_ref().err().cloned(),
                             preview: this.sent_requests[index].clone(),
                             traces: vec![],
@@ -1294,10 +1518,16 @@ impl Workbench {
                         this.request_error_toast(failure_title, &environment, &error, cx);
                         this.push_trace(format!("请求失败：{error}"), cx);
                         this.error = Some(error);
-                        this.responses[index] = None;
-                        this.response_data = None;
-                        this.response_json = None;
-                        this.status = None;
+                        if !this
+                            .response_data
+                            .as_ref()
+                            .is_some_and(HttpResponse::is_event_stream)
+                        {
+                            this.responses[index] = None;
+                            this.response_data = None;
+                            this.response_json = None;
+                            this.status = None;
+                        }
                         this.update_response(cx);
                         this.notice = "请求失败".into();
                     }
@@ -1395,6 +1625,32 @@ impl Workbench {
             );
         }
         body
+    }
+    fn apply_stream_response(
+        &mut self,
+        index: usize,
+        response: HttpResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let first = !self
+            .response_data
+            .as_ref()
+            .is_some_and(HttpResponse::is_event_stream);
+        self.responses[index] = Some(response.clone());
+        self.status = Some(response.status);
+        self.response_json = None;
+        self.response_data = Some(response);
+        if first {
+            self.push_trace("收到 SSE 响应，开始持续接收事件", cx);
+            self.update_response(cx);
+        } else {
+            let content = self.response_content();
+            self.response
+                .update(cx, |editor, cx| editor.set_content(content, cx));
+            self.sync_response_search(true, cx);
+        }
+        self.notice = "SSE 接收中 · 点击取消可断开 · 显示最近 1 MiB".into();
+        cx.notify();
     }
     fn response_content(&self) -> String {
         let Some(response) = &self.response_data else {
@@ -1601,6 +1857,12 @@ impl Workbench {
         );
     }
     fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        self.mcp_history_search
+            .update(cx, |entry, cx| entry.set_theme(theme, cx));
+        self.mcp_history_detail
+            .update(cx, |editor, cx| editor.set_theme(theme, cx));
+        self.ws_output
+            .update(cx, |output, cx| output.set_theme(theme, cx));
         self.theme = theme;
         if self.directory_settings.is_some() {
             self.sync_reference_inputs(cx);
@@ -1655,11 +1917,21 @@ impl Workbench {
         self.endpoint.update(cx, |field, cx| {
             field.set_theme(theme, cx);
             field.set_options(
-                ["GET", "POST", "PUT", "PATCH", "DELETE"]
-                    .map(|s| SelectOption::new(s, s).color(theme.color(method_color(s)))),
+                [
+                    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WS",
+                ]
+                .map(|s| SelectOption::new(s, s).color(theme.color(method_color(s)))),
                 cx,
             );
         });
+        for field in self
+            .oauth
+            .fields
+            .iter()
+            .chain([&self.oauth.secret, &self.oauth.callback])
+        {
+            field.update(cx, |entry, cx| entry.set_theme(theme, cx));
+        }
         self.authentication
             .update(cx, |field, cx| field.set_theme(theme, cx));
         self.environment.update(cx, |e, cx| e.set_theme(theme, cx));
@@ -1685,7 +1957,9 @@ impl Workbench {
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
-                    .child(if self.show_plugins {
+                    .child(if self.show_mcp {
+                        "个人工作区  ›  MCP".into()
+                    } else if self.show_plugins {
                         "个人工作区  ›  插件管理".into()
                     } else if self.show_environments {
                         format!(
@@ -1745,17 +2019,20 @@ impl Workbench {
                     .debug_selector(|| "global-environment-selector".into())
                     .child(self.environment.clone()),
             )
-            .when(!self.show_environments && !self.show_plugins, |bar| {
-                bar.child(
-                    IconButton::new(Icon::Sidebar, "展开或收起记录")
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_activity = !this.show_activity;
-                            cx.notify();
-                        })),
-                )
-            })
+            .when(
+                !self.show_environments && !self.show_plugins && !self.show_mcp,
+                |bar| {
+                    bar.child(
+                        IconButton::new(Icon::Sidebar, "展开或收起记录")
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_activity = !this.show_activity;
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
             .child(
                 div()
                     .rounded_full()
@@ -1780,6 +2057,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_mcp = false;
                         this.show_environments = false;
                         this.show_plugins = false;
                         this.show_collection_menu = false;
@@ -1791,6 +2069,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_mcp = false;
                         this.show_plugins = false;
                         this.show_environments = true;
                         this.editing_environment = this.selected_environment(cx);
@@ -1815,12 +2094,23 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_mcp = false;
                         this.show_plugins = false;
                         this.show_environments = false;
                         this.activity = 1;
                         this.show_activity = true;
                         cx.notify();
                     })),
+            )
+            .child(
+                IconButton::new(Icon::Workflow, "MCP 调用历史")
+                    .theme(self.theme)
+                    .render()
+                    .when(self.show_mcp, |button| {
+                        button.bg(rgb(self.theme.palette().accent_tint))
+                    })
+                    .debug_selector(|| "open-mcp-history".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.open_mcp_history(cx))),
             )
             .child(div().flex_1())
             .child(self.update_button(cx))
@@ -1844,7 +2134,8 @@ impl Workbench {
         let mut list = div().flex().flex_col().gap_2().px_2().py_3();
         for (index, name) in self.environment_names.iter().enumerate().skip(1) {
             let selected = self.editing_environment == index;
-            let base = self.environment_inputs[index]
+            let scoped = self.editor_environment(index);
+            let base = scoped
                 .variables
                 .iter()
                 .find(|variable| variable.name == "base_url")
@@ -1854,7 +2145,7 @@ impl Workbench {
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_else(|| "未配置服务地址".into());
-            let caption = format!("{} 个变量", self.environment_inputs[index].variables.len());
+            let caption = format!("{} 个变量", scoped.variables.len());
             list = list.child(
                 div()
                     .id(("environment-profile", index))
@@ -1987,6 +2278,9 @@ impl Workbench {
             )
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.show_mcp {
+            return self.mcp_history_sidebar(cx);
+        }
         if self.show_plugins {
             return self.plugin_sidebar(cx);
         }
@@ -2152,6 +2446,7 @@ impl Workbench {
         trigger
     }
     fn edit_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_mcp = false;
         self.show_collection_menu = false;
         self.tree_menu = None;
         self.show_environments = false;
@@ -2159,6 +2454,32 @@ impl Workbench {
         self.group_name
             .update(cx, |entry, cx| entry.set_value("", cx));
         self.group_edit = Some(GroupEdit::CreateCollection);
+        self.group_error = None;
+        window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+    fn edit_collection_name(
+        &mut self,
+        collection: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.collections.get(collection) else {
+            return;
+        };
+        let old = target.collection.clone();
+        if self.current_collection != collection {
+            self.current_directory.clear();
+        }
+        self.current_collection = collection;
+        self.show_mcp = false;
+        self.show_environments = false;
+        self.show_plugins = false;
+        self.tree_menu = None;
+        self.show_collection_menu = false;
+        self.group_name
+            .update(cx, |entry, cx| entry.set_value(old.clone(), cx));
+        self.group_edit = Some(GroupEdit::RenameCollection(old));
         self.group_error = None;
         window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
         cx.notify();
@@ -2596,11 +2917,20 @@ impl Workbench {
             for (action, icon, label) in [
                 (0, Icon::Plus, "新建请求"),
                 (1, Icon::Folder, "新建目录"),
-                (2, Icon::Pencil, "重命名目录"),
+                (
+                    2,
+                    Icon::Pencil,
+                    if path.is_empty() {
+                        "重命名集合"
+                    } else {
+                        "重命名目录"
+                    },
+                ),
                 (3, Icon::Trash, "删除目录"),
                 (4, Icon::Settings, "目录设置"),
+                (5, Icon::Code, "集合变量"),
             ] {
-                if path.is_empty() && matches!(action, 2 | 3) {
+                if path.is_empty() && action == 3 || !path.is_empty() && action == 5 {
                     continue;
                 }
                 let path = path.clone();
@@ -2627,6 +2957,10 @@ impl Workbench {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.tree_menu = None;
+                            if action == 2 && path.is_empty() {
+                                this.edit_collection_name(collection, window, cx);
+                                return;
+                            }
                             this.current_collection = collection;
                             this.current_directory = path.clone();
                             match action {
@@ -2641,6 +2975,20 @@ impl Workbench {
                                     window,
                                     cx,
                                 ),
+                                5 => {
+                                    let name = this.collections[collection].collection.clone();
+                                    match this.set_variable_scope(Some(name), cx) {
+                                        Ok(()) => {
+                                            this.editing_environment = this.selected_environment(cx)
+                                        }
+                                        Err(error) => this.variable_error = Some(error),
+                                    }
+                                    this.show_environments = true;
+                                    this.show_plugins = false;
+                                    this.show_mcp = false;
+                                    this.sync_variable_table(cx);
+                                    cx.notify();
+                                }
                                 4 => {
                                     window.focus(&this.focus, cx);
                                     this.open_directory_settings(collection, path.clone(), cx);
@@ -2709,6 +3057,25 @@ impl Workbench {
                     self.notice = format!("已创建集合 {}", name.trim());
                 })
             }
+            Some(GroupEdit::RenameCollection(old)) => self
+                .collections
+                .iter()
+                .position(|collection| collection.collection == *old)
+                .ok_or("集合不存在或已重命名，请重新选择".to_owned())
+                .and_then(|index| {
+                    RequestGroups::rename_collection(
+                        index,
+                        &name,
+                        &mut self.collections,
+                        &mut self.requests,
+                    )
+                })
+                .map(|_| {
+                    if self.editing_variable_collection.as_deref() == Some(old) {
+                        self.editing_variable_collection = Some(name.trim().into());
+                    }
+                    self.notice = format!("已重命名集合为 {}", name.trim());
+                }),
             Some(GroupEdit::Create(parent)) => self.collections[self.current_collection]
                 .add_child(parent, &name)
                 .map(|path| {
@@ -2773,6 +3140,7 @@ impl Workbench {
             Ok(()) => {
                 self.storage_dirty = true;
                 self.sync_groups(cx);
+                self.sync_commands(cx);
                 self.group_edit = None;
                 self.group_error = None;
                 self.filter.update(cx, |entry, cx| entry.set_value("", cx));
@@ -2784,6 +3152,7 @@ impl Workbench {
     fn group_editor(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         div()
+            .debug_selector(|| "group-name-editor".into())
             .mx_3()
             .mb_2()
             .p_2()
@@ -2812,6 +3181,7 @@ impl Workbench {
             }))
             .child(match self.group_edit {
                 Some(GroupEdit::CreateCollection) => "创建集合",
+                Some(GroupEdit::RenameCollection(_)) => "重命名集合",
                 Some(GroupEdit::CreateEnvironment) => "创建环境",
                 Some(GroupEdit::Create(_)) => "新建目录",
                 _ => "重命名目录",
@@ -2843,8 +3213,10 @@ impl Workbench {
                             .size(ButtonSize::Mini)
                             .theme(self.theme)
                             .render()
+                            .debug_selector(|| "group-name-cancel".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.group_edit = None;
+                                this.group_error = None;
                                 cx.notify();
                             })),
                     )
@@ -2853,6 +3225,7 @@ impl Workbench {
                             .size(ButtonSize::Mini)
                             .theme(self.theme)
                             .render()
+                            .debug_selector(|| "group-name-save".into())
                             .on_click(cx.listener(|this, _, _, cx| this.save_group(cx))),
                     ),
             )
@@ -2874,12 +3247,14 @@ impl Workbench {
         let i = self.requests.len();
         self.storage_dirty = true;
         self.requests.push(Request {
+            id: crate::model::new_id(),
             tree_order: 0,
             name: format!("新建请求 {}", i + 1),
             collection: self.collections[self.current_collection].collection.clone(),
             group,
             draft: draft.clone(),
             versions: vec![Record {
+                id: crate::model::new_id(),
                 tag: String::new(),
                 environment_name: None,
                 draft,
@@ -3220,6 +3595,19 @@ impl Workbench {
             )
     }
     fn body_configuration(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.snapshot(cx).method == "WS" {
+            return div()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .child("待发送的文本消息 · 连接后点击发送消息"),
+                )
+                .child(div().flex_1().min_h_0().child(self.body.clone()));
+        }
         let owner = cx.entity().downgrade();
         let mut head = div().flex().items_center().gap_3().child(
             SegmentedControl::new([
@@ -3279,14 +3667,11 @@ impl Workbench {
                 .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).child("Cookie 覆盖"))
                 .child(self.cookies_table.clone())
                 .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("将启用的 Cookie 键值合并到请求头 Cookie；同名键以此表为准，其余原始 Cookie 保留。禁用条目不参与覆盖。")),
-            1=>div().flex().flex_col().gap_3()
-                .child(div().text_size(px(11.)).child("验证方式 / Token"))
-                .child(self.authentication.clone())
-                .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("Bearer 使用 Token 或环境变量引用；请填写实际 Token，或在环境变量中设置 api_token。No Auth 不生成 Authorization。")),
+            1=>self.authentication_configuration(cx),
             5=>self.plugin_configuration(cx),
             6=>div().flex().flex_col().gap_3()
                 .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("提取环境变量"))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入发送时的全局环境，同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。"))
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入所属集合在发送时环境下的变量，不修改全局变量；集合内同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。"))
                 .child(self.extractors_table.clone()),
             3=>self.body_configuration(cx),
             _=>div().w_full().flex().flex_col()
@@ -3309,13 +3694,28 @@ impl Workbench {
         };
         div()
             .id("configuration")
-            .h(px(if matches!(self.config, 5 | 6) {
-                360.
-            } else {
-                218.
-            }))
+            .h(px(
+                if self.config == 1
+                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")
+                {
+                    384.
+                } else if matches!(self.config, 5 | 6) {
+                    360.
+                } else {
+                    218.
+                },
+            ))
             .flex_shrink_0()
-            .overflow_y_scroll()
+            .when(
+                self.config == 1
+                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"),
+                |view| view.overflow_hidden(),
+            )
+            .when(
+                !(self.config == 1
+                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")),
+                |view| view.overflow_y_scroll(),
+            )
             .px_5()
             .py_3()
             .child(view)
@@ -3401,6 +3801,9 @@ impl Workbench {
             }))
     }
     fn response_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.snapshot(cx).method == "WS" || self.ws_active {
+            return self.websocket_panel(cx);
+        }
         let p = self.theme.palette();
         let mut head = div()
             .h(px(42.))
@@ -3457,18 +3860,31 @@ impl Workbench {
                         0xd9342b
                     })))
                     .child(format!(
-                        "● {}   {} ms   {} B",
+                        "● {}   {} ms   {} B{}",
                         status_label(status),
-                        self.requests[self.active]
-                            .history
-                            .get(
-                                self.selected_history
-                                    .filter(|(request, _)| *request == self.active)
-                                    .map_or(0, |(_, index)| index)
-                            )
-                            .and_then(|r| r.elapsed_ms)
+                        self.trace_started
+                            .filter(|_| self.sending.is_some())
+                            .map(|started| started.elapsed().as_millis())
+                            .or_else(|| self.requests[self.active]
+                                .history
+                                .get(
+                                    self.selected_history
+                                        .filter(|(request, _)| *request == self.active)
+                                        .map_or(0, |(_, index)| index)
+                                )
+                                .and_then(|r| r.elapsed_ms))
                             .unwrap_or(0),
-                        bytes
+                        bytes,
+                        if self.sending.is_some()
+                            && self
+                                .response_data
+                                .as_ref()
+                                .is_some_and(HttpResponse::is_event_stream)
+                        {
+                            " · SSE 接收中"
+                        } else {
+                            ""
+                        }
                     )),
             );
         }
@@ -3481,7 +3897,7 @@ impl Workbench {
                 .flex()
                 .flex_col()
                 .child(self.trace_view())
-        } else if self.sending.is_some() || self.error.is_some() || self.response_data.is_none() {
+        } else if self.response_data.is_none() {
             div()
                 .flex_1()
                 .flex()
@@ -3816,8 +4232,12 @@ impl Workbench {
                     .gap_3()
                     .child(div().flex_1().min_w_0().child(self.endpoint.clone()))
                     .child(
-                        Button::new(if self.sending.is_some() {
+                        Button::new(if self.ws_commands.is_some() {
+                            "断开"
+                        } else if self.sending.is_some() {
                             "取消  ×"
+                        } else if draft.method == "WS" {
+                            "连接"
                         } else {
                             "发送  ↗"
                         })
@@ -4379,6 +4799,7 @@ impl Render for Workbench {
                 && self.response_data.is_some()
                 && !self.show_environments
                 && !self.show_plugins
+                && !self.show_mcp
                 && !self.show_curl_import
                 && self.directory_settings.is_none()
                 && self.response_tab == 0
@@ -4394,7 +4815,9 @@ impl Render for Workbench {
             .min_h_0()
             .min_w_0()
             .flex()
-            .child(if self.show_plugins {
+            .child(if self.show_mcp {
+                self.mcp_history_workspace(cx)
+            } else if self.show_plugins {
                 self.plugin_workspace(cx)
             } else if self.show_environments {
                 self.environment_workspace(cx)
@@ -4407,6 +4830,7 @@ impl Render for Workbench {
                 self.show_activity
                     && !self.show_environments
                     && !self.show_plugins
+                    && !self.show_mcp
                     && self.directory_settings.is_none(),
                 |s| s.child(self.activity_panel(cx)),
             );
@@ -4487,15 +4911,20 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
-                if !this.show_plugins
+                if !this.show_mcp
+                    && !this.show_plugins
                     && !this.show_environments
                     && this.directory_settings.is_none()
                 {
-                    this.send(cx);
+                    if this.ws_connected {
+                        this.send_websocket_message(cx);
+                    } else {
+                        this.send(cx);
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
-                if this.show_plugins {
+                if this.show_plugins || this.show_mcp {
                     return;
                 } else if this.show_environments {
                     this.save_environment_variables(cx);
@@ -4506,7 +4935,11 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
-                if !this.show_plugins && !this.show_environments && this.response_data.is_some() {
+                if !this.show_mcp
+                    && !this.show_plugins
+                    && !this.show_environments
+                    && this.response_data.is_some()
+                {
                     this.response_tab = 0;
                     if !this.show_response_search {
                         this.toggle_response_search(window, cx);
@@ -4650,6 +5083,20 @@ fn record_time() -> String {
         .to_string()
 }
 fn main() {
+    if let Some(action) = std::env::args().nth(1) {
+        if action == "--mcp" || action == "--mcp-config" {
+            let result = if action == "--mcp" {
+                mcp::proxy()
+            } else {
+                mcp::configuration().map(|config| println!("{}", config))
+            };
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-worker")) {
         if !plugins::worker() {
             std::process::exit(1);
@@ -4841,7 +5288,14 @@ mod persistence_tests {
                 };
                 host.environment
                     .update(cx, |select, cx| select.set_selected(Some("2".into()), cx));
-                host.apply_extractors(&draft, 2, &response, cx).unwrap();
+                host.apply_extractors(
+                    &draft,
+                    2,
+                    &host.requests[host.active].collection.clone(),
+                    &response,
+                    cx,
+                )
+                .unwrap();
                 host.params[0]
                     .value
                     .update(cx, |entry, cx| entry.set_value("{{new_", cx));
@@ -5143,6 +5597,7 @@ mod persistence_tests {
             host.add_request(cx);
             for (status, text) in [(200, "first"), (404, "second")] {
                 let mut record = host.requests[0].versions[0].clone();
+                record.id = model::new_id();
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{text}");
                 record.exchange = Some(model::Exchange {
@@ -5163,7 +5618,8 @@ mod persistence_tests {
                 });
                 host.requests[0].history.push(record);
             }
-            let legacy = host.requests[0].versions[0].clone();
+            let mut legacy = host.requests[0].versions[0].clone();
+            legacy.id = model::new_id();
             host.requests[0].history.push(legacy);
             host.show_activity = true;
             host.activity = 1;
@@ -5316,7 +5772,7 @@ mod persistence_tests {
             assert_eq!(host.tree_menu, Some((0, String::new())));
             assert!(!host.collapsed_directories.contains(&(0, String::new())));
         });
-        assert!(window.debug_bounds("directory-menu-action:0::2").is_none());
+        assert!(window.debug_bounds("directory-menu-action:0::2").is_some());
         let new_request = window.debug_bounds("directory-menu-action:0::0").unwrap();
         window.simulate_click(new_request.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
@@ -5973,5 +6429,112 @@ mod persistence_tests {
         drop(host);
         drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod collection_rename_tests {
+    use super::*;
+    fn click(window: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = window.debug_bounds(selector).unwrap();
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+    }
+    fn open_menu(window: &mut gpui::VisualTestContext) {
+        let root = window.debug_bounds("request-directory:0:").unwrap();
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: root.center(),
+            ..Default::default()
+        });
+        click(window, "directory-menu:0:");
+        click(window, "directory-menu-action:0::2");
+    }
+    #[gpui::test]
+    fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.collections
+                .push(RequestGroups::create_collection("Original", &[]).unwrap());
+            host.collections[0].add_child("", "Folder").unwrap();
+            host.collections[0].defaults.insert(
+                String::new(),
+                model::DirectoryDefaults {
+                    sections: [model::DefaultSection::Endpoint].into(),
+                    draft: Draft {
+                        url: "https://example.test/api".into(),
+                        ..Draft::default()
+                    },
+                },
+            );
+            host.add_request_to("Folder".into(), cx);
+            host.save(cx);
+            host.collections
+                .push(RequestGroups::create_collection("Other", &host.collections).unwrap());
+            host.current_collection = 1;
+            host.current_directory.clear();
+            host.add_request(cx);
+            host.choose(0, cx);
+            host.body.update(cx, |editor, cx| {
+                editor.set_content("unsaved body survives", cx)
+            });
+            host
+        });
+        open_menu(window);
+        assert!(window.debug_bounds("group-name-editor").is_some());
+        host.update(window, |host, cx| {
+            assert_eq!(host.group_name.read(cx).value(), "Original");
+            assert_eq!(host.current_directory, "Folder");
+            for invalid in ["   ", "Other"] {
+                host.group_name
+                    .update(cx, |entry, cx| entry.set_value(invalid, cx));
+                host.save_group(cx);
+                assert!(host.group_error.is_some());
+                assert_eq!(host.collections[0].collection, "Original");
+                assert_eq!(host.requests[0].collection, "Original");
+            }
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("  Renamed  ", cx));
+        });
+        click(window, "group-name-save");
+        host.update(window, |host, cx| {
+            assert!(host.group_edit.is_none());
+            assert!(host.group_error.is_none());
+            assert_eq!(host.collections[0].collection, "Renamed");
+            assert_eq!(host.requests[0].collection, "Renamed");
+            assert_eq!(host.requests[1].collection, "Other");
+            assert_eq!(host.requests[0].group, "Folder");
+            assert_eq!(host.current_directory, "Folder");
+            assert_eq!(host.active, 0);
+            assert_eq!(host.snapshot(cx).body, "unsaved body survives");
+            assert!(!host.requests[0].versions.is_empty());
+            assert_eq!(
+                host.collections[0].request_defaults("Folder").url,
+                "https://example.test/api"
+            );
+            host.persist(cx);
+        });
+        open_menu(window);
+        host.update(window, |host, cx| {
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("Cancelled", cx))
+        });
+        click(window, "group-name-cancel");
+        host.update(window, |host, cx| {
+            assert!(host.group_edit.is_none());
+            assert_eq!(host.collections[0].collection, "Renamed");
+            host.persist(cx);
+        });
+        let workspace = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(workspace.collections[0].collection, "Renamed");
+        assert_eq!(workspace.requests[0].collection, "Renamed");
+        assert_eq!(workspace.requests[0].draft.body, "unsaved body survives");
+        assert_eq!(workspace.requests[1].collection, "Other");
+        assert_eq!(
+            workspace.collections[0].request_defaults("Folder").url,
+            "https://example.test/api"
+        );
     }
 }

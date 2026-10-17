@@ -10,6 +10,18 @@ cargo run -p glint-api
 
 默认启用 HTML 预览；需要关闭时使用 `cargo run -p glint-api --no-default-features`。
 
+## macOS 安装包
+
+在 macOS 上安装 Rust 和 Xcode Command Line Tools 后，运行：
+
+```sh
+bash crates/glint-api/packaging/macos/build-macos.sh
+```
+
+脚本构建本机架构的 release 版本，默认包含 HTML 预览，生成带图标的 `Glint API.app`、可拖入 Applications 安装的 DMG 和 SHA-256 校验文件，输出到 `target/macos-installer/output/`。Apple Silicon 文件名为 `Glint-API-<版本>-macos-arm64.dmg`，Intel 主机输出 `macos-x86_64.dmg`；不是 Universal 通用包。最低系统版本从实际 Mach-O 可执行文件读取。
+
+默认使用本地 ad-hoc 签名，并验证签名、磁盘镜像、版本号和系统库依赖。可通过 `GLINT_API_CODESIGN_IDENTITY` 指定本机已有的 Developer ID 签名证书；脚本不执行 Apple 公证。应用替换和移除不会删除已有工作区。安装后，MCP 命令入口是 `/Applications/Glint API.app/Contents/MacOS/glint-api --mcp`，也可从应用内复制连接配置。
+
 ## Windows 安装包与发布
 
 Windows 10/11 x64 的安装包由 Inno Setup 6 生成，安装到 `%LOCALAPPDATA%\Programs\Glint API`，无需管理员权限。安装自动创建桌面和开始菜单快捷方式，EXE、安装包和快捷方式使用应用图标；卸载移除程序与快捷方式，保留工作区数据库。缺少 WebView2 时安装包会通过微软签名的 bootstrapper 下载并安装运行时，此步骤需要联网。
@@ -36,6 +48,32 @@ git push origin glint-api-v0.1.3
 ```
 
 手动运行 `Glint API Windows Release` workflow 只构建并上传 Actions artifact，不发布 Release。发布 workflow 检查标签与应用版本一致；库使用原来的 `v…` 标签，应用使用 `glint-api-v…` 标签。Windows CI 的安装测试不验证实际 GPU 窗口和 HTML 预览渲染。
+
+## WebSocket
+
+在地址栏方法中选择 `WS`，输入 `ws://` 或 `wss://` 地址，点击“连接”。连接后在“请求体”中编辑文本，点击“发送消息”（或按 `Cmd/Ctrl+Enter`）；消息中的环境变量在每次发送时解析。上方“断开”关闭当前连接，连接中可取消，切换请求或加载版本时也会关闭连接。
+
+握手复用参数、Bearer、Cookie、自定义请求头、前置签名插件、环境代理和 TLS 校验设置。`Sec-WebSocket-Protocol` 可通过请求头指定；握手必需头由客户端管理，不支持压缩扩展。消息面板按时间显示收发文本、二进制消息的 Base64 和关闭原因，支持清空；目前只发送文本消息，后置提取动作不作用于消息流。
+
+请求配置照常保存到 SQLite；消息记录仅在当前会话保留，最多 500 条 / 1 MiB，每条显示最多 64 KiB。单条收发消息上限为 1 MiB。
+
+## SSE 流式响应
+
+照常发送 HTTP 请求，响应头为 `Content-Type: text/event-stream` 时自动持续接收并实时显示原始事件流；需要时在请求头设置 `Accept: text/event-stream`。支持 GET 和 POST，沿用请求体、鉴权、Cookie、环境变量、签名插件、代理和 TLS 设置。事件中的 `data`、`event`、`id`、`retry` 与心跳注释均保留，UTF-8 跨网络分块正确解码。
+
+连接期间可查看响应头、搜索或复制已收到的内容，点击“取消”断开并保留当前结果。SSE 收到响应头后没有总时长或空闲超时，普通 HTTP 仍保留 30 秒总超时，等待响应头也有 30 秒超时。流结束或出错后保留已接收内容；显示最近 1 MiB，字节数累计计算。界面最多约每 50 ms 刷新一次。
+
+当前展示原始事件流，不自动重连、不自动合并模型输出，也不对每个事件执行后置提取动作；`[DONE]` 作为普通事件内容显示，连接由服务器关闭或手动取消。
+
+## MCP / Agent 操作接口
+
+提供 60 个 MCP 工具，直接操作正在运行的原生工作台，覆盖工作区、集合/目录、请求编辑与 HTTP/WS/SSE 执行、响应、版本/历史、环境、插件源、插件授权、界面和应用更新。请求和记录使用持久 ID，修改同步到 GUI 和 SQLite。
+
+按 `Cmd/Ctrl+K` 搜索 **MCP**，执行“复制 MCP 连接配置”，或运行 `glint-api --mcp-config`。agent 通过 `glint-api --mcp` 使用标准 stdio；没有运行中的应用时自动打开工作台。本机桥接使用随机令牌，读取结果默认隐藏已知密钥字段。
+
+侧边图标栏的 **MCP** 页面可按日期查看工具调用历史，支持搜索、结果筛选、分页和参数/结果详情。调用记录在保存前隐藏已知密钥，重启后保留。
+
+完整配置、工具列表、参数示例和长连接操作说明见 [MCP.md](MCP.md)。
 
 ## 更新检查与自动更新
 
@@ -64,7 +102,7 @@ cargo test -p glint-api downloads_published_installer_using_the_asset_api -- --i
 - 标签栏复用 `ClosableTabs`，使用 `on_add` 在末尾显示加号，点击打开请求选择器。
 - 请求标题栏加号旁的更多菜单支持“创建集合”，输入名称并确认后显示空集合；空名称和重复集合名称会显示提示。点击集合标题切换展开，顶部加号在当前选中的集合或目录内新建请求。筛选支持集合、目录和请求名称；集合与目录独立管理并持久化到 SQLite。菜单支持点击外部或 Esc 关闭。
 - 左侧是一棵目录树：至少先创建一个集合，请求可直接放在集合下；目录内可以继续创建请求和子目录，没有固定层级限制。收起／展开状态分别用 `Icon::Folder` 和 `Icon::FolderOpen` 表示，不使用箭头。各节点独立收起，打开请求会展开其父级路径；筛选显示匹配项及其祖先，清空后恢复原收起状态。深层目录支持横向滚动。
-- 悬停集合或目录行只显示一个“更多”入口；下拉菜单提供新建请求、新建目录，普通目录另有重命名目录和删除目录。打开菜单不会切换收起状态，点击外部或 Esc 关闭。目录名称在同级内唯一；重命名同步修改整棵子树，删除目录将子树内请求保留到上级，保留草稿、版本、历史与打开标签。
+- 悬停集合或目录行只显示一个“更多”入口；下拉菜单提供新建请求、新建目录，集合支持“重命名集合”，普通目录另有重命名目录和删除目录。集合重命名会同步请求归属并保留目录默认配置、草稿、版本和历史；空名称或重名会被拒绝。打开菜单不会切换收起状态，点击外部或 Esc 关闭。目录名称在同级内唯一；重命名同步修改整棵子树，删除目录将子树内请求保留到上级，保留草稿、版本、历史与打开标签。
 - 侧栏右边缘支持拖拽调宽（180–480px，上限随窗口宽度收缩），松手后结束调整，同一窗口内切换页面保持宽度。
 - 侧栏使用通用 `TreeList` 与 `TreeListItem`；拖到目录中部移入该目录，拖到节点上／下边缘调整同级位置，集合可在顶层排序。支持跨集合移动目录子树和请求，循环嵌套或目标目录重名会被拒绝，位置写入 SQLite。
 - 双击集合或目录打开目录设置，也可从“更多 → 目录设置”进入。URL / 方法、鉴权、参数、请求头、Cookie、请求体、前置动作、提取规则与 TLS 设置按集合到子目录逐层继承，并显示继承来源；每一项可独立覆盖，关闭覆盖恢复继承。覆盖按整项替换，空值、No Auth、空规则列表均可清除父级默认值。地址和 Token 支持 `{{baseurl}}` 等模板补全。保存默认配置后，新请求复制所在目录的最终配置，初始版本同步记录；已有请求可以自行修改，不随模板变更。目录重命名和跨集合移动携带自身及子目录配置，移动后继承新的父级；删除时移除对应默认配置。
@@ -77,8 +115,8 @@ cargo test -p glint-api downloads_published_installer_using_the_asset_api -- --i
 - 参数支持启用、添加、删除；发送前替换 `{{base_url}}` 并编码已启用的查询参数。
 - “更多”下拉菜单与命令面板提供“从 cURL 导入请求”（可搜索 curl / 导入），粘贴 Bash / POSIX 命令后在当前选中的集合／目录内创建请求；没有集合时自动创建“导入的请求”。支持多行续行、`-X` / `--request`、请求头、Cookie、Bearer / Basic、原始正文、`--json`、`--data-urlencode`、`-G` 与 `-k`。导入按命令内容替换默认配置，不携带目录默认鉴权或动作，不自动发送；成功时写入初始版本。格式错误、文件引用、multipart、重定向或其他不支持的参数在弹窗内显示具体原因，不执行命令或读取本地文件。
 - 响应面板提供“复制 cURL”，复制发送时已解析环境变量、合并 Cookie、应用前置动作请求头的实际请求参数，并包含实际鉴权、正文、TLS 和代理设置，参数使用 POSIX 单引号转义。每条请求历史与当前响应缓存独立保存 cURL 快照，切换历史时同步切换，后续编辑和环境变化不会重新计算。旧历史没有该快照时入口禁用，重新发送后可用。
-- 请求体支持“JSON / 原始”和“x-www-form-urlencoded”两种模式，切换保留各自内容。表单字段支持启用、添加、删除、说明、重复键、空值和模板补全；先解析当前全局环境变量再编码，自动添加 `application/x-www-form-urlencoded` Content-Type（显式请求头优先）。POST / PUT / PATCH / DELETE 使用该正文，GET 不发送正文。请求预览、前置动作签名与实际发送共享同一份编码结果；模式与字段随草稿、版本和历史保存。
-- “后置动作”支持按请求配置多条环境变量提取规则，可启用、添加、删除并填写说明。例如变量名 `api_token`、JSONPath `$.data.token`，收到 JSON 响应后自动写入发送时的全局环境快照所指向的环境，随后可用 `{{api_token}}` 引用。规则随草稿、版本和历史保存；同名变量更新并保留敏感属性。字符串直接保存，其他单个值保存为 JSON，多个匹配保存为 JSON 数组。任一启用规则无匹配、路径或变量名无效、变量名重复、响应非 JSON 或未选择环境时，本次全部提取不写入，状态栏和执行轨迹显示失败原因；HTTP 响应仍正常保留。
+- 请求体支持“JSON / 原始”和“x-www-form-urlencoded”两种模式，切换保留各自内容。表单字段支持启用、添加、删除、说明、重复键、空值和模板补全；先合并当前集合变量与全局变量并解析，再编码，自动添加 `application/x-www-form-urlencoded` Content-Type（显式请求头优先）。POST / PUT / PATCH / DELETE 使用该正文，GET 不发送正文。请求预览、前置动作签名与实际发送共享同一份编码结果；模式与字段随草稿、版本和历史保存。
+- “后置动作”支持按请求配置多条环境变量提取规则，可启用、添加、删除并填写说明。例如变量名 `api_token`、JSONPath `$.data.token`，收到 JSON 响应后自动写入请求所属集合在发送时环境下的集合变量，不写入全局变量，随后可用 `{{api_token}}` 引用。规则随草稿、版本和历史保存；同名变量更新并保留敏感属性。字符串直接保存，其他单个值保存为 JSON，多个匹配保存为 JSON 数组。任一启用规则无匹配、路径或变量名无效、变量名重复或响应非 JSON 时，本次全部提取不写入，状态栏和执行轨迹显示失败原因；HTTP 响应仍正常保留。
 - JSONPath 单元格悬停显示“从响应选取”：自动切到格式化 JSON，悬停字段高亮并显示路径，点击回填；空变量名按字段名生成，已有名称保留。可点击“取消选取”或按 Esc 退出。响应字段右键可“添加为提取规则”，优先复用空行或同路径规则；只配置规则，不立即写环境。每条路径同一行实时显示匹配数量和结果摘要，过长时截断，Token、密码及敏感环境变量只显示掩码；对象和数组显示结构摘要。
 - 版本历史使用圆点与连线时间线，显示当前／基线标签、版本时间及启用参数摘要；点击旧版本恢复时同步移动当前标记。版本号旁可编辑自定义标签，悬停版本行时显示编辑图标，已有标签文字保持可见；支持 Enter 保存、取消 / Esc / 点击外部放弃编辑；留空保存移除标签。标签独立于版本号，不恢复配置、不生成新版本，长标签单行省略并可重新打开查看完整内容，随 SQLite 工作区持久化。
 - 新请求历史保存当次响应、响应头、请求预览和执行轨迹，点击记录时同步恢复请求与响应面板。旧历史缺少响应快照时会清空响应并显示提示。响应头名称和值支持只读选中复制和长文本横向滚动；请求区与响应区之间使用 `Separator`。
@@ -89,7 +127,9 @@ cargo test -p glint-api downloads_published_installer_using_the_asset_api -- --i
 - 响应栏提供独立的“轨迹”Tab，可在发送中实时查看并独立滚动。每个请求保留最近一次的准备、校验、等待、响应、失败和取消记录，时间为相对本次发送的实际耗时；不模拟 DNS／TLS 等网络阶段。
 - 响应代码使用 `CodeCard::viewport()` 虚拟列表，仅排版可见行；源码 / 原始切换复用相同内容的缓存，预览 / 源码切换复用原生 WebView，纯 UI 通知不再序列化 SQLite 工作区。
 - 响应支持 JSON / HTML / CSS / JavaScript / XML 高亮、源码 / 原始视图、响应头、内置检查结果及复制。HTML 响应增加“预览”，运行 `cargo run -p glint-api --features webview` 启用 Wry 原生渲染（macOS / Windows 适配，macOS 验证）。预览使用实际响应正文，展示静态 HTML / CSS，不执行脚本；未启用 feature 时提供运行命令提示。
-- 环境管理使用独立详情页，变量复用 `DataTable` 展示；表格内直接编辑名称、值和类型，支持添加行、名称搜索、复制引用和删除确认。通过“保存更改”统一校验并提交，“放弃更改”恢复已保存配置；未保存的编辑不参与请求。每个环境保留独立草稿。敏感值默认隐藏，点击眼睛后编辑。名称须以英文字母或下划线开头，只含英文字母、数字、下划线，同一环境不能重名。浏览环境不会更改当前请求，点击“设为全局环境”应用。支持明暗主题。
+- 环境变量分为**全局变量**和**集合变量**，都按开发、生产等环境分别保存。已有工作区的变量保留为全局变量，供所有集合读取；集合变量仅对所属集合可见，同名时覆盖全局值，删除覆盖后恢复读取全局值。模板引用、OAuth、HTTP/SSE、WebSocket 与插件共享此规则，补全也只显示当前请求可见的变量。
+- 环境管理顶部切换“全局变量 / 集合变量”；也可从集合的“…”菜单进入“集合变量”。切换作用域前需保存或放弃当前草稿；代理仍为环境的全局设置。集合重命名保留变量，删除环境同时删除该环境下的集合变量。选择“不使用环境”时仍可管理与提取该集合的独立变量。
+- 环境管理使用独立详情页，变量复用 `DataTable` 展示；表格内直接编辑名称、值和类型，支持添加行、名称搜索、复制引用和删除确认。通过“保存更改”统一校验并提交，“放弃更改”恢复已保存配置；未保存的编辑不参与请求。每个环境保留独立草稿。敏感值默认隐藏，点击眼睛后编辑。名称须以英文字母或下划线开头，只含英文字母、数字、下划线，同一环境的同一作用域内不能重名。浏览环境不会更改当前请求，点击“设为全局环境”应用。支持明暗主题。
 
 | 快捷键 | 操作 |
 | --- | --- |
@@ -125,7 +165,7 @@ cargo check --workspace --all-targets --all-features
 cargo test -p glint-api
 ```
 
-URL、Token、参数、请求头、Cookie 和 JSON 请求体支持模板补全：输入 `{{` 展示当前全局环境的变量名和常用模板函数，继续输入可筛选；↑ / ↓ 选择，Tab / Enter 插入，Esc 或点击外部关闭。补全会补齐 `}}`，已有结束括号不会重复插入。敏感变量只显示名称；全局环境切换和后置提取后候选自动刷新。
+URL、Token、参数、请求头、Cookie 和 JSON 请求体支持模板补全：输入 `{{` 展示当前环境中该集合可见的变量名和常用模板函数，继续输入可筛选；↑ / ↓ 选择，Tab / Enter 插入，Esc 或点击外部关闭。补全会补齐 `}}`，已有结束括号不会重复插入。敏感变量只显示名称；全局环境切换和后置提取后候选自动刷新。
 
 模板方法可用于 URL、参数、请求头、Cookie 覆盖、Bearer Token、请求体和环境变量值。环境设置页提供点击复制的示例；不使用环境也能使用内置方法。
 
@@ -145,6 +185,28 @@ URL、Token、参数、请求头、Cookie 和 JSON 请求体支持模板补全�
 参数支持单引号或双引号。同次发送中，相同方法表达式（去除两端空白后）复用结果，所有时间方法使用同一时刻；再次发送会重新生成。需要不同随机值时，可使用不同参数，如 `random_string(16)` 和 `random_string(24)`。编辑徽标中的随机值是预览，实际发送时重新生成；响应区的“请求”快照展示实际值。方法不自动进行 JSON 转义，查询参数仍由参数表自动编码。
 
 Cookie 提取区分名称大小写，读取已启用的 Cookie 请求头并应用 Cookie 覆盖项，同名覆盖项优先。支持 Cookie 值中的环境变量和方法引用；缺失 Cookie、循环引用、非法参数或时间格式均在发送前报错。这里只读取当前请求配置，不读取响应 Set-Cookie 或浏览器 Cookie。
+
+## OAuth 2.0 用户授权
+
+在请求的“身份验证”中选择 **OAuth 2.0**，填写授权地址、Token 地址、Client ID、回调地址和 Scope。从 **授权预设 → WPS 用户授权** 中选择内置插件的预设，可填入 WPS 的接口地址与 `kso.user_base.read`，默认关闭该文档尚未声明支持的 PKCE。WPS 多个 Scope 使用英文逗号分隔；其他服务商按其文档配置。Client ID 与 Secret 并排填写，接口地址使用紧凑对齐表单，底部固定授权状态与主操作。客户端认证默认将 Client ID / Secret 放在表单中；“高级设置”默认收起，其中可选用 Basic 认证、PKCE S256 和手动回调。
+
+先在服务商后台登记完全一致的回调地址；自动回调默认 `http://127.0.0.1:17943/oauth/callback`，只监听本机 IPv4 回环地址。点击 **浏览器授权** 后在系统浏览器中登录并同意权限，工作台校验本次随机 state、回调地址、参数唯一性和会话有效期，再用授权码换取 Token。会话 10 分钟超时，支持取消；端口被占用时可换端口。服务商是否接受 HTTP 本机回调以其后台规则为准，WPS 文档没有保证支持本机回调。
+
+如果服务商要求已登记的 HTTPS 回调，可启用 **手动回调**：先点击“浏览器授权”，在浏览器跳转至你自己的回调页后，将包含 `code` 和 `state` 的完整地址粘贴回来，点击 **完成授权**。这仍校验本次 state 和回调地址；不能直接粘贴任意历史授权码。回调页需由开发者提供，并保留地址中的参数。
+
+**飞书用户授权**：选择 **授权预设 → 飞书用户授权**，填入飞书应用的 App ID（Client ID）与 App Secret（Client Secret），并在开发者后台“安全设置”登记相同回调地址。预设使用 `https://accounts.feishu.cn/oauth/v3/token`，默认通过表单传递应用凭据、关闭 PKCE。Scope 使用空格分隔，按需添加应用已开通的用户权限；默认的 `offline_access` 用于获取刷新令牌，需在“权限管理”开通。如后台显示“刷新 user_access_token”开关，还需启用并发布。仅保留 `offline_access` 不代表已获取业务权限。参考飞书官方的[授权码](https://open.feishu.cn/document/authentication-management/access-token/obtain-oauth-code)、[Token 交换](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3)与[刷新](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/refresh-user-access-token-v3)文档。
+
+OAuth 的授权地址、Token 地址、Client ID、回调地址、Scope 和本次输入的 Client Secret 均支持当前环境中的 `{{变量名}}`，例如 `{{wps_app_id}}` 与 `{{wps_app_secret}}`，并提供变量补全。授权、刷新和发送前解析，编辑器与请求草稿保留模板原文；未定义、空值或循环引用会提示错误。凭据按解析后的配置隔离，同一环境的 Client ID 等配置值变更后需重新授权，不会复用旧应用的 Token。Secret 引用解析后仅用于本次授权并保存在系统凭据库，环境变量本身仍按已有工作区存储规则保存。
+
+首次授权或更换密钥时填写 Client Secret（输入内容可见，提交时清空）；留空时沿用此连接已有的系统凭据。Client Secret、access_token 和 refresh_token 成对保存在 macOS Keychain、Windows Credential Store 或 Linux Secret Service 中，不能访问凭据库时会报错，不回退到明文文件。SQLite、版本、工作区导出和 MCP 中仅保存协议配置与连接 ID，不保存这些新凭据。请求快照与 cURL 始终隐藏注入的 OAuth Authorization，包括 MCP 的 `include_secrets: true`；原有手工 Bearer / 环境变量的存储方式不变。
+
+HTTP、SSE 和 WebSocket 握手发送前检查授权，Token 临近到期（30 秒内）时刷新；同一进程的刷新操作串行化，避免重复使用已轮换的 refresh_token。刷新成功后在系统凭据库一次替换整组凭据，默认保留首次授权的 refresh_token 截止时间；飞书预设按每次响应的 `refresh_token_expires_in` 更新轮换令牌的截止时间，响应缺失时保留旧值；过期或刷新失败会提示重新授权。OAuth Token 接口使用当前环境的代理，始终验证 TLS 证书，不跟随重定向。WPS 的授权和 Token 接口不执行 KSO-1 插件；业务请求仍可自行启用已有签名插件。
+
+凭据按工作区路径、环境名、连接 ID 和协议配置隔离；修改应用、Scope 或回调配置后需要重新授权。切换请求或环境会取消等待中的授权。目录设置的“身份验证”可选择 **使用当前请求的 OAuth 配置**，保存后新建请求继承同一连接；现有请求不受目录默认配置的后续变更影响。**清除本地授权** 删除当前连接的本机凭据，服务商端撤销需到其账号设置中操作。
+
+WPS 与飞书的预设配置分别来自独立插件 `plugins/wps-oauth/glint-plugin.json` 和 `plugins/feishu-oauth/glint-plugin.json`，贡献点为 `oauth.preset`；选择时不执行 JavaScript，也不向预设插件提供密钥或 Token。自定义授权服务同样可以通过本地或远程插件提供，清单格式见根目录 [插件说明](../../docs/plugins.md#oauth-presets)。预设复制后由请求自行保存，插件更新或移除不会修改已有配置。
+
+此功能用于 API 工作台调试开发者自己的应用。WPS 官方流程要求在服务端换取、刷新 Token 及调用接口；若面向最终用户发布，需要部署授权后端，不能在安装包内放入统一 APPKEY。参见 [WPS 用户授权流程](https://365.kdocs.cn/3rd/open/documents/app-integration-dev/wps365/server/certification-authorization/user-authorization/flow)。
 
 ## 请求插件
 
@@ -167,3 +229,9 @@ Cookie 提取区分名称大小写，读取已启用的 Cookie 请求头并应�
 自部署服务、发布 CLI 和协议见根目录 [插件仓库说明](../../docs/plugin-registry.md)。当前服务提供管理 API 与 CLI，尚无网页管理后台；客户端不保存发布令牌。
 
 发送前校验失败或前置动作执行失败时显示错误 Toast（10 秒后自动收起，悬停暂停，可手动关闭），说明当前环境和具体原因。缺失或未填写的动作环境变量会按名称列出；提示不包含变量值。相同原因保留在响应错误区与执行轨迹中。
+
+## Custom update source and Mac installers
+
+Version 0.1.4 adds **软件更新 → 更新源设置**. Save a distribution base URL and a trusted Ed25519 public key to replace GitHub checks/downloads; use the gateway preset for this project's mirror, or restore GitHub at any time. Publishing instructions and HTTP routes are in [the distribution guide](../../docs/plugin-registry.md#software-distribution).
+
+The release workflow builds Windows x64 Setup plus macOS Apple Silicon and Intel DMGs. Run `bash crates/glint-api/packaging/macos/build-macos.sh` on a Mac for a native-architecture `.app` and DMG. Mac installation is drag-to-Applications; Mac updates currently require manually replacing the app. Default Mac builds have ad-hoc signing only, without Developer ID signing or Apple notarization. Set `GLINT_API_CODESIGN_IDENTITY` to use an available signing certificate (notarization remains separate). Release artifacts include SHA-256 sidecars.

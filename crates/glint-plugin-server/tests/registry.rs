@@ -232,3 +232,64 @@ async fn failed_install_preserves_previous_version_and_store_refuses_replayed_in
     .unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn public_catalogue_and_skill_are_embedded_with_restricted_headers() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, server) = start(root.path()).await;
+    let client = reqwest::Client::new();
+    for (path, mime, needle) in [
+        ("/", "text/html", "浏览插件"),
+        ("/catalog.css", "text/css", "prefers-reduced-motion"),
+        ("/catalog.js", "text/javascript", "textContent"),
+        ("/glint-api-icon.svg", "image/svg+xml", "Glint API"),
+        (
+            "/skills/glint-plugin-dev/SKILL.md",
+            "text/plain",
+            "name: glint-plugin-dev",
+        ),
+    ] {
+        let response = client
+            .get(format!("{}{path}", source.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with(mime)
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("script-src 'self'")
+        );
+        assert!(response.text().await.unwrap().contains(needle));
+    }
+    let response = client
+        .get(format!(
+            "{}/skills/glint-plugin-dev/SKILL.md?download=1",
+            source.url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"SKILL.md\""
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/signing.key", source.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    server.abort();
+}

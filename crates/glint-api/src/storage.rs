@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 pub struct Workspace {
     #[serde(default)]
+    pub update_source: Option<super::updater::UpdateSource>,
+    #[serde(default)]
     pub selected_environment: usize,
     pub requests: Vec<Request>,
     pub collections: Vec<RequestGroups>,
@@ -20,6 +22,7 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            update_source: None,
             requests: vec![],
             collections: vec![],
             selected_environment: 0,
@@ -33,7 +36,7 @@ impl Default for Workspace {
     }
 }
 impl Workspace {
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.environments.first().map(String::as_str) != Some("不使用环境")
             || self.environments.len() != self.variables.len()
             || self.selected_environment >= self.environments.len()
@@ -43,14 +46,49 @@ impl Workspace {
         {
             return Err("工作区数据结构不完整".into());
         }
+        let mut request_ids = std::collections::HashSet::new();
+        for request in &self.requests {
+            if uuid::Uuid::parse_str(&request.id).is_err() || !request_ids.insert(&request.id) {
+                return Err("请求 ID 无效或重复".into());
+            }
+            let mut ids = std::collections::HashSet::new();
+            if request
+                .versions
+                .iter()
+                .chain(&request.history)
+                .any(|r| uuid::Uuid::parse_str(&r.id).is_err() || !ids.insert(&r.id))
+            {
+                return Err("版本或历史 ID 无效或重复".into());
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        if self
+            .environments
+            .iter()
+            .any(|name| name.trim().is_empty() || !names.insert(name))
+        {
+            return Err("环境名称为空或重复".into());
+        }
         for environment in &self.variables {
-            environment.proxy.validate()?;
+            environment.validate()?;
         }
         if self.variables[0].proxy.enabled {
             return Err("不使用环境时不能启用环境代理".into());
         }
         let mut collection_names = std::collections::HashSet::new();
+        let mut collection_ids = std::collections::HashSet::new();
         for collection in &self.collections {
+            if uuid::Uuid::parse_str(&collection.id).is_err()
+                || !collection_ids.insert(&collection.id)
+            {
+                return Err("集合 ID 无效或重复".into());
+            }
+            for (name, variables) in &collection.environments {
+                if !self.environments.contains(name) || variables.proxy != Default::default() {
+                    return Err("集合环境引用了不存在的环境或包含代理设置".into());
+                }
+                variables.validate()?;
+            }
             let mut paths = std::collections::HashSet::new();
             if collection.collection.trim().is_empty()
                 || !collection_names.insert(&collection.collection)
@@ -88,7 +126,7 @@ impl Workspace {
 }
 
 pub struct Store {
-    connection: Connection,
+    pub(super) connection: Connection,
     last_saved: Option<String>,
     #[cfg(test)]
     pub(super) serializations: usize,
@@ -154,6 +192,21 @@ impl Store {
             return Err("数据库版本较新，请使用更新版本的 Glint API".into());
         }
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL); COMMIT;").map_err(|e| e.to_string())?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mcp_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at_ms INTEGER NOT NULL,
+            client TEXT NOT NULL,
+            rpc_id TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            arguments TEXT NOT NULL,
+            result TEXT NOT NULL
+        ); CREATE INDEX IF NOT EXISTS mcp_calls_chronological ON mcp_calls(started_at_ms DESC,id DESC);",
+            )
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             connection,
             last_saved: None,
@@ -235,7 +288,25 @@ impl Store {
         }
         workspace.curls.resize(workspace.requests.len(), None);
         workspace.validate()?;
+        let needs_ids = data.as_ref().is_some_and(|data| {
+            serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|v| v["requests"].as_array().cloned())
+                .is_some_and(|requests| {
+                    requests.iter().any(|r| {
+                        r.get("id").is_none()
+                            || ["versions", "history"].iter().any(|key| {
+                                r[key].as_array().is_some_and(|records| {
+                                    records.iter().any(|record| record.get("id").is_none())
+                                })
+                            })
+                    })
+                })
+        });
         self.last_saved = data;
+        if needs_ids {
+            self.save(&workspace)?;
+        }
         Ok(workspace)
     }
     pub fn save(&mut self, workspace: &Workspace) -> Result<(), String> {
@@ -272,6 +343,8 @@ mod tests {
         requests[3].group = "普通目录".into();
         let data = Workspace {
             collections: vec![RequestGroups {
+                id: crate::model::new_id(),
+                environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "Test API".into(),
@@ -337,6 +410,8 @@ mod tests {
     fn invalid_folder_references_and_missing_parents_are_rejected() {
         let mut data = Workspace {
             collections: vec![RequestGroups {
+                id: crate::model::new_id(),
+                environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "Test API".into(),
@@ -404,6 +479,8 @@ mod tests {
             assert!(data.requests.is_empty() && data.collections.is_empty());
             assert_eq!(data.environments.len(), 1);
             data.collections.push(RequestGroups {
+                id: crate::model::new_id(),
+                environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "My API".into(),
@@ -418,6 +495,7 @@ mod tests {
                 ..Draft::default()
             };
             let record = Record {
+                id: crate::model::new_id(),
                 tag: String::new(),
                 environment_name: None,
                 draft: draft.clone(),
@@ -428,13 +506,17 @@ mod tests {
                 exchange: None,
             };
             data.requests.push(Request {
+                id: crate::model::new_id(),
                 tree_order: 0,
                 name: "Request".into(),
                 collection: "My API".into(),
                 group: "未分组".into(),
                 draft,
                 versions: vec![record.clone()],
-                history: vec![record],
+                history: vec![Record {
+                    id: crate::model::new_id(),
+                    ..record
+                }],
             });
             data.traces.push(vec![]);
             data.responses.push(Some(HttpResponse {
@@ -530,5 +612,74 @@ mod tests {
             .query_row("SELECT data FROM workspace", [], |r| r.get(0))
             .unwrap();
         assert_eq!(data, "bad json");
+    }
+    #[test]
+    fn mcp_legacy_ids_migrate_once_and_reject_ambiguous_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let mut request = crate::model::test_requests().remove(0);
+        let version = Record {
+            id: crate::model::new_id(),
+            tag: String::new(),
+            environment_name: None,
+            draft: request.draft.clone(),
+            label: "v1".into(),
+            time: "now".into(),
+            detail: String::new(),
+            elapsed_ms: None,
+            exchange: None,
+        };
+        request.versions.push(version.clone());
+        request.history.push(Record {
+            id: crate::model::new_id(),
+            ..version
+        });
+        let workspace = Workspace {
+            collections: vec![RequestGroups::new(std::slice::from_ref(&request))],
+            requests: vec![request],
+            traces: vec![vec![]],
+            responses: vec![None],
+            previews: vec![None],
+            curls: vec![None],
+            ..Workspace::default()
+        };
+        let mut legacy = serde_json::to_value(workspace).unwrap();
+        let request = &mut legacy["requests"][0];
+        request.as_object_mut().unwrap().remove("id");
+        for key in ["versions", "history"] {
+            for record in request[key].as_array_mut().unwrap() {
+                record.as_object_mut().unwrap().remove("id");
+            }
+        }
+        let mut store = Store::open(&path).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspace(id,data) VALUES(1,?1)",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        let migrated = store.load().unwrap();
+        let ids = (
+            &migrated.requests[0].id,
+            &migrated.requests[0].versions[0].id,
+            &migrated.requests[0].history[0].id,
+        );
+        let reloaded = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(
+            ids,
+            (
+                &reloaded.requests[0].id,
+                &reloaded.requests[0].versions[0].id,
+                &reloaded.requests[0].history[0].id
+            )
+        );
+        let mut invalid = reloaded;
+        invalid.requests[0].history[0].id = invalid.requests[0].versions[0].id.clone();
+        assert!(store.save(&invalid).is_err());
+        assert_ne!(
+            store.load().unwrap().requests[0].history[0].id,
+            invalid.requests[0].history[0].id
+        );
     }
 }

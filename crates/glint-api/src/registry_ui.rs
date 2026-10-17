@@ -49,7 +49,7 @@ impl Workbench {
         }));
         cx.notify();
     }
-    fn refresh_registry(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_registry(&mut self, cx: &mut Context<Self>) {
         self.registry_operation(
             || {
                 let store = plugins::registry_store()?;
@@ -59,14 +59,7 @@ impl Workbench {
                     let index = store.refresh(&client, &source)?;
                     for release in index.releases {
                         if release.supports("glint-api", updater::VERSION)
-                            && (release.manifest.contributions.len() > 0
-                                || release.manifest.hooks
-                                    == std::collections::BTreeSet::from([plugins::HOOK.into()]))
-                            && release
-                                .manifest
-                                .contributions
-                                .iter()
-                                .all(|c| c.kind == plugins::HOOK)
+                            && plugins::validate_manifest(&release.manifest).is_ok()
                         {
                             releases.push((source.clone(), release));
                         }

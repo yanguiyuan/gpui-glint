@@ -3,7 +3,7 @@ use model::{DefaultSection as Section, DirectoryDefaults};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct DirectorySettings {
-    collection: usize,
+    pub(super) collection: usize,
     path: String,
     title: String,
     theme: ThemePreset,
@@ -13,6 +13,8 @@ pub(super) struct DirectorySettings {
     selected: Section,
     endpoint: Entity<SelectField>,
     authentication: Entity<SelectField>,
+    oauth: Option<oauth::Config>,
+    oauth_source: Option<oauth::Config>,
     body: Entity<CodeCard>,
     body_format: BodyFormat,
     rows: BTreeMap<Section, Vec<PairInput>>,
@@ -85,8 +87,10 @@ impl DirectorySettings {
         let draft = groups.request_defaults(&path);
         let endpoint = cx.new(|cx| {
             let mut field = SelectField::new(
-                ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-                    .map(|s| SelectOption::new(s, s)),
+                [
+                    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WS",
+                ]
+                .map(|s| SelectOption::new(s, s)),
                 "{{baseurl}}/path",
                 cx,
             );
@@ -101,11 +105,24 @@ impl DirectorySettings {
                 [
                     SelectOption::new("none", "No Auth"),
                     SelectOption::new("bearer", "Bearer"),
+                    SelectOption::new("oauth2", "OAuth 2.0").disabled(draft.oauth.is_none()),
                 ],
                 "Token / {{api_token}}",
                 cx,
             );
-            field.set_selected(Some(if draft.auth { "bearer" } else { "none" }.into()), cx);
+            field.set_selected(
+                Some(
+                    if draft.oauth.is_some() {
+                        "oauth2"
+                    } else if draft.auth {
+                        "bearer"
+                    } else {
+                        "none"
+                    }
+                    .into(),
+                ),
+                cx,
+            );
             field.set_text(draft.token.clone(), cx);
             field.set_theme(theme, cx);
             field.set_completions(completions.clone(), cx);
@@ -208,6 +225,8 @@ impl DirectorySettings {
             selected: Section::Endpoint,
             endpoint,
             authentication,
+            oauth: draft.oauth.clone(),
+            oauth_source: None,
             body,
             body_format: draft.body_format,
             rows,
@@ -280,6 +299,9 @@ impl DirectorySettings {
                 .map(|s| s.to_string())
                 .unwrap_or("GET".into()),
             url: self.endpoint.read(cx).value().text.to_string(),
+            oauth: (self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"))
+                .then(|| self.oauth.clone())
+                .flatten(),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
             token: self.authentication.read(cx).value().text.to_string(),
             params: pairs(&self.rows[&Section::Params]),
@@ -509,7 +531,15 @@ impl Render for DirectorySettings {
         } else {
             panel = panel.child(match section {
                 Section::Endpoint => div().child(self.endpoint.clone()),
-                Section::Auth => div().child(self.authentication.clone()),
+                Section::Auth => div().flex().flex_col().gap_2().child(self.authentication.clone())
+                    .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("OAuth 配置可从当前请求复制；目录与新建请求共享连接，同一环境复用系统凭据。"))
+                    .when(self.oauth_source.is_some(), |view| view.child(Button::new("使用当前请求的 OAuth 配置").kind(ButtonKind::Plain).theme(self.theme).render().on_click(cx.listener(|this, _, _, cx| {
+                        this.oauth = this.oauth_source.clone();
+                        this.authentication.update(cx, |field, cx| {
+                            field.set_options([SelectOption::new("none", "No Auth"), SelectOption::new("bearer", "Bearer"), SelectOption::new("oauth2", "OAuth 2.0")], cx);
+                            field.set_selected(Some("oauth2".into()), cx); field.set_text("", cx);
+                        }); cx.notify();
+                    })))),
                 Section::Params | Section::Headers | Section::Cookies | Section::Extractors => {
                     self.pairs_view(section, false, cx)
                 }
@@ -647,13 +677,13 @@ impl Workbench {
         let groups = self.collections[collection].clone();
         let catalog = self.plugin_catalog.clone();
         let theme = self.theme;
-        let completions = self.environment_inputs[self.selected_environment(cx)]
-            .variables
-            .iter()
-            .map(|v| TextCompletion::new(&v.name, "环境变量"))
-            .collect();
+        let completions = self.environment_completions_for(cx, Some(&groups.collection));
+        let oauth_source = self.snapshot(cx).oauth;
         let editor = cx.new(|cx| {
-            DirectorySettings::new(collection, path, &groups, &catalog, theme, completions, cx)
+            let mut editor =
+                DirectorySettings::new(collection, path, &groups, &catalog, theme, completions, cx);
+            editor.oauth_source = oauth_source;
+            editor
         });
         self.directory_subscription =
             Some(cx.subscribe(&editor, |this, _, event: &SaveDefaults, cx| {

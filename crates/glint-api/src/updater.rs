@@ -18,15 +18,40 @@ const DOWNLOADS: &str = "https://github.com/yanguiyuan/gpui-glint/releases/downl
 const MAX_INSTALLER_SIZE: u64 = 200 * 1024 * 1024;
 const MAX_METADATA_SIZE: usize = 4 * 1024 * 1024;
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSource {
+    pub url: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub minimum_sequence: u64,
+}
+impl UpdateSource {
+    pub fn as_registry_source(&self) -> glint_plugin_registry::Source {
+        glint_plugin_registry::Source {
+            name: "software".into(),
+            url: self.url.clone(),
+            public_key: self.public_key.clone(),
+            allow_http: false,
+        }
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        self.as_registry_source().validate()
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Update {
     pub version: Version,
     pub url: String,
     pub size: u64,
     pub sha256: String,
+    pub source: Option<UpdateSource>,
 }
 impl Update {
     pub fn release_url(&self) -> String {
+        if let Some(source) = &self.source {
+            return format!("{}/#software", source.url.trim_end_matches('/'));
+        }
         format!(
             "https://github.com/yanguiyuan/gpui-glint/releases/tag/glint-api-v{}",
             self.version
@@ -98,6 +123,7 @@ fn select_update(releases: &[Release], current: &Version) -> Result<Option<Updat
         url: asset.url.clone(),
         size: asset.size,
         sha256,
+        source: None,
     }))
 }
 
@@ -195,6 +221,118 @@ pub async fn check() -> Result<Option<Update>, String> {
         .map_err(|error| format!("更新检查中断：{error}"))?
 }
 
+fn custom_client() -> Result<Client, String> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(1800))
+        .user_agent(format!("glint-api/{VERSION}"))
+        .build()
+        .map_err(|_| "无法初始化分发源客户端".into())
+}
+pub async fn check_custom(
+    source: UpdateSource,
+    current: &Version,
+) -> Result<(Option<Update>, u64), String> {
+    source.validate()?;
+    let current = current.clone();
+    runtime()?
+        .spawn(async move {
+            let mut response = custom_client()?
+                .get(glint_plugin_registry::software::feed_url(
+                    &source.as_registry_source(),
+                    "glint-api",
+                )?)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(|e| format!("无法连接自定义更新源：{}", e.without_url()))?;
+            if !response.status().is_success() {
+                return Err(format!("自定义更新源返回 HTTP {}", response.status()));
+            }
+            let mut bytes = vec![];
+            while let Some(chunk) = response.chunk().await.map_err(|_| "无法读取更新目录")?
+            {
+                if bytes.len() + chunk.len() > MAX_METADATA_SIZE * 2 {
+                    return Err("更新目录过大".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let signed: glint_plugin_registry::SignedIndex =
+                serde_json::from_slice(&bytes).map_err(|_| "自定义更新源不是有效的签名版本目录")?;
+            let feed = glint_plugin_registry::software::verify(
+                &signed,
+                &source.public_key,
+                "glint-api",
+                source.minimum_sequence,
+            )
+            .map_err(|e| format!("自定义更新源校验失败：{e}"))?;
+            let selected = select_custom(&feed, &source, &current)?;
+            Ok((selected, feed.sequence))
+        })
+        .await
+        .map_err(|_| "更新检查中断")?
+}
+fn select_custom(
+    feed: &glint_plugin_registry::software::Feed,
+    source: &UpdateSource,
+    current: &Version,
+) -> Result<Option<Update>, String> {
+    let newest = feed
+        .releases
+        .iter()
+        .filter(|r| !r.yanked)
+        .filter_map(|r| {
+            Version::parse(&r.version)
+                .ok()
+                .filter(|v| v.pre.is_empty() && v.build.is_empty() && v > current)
+                .map(|v| (r, v))
+        })
+        .max_by(|(_, a), (_, b)| a.cmp(b));
+    let Some((release, version)) = newest else {
+        return Ok(None);
+    };
+    let artifact = release
+        .artifacts
+        .iter()
+        .find(|a| {
+            a.target == "x86_64-pc-windows-msvc"
+                && a.name == format!("Glint-API-{version}-windows-x64-setup.exe")
+        })
+        .ok_or("最新版本尚未提供 Windows 安装包")?;
+    Ok(Some(Update {
+        version,
+        url: glint_plugin_registry::software::artifact_url(
+            &source.as_registry_source(),
+            "glint-api",
+            artifact,
+        )?,
+        size: artifact.size,
+        sha256: artifact.sha256.clone(),
+        source: Some(source.clone()),
+    }))
+}
+fn download_request(update: &Update) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(source) = &update.source {
+        source.validate()?;
+        let expected = format!(
+            "{}/v1/apps/glint-api/assets/{}/Glint-API-{}-windows-x64-setup.exe",
+            source.url.trim_end_matches('/'),
+            update.sha256,
+            update.version
+        );
+        if update.url != expected {
+            return Err("自定义更新安装包地址与已验证的源不一致".into());
+        }
+        return Ok(custom_client()?.get(&update.url));
+    }
+    authenticate(
+        client()?
+            .get(&update.url)
+            .header("Accept", "application/octet-stream"),
+    )
+}
 pub fn check_blocking() -> Result<Option<Update>, String> {
     runtime()?.block_on(check())
 }
@@ -277,14 +415,10 @@ pub fn start_download(
                 "Glint-API-{}-windows-x64-setup.exe",
                 update.version
             ));
-            let response = authenticate(
-                client()?
-                    .get(&update.url)
-                    .header("Accept", "application/octet-stream"),
-            )?
-            .send()
-            .await
-            .map_err(|error| format!("下载更新失败：{}", error.without_url()))?;
+            let response = download_request(&update)?
+                .send()
+                .await
+                .map_err(|error| format!("下载更新失败：{}", error.without_url()))?;
             save_download(response, &path, &update, &sender).await?;
             Ok(path)
         }
@@ -642,6 +776,141 @@ mod tests {
         bad.assets[0].size = MAX_INSTALLER_SIZE + 1;
         assert!(select_update(&[bad], &current).is_err());
     }
+    #[test]
+    fn custom_source_checks_signed_feed_download_and_origin() {
+        use ed25519_dalek::SigningKey;
+        use glint_plugin_registry::{digest, info, now, software as spec};
+        use std::net::TcpListener;
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let info = info(&key);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = UpdateSource {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            public_key: info.public_key,
+            minimum_sequence: 2,
+        };
+        let artifact = spec::Artifact {
+            target: "x86_64-pc-windows-msvc".into(),
+            name: "Glint-API-0.1.10-windows-x64-setup.exe".into(),
+            size: 3,
+            sha256: digest(b"abc"),
+        };
+        let mut feed = spec::Feed {
+            format: 1,
+            app_id: "glint-api".into(),
+            source_id: info.source_id,
+            sequence: 2,
+            issued_at: now(),
+            expires_at: now() + 3600,
+            releases: vec![spec::Release {
+                version: "0.1.10".into(),
+                notes: String::new(),
+                published_at: 0,
+                artifacts: vec![artifact.clone()],
+                yanked: false,
+            }],
+        };
+        let signed = serde_json::to_vec(&spec::sign(&feed, &key).unwrap()).unwrap();
+        let asset_path = format!(
+            "/v1/apps/glint-api/assets/{}/{}",
+            artifact.sha256, artifact.name
+        );
+        let server = std::thread::spawn(move || {
+            for (expected, body) in [
+                ("/v1/apps/glint-api/releases".to_owned(), signed),
+                (asset_path, b"abc".to_vec()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = vec![];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut b = [0];
+                    stream.read_exact(&mut b).unwrap();
+                    request.push(b[0]);
+                    assert!(request.len() < 16384);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("GET {expected} HTTP/1.1")));
+                assert!(!request.to_ascii_lowercase().contains("authorization:"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        runtime().unwrap().block_on(async {
+            let (update, sequence) =
+                check_custom(source.clone(), &Version::parse("0.1.9").unwrap())
+                    .await
+                    .unwrap();
+            assert_eq!(sequence, 2);
+            let update = update.unwrap();
+            assert_eq!(update.version.to_string(), "0.1.10");
+            let (sender, _) = async_channel::bounded(32);
+            let path = directory.path().join("setup.exe");
+            save_download(
+                download_request(&update).unwrap().send().await.unwrap(),
+                &path,
+                &update,
+                &sender,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read(path).unwrap(), b"abc");
+            let mut redirected = update;
+            redirected.url = "https://example.com/setup.exe".into();
+            assert!(download_request(&redirected).is_err());
+        });
+        server.join().unwrap();
+        let current = Version::parse("0.1.10").unwrap();
+        assert!(select_custom(&feed, &source, &current).unwrap().is_none());
+        feed.releases[0].yanked = true;
+        assert!(
+            select_custom(&feed, &source, &Version::parse("0.1.0").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        feed.releases[0].yanked = false;
+        feed.releases[0].artifacts.clear();
+        assert!(select_custom(&feed, &source, &Version::parse("0.1.0").unwrap()).is_err());
+        let mut insecure = source;
+        insecure.url = "http://example.com/plugins".into();
+        assert!(insecure.validate().is_err());
+    }
+    #[test]
+    #[ignore = "Downloads from the deployed distribution service"]
+    fn downloads_published_installer_from_custom_source() {
+        let source = UpdateSource {
+            url: "https://gateway.yanguiyuan.cn/plugins".into(),
+            public_key: "x1+OcqKIYuboSgnxFik6ApNpjOU4HeJiD6nMgQSYIeQ=".into(),
+            minimum_sequence: 0,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        runtime().unwrap().block_on(async {
+            let (update, _) = check_custom(source, &Version::parse("0.1.0").unwrap())
+                .await
+                .unwrap();
+            let update = update.expect("Published release");
+            let (sender, _) = async_channel::bounded(32);
+            let path = directory.path().join("installer.exe");
+            save_download(
+                download_request(&update).unwrap().send().await.unwrap(),
+                &path,
+                &update,
+                &sender,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::metadata(path).unwrap().len(), update.size);
+            eprintln!(
+                "Verified custom release {}: {} bytes, SHA-256 {}",
+                update.version, update.size, update.sha256
+            );
+        });
+    }
     fn response(bytes: &'static [u8]) -> reqwest::Response {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -674,6 +943,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("setup.exe");
         let mut update = Update {
+            source: None,
             version: Version::parse("0.1.2").unwrap(),
             url: String::new(),
             size: 3,

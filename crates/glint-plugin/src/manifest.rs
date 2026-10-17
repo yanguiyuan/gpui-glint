@@ -12,7 +12,11 @@ pub struct Contribution {
     pub id: String,
     pub kind: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hook: String,
+    /// Inert configuration interpreted and validated by the host; never a host API grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +28,7 @@ pub struct Manifest {
     pub entry: String,
     #[serde(default)]
     pub capabilities: BTreeSet<String>,
+    #[serde(default)]
     pub hooks: BTreeSet<String>,
     #[serde(default)]
     pub contributions: Vec<Contribution>,
@@ -55,7 +60,7 @@ impl Manifest {
                 "Plugin entry must stay inside its directory".into(),
             ));
         }
-        if self.hooks.is_empty()
+        if (self.hooks.is_empty() && self.contributions.is_empty())
             || self.hooks.iter().any(|h| !valid_id(h))
             || self
                 .capabilities
@@ -73,7 +78,11 @@ impl Manifest {
                 || !valid_id(&c.kind)
                 || c.title.trim().is_empty()
                 || c.title.len() > 256
-                || !self.hooks.contains(&c.hook)
+                || if c.hook.is_empty() {
+                    c.data.is_none()
+                } else {
+                    !self.hooks.contains(&c.hook)
+                }
                 || !ids.insert(&c.id)
             {
                 return Err(PluginError("Invalid plugin contribution".into()));

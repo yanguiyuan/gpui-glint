@@ -1,4 +1,4 @@
-name: Glint API Windows Release
+name: Glint API Release
 
 on:
   push:
@@ -53,9 +53,45 @@ jobs:
           path: target/windows-installer/output/*
           if-no-files-found: error
 
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+      - name: Verify tag and architecture
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          version=$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' crates/glint-api/Cargo.toml)
+          test "$GITHUB_REF_TYPE" != tag || test "$GITHUB_REF_NAME" = "glint-api-v$version"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build and verify macOS DMG
+        run: bash crates/glint-api/packaging/macos/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glint-api-macos-${{ matrix.arch }}
+          path: |
+            target/macos-installer/output/*.dmg
+            target/macos-installer/output/*.dmg.sha256
+          if-no-files-found: error
+
   publish:
     if: github.ref_type == 'tag'
-    needs: windows
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,7 +99,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: glint-api-windows-setup
+          pattern: glint-api-*
+          merge-multiple: true
           path: dist
       - name: Publish GitHub Release
         env:

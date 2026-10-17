@@ -1,0 +1,23 @@
+{
+  "id": "com.feishu.oauth",
+  "name": "飞书用户授权",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": [],
+  "hooks": [],
+  "contributions": [
+    {
+      "id": "user-authorization",
+      "kind": "oauth.preset",
+      "title": "飞书用户授权",
+      "data": {
+        "authorization_url": "https://accounts.feishu.cn/open-apis/authen/v1/authorize",
+        "token_url": "https://accounts.feishu.cn/oauth/v3/token",
+        "scope": "offline_access",
+        "pkce": false,
+        "rolling_refresh_expiry": true
+      }
+    }
+  ]
+}

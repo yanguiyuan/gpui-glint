@@ -4,7 +4,7 @@ server {
     server_name plugins.example.com;
     ssl_certificate /etc/letsencrypt/live/plugins.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/plugins.example.com/privkey.pem;
-    client_max_body_size 2m;
+    client_max_body_size 210m; # Software uploads; JSON endpoints remain bounded by the server.
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;

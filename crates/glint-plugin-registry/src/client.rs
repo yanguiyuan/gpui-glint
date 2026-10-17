@@ -1,5 +1,6 @@
 use crate::*;
 use reqwest::blocking::{Client as HttpClient, Response};
+use sha2::Digest;
 use std::{io::Read, time::Duration};
 #[derive(Clone)]
 pub struct Client {
@@ -39,6 +40,142 @@ impl Client {
             return Err("Registry response too large".into());
         }
         Ok(bytes)
+    }
+    fn management<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+        &self,
+        source: &Source,
+        token: &str,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "Invalid management token")?;
+        auth.set_sensitive(true);
+        let response = self
+            .http
+            .post(Self::endpoint(source, path)?)
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .json(body)
+            .send()
+            .map_err(|_| "Software management request failed")?;
+        serde_json::from_slice(&Self::bytes(response, MAX_METADATA)?)
+            .map_err(|_| "Invalid software response".into())
+    }
+    pub fn software_feed(
+        &self,
+        source: &Source,
+        app: &str,
+        minimum_sequence: u64,
+    ) -> Result<software::Feed> {
+        let response = self
+            .http
+            .get(software::feed_url(source, app)?)
+            .send()
+            .map_err(|_| "Cannot reach software source")?;
+        let signed: SignedIndex = serde_json::from_slice(&Self::bytes(response, MAX_INDEX * 2)?)
+            .map_err(|_| "Invalid software feed envelope")?;
+        software::verify(&signed, &source.public_key, app, minimum_sequence)
+    }
+    pub fn software_upload(
+        &self,
+        source: &Source,
+        token: &str,
+        app: &str,
+        path: &std::path::Path,
+        target: &str,
+    ) -> Result<software::Artifact> {
+        source.validate()?;
+        if !software::valid_app(app) || !software::valid_name(target) {
+            return Err("Invalid software target or app".into());
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or("Invalid artifact filename")?;
+        if !software::valid_name(name) {
+            return Err("Invalid artifact filename".into());
+        }
+        let mut file = std::fs::File::open(path).map_err(|_| "Cannot open software artifact")?;
+        let size = file
+            .metadata()
+            .map_err(|_| "Cannot read artifact size")?
+            .len();
+        if size == 0 || size > software::MAX_ARTIFACT {
+            return Err("Invalid artifact size".into());
+        }
+        let mut hash = sha2::Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buffer).map_err(|_| "Cannot hash artifact")?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        let digest = format!("{:x}", hash.finalize());
+        let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "Invalid management token")?;
+        auth.set_sensitive(true);
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/apps/{app}/assets/{name}",
+                source.url.trim_end_matches('/')
+            ))
+            .query(&[("target", target)])
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(Duration::from_secs(1800))
+            .body(reqwest::blocking::Body::new(
+                std::fs::File::open(path).map_err(|_| "Cannot read software artifact")?,
+            ))
+            .send()
+            .map_err(|_| "Cannot upload software artifact")?;
+        let artifact: software::Artifact = serde_json::from_slice(&Self::bytes(response, 8192)?)
+            .map_err(|_| "Invalid artifact response")?;
+        artifact.validate()?;
+        if artifact.sha256 != digest
+            || artifact.size != size
+            || artifact.name != name
+            || artifact.target != target
+        {
+            return Err("Uploaded software artifact verification failed".into());
+        }
+        Ok(artifact)
+    }
+    pub fn software_publish(
+        &self,
+        source: &Source,
+        token: &str,
+        app: &str,
+        release: &software::Release,
+    ) -> Result<software::Release> {
+        software::feed_url(source, app)?;
+        release.validate()?;
+        self.management(source, token, &format!("apps/{app}/releases"), release)
+    }
+    pub fn software_yank(
+        &self,
+        source: &Source,
+        token: &str,
+        app: &str,
+        version: &str,
+        yanked: bool,
+    ) -> Result<software::Release> {
+        software::feed_url(source, app)?;
+        if semver::Version::parse(version).is_err() || version.len() > 100 {
+            return Err("Invalid software version".into());
+        }
+        self.management(
+            source,
+            token,
+            &format!(
+                "apps/{app}/releases/{version}/{}",
+                if yanked { "yank" } else { "restore" }
+            ),
+            &serde_json::json!({}),
+        )
     }
     pub fn inspect(&self, url: &str, allow_http: bool) -> Result<Info> {
         validate_url(url, allow_http)?;

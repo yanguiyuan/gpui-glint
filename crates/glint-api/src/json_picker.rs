@@ -238,6 +238,21 @@ impl Render for ExtractorCell {
             || host.environment_inputs[host.selected_environment(cx)]
                 .variables
                 .iter()
+                .chain(
+                    host.requests
+                        .get(host.active)
+                        .and_then(|r| {
+                            host.collections
+                                .iter()
+                                .find(|c| c.collection == r.collection)
+                        })
+                        .and_then(|c| {
+                            c.environments
+                                .get(host.environment_name(host.selected_environment(cx)))
+                        })
+                        .into_iter()
+                        .flat_map(|env| env.variables.iter()),
+                )
                 .any(|v| v.secret && v.name == name);
         let description = preview(host.response_json.as_ref(), path, sensitive);
         let theme = host.theme;

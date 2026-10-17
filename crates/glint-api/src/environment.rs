@@ -40,6 +40,25 @@ pub struct EnvironmentVariables {
     next_id: u64,
 }
 impl EnvironmentVariables {
+    pub fn validate(&self) -> Result<(), String> {
+        self.proxy.validate()?;
+        let rows = self
+            .variables
+            .iter()
+            .map(|v| (v.name.clone(), v.value.clone(), v.secret))
+            .collect::<Vec<_>>();
+        Self::default().replace(&rows)?;
+        let mut ids = std::collections::HashSet::new();
+        if self
+            .variables
+            .iter()
+            .any(|v| v.id >= self.next_id || !ids.insert(v.id))
+        {
+            return Err("环境变量 ID 无效或重复".into());
+        }
+        Ok(())
+    }
+
     /// Validate the complete table before replacing saved values, including renames.
     pub fn replace(&mut self, rows: &[(String, String, bool)]) -> Result<(), String> {
         let mut replacement = Self {

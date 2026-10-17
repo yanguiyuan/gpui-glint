@@ -8,11 +8,24 @@ gateway.yanguiyuan.cn {
             disable_http_challenge
         }
     }
+    redir /plugins /plugins/ 308
     handle_path /plugins/* {
-        request_body {
-            max_size 2MB
+        @software_upload {
+            method POST
+            path /v1/apps/*/assets/*
         }
-        reverse_proxy registry:8787
+        handle @software_upload {
+            request_body {
+                max_size 220MB
+            }
+            reverse_proxy registry:8787
+        }
+        handle {
+            request_body {
+                max_size 2MB
+            }
+            reverse_proxy registry:8787
+        }
     }
     handle {
         reverse_proxy api-gateway-gateway-1:80

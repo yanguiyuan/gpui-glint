@@ -197,3 +197,21 @@ fn approvals_are_bound_to_source_and_permissions() {
     p.manifest.capabilities.insert("database.write".into());
     assert!(!approval.matches(&p));
 }
+
+#[test]
+fn declarative_contributions_need_data_and_do_not_change_existing_wire_format() {
+    let original =
+        json!({"id":"one","kind":"request.before-send","title":"One","hook":"request.before-send"});
+    let contribution: Contribution = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(contribution).unwrap(), original);
+    let declaration = json!({"id":"test.presets","name":"Presets","version":"1.0.0","api_version":1,"entry":"main.js","contributions":[{"id":"provider","kind":"oauth.preset","title":"Provider","data":{"authorization_url":"https://auth.test/authorize"}}]});
+    let mut plugin = Plugin::from_source(
+        &declaration.to_string(),
+        "throw new Error('must not execute')",
+    )
+    .unwrap();
+    assert!(plugin.manifest.hooks.is_empty());
+    assert!(plugin.manifest.capabilities.is_empty());
+    plugin.manifest.contributions[0].data = None;
+    assert!(plugin.manifest.validate().is_err());
+}

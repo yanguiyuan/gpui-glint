@@ -16,6 +16,132 @@ pub(super) struct VariableInput {
     _subscriptions: Rc<Vec<Subscription>>,
 }
 impl Workbench {
+    pub(super) fn environment_values(
+        &self,
+        index: usize,
+        collection: Option<&str>,
+    ) -> environment::EnvironmentValues {
+        let mut values = self.environment_inputs[index].values();
+        if let Some(local) = collection
+            .and_then(|name| self.collections.iter().find(|c| c.collection == name))
+            .and_then(|c| c.environments.get(self.environment_name(index)))
+        {
+            values.0.extend(local.values().0);
+        }
+        values
+    }
+    pub(super) fn active_environment_values(&self, cx: &App) -> environment::EnvironmentValues {
+        self.environment_values(
+            self.selected_environment(cx),
+            self.requests
+                .get(self.active)
+                .map(|r| r.collection.as_str()),
+        )
+    }
+    pub(super) fn environment_completions(&self, cx: &App) -> Vec<TextCompletion> {
+        self.environment_completions_for(
+            cx,
+            self.requests
+                .get(self.active)
+                .map(|r| r.collection.as_str()),
+        )
+    }
+    pub(super) fn environment_completions_for(
+        &self,
+        cx: &App,
+        collection: Option<&str>,
+    ) -> Vec<TextCompletion> {
+        let index = self.selected_environment(cx);
+        let mut entries = std::collections::BTreeMap::new();
+        let local = collection
+            .and_then(|name| self.collections.iter().find(|c| c.collection == name))
+            .and_then(|c| c.environments.get(self.environment_name(index)));
+        for (variables, scope) in [
+            (Some(&self.environment_inputs[index]), "全局变量"),
+            (local, "集合变量"),
+        ] {
+            if let Some(variables) = variables {
+                for variable in &variables.variables {
+                    entries.insert(
+                        variable.name.clone(),
+                        TextCompletion::new(
+                            &variable.name,
+                            if variable.secret {
+                                format!("{scope} · 敏感")
+                            } else {
+                                scope.into()
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+        entries.into_values().collect()
+    }
+    pub(super) fn editor_environment(&self, index: usize) -> EnvironmentVariables {
+        if let Some(name) = &self.editing_variable_collection {
+            self.collections
+                .iter()
+                .find(|c| &c.collection == name)
+                .and_then(|c| c.environments.get(self.environment_name(index)))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.environment_inputs[index].clone()
+        }
+    }
+    pub(super) fn scoped_environment_mut(
+        &mut self,
+        index: usize,
+        collection: Option<&str>,
+    ) -> Result<&mut EnvironmentVariables, String> {
+        if let Some(name) = collection {
+            let environment = self.environment_name(index).to_owned();
+            let collection = self
+                .collections
+                .iter_mut()
+                .find(|c| c.collection == name)
+                .ok_or("集合不存在")?;
+            Ok(collection.environments.entry(environment).or_default())
+        } else {
+            Ok(&mut self.environment_inputs[index])
+        }
+    }
+    pub(super) fn set_variable_scope(
+        &mut self,
+        collection: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.editing_variable_collection == collection {
+            return Ok(());
+        }
+        if self.has_unsaved_environment(cx) {
+            return Err("请先保存或放弃当前作用域的修改".into());
+        }
+        if collection
+            .as_ref()
+            .is_some_and(|name| !self.collections.iter().any(|c| &c.collection == name))
+        {
+            return Err("集合不存在".into());
+        }
+        self.editing_variable_collection = collection;
+        self.reset_variable_rows(cx);
+        Ok(())
+    }
+    pub(super) fn mcp_environment_editor(&self, index: usize, cx: &App) -> serde_json::Value {
+        let rows = self.variable_rows[index]
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "name":row.name.read(cx).value(),"value":row.value.read(cx).value(),
+                    "secret":row.kind.read(cx).value().is_some_and(|kind| kind.as_ref() == "secret")
+                })
+            })
+            .collect::<Vec<_>>();
+        let proxy = &self.proxy_inputs[index];
+        serde_json::json!({"variables":rows,"proxy":{"enabled":proxy.enabled,"url":proxy.url.read(cx).value(),"skip_tls_verification":proxy.skip_tls_verification}})
+    }
+
     fn variable_input(
         &mut self,
         name: &str,
@@ -108,10 +234,14 @@ impl Workbench {
     pub(super) fn merge_extracted_variables(
         &mut self,
         index: usize,
+        collection: &str,
         names: &[String],
         cx: &mut Context<Self>,
     ) {
-        let variables = self.environment_inputs[index].variables.clone();
+        if self.editing_variable_collection.as_deref() != Some(collection) {
+            return;
+        }
+        let variables = self.editor_environment(index).variables;
         for variable in variables.iter().filter(|v| names.contains(&v.name)) {
             if let Some(row) = self.variable_rows[index]
                 .iter()
@@ -126,7 +256,7 @@ impl Workbench {
         }
         self.sync_variable_table(cx);
     }
-    fn reset_environment_rows(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn reset_environment_rows(&mut self, index: usize, cx: &mut Context<Self>) {
         let saved = self.environment_inputs[index].proxy.clone();
         let input = &mut self.proxy_inputs[index];
         input.enabled = saved.enabled;
@@ -134,7 +264,7 @@ impl Workbench {
         input
             .url
             .update(cx, |entry, cx| entry.set_value(saved.url, cx));
-        let variables = self.environment_inputs[index].variables.clone();
+        let variables = self.editor_environment(index).variables;
         self.variable_rows[index] = variables
             .iter()
             .map(|v| self.variable_input(&v.name, &v.value, v.secret, cx))
@@ -160,7 +290,8 @@ impl Workbench {
             .collect()
     }
     fn environment_dirty(&self, cx: &App) -> bool {
-        let saved: Vec<_> = self.environment_inputs[self.editing_environment]
+        let saved: Vec<_> = self
+            .editor_environment(self.editing_environment)
             .variables
             .iter()
             .map(|v| (v.name.clone(), v.value.clone(), v.secret))
@@ -186,7 +317,8 @@ impl Workbench {
                         )
                     })
                     .collect();
-                let variables: Vec<_> = saved
+                let variables: Vec<_> = self
+                    .editor_environment(index)
                     .variables
                     .iter()
                     .map(|v| (v.name.clone(), v.value.clone(), v.secret))
@@ -199,7 +331,7 @@ impl Workbench {
             })
     }
     pub(super) fn add_variable(&mut self, cx: &mut Context<Self>) {
-        if self.editing_environment == 0 {
+        if self.editing_environment == 0 && self.editing_variable_collection.is_none() {
             return;
         }
         let row = self.variable_input("", "", false, cx);
@@ -214,12 +346,15 @@ impl Workbench {
         let rows = self.variable_draft(cx);
         let index = self.editing_environment;
         let proxy = self.proxy_draft(cx);
-        match proxy
-            .validate()
-            .and_then(|_| self.environment_inputs[index].replace(&rows))
-        {
+        let scope = self.editing_variable_collection.clone();
+        match proxy.validate().and_then(|_| {
+            self.scoped_environment_mut(index, scope.as_deref())?
+                .replace(&rows)
+        }) {
             Ok(()) => {
-                self.environment_inputs[index].proxy = proxy;
+                if scope.is_none() {
+                    self.environment_inputs[index].proxy = proxy;
+                }
                 self.storage_dirty = true;
                 self.reset_environment_rows(index, cx);
                 self.sync_reference_inputs(cx);
@@ -495,16 +630,80 @@ impl Workbench {
                 ),
             )
     }
+    fn variable_scope_tabs(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut tabs = div().flex().items_center().gap_2();
+        let collection = self.editing_variable_collection.clone().or_else(|| {
+            self.collections
+                .get(self.current_collection)
+                .map(|c| c.collection.clone())
+        });
+        for (scope, title) in [
+            (None, "全局变量".to_owned()),
+            (
+                collection.clone(),
+                format!(
+                    "集合变量 · {}",
+                    collection.as_deref().unwrap_or("未选择集合")
+                ),
+            ),
+        ] {
+            if title.starts_with("集合") && scope.is_none() {
+                continue;
+            }
+            let active = self.editing_variable_collection == scope;
+            tabs = tabs.child(
+                Button::new(title)
+                    .kind(if active {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Gray
+                    })
+                    .size(ButtonSize::Mini)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector({
+                        let local = scope.is_some();
+                        move || {
+                            if local {
+                                "variable-scope-collection".into()
+                            } else {
+                                "variable-scope-global".into()
+                            }
+                        }
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Err(error) = this.set_variable_scope(scope.clone(), cx) {
+                            this.variable_error = Some(error);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        tabs.child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(self.theme.palette().text_muted))
+                .child("集合优先于全局，仅在所属集合生效"),
+        )
+    }
     pub(super) fn environment_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        if self.editing_environment == 0 {
+        if self.editing_environment == 0 && self.editing_variable_collection.is_none() {
             return div()
                 .size_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(p.text_muted))
-                .child("暂无环境，请从左侧创建环境");
+                .flex_col()
+                .gap_4()
+                .child(self.variable_scope_tabs(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(p.text_muted))
+                        .child("请选择或创建环境来管理全局变量；集合变量可单独设置。"),
+                );
         }
         let index = self.editing_environment;
         let applied = self.selected_environment(cx) == index;
@@ -513,6 +712,7 @@ impl Workbench {
             .flex()
             .flex_col()
             .gap_4()
+            .child(self.variable_scope_tabs(cx))
             .child(
                 div()
                     .flex()
@@ -523,7 +723,14 @@ impl Workbench {
                             .flex_1()
                             .text_size(px(20.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.environment_name(index).to_owned()),
+                            .child(format!(
+                                "{} · {}",
+                                self.environment_name(index),
+                                self.editing_variable_collection
+                                    .as_ref()
+                                    .map(|name| format!("集合 {name}"))
+                                    .unwrap_or_else(|| "全局".into())
+                            )),
                     )
                     .when(applied, |el| {
                         el.child(
@@ -598,7 +805,7 @@ impl Workbench {
                     .child(div().text_size(px(10.)).text_color(rgb(p.text_muted))
                         .child("用于 URL、参数、请求头、Cookie、认证和请求体；同次发送复用相同表达式，时间为 UTC。"))
             )
-            .child(self.environment_proxy_settings(cx))
+            .when(self.editing_variable_collection.is_none() && index != 0, |body| body.child(self.environment_proxy_settings(cx)))
             .when_some(self.variable_error.clone(), |el, error| {
                 el.child(
                     div()
@@ -704,6 +911,169 @@ impl Workbench {
                     .text_color(rgb(p.text_muted))
                     .child("敏感变量默认隐藏 · 已保存环境设置存储于本机 SQLite"),
             )
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[gpui::test]
+    fn scoped_variables_edit_override_extract_and_persist_without_cross_collection_leaks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scopes.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            for name in ["A", "B"] {
+                host.collections
+                    .push(RequestGroups::create_collection(name, &host.collections).unwrap());
+            }
+            host.current_collection = 0;
+            host.add_request(cx);
+            host.environment_names.push("Dev".into());
+            host.environment_inputs.push(Default::default());
+            host.variable_rows.push(vec![]);
+            host.add_proxy_input(cx);
+            host.environment_inputs[1]
+                .save(None, "host", "https://global.test", false)
+                .unwrap();
+            host.environment_inputs[1]
+                .save(None, "token", "global-secret", true)
+                .unwrap();
+            host.scoped_environment_mut(1, Some("A"))
+                .unwrap()
+                .save(None, "host", "https://a.test", false)
+                .unwrap();
+            host.scoped_environment_mut(1, Some("A"))
+                .unwrap()
+                .save(None, "only_a", "A", false)
+                .unwrap();
+            host.reset_variable_rows(cx);
+            host.show_environments = true;
+            host.editing_environment = 1;
+            host
+        });
+        let local = window.debug_bounds("variable-scope-collection").unwrap();
+        window.simulate_click(local.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            assert_eq!(host.editing_variable_collection.as_deref(), Some("A"));
+            assert_eq!(host.editor_environment(1).variables.len(), 2);
+            host.variable_rows[1][0]
+                .value
+                .update(cx, |entry, cx| entry.set_value("https://unsaved.test", cx));
+            assert_eq!(
+                host.environment_values(1, Some("A")).0["host"],
+                "https://a.test"
+            );
+            assert!(host.set_variable_scope(None, cx).is_err());
+            host.save_environment_variables(cx);
+            assert_eq!(
+                host.environment_values(1, Some("A")).0["host"],
+                "https://unsaved.test"
+            );
+            assert_eq!(
+                host.environment_values(1, Some("B")).0["host"],
+                "https://global.test"
+            );
+            assert!(
+                !host
+                    .environment_values(1, Some("B"))
+                    .0
+                    .contains_key("only_a")
+            );
+            host.set_variable_scope(None, cx).unwrap();
+            // A response from A must still write A/Dev after the UI moves to B/no environment.
+            host.current_collection = 1;
+            host.add_request(cx);
+            let draft = Draft {
+                extractors: vec![Pair::new("token", "$.token", "")],
+                ..Draft::default()
+            };
+            let response = HttpResponse {
+                status: 200,
+                headers: vec![],
+                text: String::new(),
+                bytes: 0,
+                json: Some(serde_json::json!({"token":"local-secret"})),
+            };
+            host.apply_extractors(&draft, 1, "A", &response, cx)
+                .unwrap();
+            assert_eq!(
+                host.environment_values(1, Some("A")).0["token"],
+                "local-secret"
+            );
+            assert_eq!(
+                host.environment_values(1, Some("B")).0["token"],
+                "global-secret"
+            );
+            assert_eq!(
+                host.environment_inputs[1].values().0["token"],
+                "global-secret"
+            );
+            let token = host.collections[0].environments["Dev"]
+                .variables
+                .iter()
+                .find(|v| v.name == "token")
+                .unwrap();
+            assert!(token.secret);
+            assert!(host.collections[1].environments.is_empty());
+            let bad = Draft {
+                extractors: vec![
+                    Pair::new("token", "$.token", ""),
+                    Pair::new("missing", "$.missing", ""),
+                ],
+                ..Draft::default()
+            };
+            assert!(host.apply_extractors(&bad, 1, "A", &response, cx).is_err());
+            assert_eq!(
+                host.environment_values(1, Some("A")).0["token"],
+                "local-secret"
+            );
+            host.apply_extractors(&draft, 0, "A", &response, cx)
+                .unwrap();
+            assert!(host.environment_inputs[0].variables.is_empty());
+            assert!(
+                !host
+                    .environment_values(0, Some("B"))
+                    .0
+                    .contains_key("token")
+            );
+            RequestGroups::rename_collection(
+                0,
+                "Renamed",
+                &mut host.collections,
+                &mut host.requests,
+            )
+            .unwrap();
+            assert_eq!(host.environment_values(1, Some("Renamed")).0["only_a"], "A");
+            let origin_id = host.collections[0].id.clone();
+            host.collections
+                .push(RequestGroups::create_collection("A", &host.collections).unwrap());
+            host.apply_extractors_for_id(&draft, 1, &origin_id, &response, cx)
+                .unwrap();
+            assert!(host.collections[2].environments.is_empty());
+            assert_eq!(
+                host.environment_values(1, Some("Renamed")).0["token"],
+                "local-secret"
+            );
+
+            host.persist(cx);
+        });
+        let mut store = storage::Store::open(&path).unwrap();
+        let saved = store.load().unwrap();
+        saved.validate().unwrap();
+        assert_eq!(
+            saved.collections[0].environments["Dev"].values().0["token"],
+            "local-secret"
+        );
+        assert!(saved.collections[1].environments.is_empty());
+        // Legacy collection JSON loads with an empty collection scope.
+        let mut legacy = serde_json::to_value(&saved.collections[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("environments");
+        legacy.as_object_mut().unwrap().remove("id");
+        let legacy: RequestGroups = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.environments.is_empty());
     }
 }
 

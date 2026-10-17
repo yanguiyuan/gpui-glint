@@ -11,7 +11,12 @@ impl Workbench {
         self.selected_history = Some((request, 0));
     }
 
-    fn delete_history_record(&mut self, request: usize, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn delete_history_record(
+        &mut self,
+        request: usize,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.history_delete = None;
         let Some(history) = self.requests.get_mut(request).map(|r| &mut r.history) else {
             return;
@@ -154,6 +159,7 @@ mod tests {
             host.add_request(cx);
             for (i, status) in [200, 404, 200].into_iter().enumerate() {
                 let mut record = host.requests[0].versions[0].clone();
+                record.id = model::new_id();
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{i}");
                 record.exchange = Some(model::Exchange {

@@ -29,14 +29,25 @@ fn resolve_pairs(
 
 pub struct PreparedRequest {
     method: Method,
-    url: Url,
-    headers: Vec<(HeaderName, HeaderValue)>,
+    pub(super) url: Url,
+    pub(super) headers: Vec<(HeaderName, HeaderValue)>,
     body: String,
-    skip_tls_verification: bool,
-    proxy: Option<ProxySettings>,
+    pub(super) skip_tls_verification: bool,
+    pub(super) proxy: Option<ProxySettings>,
     pub preview: String,
 }
 impl PreparedRequest {
+    pub fn with_oauth_token(mut self, token: &str) -> Result<Self, String> {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "OAuth Token 格式无效")?;
+        value.set_sensitive(true);
+        self.headers
+            .retain(|(name, _)| name != reqwest::header::AUTHORIZATION);
+        self.headers.push((reqwest::header::AUTHORIZATION, value));
+        self.apply_plugin_headers(&serde_json::json!({"setHeaders": {}}), &Default::default())?;
+        Ok(self)
+    }
+
     /// Export the resolved request after plugin headers have been applied.
     pub fn to_curl(&self) -> Result<String, String> {
         let mut args = vec![
@@ -64,8 +75,12 @@ impl PreparedRequest {
             args.push("--header 'User-Agent:'".into());
         }
         for (name, value) in &self.headers {
-            let value = std::str::from_utf8(value.as_bytes())
-                .map_err(|_| "请求头不是 UTF-8 文本，无法导出 cURL")?;
+            let value = if value.is_sensitive() {
+                "[已隐藏]"
+            } else {
+                std::str::from_utf8(value.as_bytes())
+                    .map_err(|_| "请求头不是 UTF-8 文本，无法导出 cURL")?
+            };
             let header = if value.is_empty() {
                 format!("{name};")
             } else {
@@ -130,7 +145,14 @@ impl PreparedRequest {
                 .as_str()
                 .filter(|v| v.len() <= 8192)
                 .ok_or("插件请求头的值无效")?;
-            let parsed = HeaderValue::from_str(value).map_err(|_| "插件请求头的值无效")?;
+            let mut parsed = HeaderValue::from_str(value).map_err(|_| "插件请求头的值无效")?;
+            if self
+                .headers
+                .iter()
+                .any(|(existing, value)| existing == &name && value.is_sensitive())
+            {
+                parsed.set_sensitive(true);
+            }
             changes.push((name, parsed));
         }
         for (name, value) in changes {
@@ -162,12 +184,21 @@ impl PreparedRequest {
         Ok(self)
     }
     pub fn new(draft: &Draft, environment: &EnvironmentValues) -> Result<Self, String> {
-        let method = Method::from_bytes(draft.method.as_bytes()).map_err(|_| "HTTP 方法无效")?;
+        let method = Method::from_bytes(if draft.method == "WS" {
+            b"GET"
+        } else {
+            draft.method.as_bytes()
+        })
+        .map_err(|_| "HTTP 方法无效")?;
         let environment = super::template::TemplateResolver::for_request(environment, draft)?;
         let mut resolved = draft.clone();
         resolved.headers = resolve_pairs(&draft.headers, &environment)?;
         resolved.cookies = resolve_pairs(&draft.cookies, &environment)?;
-        if draft.auth {
+        if draft.oauth.is_some() {
+            resolved.auth = false;
+            resolved.token.clear();
+        }
+        if draft.auth && draft.oauth.is_none() {
             resolved.token = environment.resolve(&draft.token)?;
             if resolved.token.trim().is_empty() {
                 return Err("请填写 Bearer Token 或选择 No Auth".into());
@@ -210,7 +241,10 @@ impl PreparedRequest {
             })
             .collect::<Result<_, String>>()?;
         let mut url = Url::parse(&resolved.resolved_url()?).map_err(|_| "请输入有效的 HTTP URL")?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        if !(matches!(url.scheme(), "http" | "https")
+            || draft.method == "WS" && matches!(url.scheme(), "ws" | "wss"))
+            || url.host_str().is_none()
+        {
             return Err("仅支持 HTTP / HTTPS URL".into());
         }
         url.set_fragment(None);
@@ -221,7 +255,10 @@ impl PreparedRequest {
             let name = HeaderName::from_bytes(header.key.trim().as_bytes())
                 .map_err(|_| "请求头名称无效")?;
             let value = header.value;
-            if name == reqwest::header::AUTHORIZATION && draft.auth && draft.token.trim().is_empty()
+            if name == reqwest::header::AUTHORIZATION
+                && draft.auth
+                && draft.oauth.is_none()
+                && draft.token.trim().is_empty()
             {
                 return Err("请填写 Bearer Token 或选择 No Auth".into());
             }
@@ -267,7 +304,21 @@ pub struct HttpResponse {
     pub json: Option<serde_json::Value>,
 }
 impl HttpResponse {
+    pub fn is_event_stream(&self) -> bool {
+        self.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+        })
+    }
     pub fn language(&self) -> &'static str {
+        if self.is_event_stream() {
+            return "text";
+        }
         let mime = self
             .headers
             .iter()
@@ -312,15 +363,24 @@ impl Drop for AbortOnDrop {
 }
 
 static HTTP: OnceLock<Result<(tokio::runtime::Runtime, [Client; 2]), String>> = OnceLock::new();
-fn client_builder(skip_tls_verification: bool) -> reqwest::ClientBuilder {
+pub(super) fn client_builder(skip_tls_verification: bool) -> reqwest::ClientBuilder {
+    streaming_client_builder(skip_tls_verification).timeout(Duration::from_secs(30))
+}
+fn streaming_client_builder(skip_tls_verification: bool) -> reqwest::ClientBuilder {
     Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_tls_verification)
 }
+#[cfg(test)]
 pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
+    execute_stream(request, None).await
+}
+pub async fn execute_stream(
+    request: PreparedRequest,
+    progress: Option<async_channel::Sender<HttpResponse>>,
+) -> Result<HttpResponse, String> {
     let (runtime, clients) = HTTP
         .get_or_init(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -329,7 +389,7 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
                 .build()
                 .map_err(|_| "无法启动 HTTP 执行器")?;
             let client = |skip_tls_verification| {
-                client_builder(skip_tls_verification)
+                streaming_client_builder(skip_tls_verification)
                     .build()
                     .map_err(|_| "无法初始化 HTTP 客户端")
             };
@@ -340,7 +400,7 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
     let client = clients[usize::from(request.skip_tls_verification)].clone();
     let task = runtime.spawn(async move {
         let client = if let Some(proxy) = &request.proxy {
-            client_builder(request.skip_tls_verification)
+            streaming_client_builder(request.skip_tls_verification)
                 .proxy(
                     reqwest::Proxy::all(proxy.url.trim()).map_err(|_| "代理地址无效".to_owned())?,
                 )
@@ -349,6 +409,7 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
         } else {
             client
         };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut builder = client.request(request.method, request.url);
         for (name, value) in request.headers {
             builder = builder.header(name, value);
@@ -356,9 +417,12 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
         if !request.body.is_empty() {
             builder = builder.body(request.body);
         }
-        let mut response = builder.send().await.map_err(network_error)?;
+        let mut response = tokio::time::timeout_at(deadline, builder.send())
+            .await
+            .map_err(|_| "等待响应头超时（30 秒）".to_owned())?
+            .map_err(network_error)?;
         let status = response.status().as_u16();
-        let headers = response
+        let headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -368,6 +432,56 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
                 )
             })
             .collect();
+        let mut snapshot = HttpResponse {
+            status,
+            headers: headers.clone(),
+            text: String::new(),
+            bytes: 0,
+            json: None,
+        };
+        if snapshot.is_event_stream() {
+            let mut buffer = super::sse::Buffer::new();
+            if let Some(sender) = &progress {
+                sender
+                    .send(snapshot.clone())
+                    .await
+                    .map_err(|_| "SSE 已取消")?;
+            }
+            let mut ticker = tokio::time::interval(Duration::from_millis(50));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut dirty = false;
+            loop {
+                tokio::select! {
+                    chunk = response.chunk() => {
+                        match chunk {
+                            Ok(Some(chunk)) => { buffer.push(&chunk, false); dirty = true; }
+                            Ok(None) => break,
+                            Err(error) => {
+                                snapshot.text = buffer.text();
+                                snapshot.bytes = buffer.bytes;
+                                if let Some(sender) = &progress { let _ = sender.send(snapshot.clone()).await; }
+                                return Err(network_error(error));
+                            }
+                        }
+                    }
+                    _ = ticker.tick(), if dirty && progress.is_some() => {
+                        snapshot.text = buffer.text();
+                        snapshot.bytes = buffer.bytes;
+                        if let Some(sender) = &progress {
+                            sender.send(snapshot.clone()).await.map_err(|_| "SSE 已取消")?;
+                        }
+                        dirty = false;
+                    }
+                }
+            }
+            buffer.push(&[], true);
+            snapshot.text = buffer.text();
+            snapshot.bytes = buffer.bytes;
+            if let Some(sender) = &progress {
+                let _ = sender.send(snapshot.clone()).await;
+            }
+            return Ok(snapshot);
+        }
         let encoding = response
             .headers()
             .get(CONTENT_TYPE)
@@ -382,7 +496,11 @@ pub async fn execute(request: PreparedRequest) -> Result<HttpResponse, String> {
             .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
             .unwrap_or(encoding_rs::UTF_8);
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+        while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+            .await
+            .map_err(|_| "HTTP 请求超时（30 秒）".to_owned())?
+            .map_err(network_error)?
+        {
             if bytes.len() + chunk.len() > 16 * 1024 * 1024 {
                 return Err("响应内容超过 16 MiB，请使用下载工具获取".into());
             }
@@ -943,6 +1061,132 @@ mod tests {
             ready.await.unwrap();
             task.abort();
             assert!(task.await.err().unwrap().is_cancelled());
+        });
+        server.join().unwrap();
+    }
+    #[test]
+    fn sse_streams_before_eof_and_survives_the_http_total_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("POST /events HTTP/1.1"));
+            assert!(request.contains("accept: text/event-stream"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; charset=utf-8\r\nConnection: close\r\n\r\n").unwrap();
+            stream
+                .write_all("id: 1\nevent: message\ndata: 你好\n\n".as_bytes())
+                .unwrap();
+            // A normal response has a 30-second total deadline; an SSE stream must outlive it.
+            thread::sleep(Duration::from_secs(31));
+            stream.write_all(b"data: [DONE]\n\n").unwrap();
+        });
+        let draft = Draft {
+            method: "POST".into(),
+            url,
+            body: "{}".into(),
+            headers: vec![Pair::new("Accept", "text/event-stream", "")],
+            ..Draft::default()
+        };
+        let request = PreparedRequest::new(&draft, &variables("")).unwrap();
+        runtime().block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            let task = tokio::spawn(execute_stream(request, Some(sender)));
+            let mut first = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(first.is_event_stream());
+            assert_eq!(first.status, 200);
+            while !first.text.contains("你好") {
+                first = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(!task.is_finished(), "events must be visible before EOF");
+            let mut last = first;
+            while let Ok(response) = tokio::time::timeout(Duration::from_secs(35), receiver.recv())
+                .await
+                .unwrap()
+            {
+                last = response;
+            }
+            assert!(last.text.contains("data: [DONE]"));
+            assert_eq!(task.await.unwrap().unwrap().text, last.text);
+        });
+        server.join().unwrap();
+    }
+    #[test]
+    fn sse_cancellation_closes_an_open_event_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: first\n\n").unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let request = PreparedRequest::new(
+            &Draft {
+                url,
+                ..Draft::default()
+            },
+            &variables(""),
+        )
+        .unwrap();
+        runtime().block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            let task = tokio::spawn(execute_stream(request, Some(sender)));
+            loop {
+                let response = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if response.text.contains("data: first") {
+                    break;
+                }
+            }
+            task.abort();
+            assert!(task.await.err().unwrap().is_cancelled());
+        });
+        server.join().unwrap();
+    }
+    #[test]
+    fn sse_disconnect_error_keeps_the_latest_partial_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            let data = "data: partial\n\n";
+            write!(stream, "{:X}\r\n{data}\r\n", data.len()).unwrap();
+            // Disconnect without the terminating chunk, producing a transport error.
+        });
+        let request = PreparedRequest::new(
+            &Draft {
+                url,
+                ..Draft::default()
+            },
+            &variables(""),
+        )
+        .unwrap();
+        runtime().block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            let task = tokio::spawn(execute_stream(request, Some(sender)));
+            let mut text = String::new();
+            while let Ok(response) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+            {
+                text = response.text;
+            }
+            assert!(text.contains("data: partial"));
+            assert!(task.await.unwrap().is_err());
         });
         server.join().unwrap();
     }

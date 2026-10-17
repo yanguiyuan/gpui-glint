@@ -7,9 +7,10 @@ license = "MIT"
 [dependencies]
 glint-plugin-registry = { path = "../glint-plugin-registry" }
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "io-util"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde_json = "1"
+futures-util = "0.3"
 ed25519-dalek = "2"
 sha2 = "0.10"
 subtle = "2"

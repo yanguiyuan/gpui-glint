@@ -28,3 +28,5 @@ The v1 page schema supports `text`, `column`, `row`, `button`, and `table`. Nati
 Glint API uses an auxiliary process with a three-second watchdog and bounded IPC. It exposes only selected environment values, crypto and header patches. This protects the UI and stops runaway execution, but is not an OS filesystem sandbox or a hard OS memory quota. No capability automatically exposes a system API: only registered Rust callbacks do.
 
 `TYPESCRIPT_API` contains editor declarations for the generic boundary. Application-specific callback argument/output types belong to the application. The API is experimental; pin versions while integrating.
+
+Declarative contributions may omit `hook` and provide an optional `data` JSON value. A manifest containing only such contributions may have empty `hooks`; the host must validate supported kinds and the data schema before use. Declaration data grants no runtime capabilities. Existing hook contributions serialize exactly as before when `data` is absent. Glint API uses this for inert `oauth.preset` configuration and never activates a JavaScript runtime to select a preset.

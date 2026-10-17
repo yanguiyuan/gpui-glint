@@ -1,4 +1,6 @@
 //! Self-hosted plugin repository. Published source is validated as data and never executed.
+mod software;
+mod web;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
@@ -57,12 +59,15 @@ impl Repository {
                 .map_err(|_| "Cannot save signing key")?;
             SigningKey::from_bytes(&bytes)
         };
+        fs::create_dir_all(root.join("software-assets"))
+            .map_err(|_| "Cannot create software asset directory")?;
         let connection = Connection::open(root.join("registry.sqlite3"))
             .map_err(|_| "Cannot open registry database")?;
         connection
             .busy_timeout(std::time::Duration::from_secs(10))
             .map_err(|_| "Cannot configure database")?;
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS releases (plugin_id TEXT NOT NULL, version TEXT NOT NULL, metadata TEXT NOT NULL, PRIMARY KEY(plugin_id,version)); CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL); INSERT OR IGNORE INTO state VALUES(1,0);").map_err(|_| "Cannot initialize registry database")?;
+        software::initialize(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             root: root.into(),
@@ -338,6 +343,29 @@ async fn package_handler(
 }
 pub fn router(repository: Repository) -> Router {
     Router::new()
+        .route("/", get(web::index))
+        .route("/catalog.css", get(web::css))
+        .route("/catalog.js", get(web::js))
+        .route("/glint-api-icon.svg", get(web::icon))
+        .route("/skills/glint-plugin-dev/SKILL.md", get(web::skill))
+        .route("/v1/apps", get(software::apps))
+        .route(
+            "/v1/apps/{app}/releases",
+            get(software::feed).post(software::publish),
+        )
+        .route("/v1/apps/{app}/assets/{name}", post(software::upload))
+        .route(
+            "/v1/apps/{app}/assets/{sha}/{name}",
+            get(software::download),
+        )
+        .route(
+            "/v1/apps/{app}/releases/{version}/yank",
+            post(software::yank),
+        )
+        .route(
+            "/v1/apps/{app}/releases/{version}/restore",
+            post(software::restore),
+        )
         .route("/health", get(|| async { "ok" }))
         .route("/v1/info", get(info_handler))
         .route("/v1/index", get(index_handler))

@@ -37,32 +37,72 @@ pub fn extract(
 }
 
 impl super::Workbench {
+    pub(super) fn apply_extractors_for_id(
+        &mut self,
+        draft: &super::model::Draft,
+        environment_index: usize,
+        collection_id: &str,
+        response: &super::http::HttpResponse,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<usize, String> {
+        if !draft.extractors.iter().any(|r| r.enabled) {
+            return Ok(0);
+        }
+        let collection = self
+            .collections
+            .iter()
+            .find(|c| c.id == collection_id)
+            .map(|c| c.collection.clone())
+            .ok_or("提取变量的所属集合已不存在")?;
+        self.apply_extractors(draft, environment_index, &collection, response, cx)
+    }
     pub(super) fn apply_extractors(
         &mut self,
         draft: &super::model::Draft,
         environment_index: usize,
+        collection_name: &str,
         response: &super::http::HttpResponse,
         cx: &mut gpui::Context<Self>,
     ) -> Result<usize, String> {
         if !draft.extractors.iter().any(|rule| rule.enabled) {
             return Ok(0);
         }
-        let result = extract(
-            &draft.extractors,
-            response.json.as_ref(),
-            (environment_index != 0)
-                .then(|| self.environment_inputs.get(environment_index))
-                .flatten(),
-        );
+        let collection = self
+            .collections
+            .iter()
+            .position(|c| c.collection == collection_name)
+            .ok_or("提取变量的所属集合已不存在")?;
+        let environment_name = self.environment_name(environment_index).to_owned();
+        let mut local = self.collections[collection]
+            .environments
+            .get(&environment_name)
+            .cloned()
+            .unwrap_or_default();
+        // Preserve a globally marked secret when a rule first creates its local override.
+        for rule in draft.extractors.iter().filter(|r| r.enabled) {
+            if !local.variables.iter().any(|v| v.name == rule.key.trim()) {
+                if let Some(global) = self.environment_inputs[environment_index]
+                    .variables
+                    .iter()
+                    .find(|v| v.name == rule.key.trim() && v.secret)
+                {
+                    local.save(None, &global.name, "", true)?;
+                }
+            }
+        }
+        let result = extract(&draft.extractors, response.json.as_ref(), Some(&local));
         match result {
             Ok((environment, names)) => {
-                self.environment_inputs[environment_index] = environment;
-                self.merge_extracted_variables(environment_index, &names, cx);
+                self.collections[collection]
+                    .environments
+                    .insert(environment_name, environment);
+                self.merge_extracted_variables(environment_index, collection_name, &names, cx);
                 self.sync_reference_inputs(cx);
                 self.push_trace(
                     format!(
-                        "后置动作完成 · 已写入 {} 个变量到 {}",
+                        "后置动作完成 · 已写入 {} 个变量到集合 {} · {}",
                         names.len(),
+                        collection_name,
                         self.environment_name(environment_index)
                     ),
                     cx,
@@ -130,10 +170,15 @@ mod tests {
             // The send-time environment wins even if the selector changes before completion.
             host.environment
                 .update(cx, |select, cx| select.set_selected(Some("0".into()), cx));
-            assert_eq!(host.apply_extractors(&draft, 1, &response, cx).unwrap(), 1);
+            assert_eq!(
+                host.apply_extractors(&draft, 1, "API", &response, cx)
+                    .unwrap(),
+                1
+            );
             assert!(host.environment_inputs[0].variables.is_empty());
-            assert_eq!(host.environment_inputs[1].values().0["token"], "abc");
-            assert_eq!(host.variable_rows[1][0].value.read(cx).value(), "abc");
+            assert_eq!(host.environment_values(1, Some("API")).0["token"], "abc");
+            assert!(host.environment_inputs[1].variables.is_empty());
+            assert!(host.variable_rows[1].is_empty());
             assert!(!host.traces[0].last().unwrap().message.contains("abc"));
             host.environment
                 .update(cx, |select, cx| select.set_selected(Some("1".into()), cx));
@@ -147,7 +192,8 @@ mod tests {
             window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(window, |host, cx| {
             assert_eq!(host.snapshot(cx).extractors[0].value, "$.token");
-            assert_eq!(host.environment_inputs[1].values().0["token"], "abc");
+            assert_eq!(host.environment_values(1, Some("API")).0["token"], "abc");
+            assert!(host.environment_inputs[1].variables.is_empty());
         });
     }
 

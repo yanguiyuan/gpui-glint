@@ -1,5 +1,6 @@
 //! Portable, signed registry protocol. No GPUI, JavaScript engine or database driver.
 mod client;
+pub mod software;
 mod store;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 pub use client::Client;
@@ -342,6 +343,23 @@ mod tests {
         assert!(validate_url("https://user:password@example.com", false).is_err());
         assert!(validate_url("https://example.com?token=secret", false).is_err());
         assert!(validate_url("https://example.com/registry", false).is_ok());
+    }
+    #[test]
+    fn packages_preserve_declarative_contributions_with_no_hooks() {
+        let manifest = serde_json::json!({"id":"test.presets","name":"Presets","version":"1.0.0","api_version":1,"entry":"main.js","hooks":[],"contributions":[{"id":"provider","kind":"test.preset","title":"Provider","data":{"setting":"value"}}]});
+        let plugin =
+            Plugin::from_source(&manifest.to_string(), "throw new Error('never execute');")
+                .unwrap();
+        let bytes = Package::encode(plugin).unwrap();
+        let decoded = Package::decode(&bytes).unwrap();
+        assert!(decoded.plugin.manifest.hooks.is_empty());
+        assert_eq!(
+            decoded.plugin.manifest.contributions[0]
+                .data
+                .as_ref()
+                .unwrap()["setting"],
+            "value"
+        );
     }
     #[test]
     fn packages_validate_data_without_executing_scripts() {

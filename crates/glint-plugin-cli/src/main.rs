@@ -11,6 +11,10 @@ struct Arguments {
 }
 #[derive(Subcommand)]
 enum Commands {
+    Software {
+        #[command(subcommand)]
+        command: SoftwareCommands,
+    },
     Source {
         #[command(subcommand)]
         command: Sources,
@@ -59,6 +63,41 @@ enum Commands {
     },
 }
 #[derive(Subcommand)]
+enum SoftwareCommands {
+    List {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        app: String,
+    },
+    Publish {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        app: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long = "artifact", required = true)]
+        artifacts: Vec<String>,
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+    },
+    Yank {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        app: String,
+        version: String,
+    },
+    Restore {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        app: String,
+        version: String,
+    },
+}
+#[derive(Subcommand)]
 enum Sources {
     Inspect {
         url: String,
@@ -104,6 +143,82 @@ fn run(args: Arguments) -> Result<()> {
             .map_err(|_| "Set GLINT_PLUGIN_TOKEN for management operations".to_owned())
     };
     match args.command {
+        Commands::Software { command } => match command {
+            SoftwareCommands::List { source, app } => {
+                output(client.software_feed(&store.source(&source)?, &app, 0)?)
+            }
+            SoftwareCommands::Publish {
+                source,
+                app,
+                version,
+                artifacts,
+                notes_file,
+            } => {
+                let source = store.source(&source)?;
+                let token = token()?;
+                let notes = if let Some(path) = notes_file {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    std::fs::File::open(path)
+                        .map_err(|_| "Cannot read release notes")?
+                        .take(8193)
+                        .read_to_string(&mut text)
+                        .map_err(|_| "Cannot read release notes")?;
+                    text
+                } else {
+                    String::new()
+                };
+                if notes.len() > 8192
+                    || artifacts.len() > 8
+                    || semver::Version::parse(&version).is_err()
+                {
+                    return Err("Invalid software release metadata".into());
+                }
+                let mut uploaded = vec![];
+                for spec in artifacts {
+                    let (target, path) = spec
+                        .split_once('=')
+                        .ok_or("--artifact must be target=path")?;
+                    uploaded.push(client.software_upload(
+                        &source,
+                        &token,
+                        &app,
+                        &PathBuf::from(path),
+                        target,
+                    )?);
+                }
+                let release = glint_plugin_registry::software::Release {
+                    version,
+                    notes,
+                    published_at: 0,
+                    artifacts: uploaded,
+                    yanked: false,
+                };
+                output(client.software_publish(&source, &token, &app, &release)?)
+            }
+            SoftwareCommands::Yank {
+                source,
+                app,
+                version,
+            } => output(client.software_yank(
+                &store.source(&source)?,
+                &token()?,
+                &app,
+                &version,
+                true,
+            )?),
+            SoftwareCommands::Restore {
+                source,
+                app,
+                version,
+            } => output(client.software_yank(
+                &store.source(&source)?,
+                &token()?,
+                &app,
+                &version,
+                false,
+            )?),
+        },
         Commands::Source { command } => match command {
             Sources::Inspect { url, allow_http } => output(client.inspect(&url, allow_http)?),
             Sources::Add {

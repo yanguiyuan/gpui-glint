@@ -221,6 +221,7 @@ mod tests {
             .unwrap();
             for (i, curl) in [new.clone(), old.clone()].into_iter().enumerate() {
                 let mut record = h.requests[1].versions[0].clone();
+                record.id = model::new_id();
                 record.label = "200 OK".into();
                 record.exchange = Some(model::Exchange {
                     curl: Some(curl),
