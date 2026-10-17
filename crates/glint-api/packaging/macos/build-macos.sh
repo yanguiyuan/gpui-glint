@@ -8,7 +8,7 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 repo="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$repo"
-for tool in cargo rustc plutil xcrun sips iconutil codesign hdiutil ditto shasum; do
+for tool in cargo rustc plutil xcrun sips iconutil codesign hdiutil ditto shasum otool; do
     command -v "$tool" >/dev/null || { echo "Required tool is missing: $tool" >&2; exit 1; }
 done
 version="$(awk -F '"' '/^version[[:space:]]*=/ { print $2; exit }' crates/glint-api/Cargo.toml)"
@@ -40,7 +40,11 @@ mkdir -p "$app/Contents/MacOS" "$resources"
 cp "$target_dir/$host/release/glint-api" "$app/Contents/MacOS/glint-api"
 chmod 755 "$app/Contents/MacOS/glint-api"
 strip -x "$app/Contents/MacOS/glint-api"
-minimum_os="$(xcrun vtool -show-build "$app/Contents/MacOS/glint-api" | awk '$1 == "minos" {print $2; exit}')"
+# Intel binaries may use LC_VERSION_MIN_MACOSX; Apple Silicon uses LC_BUILD_VERSION.
+minimum_os="$(otool -l "$app/Contents/MacOS/glint-api" | awk '
+    $1 == "cmd" { legacy = ($2 == "LC_VERSION_MIN_MACOSX"); modern = ($2 == "LC_BUILD_VERSION") }
+    (legacy && $1 == "version") || (modern && $1 == "minos") { print $2; exit }
+')"
 [[ -n "$minimum_os" ]] || { echo "Cannot read macOS deployment target." >&2; exit 1; }
 external="$(otool -L "$app/Contents/MacOS/glint-api" | awk 'NR>1 && $1 !~ /^\/System\/Library\// && $1 !~ /^\/usr\/lib\// {print $1}')"
 if [[ -n "$external" ]]; then

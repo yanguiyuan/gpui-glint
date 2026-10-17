@@ -1,0 +1,53 @@
+name: Glint API macOS Repack
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Glint API tag to package
+        required: true
+        type: string
+      arch:
+        description: macOS architecture
+        required: true
+        default: x86_64
+        type: choice
+        options: [x86_64, arm64]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ${{ inputs.arch == 'x86_64' && 'macos-15-intel' || 'macos-15' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ inputs.arch }}
+          cache-on-failure: true
+      - name: Verify tag and use corrected packaging script
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_ARCH: ${{ inputs.arch }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^glint-api-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version=$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' crates/glint-api/Cargo.toml)
+          test "$RELEASE_TAG" = "glint-api-v$version"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          # Only packaging comes from this workflow revision; application sources remain at the tag.
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git show "$GITHUB_SHA:crates/glint-api/packaging/macos/build-macos.sh" > crates/glint-api/packaging/macos/build-macos.sh
+      - name: Build and verify macOS DMG
+        run: bash crates/glint-api/packaging/macos/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glint-api-macos-${{ inputs.arch }}
+          path: |
+            target/macos-installer/output/*.dmg
+            target/macos-installer/output/*.dmg.sha256
+          if-no-files-found: error
