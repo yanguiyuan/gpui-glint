@@ -54,3 +54,11 @@ The upgrade preserved the plugin key, source ID, index sequence and package meta
 Use `glint-pluginctl software publish/list/yank/restore` with the private publishing token to manage software releases; see [the protocol and CLI guide](../../../docs/plugin-registry.md#software-distribution). Publish all platform installers together because existing release versions are immutable. GitHub releases and this distribution source are separate publishing destinations.
 
 The embedded developer Skill now marks declaration data and OAuth presets as Glint API 0.1.4 features; 0.1.3 is an earlier published version without that interface. This documentation-only image refresh uses `build-source/Dockerfile.skill-update`; installer data and signing identity remain in the persistent volume.
+
+### Published application versions
+
+Glint API 0.1.4 is published to GitHub Release and this source with Windows x64 Setup, macOS Apple Silicon DMG and macOS Intel DMG. Windows 0.1.2 and 0.1.3 remain available in the version selector. The software feed sequence is 3. All three mirrored binaries were checked against GitHub asset SHA-256 digests; the app updater checked and downloaded 0.1.4 from the custom source. Both macOS mirror downloads were independently streamed and hashed.
+
+`backups/post-distribution-0.1.4-data.tar.gz` contains a consistent live SQLite backup together with the signing key and immutable plugin/software artifacts. It is private (mode 600). The SQLite backup API captured metadata without interrupting downloads.
+
+The Intel release package was rebuilt from the original `glint-api-v0.1.4` application sources using the corrected packaging script in commit `4fc2d55`. The original tag is unchanged. The separate macOS repack workflow succeeded; normal future releases use the corrected script and the three-platform release matrix.
