@@ -5,7 +5,7 @@ description: 为 Glint 应用开发 JavaScript 插件，编写插件清单、注
 
 # Glint 插件开发
 
-将业务算法放在插件，公共运行时保持与 HTTP、数据库和具体业务无关。宿主决定支持的贡献类型和权限；先确认用户的目标应用与版本。以下同步前置动作示例兼容 Glint API 0.1.2 的协议；`data` 与 `oauth.preset` 对应当前 0.1.3 源码的能力；不要声称 0.1.2 已支持，也不要把源码版本当作已发布版本。使用目标客户端实际支持的契约。
+将业务算法放在插件，公共运行时保持与 HTTP、数据库和具体业务无关。宿主决定支持的贡献类型和权限；先确认用户的目标应用与版本。以下同步前置动作示例兼容 Glint API 0.1.2 的协议；`data` 与 `oauth.preset` 从 Glint API 0.1.4 起提供；0.1.2 / 0.1.3 发布版不支持这些声明。使用目标客户端实际支持的契约。
 
 ## 最小插件
 
@@ -92,7 +92,7 @@ glint.on('request.before-send', request => ({
 
 禁止在预设 `data` 中携带 `client_id`、Client Secret、access token、refresh token 或其他未知字段；未知字段会被拒绝。纯预设插件不声明 `request.read`、`crypto` 或其他运行时权限，`hooks` 保持空。若同一插件同时提供前置动作与预设，分别注册贡献，并仅为实际执行的动作声明其所需权限。
 
-先验证授权端点、Token 端点、回调、scope 和服务商要求，再提供预设。参考目标仓库的 `plugins::OAuthPreset`、`oauth::Config::validate` 和 `crates/glint-api/plugins/wps-oauth` / `feishu-oauth`；不要仅根据字段名猜测供应商语义。发布纯授权预设时最低宿主版本应包含预设能力，例如当前源码为 `--host glint-api@0.1.3`，而不是动作示例的 `0.1.2`。仓库服务也必须包含支持 `data` 的协议版本。
+先验证授权端点、Token 端点、回调、scope 和服务商要求，再提供预设。参考目标仓库的 `plugins::OAuthPreset`、`oauth::Config::validate` 和 `crates/glint-api/plugins/wps-oauth` / `feishu-oauth`；不要仅根据字段名猜测供应商语义。发布纯授权预设时最低宿主版本应包含预设能力，使用 `--host glint-api@0.1.4` 或兼容的更新版本，而不是动作示例的 `0.1.2`。仓库服务也必须包含支持 `data` 的协议版本。
 
 ## 本地验证
 
