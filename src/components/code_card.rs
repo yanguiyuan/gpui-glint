@@ -1,7 +1,13 @@
 use super::rich_text::{Format, RichText};
+use super::text_completion::{CompletionKey, CompletionState, TextCompletion, completion_menu};
 use crate::theme::ThemePreset;
 use gpui::AppContext;
-use std::{collections::HashMap, ops::Range, rc::Rc};
+use gpui::prelude::FluentBuilder;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    rc::Rc,
+};
 
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
@@ -118,6 +124,9 @@ struct LineCacheKey {
 struct ViewportCache {
     key: LineCacheKey,
     ranges: Vec<Range<usize>>,
+    folds: Option<HashMap<usize, super::json_folding::JsonFold>>,
+    visible: Vec<usize>,
+    fold_revision: u64,
     tokens: Vec<(Range<usize>, TokenKind)>,
     lines: HashMap<usize, EditorLine>,
     width: Pixels,
@@ -147,6 +156,9 @@ enum ScrollAxis {
 /// subscribe to [`CodeCardEvent`] to integrate with a document.
 pub struct CodeCard {
     viewport: bool,
+    json_folding: bool,
+    collapsed_json: HashSet<usize>,
+    fold_revision: u64,
     viewport_cache: Option<ViewportCache>,
     viewport_scroll: gpui::UniformListScrollHandle,
     scroll_axis: Option<ScrollAxis>,
@@ -161,6 +173,7 @@ pub struct CodeCard {
     content: SharedString,
     language: SharedString,
     read_only: bool,
+    completions: CompletionState,
     show_header: bool,
     prose: bool,
     rich: Option<RichText>,
@@ -179,10 +192,92 @@ pub struct CodeCard {
     last_lines: Vec<(usize, EditorLine, Bounds<Pixels>)>,
     is_selecting: bool,
     document_selection: Option<Range<usize>>,
+    source_highlight: Option<Range<usize>>,
     reveal_cursor: bool,
 }
 
 impl CodeCard {
+    /// Enable object/array folding in a read-only JSON viewport. Disabled by default.
+    pub fn json_folding(mut self, enabled: bool) -> Self {
+        self.json_folding = enabled;
+        self
+    }
+    /// Temporarily disabling folding shows the full source while retaining folded blocks.
+    pub fn set_json_folding(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.json_folding != enabled {
+            self.json_folding = enabled;
+            self.fold_revision = self.fold_revision.wrapping_add(1);
+            cx.notify();
+        }
+    }
+    fn toggle_json_fold(&mut self, line: usize, cx: &mut Context<Self>) {
+        if !self.collapsed_json.remove(&line) {
+            self.collapsed_json.insert(line);
+        }
+        self.fold_revision = self.fold_revision.wrapping_add(1);
+        cx.notify();
+    }
+    /// Offer template expressions after `{{`; empty by default.
+    pub fn set_completions(&mut self, items: Vec<TextCompletion>, cx: &mut Context<Self>) {
+        if self.completions.set_items(items) {
+            cx.notify();
+        }
+    }
+    fn handle_completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        if let Some(action) = self.completions.key(
+            &self.content,
+            &self.selected_range,
+            self.marked_range.is_some(),
+            key,
+        ) {
+            if let CompletionKey::Insert(range, text) = action {
+                self.selected_range = range;
+                self.replace_selection(&text, cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+    fn choose_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only || self.marked_range.is_some() {
+            return;
+        }
+        if let Some(active) = self
+            .completions
+            .active(&self.content, &self.selected_range, false)
+            && let Some(item) = active.items.get(index)
+        {
+            self.selected_range = active.range;
+            self.replace_selection(&format!("{{{{{}}}}}", item.expression), cx);
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+    fn completion_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = &event.keystroke.modifiers;
+        if self.read_only
+            || modifiers.platform
+            || modifiers.control
+            || modifiers.alt
+            || modifiers.shift
+        {
+            return;
+        }
+        if self.handle_completion_key(&event.keystroke.key, cx) {
+            window.prevent_default();
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn measured_widths(&self) -> (Pixels, Pixels, Pixels) {
         (
@@ -237,6 +332,23 @@ impl CodeCard {
         let Some(range) = self.cached_search_matches().get(index).cloned() else {
             return false;
         };
+        if let Some(cache) = &self.viewport_cache
+            && let Some(folds) = &cache.folds
+        {
+            let line = cache
+                .ranges
+                .partition_point(|line| line.start <= range.start)
+                .saturating_sub(1);
+            let before = self.collapsed_json.len();
+            self.collapsed_json.retain(|start| {
+                !folds
+                    .get(start)
+                    .is_some_and(|fold| *start < line && line <= fold.end_line)
+            });
+            if before != self.collapsed_json.len() {
+                self.fold_revision = self.fold_revision.wrapping_add(1);
+            }
+        }
         self.active_search_match = Some(range.clone());
         self.pending_search_reveal = Some(range);
         cx.notify();
@@ -252,6 +364,9 @@ impl CodeCard {
         let end = content.len();
         Self {
             viewport: false,
+            json_folding: false,
+            collapsed_json: HashSet::new(),
+            fold_revision: 0,
             viewport_cache: None,
             viewport_scroll: gpui::UniformListScrollHandle::default(),
             scroll_axis: None,
@@ -266,6 +381,7 @@ impl CodeCard {
             content,
             language: language.into(),
             read_only: false,
+            completions: CompletionState::default(),
             show_header: true,
             prose: false,
             rich: None,
@@ -284,6 +400,7 @@ impl CodeCard {
             last_lines: Vec::new(),
             is_selecting: false,
             document_selection: None,
+            source_highlight: None,
             reveal_cursor: false,
         }
     }
@@ -492,6 +609,18 @@ impl CodeCard {
         }
     }
 
+    /// Byte offset under a pointer on a visible source line, including virtualized cards.
+    pub fn source_offset_at(&self, position: gpui::Point<Pixels>) -> Option<usize> {
+        self.mouse_text_hit(position)
+            .and_then(|(distance, offset)| (distance == 0.).then_some(offset))
+    }
+    /// Temporary source decoration without changing selection, content or search results.
+    pub fn set_source_highlight(&mut self, range: Option<Range<usize>>, cx: &mut Context<Self>) {
+        if self.source_highlight != range {
+            self.source_highlight = range;
+            cx.notify();
+        }
+    }
     pub(super) fn mouse_text_hit(&self, position: gpui::Point<Pixels>) -> Option<(f32, usize)> {
         let distance = self
             .last_lines
@@ -609,6 +738,9 @@ impl CodeCard {
     }
 
     fn newline(&mut self, _: &Newline, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_completion_key("enter", cx) {
+            return;
+        }
         if self.read_only {
             return;
         }
@@ -644,6 +776,9 @@ impl CodeCard {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_completion_key("tab", cx) {
+            return;
+        }
         self.replace_selection("    ", cx);
     }
 
@@ -684,9 +819,15 @@ impl CodeCard {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_completion_key("up", cx) {
+            return;
+        }
         self.vertical(false, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_completion_key("down", cx) {
+            return;
+        }
         self.vertical(true, false, cx);
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -1932,9 +2073,16 @@ impl Element for CodeLine {
                     rgb(0x007aff),
                 )
             });
+        let external = input.source_highlight.as_ref().and_then(|range| {
+            let start = range.start.max(self.start);
+            let end = range.end.min(end);
+            (start < end).then_some(start..end)
+        });
         let search_highlights = self
             .search_matches
             .iter()
+            .cloned()
+            .chain(external)
             .map(|hit| {
                 fill(
                     Bounds::from_corners(
@@ -2038,12 +2186,20 @@ impl CodeCard {
     ) {
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
         if delta.x.abs() > delta.y.abs() {
-            let (width, gutter_width) = self
-                .viewport_cache
-                .as_ref()
-                .map_or((px(0.), px(42.)), |cache| {
-                    (cache.width, viewport_gutter_width(cache.ranges.len()))
-                });
+            let (width, gutter_width) =
+                self.viewport_cache
+                    .as_ref()
+                    .map_or((px(0.), px(42.)), |cache| {
+                        (
+                            cache.width,
+                            viewport_gutter_width(cache.ranges.len())
+                                + if self.json_folding && self.is_json() {
+                                    px(16.)
+                                } else {
+                                    px(0.)
+                                },
+                        )
+                    });
             let bounds = self.viewport_scroll.0.borrow().base_handle.bounds();
             let max = (width + gutter_width + px(26.) - bounds.size.width).max(px(0.));
             let offset = self.scroll.offset();
@@ -2099,19 +2255,41 @@ impl CodeCard {
             self.viewport_cache = Some(ViewportCache {
                 key,
                 ranges,
+                folds: None,
+                visible: vec![],
+                fold_revision: u64::MAX,
                 tokens: tokens(&self.content, &self.language),
                 lines: HashMap::new(),
                 width: px(0.),
             });
             if reset_scroll {
+                self.collapsed_json.clear();
                 self.viewport_scroll
                     .scroll_to_item(0, gpui::ScrollStrategy::Top);
                 self.scroll.set_offset(point(px(0.), px(0.)));
             }
         }
         self.last_lines.clear();
+        let folding = self.json_folding && self.is_json();
+        let cache = self.viewport_cache.as_mut().unwrap();
+        if folding && cache.folds.is_none() {
+            cache.folds = Some(super::json_folding::folds(&self.content));
+        }
+        if cache.fold_revision != self.fold_revision {
+            cache.visible = if folding {
+                super::json_folding::visible_lines(
+                    cache.ranges.len(),
+                    cache.folds.as_ref().unwrap(),
+                    &self.collapsed_json,
+                )
+            } else {
+                (0..cache.ranges.len()).collect()
+            };
+            cache.fold_revision = self.fold_revision;
+        }
+        let source_count = cache.ranges.len();
+        let count = cache.visible.len();
         let search_matches = self.cached_search_matches();
-        let count = self.viewport_cache.as_ref().unwrap().ranges.len();
         if let Some(hit) = self.pending_search_reveal.take() {
             let cache = self.viewport_cache.as_mut().unwrap();
             let index = cache
@@ -2134,10 +2312,13 @@ impl CodeCard {
             let x = line.x_for_index(hit.start - range.start);
             self.scroll
                 .set_offset(point(-(x - px(40.)).max(px(0.)), px(0.)));
-            self.viewport_scroll
-                .scroll_to_item(index, gpui::ScrollStrategy::Top);
+            self.viewport_scroll.scroll_to_item(
+                cache.visible.binary_search(&index).unwrap_or(0),
+                gpui::ScrollStrategy::Top,
+            );
         }
-        let gutter_width = viewport_gutter_width(count);
+        let gutter_width =
+            viewport_gutter_width(source_count) + if folding { px(16.) } else { px(0.) };
         let list = gpui::uniform_list(
             "code-card-viewport-lines",
             count,
@@ -2151,7 +2332,25 @@ impl CodeCard {
                     cache.lines.clear();
                 }
                 indexes
-                    .map(|index| {
+                    .map(|visible_index| {
+                        let index = cache.visible[visible_index];
+                        let fold = if folding {
+                            cache.folds.as_ref().and_then(|folds| folds.get(&index))
+                        } else {
+                            None
+                        };
+                        let collapsed = fold.is_some() && this.collapsed_json.contains(&index);
+                        let summary = if collapsed {
+                            fold.map(|fold| {
+                                format!(
+                                    " … {} 行 {}",
+                                    fold.end_line - index,
+                                    &content[fold.close_offset..cache.ranges[fold.end_line].end]
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         let range = cache.ranges[index].clone();
                         let start = range.start;
                         let line = cache
@@ -2181,7 +2380,9 @@ impl CodeCard {
                                 )
                             })
                             .clone();
-                        cache.width = cache.width.max(line.width);
+                        let row_width =
+                            line.width + if summary.is_some() { px(200.) } else { px(0.) };
+                        cache.width = cache.width.max(row_width);
                         let end = start + line.len();
                         div()
                             .w_full()
@@ -2192,20 +2393,59 @@ impl CodeCard {
                                     .w(gutter_width)
                                     .h_full()
                                     .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
                                     .font_family("Menlo")
                                     .overflow_hidden()
-                                    .pr(px(9.))
-                                    .text_right()
+                                    .pr(px(if folding { 5. } else { 9. }))
                                     .border_r_1()
                                     .border_color(rgb(colors.border))
-                                    .child((index + 1).to_string()),
+                                    .child(
+                                        div().flex_1().text_right().child((index + 1).to_string()),
+                                    )
+                                    .when(folding, |gutter| {
+                                        gutter.child(
+                                            div()
+                                                .id(("json-fold", index))
+                                                .w(px(16.))
+                                                .h_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .when(fold.is_some(), |button| {
+                                                    button
+                                                        .debug_selector(move || {
+                                                            format!("json-fold-{}", index + 1)
+                                                                .into()
+                                                        })
+                                                        .cursor(gpui::CursorStyle::PointingHand)
+                                                        .child(if collapsed {
+                                                            "▸"
+                                                        } else {
+                                                            "▾"
+                                                        })
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                cx.stop_propagation();
+                                                                this.toggle_json_fold(index, cx);
+                                                            },
+                                                        ))
+                                                }),
+                                        )
+                                    }),
                             )
                             .child(
                                 div().flex_1().min_w_0().h_full().overflow_hidden().child(
                                     div()
                                         .ml(px(8.) + offset)
-                                        .w(line.width + px(18.))
+                                        .w(row_width + px(18.))
                                         .h_full()
+                                        .flex()
+                                        .items_center()
                                         .child(CodeLine {
                                             input: input.clone(),
                                             start,
@@ -2220,7 +2460,13 @@ impl CodeCard {
                                                     (from < to).then_some(from..to)
                                                 })
                                                 .collect(),
-                                        }),
+                                        })
+                                        .children(summary.map(|summary| {
+                                            div()
+                                                .whitespace_nowrap()
+                                                .text_color(rgb(colors.comment))
+                                                .child(summary)
+                                        })),
                                 ),
                             )
                     })
@@ -2302,6 +2548,54 @@ impl Render for CodeCard {
                     bounds.top() - px(36.),
                 )
             });
+        let completion_popup = if focused && !self.read_only {
+            self.completions
+                .active(
+                    &self.content,
+                    &self.selected_range,
+                    self.marked_range.is_some(),
+                )
+                .and_then(|active| {
+                    self.last_lines
+                        .iter()
+                        .rev()
+                        .find(|(start, _, _)| *start <= self.selected_range.end)
+                        .map(|(start, line, bounds)| {
+                            let position = point(
+                                bounds.left()
+                                    + line.x_for_index(
+                                        (self.selected_range.end - *start).min(line.len()),
+                                    ),
+                                bounds.bottom() + px(4.),
+                            );
+                            let owner = cx.entity().downgrade();
+                            let dismiss_owner = owner.clone();
+                            completion_menu(
+                                active,
+                                self.completions.selected,
+                                position,
+                                if self.dark {
+                                    ThemePreset::DarkObsidian
+                                } else {
+                                    ThemePreset::Moonstone
+                                },
+                                move |index, window, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.choose_completion(index, window, cx)
+                                    });
+                                },
+                                move |_, cx| {
+                                    let _ = dismiss_owner.update(cx, |this, cx| {
+                                        this.completions.dismiss();
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                        })
+                })
+        } else {
+            None
+        };
         self.last_lines.clear();
         let mut font = window.text_style().font();
         if !self.prose {
@@ -2604,6 +2898,7 @@ impl Render for CodeCard {
         }
         let mut source = div()
             .id("code-card-source")
+            .capture_key_down(cx.listener(Self::completion_key))
             .key_context("GlassCodeCard")
             .track_focus(&self.focus_handle)
             .tab_index(0)
@@ -2775,7 +3070,7 @@ impl Render for CodeCard {
                     .with_priority(40),
                 );
             }
-            return container;
+            return container.children(completion_popup);
         }
         div()
             .w_full()
@@ -2791,6 +3086,7 @@ impl Render for CodeCard {
             .bg(rgb(colors.surface))
             .children(self.show_header.then_some(head))
             .child(source)
+            .children(completion_popup)
     }
 }
 
@@ -2803,6 +3099,33 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn template_completion_in_json_preserves_suffix_and_undo(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| bind_code_card_keys(cx));
+        let (editor, window) = cx.add_window_view(|_, cx| {
+            let mut editor = CodeCard::new(cx, "json", r#"{"token":"{{to}}"}"#);
+            editor.set_completions(vec![TextCompletion::new("token", "环境变量")], cx);
+            editor
+        });
+        window.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.move_to(r#"{"token":"{{to"#.len(), cx);
+                window.focus(&editor.focus_handle, cx);
+            });
+        });
+        assert!(window.debug_bounds("template-completion-menu").is_some());
+        window.simulate_keystrokes("enter");
+        editor.update(window, |editor, _| {
+            assert_eq!(editor.content(), r#"{"token":"{{token}}"}"#)
+        });
+        window.simulate_keystrokes("cmd-z");
+        editor.update(window, |editor, _| {
+            assert_eq!(editor.content(), r#"{"token":"{{to}}"}"#)
+        });
+        window.simulate_keystrokes("escape");
+        assert!(window.debug_bounds("template-completion-menu").is_none());
+    }
+
     #[gpui::test]
     fn viewport_search_reveals_distant_unicode_matches_without_changing_selection(
         cx: &mut gpui::TestAppContext,
@@ -2894,6 +3217,96 @@ mod tests {
             }
             assert_eq!(end, source.len());
         }
+    }
+
+    #[gpui::test]
+    fn json_folding_clicks_preserve_source_copy_and_reveal_search_hits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_code_card_keys);
+        struct Viewer(Entity<CodeCard>);
+        impl Render for Viewer {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(500.)).h(px(300.)).child(self.0.clone())
+            }
+        }
+        let source = r#"{
+  "items": [
+    {
+      "name": "needle 中文"
+    },
+    {
+      "id": 2
+    }
+  ],
+  "count": 2
+}"#
+        .to_owned();
+        let editor = cx.new(|cx| {
+            CodeCard::new(cx, "json", source.clone())
+                .read_only(true)
+                .show_header(false)
+                .viewport()
+                .json_folding(true)
+        });
+        let (_, window) = cx.add_window_view(|_, _| Viewer(editor.clone()));
+        let item = window.debug_bounds("json-fold-3").unwrap();
+        window.simulate_click(item.center(), gpui::Modifiers::default());
+        editor.update(window, |editor, _| {
+            assert!(editor.collapsed_json.contains(&2));
+            assert_eq!(
+                editor.viewport_cache.as_ref().unwrap().visible,
+                vec![0, 1, 2, 5, 6, 7, 8, 9, 10]
+            );
+            assert_eq!(editor.content(), source);
+        });
+        let items = window.debug_bounds("json-fold-2").unwrap();
+        window.simulate_click(items.center(), gpui::Modifiers::default());
+        editor.update(window, |editor, _| {
+            assert_eq!(
+                editor.viewport_cache.as_ref().unwrap().visible,
+                vec![0, 1, 9, 10]
+            )
+        });
+        window.update(|window, cx| {
+            let focus = editor.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        window.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            source
+        );
+        editor.update(window, |editor, cx| {
+            editor.set_search_query("needle", cx);
+            assert_eq!(editor.search_match_count(), 1);
+            assert!(editor.reveal_search_match(0, cx));
+            assert!(editor.collapsed_json.is_empty());
+        });
+        editor.update(window, |editor, _| {
+            assert_eq!(editor.viewport_cache.as_ref().unwrap().visible.len(), 11)
+        });
+        let item = window.debug_bounds("json-fold-3").unwrap();
+        window.simulate_click(item.center(), gpui::Modifiers::default());
+        editor.update(window, |editor, cx| editor.set_json_folding(false, cx));
+        assert!(window.debug_bounds("json-fold-3").is_none());
+        editor.update(window, |editor, cx| {
+            assert_eq!(editor.viewport_cache.as_ref().unwrap().visible.len(), 11);
+            editor.set_json_folding(true, cx);
+        });
+        editor.update(window, |editor, cx| {
+            assert_eq!(editor.viewport_cache.as_ref().unwrap().visible.len(), 9);
+            editor.set_content(
+                "{\n  \"new\": []\n}"
+                    .replace("\\n", "\n")
+                    .replace("\\\"", "\""),
+                cx,
+            );
+        });
+        editor.update(window, |editor, _| {
+            assert!(editor.collapsed_json.is_empty());
+            assert_eq!(editor.viewport_cache.as_ref().unwrap().visible.len(), 3);
+        });
     }
 
     #[gpui::test]

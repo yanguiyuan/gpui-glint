@@ -1,4 +1,4 @@
-use super::{Select, SelectEvent, SelectOption, TextEntry, TextReferenceResolver};
+use super::{Select, SelectEvent, SelectOption, TextCompletion, TextEntry, TextReferenceResolver};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -124,6 +124,10 @@ impl SelectField {
     ) {
         self.input
             .update(cx, |input, cx| input.set_reference_resolver(resolver, cx));
+    }
+    pub fn set_completions(&mut self, items: Vec<TextCompletion>, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_completions(items, cx));
     }
     pub fn set_options(
         &mut self,

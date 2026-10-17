@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 pub struct Workspace {
+    #[serde(default)]
+    pub selected_environment: usize,
     pub requests: Vec<Request>,
     pub collections: Vec<RequestGroups>,
     pub environments: Vec<String>,
@@ -12,17 +14,21 @@ pub struct Workspace {
     pub traces: Vec<Vec<TraceEntry>>,
     pub responses: Vec<Option<HttpResponse>>,
     pub previews: Vec<Option<String>>,
+    #[serde(default)]
+    pub curls: Vec<Option<String>>,
 }
 impl Default for Workspace {
     fn default() -> Self {
         Self {
             requests: vec![],
             collections: vec![],
+            selected_environment: 0,
             environments: vec!["不使用环境".into()],
             variables: vec![EnvironmentVariables::default()],
             traces: vec![],
             responses: vec![],
             previews: vec![],
+            curls: vec![],
         }
     }
 }
@@ -30,6 +36,7 @@ impl Workspace {
     fn validate(&self) -> Result<(), String> {
         if self.environments.first().map(String::as_str) != Some("不使用环境")
             || self.environments.len() != self.variables.len()
+            || self.selected_environment >= self.environments.len()
             || self.requests.len() != self.traces.len()
             || self.requests.len() != self.responses.len()
             || self.requests.len() != self.previews.len()
@@ -50,6 +57,13 @@ impl Workspace {
             {
                 return Err("集合名称为空或重复".into());
             }
+            if collection
+                .defaults
+                .keys()
+                .any(|path| !collection.contains(path))
+            {
+                return Err("目录默认配置引用了不存在的目录".into());
+            }
             for path in &collection.names {
                 if path.is_empty()
                     || path.split('/').any(|name| name.trim().is_empty())
@@ -65,12 +79,8 @@ impl Workspace {
                 .collections
                 .iter()
                 .any(|c| c.collection == request.collection && c.contains(&request.group))
-                || std::iter::once(&request.draft)
-                    .chain(request.versions.iter().map(|r| &r.draft))
-                    .chain(request.history.iter().map(|r| &r.draft))
-                    .any(|d| d.environment >= self.environments.len())
             {
-                return Err("请求引用了不存在的集合、目录或环境".into());
+                return Err("请求引用了不存在的集合或目录".into());
             }
         }
         Ok(())
@@ -164,6 +174,29 @@ impl Store {
         if let Some(data) = &data {
             let legacy: serde_json::Value =
                 serde_json::from_str(data).map_err(|e| e.to_string())?;
+            if let Some(requests) = legacy.get("requests").and_then(|value| value.as_array()) {
+                // Carry the initial selection forward once; future request restores never select an environment.
+                if legacy.get("selected_environment").is_none() {
+                    workspace.selected_environment = requests
+                        .first()
+                        .and_then(|r| r["draft"]["environment"].as_u64())
+                        .map(|index| index as usize)
+                        .filter(|index| *index < workspace.environments.len())
+                        .unwrap_or(0);
+                }
+                for (request, saved) in workspace.requests.iter_mut().zip(requests) {
+                    if let Some(history) = saved.get("history").and_then(|value| value.as_array()) {
+                        for (record, saved) in request.history.iter_mut().zip(history) {
+                            if record.environment_name.is_none() {
+                                record.environment_name = saved["draft"]["environment"]
+                                    .as_u64()
+                                    .and_then(|index| workspace.environments.get(index as usize))
+                                    .cloned();
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(collections) = legacy.get("collections").and_then(|value| value.as_array())
             {
                 for (index, value) in collections.iter().enumerate() {
@@ -200,6 +233,7 @@ impl Store {
                 }
             }
         }
+        workspace.curls.resize(workspace.requests.len(), None);
         workspace.validate()?;
         self.last_saved = data;
         Ok(workspace)
@@ -238,6 +272,7 @@ mod tests {
         requests[3].group = "普通目录".into();
         let data = Workspace {
             collections: vec![RequestGroups {
+                defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "Test API".into(),
                 names: vec![
@@ -302,6 +337,7 @@ mod tests {
     fn invalid_folder_references_and_missing_parents_are_rejected() {
         let mut data = Workspace {
             collections: vec![RequestGroups {
+                defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "Test API".into(),
                 names: vec![],
@@ -368,6 +404,7 @@ mod tests {
             assert!(data.requests.is_empty() && data.collections.is_empty());
             assert_eq!(data.environments.len(), 1);
             data.collections.push(RequestGroups {
+                defaults: Default::default(),
                 folder_order: Default::default(),
                 collection: "My API".into(),
                 names: vec!["未分组".into()],
@@ -377,11 +414,12 @@ mod tests {
             variables.save(None, "token", "test-secret", true).unwrap();
             data.variables.push(variables);
             let draft = Draft {
-                environment: 1,
                 url: "https://example.test/".into(),
                 ..Draft::default()
             };
             let record = Record {
+                tag: String::new(),
+                environment_name: None,
                 draft: draft.clone(),
                 label: "v1".into(),
                 time: "now".into(),
@@ -408,10 +446,29 @@ mod tests {
             }));
             data.previews.push(Some("GET https://example.test/".into()));
             store.save(&data).unwrap();
+            let mut legacy = serde_json::to_value(&data).unwrap();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("selected_environment");
+            legacy["requests"][0]["draft"]["environment"] = 1.into();
+            legacy["requests"][0]["history"][0]["draft"]["environment"] = 1.into();
+            store
+                .connection
+                .execute(
+                    "UPDATE workspace SET data = ?1 WHERE id = 1",
+                    [legacy.to_string()],
+                )
+                .unwrap();
         }
         {
             let mut store = Store::open(&path).unwrap();
             let mut data = store.load().unwrap();
+            assert_eq!(data.selected_environment, 1);
+            assert_eq!(
+                data.requests[0].history[0].environment_name.as_deref(),
+                Some("Test")
+            );
             assert_eq!(data.variables[1].variables[0].value, "test-secret");
             assert!(data.variables[1].variables[0].secret);
             assert_eq!(data.requests[0].history[0].elapsed_ms, Some(42));

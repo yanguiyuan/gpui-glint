@@ -6,6 +6,8 @@
 
 `AppLayout` 填满父容器，顶部栏高 42px，下方为可伸缩的横向布局。导航轨道位于外层表面；侧栏和主内容共享带圆角、高光与柔和阴影的面板。各区域均可接收任意 GPUI 元素。
 
+通过 `.sidebar_resize_handle(handle)` 可在侧栏右边缘叠加 6px 的自定义拖拽手柄，宿主管理拖拽状态并用 `.sidebar_width(width)` 更新宽度；默认仍为固定宽度。
+
 Windows 下 `AppLayout` 默认在顶栏右侧显示最小化、最大化／还原和关闭按钮，使用原生窗口控制区域（关闭操作会经过宿主的 `on_window_should_close` 回调）。窗口需使用透明标题栏 `TitlebarOptions { appears_transparent: true, ..Default::default() }`；嵌入预览或保留系统标题栏时设置 `.window_controls(false)`。品牌名仅在 macOS 为红绿灯预留左侧空间。把 `window_drag_region()` 放在顶栏控件之间作为可伸缩空白区域，可拖动窗口，双击最大化／还原；不要用拖拽区域包裹搜索框或按钮。
 
 `SegmentedControl` 默认以 `new` 的调用位置区分控件，隔离每个选项的点击状态。在循环或公共工厂函数中创建多组控件时，为每组设置稳定且不同的 `.id(...)`。
@@ -91,6 +93,8 @@ let subscription = cx.subscribe(&environment, |_, select, event: &SelectEvent, c
 `width(px)` 设置期望宽度，`min_width(px)` 设置最小宽度（默认 100 像素），两者调用顺序不影响最终尺寸。例如表格内可使用 `.width(78.).min_width(60.)`；触发器和下拉面板遵守最小宽度。使用 `set_min_width(px, cx)` 可在运行时更新。
 
 `TextEntry` 是原生 GPUI 单行文本编辑器，支持输入法组合输入、文本选择、光标定位和剪贴板快捷键。通过 `bind_text_entry_keys(cx)` 注册一次快捷键，再使用 `.control(...)` 将其实体传入 `InputField` 或 `SearchInput`。其他输入组件通过受控状态和回调，由所属视图负责更新。
+
+`TextEntry`、`SelectField` 和 `CodeCard` 支持 `set_completions(Vec<TextCompletion>, cx)`，默认不开启。使用 `TextCompletion::new("base_url", "环境变量")` 提供表达式及说明，输入 `{{` 后按名称筛选；方向键选择，Tab / Enter 插入完整表达式，Esc 或点击外部关闭。已有结束括号会整体替换，组合输入期间不弹出；`CodeCard` 插入支持撤销。候选说明由宿主提供，应避免包含敏感变量值。
 
 `TextEntry` 与 `SelectField` 可通过 `set_reference_resolver(Some(resolver), cx)` 开启 `{{变量名}}` 引用展示。`TextReferenceResolver` 是 `Rc<dyn Fn(&str) -> Result<String, String>>`，接收完整表达式；解析成功时，失焦输入显示值徽标，失败时用警告色保留表达式并在悬停时显示原因。点击徽标进入原文编辑，编辑时引用仍有背景高亮；`value()`、选区、输入法和剪贴板始终使用原始内容。默认不开启，传入 `None` 可关闭。环境变化时应更新 resolver。
 
@@ -284,7 +288,7 @@ Popover::new("delete-confirm", trigger, confirmation_content)
     })
 ```
 
-每个实例使用唯一且稳定的 ID。`trigger_height` 默认 30px，`gap` 默认 6px；浮层使用延后绘制，避免被表格或滚动容器裁剪。确认按钮由宿主提供；组件本身不执行删除等业务操作。`glint-api` 环境变量表格提供删除确认示例，确认后移除草稿行，保存更改后生效。
+每个实例使用唯一且稳定的 ID。`right_of_trigger(width)` 可选地将浮层改为在触发器右侧展开并底部对齐，`width` 为触发器宽度，适合底部导航栏。`trigger_height` 默认 30px，`gap` 默认 6px；浮层使用延后绘制，避免被表格或滚动容器裁剪。确认按钮由宿主提供；组件本身不执行删除等业务操作。`glint-api` 环境变量表格提供删除确认示例，确认后移除草稿行，保存更改后生效。
 
 ## 通知与日期选择器
 
@@ -655,3 +659,7 @@ selector.update(cx, |selector, cx| {
 ## 主题
 
 主题预设、亮暗切换和子组件同步方式见 [README 的主题说明](../README.md#主题)。
+
+`CodeCard::source_offset_at(position)` 返回可见源码行中指针对应的 UTF-8 字节偏移，支持虚拟化只读视图；`set_source_highlight(Some(range), cx)` 添加临时背景高亮，不修改选区、正文和查找结果，传入 `None` 清除。Glint API 的响应 JSONPath 选取使用这两个接口。
+
+`CodeCard::json_folding(true)` 为只读 JSON 的 `.viewport()` 开启对象／数组折叠（默认关闭）；行号旁箭头控制各个多行块，收起行展示隐藏行数和结束括号，行号始终对应完整源码。`set_json_folding(false, cx)` 临时显示全部内容，重新启用恢复折叠状态；正文变化时清空折叠状态。查找跳转自动展开包含命中的折叠块，复制与源码命中偏移保持完整原文。

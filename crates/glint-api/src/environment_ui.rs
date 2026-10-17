@@ -105,6 +105,27 @@ impl Workbench {
             skip_tls_verification: input.skip_tls_verification,
         }
     }
+    pub(super) fn merge_extracted_variables(
+        &mut self,
+        index: usize,
+        names: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let variables = self.environment_inputs[index].variables.clone();
+        for variable in variables.iter().filter(|v| names.contains(&v.name)) {
+            if let Some(row) = self.variable_rows[index]
+                .iter()
+                .find(|row| row.name.read(cx).value() == variable.name)
+            {
+                row.value
+                    .update(cx, |entry, cx| entry.set_value(variable.value.clone(), cx));
+            } else {
+                let row = self.variable_input(&variable.name, &variable.value, variable.secret, cx);
+                self.variable_rows[index].push(row);
+            }
+        }
+        self.sync_variable_table(cx);
+    }
     fn reset_environment_rows(&mut self, index: usize, cx: &mut Context<Self>) {
         let saved = self.environment_inputs[index].proxy.clone();
         let input = &mut self.proxy_inputs[index];
@@ -225,6 +246,8 @@ impl Workbench {
                 let name_cell = TableCell::custom(move || {
                     div()
                         .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
                         .h(px(32.))
                         .font_family("Menlo")
                         .child(name.clone())
@@ -241,6 +264,8 @@ impl Workbench {
                 let value_cell = TableCell::custom(move || {
                     let mut cell = div()
                         .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
                         .h(px(32.))
                         .flex()
                         .items_center()
@@ -272,6 +297,7 @@ impl Workbench {
                             .theme(theme)
                             .render()
                             .size(px(22.))
+                            .flex_shrink_0()
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
                                 let _ = owner.update(cx, |this, cx| {
@@ -504,12 +530,12 @@ impl Workbench {
                             div()
                                 .text_size(px(10.))
                                 .text_color(rgb(self.theme.color(0x278258)))
-                                .child("当前请求使用中"),
+                                .child("全局使用中"),
                         )
                     })
                     .when(!applied, |el| {
                         el.child(
-                            Button::new("用于当前请求")
+                            Button::new("设为全局环境")
                                 .kind(ButtonKind::Gray)
                                 .size(ButtonSize::Mini)
                                 .theme(self.theme)

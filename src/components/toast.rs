@@ -127,6 +127,10 @@ impl ToastHost {
             cx.notify();
         }
     }
+    /// Currently visible notifications, in insertion order.
+    pub fn toasts(&self) -> impl Iterator<Item = &Toast> {
+        self.entries.iter().map(|entry| &entry.toast)
+    }
     pub fn push(&mut self, toast: Toast, cx: &mut Context<Self>) -> ToastId {
         while self.entries.len() >= self.max_visible {
             self.dismiss(self.entries[0].id, ToastDismissReason::Overflow, cx);

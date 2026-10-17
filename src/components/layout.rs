@@ -104,6 +104,7 @@ pub struct AppLayout {
     navigation_rail_width: f32,
     sidebar_width: f32,
     sidebar_visible: bool,
+    sidebar_resize_handle: Option<AnyElement>,
     window_controls: bool,
     theme: ThemePreset,
 }
@@ -123,6 +124,7 @@ impl AppLayout {
             navigation_rail_width: 48.,
             sidebar_width: 248.,
             sidebar_visible: true,
+            sidebar_resize_handle: None,
             window_controls: cfg!(target_os = "windows"),
             theme: ThemePreset::default(),
         }
@@ -143,6 +145,12 @@ impl AppLayout {
     /// Sets the width of the sidebar in pixels. Defaults to 248px.
     pub fn sidebar_width(mut self, width: f32) -> Self {
         self.sidebar_width = width.max(0.);
+        self
+    }
+
+    /// Adds a resize handle over the sidebar's right edge. The host owns drag state and width.
+    pub fn sidebar_resize_handle(mut self, handle: impl IntoElement) -> Self {
+        self.sidebar_resize_handle = Some(handle.into_any_element());
         self
     }
 
@@ -179,6 +187,7 @@ impl AppLayout {
             });
 
         let sidebar = div()
+            .relative()
             .w(px(self.sidebar_width))
             .h_full()
             .flex_shrink_0()
@@ -189,7 +198,18 @@ impl AppLayout {
             } else {
                 rgb(palette.border)
             })
-            .child(self.sidebar);
+            .child(self.sidebar)
+            .when_some(self.sidebar_resize_handle, |sidebar, handle| {
+                sidebar.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .h_full()
+                        .w(px(6.))
+                        .child(handle),
+                )
+            });
 
         let content = div()
             .flex_1()

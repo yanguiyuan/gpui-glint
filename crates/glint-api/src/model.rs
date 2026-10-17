@@ -36,13 +36,26 @@ impl std::ops::Deref for BeforeAction {
         &self.approval
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyFormat {
+    #[default]
+    Raw,
+    UrlEncoded,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Draft {
     #[serde(default)]
     pub plugins: Vec<BeforeAction>,
+    #[serde(default)]
+    pub extractors: Vec<Pair>,
     pub method: String,
     pub url: String,
     pub body: String,
+    #[serde(default)]
+    pub body_format: BodyFormat,
+    #[serde(default)]
+    pub form: Vec<Pair>,
     pub params: Vec<Pair>,
     pub headers: Vec<Pair>,
     pub cookies: Vec<Pair>,
@@ -50,10 +63,11 @@ pub struct Draft {
     pub auth: bool,
     #[serde(default)]
     pub skip_tls_verification: bool,
-    pub environment: usize,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Exchange {
+    #[serde(default)]
+    pub curl: Option<String>,
     pub response: Option<super::http::HttpResponse>,
     pub error: Option<String>,
     pub preview: Option<String>,
@@ -61,6 +75,10 @@ pub struct Exchange {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    #[serde(default)]
+    pub environment_name: Option<String>,
     pub draft: Draft,
     pub label: String,
     pub time: String,
@@ -81,8 +99,85 @@ pub struct Request {
     pub versions: Vec<Record>,
     pub history: Vec<Record>,
 }
+/// Each section is either inherited or replaced in full, including explicit empty values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultSection {
+    Endpoint,
+    Auth,
+    Params,
+    Headers,
+    Cookies,
+    Body,
+    Plugins,
+    Extractors,
+    Settings,
+}
+impl DefaultSection {
+    pub const ALL: [Self; 9] = [
+        Self::Endpoint,
+        Self::Auth,
+        Self::Params,
+        Self::Headers,
+        Self::Cookies,
+        Self::Body,
+        Self::Plugins,
+        Self::Extractors,
+        Self::Settings,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Endpoint => "请求地址",
+            Self::Auth => "身份验证",
+            Self::Params => "参数",
+            Self::Headers => "请求头",
+            Self::Cookies => "Cookie",
+            Self::Body => "请求体",
+            Self::Plugins => "前置动作",
+            Self::Extractors => "后置动作",
+            Self::Settings => "请求设置",
+        }
+    }
+    pub fn apply(self, from: &Draft, to: &mut Draft) {
+        match self {
+            Self::Endpoint => {
+                to.url = from.url.clone();
+                to.method = from.method.clone();
+            }
+            Self::Auth => {
+                to.auth = from.auth;
+                to.token = from.token.clone();
+            }
+            Self::Params => to.params = from.params.clone(),
+            Self::Headers => to.headers = from.headers.clone(),
+            Self::Cookies => to.cookies = from.cookies.clone(),
+            Self::Body => {
+                to.body = from.body.clone();
+                to.body_format = from.body_format;
+                to.form = from.form.clone();
+            }
+            Self::Plugins => to.plugins = from.plugins.clone(),
+            Self::Extractors => to.extractors = from.extractors.clone(),
+            Self::Settings => to.skip_tls_verification = from.skip_tls_verification,
+        }
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryDefaults {
+    pub sections: std::collections::BTreeSet<DefaultSection>,
+    pub draft: Draft,
+}
+impl DirectoryDefaults {
+    pub fn apply(&self, draft: &mut Draft) {
+        for section in &self.sections {
+            section.apply(&self.draft, draft);
+        }
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RequestGroups {
+    #[serde(default)]
+    pub defaults: std::collections::BTreeMap<String, DirectoryDefaults>,
     #[serde(default)]
     pub folder_order: std::collections::BTreeMap<String, u64>,
     pub collection: String,
@@ -104,6 +199,7 @@ impl RequestGroups {
         Self {
             collection: "Test API".into(),
             folder_order: Default::default(),
+            defaults: Default::default(),
             names,
         }
     }
@@ -121,8 +217,24 @@ impl RequestGroups {
         Ok(Self {
             collection: name.into(),
             folder_order: Default::default(),
+            defaults: Default::default(),
             names: vec![],
         })
+    }
+    pub fn request_defaults(&self, path: &str) -> Draft {
+        let mut ancestors = vec![path];
+        let mut parent = path;
+        while !parent.is_empty() {
+            parent = Self::parent(parent);
+            ancestors.push(parent);
+        }
+        let mut draft = Draft::default();
+        for path in ancestors.into_iter().rev() {
+            if let Some(defaults) = self.defaults.get(path) {
+                defaults.apply(&mut draft);
+            }
+        }
+        draft
     }
     pub fn parent(path: &str) -> &str {
         path.rsplit_once('/').map_or("", |(parent, _)| parent)
@@ -197,6 +309,13 @@ impl RequestGroups {
                 (path, order)
             })
             .collect();
+        self.defaults = std::mem::take(&mut self.defaults)
+            .into_iter()
+            .map(|(mut path, defaults)| {
+                replace(&mut path);
+                (path, defaults)
+            })
+            .collect();
         for request in requests
             .iter_mut()
             .filter(|r| r.collection == self.collection)
@@ -214,6 +333,8 @@ impl RequestGroups {
         self.names
             .retain(|folder| folder != path && !folder.starts_with(&prefix));
         self.folder_order
+            .retain(|folder, _| folder != path && !folder.starts_with(&prefix));
+        self.defaults
             .retain(|folder, _| folder != path && !folder.starts_with(&prefix));
         for request in requests
             .iter_mut()
@@ -372,6 +493,14 @@ pub fn move_node(
                     )
                 })
                 .collect::<Vec<_>>();
+            let defaults = collections[*collection]
+                .defaults
+                .iter()
+                .filter(|(p, _)| subtree(p))
+                .map(|(p, d)| (format!("{next}{}", &p[path.len()..]), d.clone()))
+                .collect::<Vec<_>>();
+            collections[*collection].defaults.retain(|p, _| !subtree(p));
+            collections[destination].defaults.extend(defaults);
             collections[*collection].names.retain(|p| !subtree(p));
             collections[*collection]
                 .folder_order
@@ -544,16 +673,18 @@ impl Default for Draft {
     fn default() -> Self {
         Self {
             plugins: vec![],
+            extractors: vec![],
             method: "GET".into(),
             url: String::new(),
             body: String::new(),
+            body_format: BodyFormat::Raw,
+            form: vec![],
             params: vec![],
             headers: vec![],
             cookies: vec![],
             token: String::new(),
             auth: false,
             skip_tls_verification: false,
-            environment: 0,
         }
     }
 }

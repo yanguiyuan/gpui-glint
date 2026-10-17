@@ -1,3 +1,19 @@
+use std::sync::{Arc, OnceLock};
+
+const ICON_PNG: &[u8] = include_bytes!("../assets/glint-api-icon.png");
+
+pub fn image() -> Arc<gpui::Image> {
+    static IMAGE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
+    IMAGE
+        .get_or_init(|| {
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                ICON_PNG.to_vec(),
+            ))
+        })
+        .clone()
+}
+
 /// Embedded so direct `cargo run` launches have the same Dock icon as a bundle.
 #[cfg(target_os = "macos")]
 pub fn install() {
@@ -6,7 +22,7 @@ pub fn install() {
         runtime::{AnyClass, AnyObject},
     };
 
-    let bytes = include_bytes!("../assets/glint-api-icon.png");
+    let bytes = ICON_PNG;
     // Application::run invokes this on the AppKit main thread. NSData copies
     // the bytes; NSApplication retains the decoded image after assignment.
     unsafe {

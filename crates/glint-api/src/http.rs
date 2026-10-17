@@ -1,4 +1,4 @@
-use super::model::{Draft, Pair};
+use super::model::{BodyFormat, Draft, Pair};
 use reqwest::{
     Client, Method, Url,
     header::{CONTENT_TYPE, HeaderName, HeaderValue},
@@ -37,6 +37,48 @@ pub struct PreparedRequest {
     pub preview: String,
 }
 impl PreparedRequest {
+    /// Export the resolved request after plugin headers have been applied.
+    pub fn to_curl(&self) -> Result<String, String> {
+        let mut args = vec![
+            "curl --globoff --compressed".to_owned(),
+            format!("--request {}", super::curl::quote(self.method.as_str())?),
+            format!("--url {}", super::curl::quote(self.url.as_str())?),
+        ];
+        if self.method == Method::HEAD {
+            args.push("--head".into());
+        }
+        if self.skip_tls_verification {
+            args.push("--insecure".into());
+        }
+        if let Some(proxy) = &self.proxy {
+            args.push(format!("--proxy {}", super::curl::quote(proxy.url.trim())?));
+            args.push("--noproxy ''".into());
+        } else {
+            args.push("--noproxy '*'".into());
+        }
+        if !self
+            .headers
+            .iter()
+            .any(|(name, _)| name == reqwest::header::USER_AGENT)
+        {
+            args.push("--header 'User-Agent:'".into());
+        }
+        for (name, value) in &self.headers {
+            let value = std::str::from_utf8(value.as_bytes())
+                .map_err(|_| "请求头不是 UTF-8 文本，无法导出 cURL")?;
+            let header = if value.is_empty() {
+                format!("{name};")
+            } else {
+                format!("{name}: {value}")
+            };
+            args.push(format!("--header {}", super::curl::quote(&header)?));
+        }
+        if !self.body.is_empty() {
+            args.push(format!("--data-raw {}", super::curl::quote(&self.body)?));
+        }
+        Ok(args.join(" \\\n  "))
+    }
+
     pub fn plugin_payload(&self) -> Result<serde_json::Value, String> {
         let mut headers = serde_json::Map::new();
         for (name, value) in &self.headers {
@@ -132,10 +174,24 @@ impl PreparedRequest {
             }
         }
         resolved.url = environment.resolve(&draft.url)?;
-        resolved.body = if matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-            environment.resolve(&draft.body)?
-        } else {
+        let sends_body = matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+        resolved.body = if !sends_body {
             String::new()
+        } else if draft.body_format == BodyFormat::UrlEncoded {
+            let mut serializer = form_urlencoded::Serializer::new(String::new());
+            for pair in draft
+                .form
+                .iter()
+                .filter(|pair| pair.enabled && !pair.key.trim().is_empty())
+            {
+                serializer.append_pair(
+                    &environment.resolve(&pair.key)?,
+                    &environment.resolve(&pair.value)?,
+                );
+            }
+            serializer.finish()
+        } else {
+            environment.resolve(&draft.body)?
         };
         resolved.params = draft
             .params
@@ -175,8 +231,12 @@ impl PreparedRequest {
             headers.push((name, parsed));
         }
         // Default JSON content type matches the editor, but explicit content types win.
-        if !body.is_empty() && !headers.iter().any(|(name, _)| name == CONTENT_TYPE) {
-            let content_type = if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+        if (!body.is_empty() || sends_body && draft.body_format == BodyFormat::UrlEncoded)
+            && !headers.iter().any(|(name, _)| name == CONTENT_TYPE)
+        {
+            let content_type = if draft.body_format == BodyFormat::UrlEncoded {
+                "application/x-www-form-urlencoded"
+            } else if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
                 "application/json"
             } else {
                 "text/plain; charset=utf-8"
@@ -634,6 +694,100 @@ mod tests {
         assert!(preview.ends_with(wire.split_once("\r\n\r\n").unwrap().1));
         server.join().unwrap();
     }
+    #[test]
+    fn sends_urlencoded_form_with_templates_duplicate_keys_and_exact_plugin_payload() {
+        use std::{io::Write, net::TcpListener, sync::mpsc, thread};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            tx.send(read_request(&mut stream)).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .unwrap();
+        });
+        let mut env = variables(&base);
+        env.0.insert("name".into(), "中 文".into());
+        env.0.insert("field".into(), "tag".into());
+        let mut disabled = Pair::new("skip", "{{missing}}", "");
+        disabled.enabled = false;
+        let mut draft = Draft {
+            method: "POST".into(),
+            url: format!("{base}/form"),
+            body_format: BodyFormat::UrlEncoded,
+            body: "{{unused_raw_missing}}".into(),
+            form: vec![
+                Pair::new("name", "{{name}}", ""),
+                Pair::new("{{field}}", "a+b&=", ""),
+                Pair::new("tag", "second", ""),
+                Pair::new("empty", "", ""),
+                disabled,
+                Pair::new("", "{{missing}}", ""),
+            ],
+            ..Draft::default()
+        };
+        let expected = "name=%E4%B8%AD+%E6%96%87&tag=a%2Bb%26%3D&tag=second&empty=";
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert_eq!(request.plugin_payload().unwrap()["body"], expected);
+        assert_eq!(
+            request.plugin_payload().unwrap()["headers"]["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        assert!(request.preview.ends_with(expected));
+        runtime().block_on(execute(request)).unwrap();
+        let wire = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            wire.to_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded\r\n")
+        );
+        assert!(wire.ends_with(expected));
+        server.join().unwrap();
+        draft.headers.push(Pair::new(
+            "Content-Type",
+            "application/x-www-form-urlencoded; charset=UTF-8",
+            "",
+        ));
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert_eq!(
+            request.plugin_payload().unwrap()["headers"]["content-type"],
+            "application/x-www-form-urlencoded; charset=UTF-8"
+        );
+        draft.form.push(Pair::new("missing", "{{missing}}", ""));
+        assert!(
+            PreparedRequest::new(&draft, &env)
+                .err()
+                .unwrap()
+                .contains("missing")
+        );
+    }
+
+    #[test]
+    fn empty_form_keeps_mime_and_get_ignores_body_configuration() {
+        let mut draft = Draft {
+            method: "POST".into(),
+            url: "https://example.test/".into(),
+            body_format: BodyFormat::UrlEncoded,
+            ..Draft::default()
+        };
+        let env = variables("https://example.test");
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert!(request.body.is_empty());
+        assert_eq!(
+            request.plugin_payload().unwrap()["headers"]["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        draft.method = "GET".into();
+        draft.form.push(Pair::new("key", "{{missing}}", ""));
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert!(request.body.is_empty());
+        assert!(
+            request.plugin_payload().unwrap()["headers"]
+                .get("content-type")
+                .is_none()
+        );
+    }
+
     #[test]
     fn sends_resolved_post_headers_cookies_and_body_and_keeps_http_error_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

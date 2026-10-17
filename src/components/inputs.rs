@@ -220,6 +220,7 @@ impl SearchInput {
         let theme = self.theme;
         let mut field = div()
             .w(px(self.width))
+            .min_w_0()
             .h(px(30.))
             .px(px(10.))
             .flex()
@@ -236,12 +237,12 @@ impl SearchInput {
             .shadow_sm()
             .text_size(px(13.))
             .text_color(rgb(theme.color(0x92979a)))
-            .child(Icon::Search.render(13.));
+            .child(Icon::Search.render(13.).flex_shrink_0());
 
         field = field.child(if let Some(control) = self.control {
-            div().flex_1().child(control)
+            div().flex_1().min_w_0().child(control)
         } else {
-            div().flex_1().child(self.placeholder)
+            div().flex_1().min_w_0().truncate().child(self.placeholder)
         });
 
         if let Some(shortcut) = self.shortcut {

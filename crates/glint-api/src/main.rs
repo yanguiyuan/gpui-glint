@@ -4,42 +4,53 @@
 )]
 
 mod app_icon;
+mod curl;
+mod curl_ui;
+mod directory_ui;
 mod environment;
 mod environment_ui;
+mod history_ui;
 mod http;
+mod json_picker;
 mod model;
 mod plugin_ui;
 mod plugins;
+mod post_actions;
 mod registry_ui;
 mod storage;
 mod template;
+mod tree_delete_ui;
 mod update_ui;
 mod updater;
+mod version_tags;
 
 use environment::EnvironmentVariables;
 use environment_ui::{ProxyInput, VariableInput};
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
-    KeyBinding, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
+    KeyBinding, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img,
     point, prelude::*, px, rgb, size,
 };
 use gpui_glint::{
     components::{
         AppLayout, Button, ButtonKind, ButtonSize, Checkbox, ClosableTab, ClosableTabs, CodeCard,
         CommandItem, CommandPalette, CommandPaletteEvent, DataTable, GlintAssets, Icon, IconButton,
-        Popover, SearchInput, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption,
-        Separator, Switch, TableCell, TableColumn, TableEvent, TableRow, TextEntry,
-        TextReferenceResolver, ThemeSelector, ThemeSelectorEvent, TreeDrop, TreeListItem,
-        bind_code_card_keys, bind_text_entry_keys,
+        Popover, SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectField,
+        SelectFieldEvent, SelectOption, Separator, Switch, TableCell, TableColumn, TableEvent,
+        TableRow, TextCompletion, TextEntry, TextReferenceResolver, Toast, ToastHost, ToastKind,
+        TreeDrop, TreeListItem, bind_code_card_keys, bind_text_entry_keys,
     },
     theme::ThemePreset,
 };
 use http::{HttpResponse, PreparedRequest};
-use model::{Draft, Pair, Record, Request, RequestGroups};
+use model::{BodyFormat, Draft, Pair, Record, Request, RequestGroups};
 use std::collections::HashSet;
 use std::time::Instant;
 
-gpui::actions!(api_workbench, [SendRequest, SaveRequest, SearchCommands]);
+gpui::actions!(
+    api_workbench,
+    [SendRequest, SaveRequest, SearchCommands, SearchResponse]
+);
 
 enum GroupEdit {
     CreateCollection,
@@ -59,6 +70,11 @@ struct PairInput {
     note: Entity<TextEntry>,
 }
 struct Workbench {
+    directory_settings: Option<Entity<directory_ui::DirectorySettings>>,
+    directory_subscription: Option<Subscription>,
+    version_tag_edit: Option<(usize, String)>,
+    version_tag_input: Entity<TextEntry>,
+    toasts: Entity<ToastHost>,
     update_state: update_ui::UpdateState,
     update_task: Option<Task<()>>,
     show_update_details: bool,
@@ -75,10 +91,13 @@ struct Workbench {
     current_collection: usize,
     show_collection_menu: bool,
     current_directory: String,
+    sidebar_width: f32,
+    sidebar_resize_start: Option<(gpui::Pixels, f32)>,
     collapsed_directories: HashSet<(usize, String)>,
     hovered_tree_row: Option<String>,
     tree_drop: Option<(model::TreeNode, model::Placement)>,
     tree_menu: Option<(usize, String)>,
+    tree_delete: Option<model::TreeNode>,
     group_edit: Option<GroupEdit>,
     group_name: Entity<TextEntry>,
     group_error: Option<String>,
@@ -106,6 +125,11 @@ struct Workbench {
     response_tab: usize,
     traces: Vec<Vec<TraceEntry>>,
     sent_requests: Vec<Option<String>>,
+    sent_curls: Vec<Option<String>>,
+    curl_input: Entity<CodeCard>,
+    show_curl_import: bool,
+    curl_import_needs_focus: bool,
+    curl_error: Option<String>,
     request_preview: Entity<CodeCard>,
     trace_started: Option<Instant>,
     activity: usize,
@@ -124,18 +148,21 @@ struct Workbench {
     next_variable_row: u64,
     history_filter: usize,
     selected_history: Option<(usize, usize)>,
+    history_delete: Option<(usize, usize)>,
     current_versions: Vec<usize>,
     filter: Entity<TextEntry>,
     history_search: Entity<TextEntry>,
     authentication: Entity<SelectField>,
     skip_tls_verification: bool,
     endpoint: Entity<SelectField>,
-    theme_selector: Entity<ThemeSelector>,
     environment: Entity<Select>,
+    saved_environment: usize,
     environment_inputs: Vec<EnvironmentVariables>,
     params: Vec<PairInput>,
     headers: Vec<PairInput>,
     cookies: Vec<PairInput>,
+    extractors: Vec<PairInput>,
+    extractors_table: Entity<DataTable>,
     params_table: Entity<DataTable>,
     headers_table: Entity<DataTable>,
     response_headers_table: Entity<DataTable>,
@@ -143,6 +170,9 @@ struct Workbench {
     response_header_entries: Vec<[Entity<TextEntry>; 2]>,
     cookies_table: Entity<DataTable>,
     body: Entity<CodeCard>,
+    body_format: BodyFormat,
+    form: Vec<PairInput>,
+    form_table: Entity<DataTable>,
     response: Entity<CodeCard>,
     response_search: Entity<TextEntry>,
     show_response_search: bool,
@@ -150,6 +180,10 @@ struct Workbench {
     response_search_count: usize,
     commands: Entity<CommandPalette>,
     response_json: Option<serde_json::Value>,
+    json_nodes: Vec<json_picker::JsonNode>,
+    json_pick: Option<usize>,
+    json_hover: Option<usize>,
+    json_menu: Option<(json_picker::JsonNode, gpui::Point<gpui::Pixels>)>,
     response_data: Option<HttpResponse>,
     status: Option<u16>,
     pretty: bool,
@@ -193,6 +227,7 @@ impl Workbench {
         let data = storage
             .load()
             .expect("无法加载 SQLite 工作区，已保留原文件");
+        let selected_environment = data.selected_environment;
         let requests = data.requests;
         let collections = data.collections;
         let environment_names = data.environments;
@@ -219,18 +254,11 @@ impl Workbench {
         let history_search = Self::entry("", "搜索历史路径…", cx);
         let endpoint = cx.new(|cx| {
             SelectField::new(
-                ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
                     .map(|s| SelectOption::new(s, s).color(method_color(s))),
                 "https://",
                 cx,
             )
-        });
-        let theme_selector = cx.new(|cx| {
-            ThemeSelector::new(cx)
-                .themes([ThemePreset::Moonstone, ThemePreset::DarkObsidian])
-                .selected(ThemePreset::Moonstone)
-                .theme(ThemePreset::Moonstone)
-                .width(220.)
         });
         let environment = cx.new(|cx| {
             Select::new(
@@ -240,8 +268,8 @@ impl Workbench {
                     .map(|(i, label)| SelectOption::new(i.to_string(), label.clone())),
                 cx,
             )
-            .selected("0")
-            .width(112.)
+            .selected(selected_environment.to_string())
+            .width(150.)
         });
         let body = cx.new(|cx| CodeCard::new(cx, "json", initial.body.clone()));
         let response = cx.new(|cx| {
@@ -287,13 +315,6 @@ impl Workbench {
             },
         ));
         subscriptions.push(cx.subscribe(
-            &theme_selector,
-            |this: &mut Self, _, event: &ThemeSelectorEvent, cx| {
-                let ThemeSelectorEvent::Changed(theme) = event;
-                this.set_theme(*theme, cx);
-            },
-        ));
-        subscriptions.push(cx.subscribe(
             &environment,
             |this: &mut Self, _, event: &SelectEvent, cx| {
                 let SelectEvent::Changed(value) = event;
@@ -313,6 +334,7 @@ impl Workbench {
             |this: &mut Self, _, event: &CommandPaletteEvent, cx| {
                 if let CommandPaletteEvent::Executed(id) = event {
                     match id.as_ref() {
+                        "import-curl" => this.open_curl_import(cx),
                         "send" => this.send(cx),
                         "save" => this.save(cx),
                         "theme" => this.toggle_theme(cx),
@@ -348,6 +370,28 @@ impl Workbench {
                 .empty_row("暂无 Cookie 字段覆盖。")
                 .add_row("添加 Cookie 字段覆盖")
         });
+        let form_table = cx.new(|cx| {
+            make_table(cx)
+                .empty_row("暂无表单字段。")
+                .add_row("添加表单字段")
+        });
+        let extractors_table = cx.new(|cx| {
+            DataTable::new(
+                cx,
+                [
+                    TableColumn::new("", 48.),
+                    TableColumn::new("环境变量名", 160.).flexible(),
+                    TableColumn::new("JSONPath", 240.).flexible(),
+                    TableColumn::new("说明", 140.),
+                    TableColumn::new("", 36.),
+                ],
+                [],
+            )
+            .document()
+            .compact()
+            .empty_row("暂无提取规则。")
+            .add_row("添加提取规则")
+        });
         let response_headers_table = cx.new(|cx| {
             DataTable::new(
                 cx,
@@ -361,15 +405,27 @@ impl Workbench {
             .compact()
             .empty_row("暂无响应头。")
         });
-        for (kind, table) in [(0, &params_table), (1, &headers_table), (2, &cookies_table)] {
+        for (kind, table) in [
+            (0, &params_table),
+            (1, &headers_table),
+            (2, &cookies_table),
+            (3, &extractors_table),
+            (4, &form_table),
+        ] {
             subscriptions.push(cx.subscribe(
                 table,
                 move |this: &mut Self, _, event: &TableEvent, cx| {
                     if let TableEvent::AddRow = event {
-                        let row = this.pair(&Pair::new("", "", ""), cx);
+                        let row = if kind == 3 {
+                            this.extractor_input(&Pair::new("", "", ""), cx)
+                        } else {
+                            this.pair(&Pair::new("", "", ""), cx)
+                        };
                         match kind {
                             1 => this.headers.push(row),
                             2 => this.cookies.push(row),
+                            3 => this.extractors.push(row),
+                            4 => this.form.push(row),
                             _ => this.params.push(row),
                         }
                         this.sync_pair_tables(cx);
@@ -417,6 +473,7 @@ impl Workbench {
             .and_then(|store| store.sources())
             .unwrap_or_default();
         let mut this = Self {
+            toasts: cx.new(|_| ToastHost::new()),
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
             show_update_details: false,
@@ -432,11 +489,18 @@ impl Workbench {
             collections,
             current_collection: 0,
             show_collection_menu: false,
+            directory_settings: None,
+            directory_subscription: None,
+            version_tag_edit: None,
+            version_tag_input: Self::entry("", "例如：联调通过、上线基线", cx),
             current_directory: String::new(),
+            sidebar_width: 220.,
+            sidebar_resize_start: None,
             collapsed_directories: HashSet::new(),
             hovered_tree_row: None,
             tree_drop: None,
             tree_menu: None,
+            tree_delete: None,
             group_name,
             group_edit: None,
             group_error: None,
@@ -461,6 +525,11 @@ impl Workbench {
             response_tab: 0,
             traces,
             sent_requests,
+            sent_curls: data.curls,
+            curl_input: cx.new(|cx| CodeCard::new(cx, "bash", "").show_header(false)),
+            show_curl_import: false,
+            curl_import_needs_focus: false,
+            curl_error: None,
             request_preview,
             trace_started: None,
             activity: 0,
@@ -479,18 +548,21 @@ impl Workbench {
             next_variable_row: 0,
             history_filter: 0,
             selected_history: None,
+            history_delete: None,
             current_versions,
             filter,
             history_search,
             authentication,
             skip_tls_verification: false,
             endpoint,
-            theme_selector,
             environment,
+            saved_environment: selected_environment,
             environment_inputs,
             params: vec![],
             headers: vec![],
             cookies: vec![],
+            extractors: vec![],
+            extractors_table,
             params_table,
             headers_table,
             response_headers_table,
@@ -498,6 +570,9 @@ impl Workbench {
             response_header_entries: vec![],
             cookies_table,
             body,
+            body_format: BodyFormat::Raw,
+            form: vec![],
+            form_table,
             response,
             response_search,
             show_response_search: false,
@@ -505,6 +580,10 @@ impl Workbench {
             response_search_count: 0,
             commands,
             response_json: None,
+            json_nodes: vec![],
+            json_pick: None,
+            json_hover: None,
+            json_menu: None,
             response_data: None,
             status: None,
             pretty: true,
@@ -538,6 +617,10 @@ impl Workbench {
                     .icon(Icon::ApiDoc)
             })
             .chain([
+                CommandItem::new("import-curl", "从 cURL 导入请求")
+                    .group("操作")
+                    .keywords("import curl 导入 粘贴")
+                    .icon(Icon::Download),
                 CommandItem::new("send", "发送 HTTP 请求")
                     .group("操作")
                     .icon(Icon::Play)
@@ -711,10 +794,12 @@ impl Workbench {
     }
     fn persist(&mut self, cx: &mut Context<Self>) {
         self.capture_draft(cx);
+        self.storage_dirty |= self.selected_environment(cx) != self.saved_environment;
         if !self.storage_dirty {
             return;
         }
         let workspace = storage::Workspace {
+            selected_environment: self.selected_environment(cx),
             requests: self.requests.clone(),
             collections: self.collections.clone(),
             environments: self.environment_names.clone(),
@@ -722,10 +807,12 @@ impl Workbench {
             traces: self.traces.clone(),
             responses: self.responses.clone(),
             previews: self.sent_requests.clone(),
+            curls: self.sent_curls.clone(),
         };
         let error = self.storage.save(&workspace).err();
         if error.is_none() {
             self.storage_dirty = false;
+            self.saved_environment = workspace.selected_environment;
         }
         if error != self.storage_error {
             self.storage_error = error;
@@ -766,18 +853,15 @@ impl Workbench {
                 .unwrap_or("GET".into()),
             url: self.endpoint.read(cx).value().text.to_string(),
             body: self.body.read(cx).content().into(),
+            body_format: self.body_format,
+            form: pairs(&self.form),
             params: pairs(&self.params),
             headers: pairs(&self.headers),
             cookies: pairs(&self.cookies),
+            extractors: pairs(&self.extractors),
             token: self.authentication.read(cx).value().text.to_string(),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
             skip_tls_verification: self.skip_tls_verification,
-            environment: self
-                .environment
-                .read(cx)
-                .value()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
         }
     }
     fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
@@ -790,21 +874,73 @@ impl Workbench {
     }
     fn sync_reference_inputs(&mut self, cx: &mut Context<Self>) {
         let resolver = self.reference_resolver(cx);
+        let mut completions: Vec<_> = self.environment_inputs[self.selected_environment(cx)]
+            .variables
+            .iter()
+            .map(|variable| {
+                TextCompletion::new(
+                    &variable.name,
+                    if variable.secret {
+                        "环境变量 · 敏感"
+                    } else {
+                        "环境变量"
+                    },
+                )
+            })
+            .collect();
+        completions.extend(
+            [
+                ("uuid()", "生成 UUID"),
+                ("random_id()", "生成随机 ID"),
+                ("random_int(0, 100)", "生成随机整数"),
+                ("random_string(16)", "生成随机字符串"),
+                ("random_name()", "生成随机姓名"),
+                ("now()", "当前时间"),
+                ("now('%Y-%m-%d')", "格式化日期"),
+                ("timestamp()", "Unix 秒级时间戳"),
+                ("timestamp_ms()", "Unix 毫秒级时间戳"),
+            ]
+            .map(|(expression, description)| TextCompletion::new(expression, description)),
+        );
+        let draft = self.snapshot(cx);
+        for cookie in draft
+            .cookies
+            .iter()
+            .filter(|pair| pair.enabled && !pair.key.trim().is_empty())
+        {
+            completions.push(TextCompletion::new(
+                format!(
+                    "cookie('{}')",
+                    cookie.key.replace('\\', "\\\\").replace('\'', "\\'")
+                ),
+                "读取请求 Cookie",
+            ));
+        }
         for row in self
             .params
             .iter()
             .chain(self.headers.iter())
             .chain(self.cookies.iter())
+            .chain(self.form.iter())
         {
             for entry in [&row.key, &row.value] {
                 entry.update(cx, |entry, cx| {
-                    entry.set_reference_resolver(Some(resolver.clone()), cx)
+                    entry.set_reference_resolver(Some(resolver.clone()), cx);
+                    entry.set_completions(completions.clone(), cx)
                 });
             }
         }
         for field in [&self.endpoint, &self.authentication] {
             field.update(cx, |field, cx| {
-                field.set_reference_resolver(Some(resolver.clone()), cx)
+                field.set_reference_resolver(Some(resolver.clone()), cx);
+                field.set_completions(completions.clone(), cx)
+            });
+        }
+        self.body
+            .update(cx, |body, cx| body.set_completions(completions.clone(), cx));
+        if let Some(editor) = &self.directory_settings {
+            editor.update(cx, |editor, cx| {
+                editor.set_context(self.theme, completions, cx)
             });
         }
     }
@@ -852,20 +988,28 @@ impl Workbench {
             field.set_selected(Some(draft.method.clone().into()), cx);
             field.set_text(draft.url.clone(), cx);
         });
-        self.environment.update(cx, |select, cx| {
-            select.set_selected(Some(draft.environment.to_string().into()), cx)
-        });
         self.body
             .update(cx, |editor, cx| editor.set_content(draft.body.clone(), cx));
         self.row_subscriptions.clear();
         self.params = draft.params.iter().map(|p| self.pair(p, cx)).collect();
         self.headers = draft.headers.iter().map(|p| self.pair(p, cx)).collect();
         self.cookies = draft.cookies.iter().map(|p| self.pair(p, cx)).collect();
+        self.body_format = draft.body_format;
+        self.form = draft.form.iter().map(|pair| self.pair(pair, cx)).collect();
+        self.extractors = draft
+            .extractors
+            .iter()
+            .map(|p| self.extractor_input(p, cx))
+            .collect();
         self.sync_pair_tables(cx);
         self.sync_reference_inputs(cx);
         cx.notify();
     }
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.history_delete = None;
+        self.version_tag_edit = None;
+        self.directory_settings = None;
+        self.tree_delete = None;
         self.show_plugins = false;
         self.show_environments = false;
         if index >= self.requests.len() {
@@ -918,6 +1062,17 @@ impl Workbench {
         self.error = None;
     }
     fn save(&mut self, cx: &mut Context<Self>) {
+        if self.show_curl_import {
+            return;
+        }
+        if self.version_tag_edit.is_some() {
+            self.save_version_tag(cx);
+            return;
+        }
+        if let Some(editor) = self.directory_settings.clone() {
+            editor.update(cx, |editor, cx| editor.save(cx));
+            return;
+        }
         if self.requests.is_empty() {
             return;
         }
@@ -941,6 +1096,8 @@ impl Workbench {
         request.versions.insert(
             0,
             Record {
+                tag: String::new(),
+                environment_name: None,
                 draft,
                 label: format!("v{}", request.versions.len() + 1),
                 time: record_time(),
@@ -956,6 +1113,12 @@ impl Workbench {
         cx.notify();
     }
     fn send(&mut self, cx: &mut Context<Self>) {
+        if self.show_curl_import {
+            return;
+        }
+        if self.directory_settings.is_some() {
+            return;
+        }
         if self.requests.is_empty() {
             return;
         }
@@ -966,30 +1129,36 @@ impl Workbench {
             cx.notify();
             return;
         }
+        self.sent_curls[self.active] = None;
         let draft = self.snapshot(cx);
+        let environment_index = self.selected_environment(cx);
+        let environment_name = self.environment_name(environment_index).to_owned();
         self.trace_started = Some(Instant::now());
         self.traces[self.active].clear();
         self.push_trace(
-            format!(
-                "准备 {} 请求 · {}",
-                draft.method,
-                self.environment_name(draft.environment)
-            ),
+            format!("准备 {} 请求 · {}", draft.method, environment_name),
             cx,
         );
+        self.cancel_json_pick(cx);
+        self.json_menu = None;
+        self.json_nodes.clear();
         self.response_json = None;
         self.response_data = None;
         self.status = None;
         self.error = None;
-        let inputs = &self.environment_inputs[draft.environment];
+        let inputs = &self.environment_inputs[environment_index];
         let variables = inputs.values();
         let request = match PreparedRequest::new(&draft, &variables)
             .and_then(|request| request.with_proxy(&inputs.proxy))
-        {
+            .and_then(|request| {
+                plugins::validate_variables(&draft.plugins, &self.plugin_catalog, &variables)?;
+                Ok(request)
+            }) {
             Ok(request) => request,
             Err(error) => {
                 self.push_trace(format!("校验失败：{error}"), cx);
                 self.trace_started = None;
+                self.request_error_toast("无法发送请求", &environment_name, &error, cx);
                 self.error = Some(error);
                 self.notice = "请求配置有误".into();
                 cx.notify();
@@ -1006,7 +1175,14 @@ impl Workbench {
         {
             self.push_trace("已合并 Cookie 覆盖表格到请求头", cx);
         }
-        self.push_trace("发送 HTTP 请求，等待服务器响应", cx);
+        self.push_trace(
+            if draft.plugins.iter().any(|action| action.enabled) {
+                "执行发送前动作"
+            } else {
+                "准备发送 HTTP 请求"
+            },
+            cx,
+        );
         self.requests[self.active].draft = draft.clone();
         self.notice = "正在发送 HTTP 请求".into();
         let index = self.active;
@@ -1021,10 +1197,17 @@ impl Workbench {
                     plugins::apply(request, &plugin_ids, &plugin_catalog, &plugin_variables)
                 })
                 .await;
+            let failure_title = if prepared.is_ok() {
+                "请求失败"
+            } else {
+                "无法发送请求"
+            };
             let result = match prepared {
                 Ok(request) => {
                     let _ = this.update(cx, |this, cx| {
+                        this.push_trace("发送 HTTP 请求，等待服务器响应", cx);
                         this.sent_requests[index] = Some(request.preview.clone());
+                        this.sent_curls[index] = request.to_curl().ok();
                         if this.active == index {
                             this.sync_request_preview(cx);
                         }
@@ -1041,22 +1224,38 @@ impl Workbench {
                         status_label(response.status),
                         format!(
                             "{elapsed_ms} ms · {} · {} B",
-                            this.environment_name(draft.environment),
-                            response.bytes
+                            environment_name, response.bytes
                         ),
                     ),
                     Err(error) => ("请求失败".into(), format!("{elapsed_ms} ms · {error}")),
                 };
+                if let Ok(response) = &result {
+                    this.push_trace(
+                        format!(
+                            "收到响应 · {} · {} B",
+                            status_label(response.status),
+                            response.bytes
+                        ),
+                        cx,
+                    );
+                }
+                let extraction = result
+                    .as_ref()
+                    .ok()
+                    .map(|response| this.apply_extractors(&draft, environment_index, response, cx));
                 this.storage_dirty = true;
-                this.requests[index].history.insert(
-                    0,
+                this.prepend_history(
+                    index,
                     Record {
+                        tag: String::new(),
+                        environment_name: Some(environment_name),
                         draft,
                         label,
                         detail,
                         time: record_time(),
                         elapsed_ms: Some(elapsed_ms),
                         exchange: Some(model::Exchange {
+                            curl: this.sent_curls[index].clone(),
                             response: result.as_ref().ok().cloned(),
                             error: result.as_ref().err().cloned(),
                             preview: this.sent_requests[index].clone(),
@@ -1064,17 +1263,8 @@ impl Workbench {
                         }),
                     },
                 );
-                this.selected_history = Some((index, 0));
                 match result {
                     Ok(response) => {
-                        this.push_trace(
-                            format!(
-                                "收到响应 · {} · {} B",
-                                status_label(response.status),
-                                response.bytes
-                            ),
-                            cx,
-                        );
                         this.push_trace(
                             if response.status < 400 {
                                 "请求完成"
@@ -1088,9 +1278,20 @@ impl Workbench {
                         this.response_json = response.json.clone();
                         this.response_data = Some(response);
                         this.update_response(cx);
-                        this.notice = "请求完成".into();
+                        this.notice = match extraction {
+                            Some(Ok(count)) if count > 0 => {
+                                format!("请求完成 · 已提取 {count} 个环境变量")
+                            }
+                            Some(Err(error)) => format!("请求完成 · 后置动作失败：{error}"),
+                            _ => "请求完成".into(),
+                        };
                     }
                     Err(error) => {
+                        let environment = this.requests[index].history[0]
+                            .environment_name
+                            .clone()
+                            .unwrap_or_default();
+                        this.request_error_toast(failure_title, &environment, &error, cx);
                         this.push_trace(format!("请求失败：{error}"), cx);
                         this.error = Some(error);
                         this.responses[index] = None;
@@ -1112,6 +1313,23 @@ impl Workbench {
             });
         }));
         cx.notify();
+    }
+    fn request_error_toast(
+        &mut self,
+        title: &str,
+        environment: &str,
+        error: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts.update(cx, |host, cx| {
+            host.push(
+                Toast::new(title.to_owned())
+                    .kind(ToastKind::Error)
+                    .description(format!("环境：{environment}\n{error}"))
+                    .duration(Some(std::time::Duration::from_secs(10))),
+                cx,
+            );
+        });
     }
     fn push_trace(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.storage_dirty = true;
@@ -1227,6 +1445,7 @@ impl Workbench {
         cx.notify();
     }
     fn toggle_response_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_json_pick(cx);
         self.show_response_search = !self.show_response_search;
         if self.show_response_search {
             self.html_preview = false;
@@ -1237,6 +1456,8 @@ impl Workbench {
         self.sync_response_search(true, cx);
     }
     fn update_response(&mut self, cx: &mut Context<Self>) {
+        self.cancel_json_pick(cx);
+        self.json_menu = None;
         let headers = self
             .response_data
             .as_ref()
@@ -1288,13 +1509,20 @@ impl Workbench {
         self.response_headers_scroll
             .set_offset(point(px(0.), px(0.)));
         let content = self.response_content();
+        self.json_nodes = if self.response_json.is_some() {
+            json_picker::index(&content)
+        } else {
+            vec![]
+        };
         self.html_preview = false;
         let language = self
             .response_data
             .as_ref()
             .map(HttpResponse::language)
             .unwrap_or("text");
+        let folding = self.pretty && self.response_json.is_some();
         self.response.update(cx, |editor, cx| {
+            editor.set_json_folding(folding, cx);
             editor.set_language(language, cx);
             editor.set_content(content, cx);
         });
@@ -1374,6 +1602,12 @@ impl Workbench {
     }
     fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         self.theme = theme;
+        if self.directory_settings.is_some() {
+            self.sync_reference_inputs(cx);
+        }
+        self.curl_input
+            .update(cx, |editor, cx| editor.set_theme(theme, cx));
+        self.toasts.update(cx, |host, cx| host.set_theme(theme, cx));
         self.sync_groups(cx);
         self.sync_pair_tables(cx);
         self.response_headers_table
@@ -1387,6 +1621,7 @@ impl Workbench {
             &self.response_search,
             &self.group_name,
             &self.request_name,
+            &self.version_tag_input,
         ] {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }
@@ -1407,6 +1642,8 @@ impl Workbench {
             .iter()
             .chain(self.headers.iter())
             .chain(self.cookies.iter())
+            .chain(self.form.iter())
+            .chain(self.extractors.iter())
         {
             for entry in [&row.key, &row.value, &row.note] {
                 entry.update(cx, |e, cx| e.set_theme(theme, cx));
@@ -1426,10 +1663,6 @@ impl Workbench {
         self.authentication
             .update(cx, |field, cx| field.set_theme(theme, cx));
         self.environment.update(cx, |e, cx| e.set_theme(theme, cx));
-        self.theme_selector.update(cx, |e, cx| {
-            e.set_selected(theme, cx);
-            e.set_theme(theme, cx);
-        });
         self.commands.update(cx, |e, cx| e.set_theme(theme, cx));
         cx.notify();
     }
@@ -1447,7 +1680,7 @@ impl Workbench {
             .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
             .pr_3()
             .text_size(px(12.))
-            .child(Icon::ApiDoc.render(18.).text_color(rgb(0x007aff)))
+            .child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
             .child(div().font_weight(FontWeight::SEMIBOLD).child("Glint API"))
             .child(
                 div()
@@ -1506,8 +1739,12 @@ impl Workbench {
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.open_commands(window, cx))),
             )
-            .child(self.theme_selector.clone())
-            .child(self.update_button(cx))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .debug_selector(|| "global-environment-selector".into())
+                    .child(self.environment.clone()),
+            )
             .when(!self.show_environments && !self.show_plugins, |bar| {
                 bar.child(
                     IconButton::new(Icon::Sidebar, "展开或收起记录")
@@ -1586,6 +1823,7 @@ impl Workbench {
                     })),
             )
             .child(div().flex_1())
+            .child(self.update_button(cx))
             .child(
                 IconButton::new(Icon::Settings, "切换明暗主题")
                     .theme(self.theme)
@@ -1735,7 +1973,7 @@ impl Workbench {
                     .border_color(rgb(p.border))
                     .text_size(px(10.))
                     .text_color(rgb(p.text_muted))
-                    .child("当前请求使用")
+                    .child("全局当前环境")
                     .child(
                         div()
                             .mt_2()
@@ -1818,8 +2056,10 @@ impl Workbench {
                     SearchInput::new("筛选集合、目录或请求…")
                         .control(self.filter.clone())
                         .theme(self.theme)
-                        .width(196.)
-                        .render(),
+                        .render()
+                        .w_full()
+                        .min_w_0()
+                        .debug_selector(|| "sidebar-search-input".into()),
                 ),
             )
             .when(
@@ -1843,6 +2083,7 @@ impl Workbench {
             IconButton::new(Icon::More, "更多集合操作")
                 .theme(self.theme)
                 .render()
+                .debug_selector(|| "collection-more".into())
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.show_collection_menu = !this.show_collection_menu;
                     window.focus(&this.focus, cx);
@@ -1884,6 +2125,25 @@ impl Workbench {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.edit_collection(window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("import-curl-menu")
+                                .debug_selector(|| "open-curl-import".into())
+                                .h(px(32.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(p.accent_tint)))
+                                .child(Icon::Download.render(14.))
+                                .child("从 cURL 导入")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_curl_import(cx);
                                 })),
                         ),
                 );
@@ -1948,6 +2208,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         use model::{Placement, TreeNode};
+        self.directory_settings = None;
         self.capture_draft(cx);
         let old_names = self
             .collections
@@ -2194,23 +2455,38 @@ impl Workbench {
                             .child(label),
                     );
                 }
-                if hovered || self.tree_menu.as_ref() == Some(&(collection, path.clone())) {
+                if hovered
+                    || self.tree_menu.as_ref() == Some(&(collection, path.clone()))
+                    || self.tree_delete.as_ref()
+                        == Some(&model::TreeNode::Directory {
+                            collection,
+                            path: path.clone(),
+                        })
+                {
                     item = item.trailing(self.directory_menu(collection, path.clone(), cx));
                 }
                 item.render()
                     .debug_selector(move || debug_key.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tree_menu = None;
-                        this.current_collection = collection;
-                        this.current_directory = path.clone();
-                        let key = (collection, path.clone());
-                        if !this.collapsed_directories.remove(&key) {
-                            this.collapsed_directories.insert(key);
-                        }
-                        this.group_edit = None;
-                        this.group_error = None;
-                        cx.notify();
-                    }))
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            if event.click_count() == 2 {
+                                window.focus(&this.focus, cx);
+                                this.open_directory_settings(collection, path.clone(), cx);
+                                return;
+                            }
+                            this.tree_menu = None;
+                            this.tree_delete = None;
+                            this.current_collection = collection;
+                            this.current_directory = path.clone();
+                            let key = (collection, path.clone());
+                            if !this.collapsed_directories.remove(&key) {
+                                this.collapsed_directories.insert(key);
+                            }
+                            this.group_edit = None;
+                            this.group_error = None;
+                            cx.notify();
+                        }),
+                    )
             }
             model::TreeNode::Request(index) => {
                 let request = &self.requests[index];
@@ -2238,16 +2514,17 @@ impl Workbench {
                                 .child(request.name.clone()),
                         ),
                 );
-                if hovered {
+                if hovered || self.tree_delete.as_ref() == Some(&model::TreeNode::Request(index)) {
                     item = item.trailing(
-                        IconButton::new(Icon::Trash, "删除请求")
-                            .theme(self.theme)
-                            .render()
-                            .size(px(20.))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.delete_request(index, cx);
-                            })),
+                        self.tree_delete_popover(
+                            model::TreeNode::Request(index),
+                            IconButton::new(Icon::Trash, "删除请求")
+                                .theme(self.theme)
+                                .render()
+                                .size(px(20.))
+                                .debug_selector(move || format!("delete-request:{index}").into()),
+                            cx,
+                        ),
                     );
                 }
                 item.render()
@@ -2266,6 +2543,22 @@ impl Workbench {
         .into_any_element()
     }
     fn directory_menu(&self, collection: usize, path: String, cx: &mut Context<Self>) -> gpui::Div {
+        let target = model::TreeNode::Directory {
+            collection,
+            path: path.clone(),
+        };
+        if self.tree_delete.as_ref() == Some(&target) {
+            return div().child(
+                self.tree_delete_popover(
+                    target,
+                    IconButton::new(Icon::More, "目录操作")
+                        .theme(self.theme)
+                        .render()
+                        .size(px(22.)),
+                    cx,
+                ),
+            );
+        }
         let p = self.theme.palette();
         let key = (collection, path.clone());
         let open = self.tree_menu.as_ref() == Some(&key);
@@ -2285,6 +2578,7 @@ impl Workbench {
                     } else {
                         Some(toggle_key.clone())
                     };
+                    this.tree_delete = None;
                     this.show_collection_menu = false;
                     window.focus(&this.focus, cx);
                     cx.notify();
@@ -2304,8 +2598,9 @@ impl Workbench {
                 (1, Icon::Folder, "新建目录"),
                 (2, Icon::Pencil, "重命名目录"),
                 (3, Icon::Trash, "删除目录"),
+                (4, Icon::Settings, "目录设置"),
             ] {
-                if path.is_empty() && action >= 2 {
+                if path.is_empty() && matches!(action, 2 | 3) {
                     continue;
                 }
                 let path = path.clone();
@@ -2346,19 +2641,16 @@ impl Workbench {
                                     window,
                                     cx,
                                 ),
+                                4 => {
+                                    window.focus(&this.focus, cx);
+                                    this.open_directory_settings(collection, path.clone(), cx);
+                                }
                                 _ => {
-                                    this.collections[collection].remove(&path, &mut this.requests);
-                                    this.collapsed_directories.retain(|(c, folder)| {
-                                        *c != collection
-                                            || (folder != &path
-                                                && !folder.starts_with(&format!("{path}/")))
+                                    this.tree_delete = Some(model::TreeNode::Directory {
+                                        collection,
+                                        path: path.clone(),
                                     });
-                                    this.current_directory =
-                                        RequestGroups::parent(&path).to_owned();
-                                    this.group_edit = None;
-                                    this.storage_dirty = true;
-                                    this.notice = "已删除目录，请求保留在上级目录中".into();
-                                    this.sync_groups(cx);
+                                    cx.notify();
                                 }
                             }
                         })),
@@ -2380,6 +2672,7 @@ impl Workbench {
         trigger
     }
     fn save_group(&mut self, cx: &mut Context<Self>) {
+        self.directory_settings = None;
         let name = self.group_name.read(cx).value().to_owned();
         let result = match &self.group_edit {
             Some(GroupEdit::CreateEnvironment) => {
@@ -2574,7 +2867,7 @@ impl Workbench {
             cx.notify();
             return;
         }
-        let draft = Draft::default();
+        let draft = self.collections[self.current_collection].request_defaults(&group);
         if !self.collections[self.current_collection].contains(&group) {
             return;
         }
@@ -2587,6 +2880,8 @@ impl Workbench {
             group,
             draft: draft.clone(),
             versions: vec![Record {
+                tag: String::new(),
+                environment_name: None,
                 draft,
                 label: "v1".into(),
                 time: record_time(),
@@ -2610,6 +2905,7 @@ impl Workbench {
         self.responses.push(None);
         self.traces.push(vec![]);
         self.sent_requests.push(None);
+        self.sent_curls.push(None);
         self.current_versions.push(0);
         if i == 0 {
             self.load(&self.requests[0].draft.clone(), cx);
@@ -2617,6 +2913,9 @@ impl Workbench {
         self.choose(i, cx);
     }
     fn delete_request(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.history_delete = None;
+        self.version_tag_edit = None;
+        self.tree_delete = None;
         if index >= self.requests.len() {
             return;
         }
@@ -2633,6 +2932,7 @@ impl Workbench {
         self.responses.remove(index);
         self.traces.remove(index);
         self.sent_requests.remove(index);
+        self.sent_curls.remove(index);
         self.current_versions.remove(index);
         self.tabs = self
             .tabs
@@ -2731,10 +3031,12 @@ impl Workbench {
         view
     }
     fn sync_pair_tables(&mut self, cx: &mut Context<Self>) {
-        for kind in [0, 1, 2] {
+        for kind in [0, 1, 2, 3, 4] {
             let rows = match kind {
                 1 => &self.headers,
                 2 => &self.cookies,
+                3 => &self.extractors,
+                4 => &self.form,
                 _ => &self.params,
             };
             let theme = self.theme;
@@ -2755,6 +3057,8 @@ impl Workbench {
                                     let rows = match kind {
                                         1 => &mut this.headers,
                                         2 => &mut this.cookies,
+                                        3 => &mut this.extractors,
+                                        4 => &mut this.form,
                                         _ => &mut this.params,
                                     };
                                     rows[i].enabled = checked;
@@ -2767,6 +3071,9 @@ impl Workbench {
                     let key = row.key.clone();
                     let value = row.value.clone();
                     let note = row.note.clone();
+                    let workbench = cx.entity().downgrade();
+                    let extractor_cell = (kind == 3)
+                        .then(|| cx.new(|cx| json_picker::ExtractorCell::new(workbench, i, cx)));
                     let owner = cx.entity().downgrade();
                     let delete = TableCell::custom(move || {
                         let owner = owner.clone();
@@ -2780,9 +3087,14 @@ impl Workbench {
                                     let rows = match kind {
                                         1 => &mut this.headers,
                                         2 => &mut this.cookies,
+                                        3 => &mut this.extractors,
+                                        4 => &mut this.form,
                                         _ => &mut this.params,
                                     };
                                     rows.remove(i);
+                                    if kind == 3 {
+                                        this.cancel_json_pick(cx);
+                                    }
                                     this.sync_pair_tables(cx);
                                     cx.notify();
                                 });
@@ -2793,12 +3105,35 @@ impl Workbench {
                         [
                             check,
                             TableCell::custom(move || {
-                                div().w_full().font_family("Menlo").child(key.clone())
+                                div()
+                                    .w_full()
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .font_family("Menlo")
+                                    .child(key.clone())
                             }),
                             TableCell::custom(move || {
-                                div().w_full().font_family("Menlo").child(value.clone())
+                                if let Some(cell) = &extractor_cell {
+                                    return cell.clone().into_any_element();
+                                }
+                                div()
+                                    .w_full()
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .font_family("Menlo")
+                                    .child(value.clone())
+                                    .into_any_element()
                             }),
-                            TableCell::custom(move || div().w_full().child(note.clone())),
+                            TableCell::custom(move || {
+                                div()
+                                    .w_full()
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .child(note.clone())
+                            }),
                             delete,
                         ],
                     )
@@ -2807,6 +3142,8 @@ impl Workbench {
             let table = match kind {
                 1 => &self.headers_table,
                 2 => &self.cookies_table,
+                3 => &self.extractors_table,
+                4 => &self.form_table,
                 _ => &self.params_table,
             };
             table.update(cx, |table, cx| {
@@ -2882,6 +3219,56 @@ impl Workbench {
                     .child(control),
             )
     }
+    fn body_configuration(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let owner = cx.entity().downgrade();
+        let mut head = div().flex().items_center().gap_3().child(
+            SegmentedControl::new([
+                SegmentOption::new("JSON / 原始"),
+                SegmentOption::new("x-www-form-urlencoded"),
+            ])
+            .id("request-body-format")
+            .selected(usize::from(self.body_format == BodyFormat::UrlEncoded))
+            .theme(self.theme)
+            .on_change(move |index, _, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.body_format = if index == 1 {
+                        BodyFormat::UrlEncoded
+                    } else {
+                        BodyFormat::Raw
+                    };
+                    cx.notify();
+                });
+            })
+            .render()
+            .debug_selector(|| "request-body-format".into()),
+        );
+        if self.body_format == BodyFormat::Raw {
+            head = head.child(div().flex_1()).child(
+                Button::new("格式化 JSON")
+                    .kind(ButtonKind::Plain)
+                    .size(ButtonSize::Mini)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let valid = this.body.update(cx, |editor, cx| editor.format_json(cx));
+                        this.notice = if valid {
+                            "已格式化 JSON"
+                        } else {
+                            "JSON 格式有误，请检查后重试"
+                        }
+                        .into();
+                        cx.notify();
+                    })),
+            );
+        }
+        let content = div().h_full().flex().flex_col().gap_2().child(head);
+        if self.body_format == BodyFormat::UrlEncoded {
+            content.child(self.form_table.clone()).child(div().text_size(px(10.)).text_color(rgb(self.theme.palette().text_muted))
+                .child("仅发送已启用字段，支持同名字段和模板变量；无需手动编码。自动使用 application/x-www-form-urlencoded，显式 Content-Type 优先。"))
+        } else {
+            content.child(div().flex_1().min_h_0().child(self.body.clone()))
+        }
+    }
     fn configuration(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
         let owner = cx.entity().downgrade();
@@ -2897,8 +3284,11 @@ impl Workbench {
                 .child(self.authentication.clone())
                 .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child("Bearer 使用 Token 或环境变量引用；请填写实际 Token，或在环境变量中设置 api_token。No Auth 不生成 Authorization。")),
             5=>self.plugin_configuration(cx),
-            3=>div().h_full().flex().flex_col().gap_2().child(div().flex().items_center().text_size(px(11.)).child("JSON 请求体").child(div().flex_1()).child(Button::new("格式化 JSON").kind(ButtonKind::Plain).size(ButtonSize::Mini).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx| {let valid=this.body.update(cx,|e,cx|e.format_json(cx));this.notice=if valid {"已格式化 JSON"} else {"JSON 格式有误，请检查后重试"}.into();cx.notify();}))))
-                .child(div().flex_1().min_h_0().child(self.body.clone())),
+            6=>div().flex().flex_col().gap_3()
+                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("提取环境变量"))
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入发送时的全局环境，同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。"))
+                .child(self.extractors_table.clone()),
+            3=>self.body_configuration(cx),
             _=>div().w_full().flex().flex_col()
                 .child(self.request_setting_row("跳过 TLS 证书校验",
                     "允许自签名、过期或域名不匹配的证书，仅作用于当前请求。",
@@ -2919,12 +3309,96 @@ impl Workbench {
         };
         div()
             .id("configuration")
-            .h(px(if self.config == 5 { 360. } else { 218. }))
+            .h(px(if matches!(self.config, 5 | 6) {
+                360.
+            } else {
+                218.
+            }))
             .flex_shrink_0()
             .overflow_y_scroll()
             .px_5()
             .py_3()
             .child(view)
+    }
+    fn response_search_controls(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = self.theme.palette();
+        div()
+            .id("response-search-bar")
+            .debug_selector(|| "response-search-bar".into())
+            .w(px(340.))
+            .min_w(px(180.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface_subtle))
+            .child(
+                Icon::Search
+                    .render(12.)
+                    .flex_shrink_0()
+                    .text_color(rgb(p.text_muted)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.response_search.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child(format!(
+                        "{}/{}",
+                        self.response_search_index.map_or(0, |i| i + 1),
+                        self.response_search_count
+                    )),
+            )
+            .child(
+                IconButton::new(Icon::ArrowUp, "上一处（Shift+Enter）")
+                    .plain()
+                    .theme(self.theme)
+                    .render()
+                    .size(px(22.))
+                    .on_click(cx.listener(|this, _, _, cx| this.step_response_search(true, cx))),
+            )
+            .child(
+                IconButton::new(Icon::ChevronDown, "下一处（Enter）")
+                    .plain()
+                    .theme(self.theme)
+                    .render()
+                    .size(px(22.))
+                    .on_click(cx.listener(|this, _, _, cx| this.step_response_search(false, cx))),
+            )
+            .child(
+                IconButton::new(Icon::Close, "关闭搜索（Esc）")
+                    .plain()
+                    .theme(self.theme)
+                    .render()
+                    .size(px(22.))
+                    .debug_selector(|| "response-search-close".into())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_response_search(window, cx)),
+                    ),
+            )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.response_search.read(cx).is_composing() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "enter" => this.step_response_search(event.keystroke.modifiers.shift, cx),
+                    "escape" => this.toggle_response_search(window, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+                window.prevent_default();
+            }))
     }
     fn response_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
@@ -2951,7 +3425,23 @@ impl Workbench {
                 )),
             );
         }
-        head = head.child(div().flex_1());
+        head = head.child(div().flex_1()).child(
+            Button::new("复制 cURL")
+                .icon(Icon::Copy)
+                .kind(ButtonKind::Plain)
+                .size(ButtonSize::Mini)
+                .theme(self.theme)
+                .when(
+                    self.sent_curls
+                        .get(self.active)
+                        .and_then(|c| c.as_ref())
+                        .is_none(),
+                    |button| button.disabled(),
+                )
+                .render()
+                .debug_selector(|| "export-response-curl".into())
+                .on_click(cx.listener(|this, _, _, cx| this.copy_response_curl(cx))),
+        );
         if let Some(status) = self.status {
             let bytes = self
                 .response_data
@@ -3068,83 +3558,116 @@ impl Workbench {
                 .flex_col()
                 .child(
                     div()
+                        .id("response-body-toolbar")
+                        .debug_selector(|| "response-body-toolbar".into())
                         .h(px(36.))
                         .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap_3()
                         .px_5()
-                        .child(
-                            tab_button(
-                                if self.response_json.is_some() {
+                        .child({
+                            let html = self
+                                .response_data
+                                .as_ref()
+                                .is_some_and(|response| response.language() == "html");
+                            let mut options = vec![
+                                SegmentOption::new(if self.response_json.is_some() {
                                     "格式化"
                                 } else {
                                     "源码"
-                                },
-                                self.pretty && !self.html_preview,
-                                self.theme,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pretty = true;
-                                this.update_response(cx);
-                                cx.notify();
-                            })),
-                        )
-                        .child(
-                            tab_button("原始", !self.pretty && !self.html_preview, self.theme)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pretty = false;
-                                    this.update_response(cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .when(
-                            self.response_data
-                                .as_ref()
-                                .is_some_and(|r| r.language() == "html"),
-                            |el| {
-                                el.child(
-                                    tab_button("预览", self.html_preview, self.theme).on_click(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.preview_html(window, cx)
-                                        }),
-                                    ),
-                                )
-                            },
-                        )
+                                }),
+                                SegmentOption::new("原始"),
+                            ];
+                            if html {
+                                options.push(SegmentOption::new("预览"));
+                            }
+                            let owner = cx.entity().downgrade();
+                            SegmentedControl::new(options)
+                                .id("response-format-segments")
+                                .selected(if self.html_preview && html {
+                                    2
+                                } else if self.pretty {
+                                    0
+                                } else {
+                                    1
+                                })
+                                .theme(self.theme)
+                                .on_change(move |selected, window, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        if selected == 2 {
+                                            this.preview_html(window, cx);
+                                        } else {
+                                            this.pretty = selected == 0;
+                                            this.update_response(cx);
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .render()
+                                .flex_shrink_0()
+                        })
                         .child(
                             div()
                                 .text_size(px(10.))
                                 .text_color(rgb(p.text_muted))
-                                .child(
-                                    if self
-                                        .response_data
-                                        .as_ref()
-                                        .is_some_and(|r| r.language() == "html")
-                                    {
-                                        "HTML 响应"
-                                    } else if self.response_json.is_some() {
-                                        "JSON 响应"
-                                    } else {
-                                        "文本响应"
-                                    },
-                                ),
+                                .max_w(px(280.))
+                                .truncate()
+                                .child(if self.json_pick.is_some() {
+                                    self.json_hover
+                                        .and_then(|index| self.json_nodes.get(index))
+                                        .map(|node| node.path.clone())
+                                        .unwrap_or_else(|| "点击字段选取 · Esc 取消".into())
+                                } else if self
+                                    .response_data
+                                    .as_ref()
+                                    .is_some_and(|r| r.language() == "html")
+                                {
+                                    "HTML 响应".to_owned()
+                                } else if self.response_json.is_some() {
+                                    "JSON 响应".to_owned()
+                                } else {
+                                    "文本响应".to_owned()
+                                }),
                         )
+                        .when(self.json_pick.is_some(), |toolbar| {
+                            toolbar.child(
+                                Button::new("取消选取")
+                                    .kind(ButtonKind::Plain)
+                                    .size(ButtonSize::Mini)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "cancel-json-pick".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_json_pick(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                         .child(div().flex_1())
-                        .child(
-                            IconButton::new(Icon::Search, "搜索响应体")
-                                .theme(self.theme)
-                                .render()
-                                .id("response-search-toggle")
-                                .debug_selector(|| "response-search-toggle".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_response_search(window, cx);
-                                })),
-                        )
+                        .when(self.show_response_search, |toolbar| {
+                            toolbar.child(self.response_search_controls(cx))
+                        })
+                        .when(!self.show_response_search, |toolbar| {
+                            toolbar.child(
+                                IconButton::new(Icon::Search, "搜索响应体（⌘ / Ctrl + F）")
+                                    .plain()
+                                    .theme(self.theme)
+                                    .render()
+                                    .size(px(26.))
+                                    .id("response-search-toggle")
+                                    .debug_selector(|| "response-search-toggle".into())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_response_search(window, cx)
+                                    })),
+                            )
+                        })
                         .child(
                             IconButton::new(Icon::Copy, "复制响应")
+                                .plain()
                                 .theme(self.theme)
                                 .render()
+                                .size(px(26.))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if this.response_data.is_some() {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
@@ -3156,90 +3679,16 @@ impl Workbench {
                                 })),
                         ),
                 )
-                .when(self.show_response_search, |el| {
-                    el.child(
-                        div()
-                            .id("response-search-bar")
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_5()
-                            .py_1()
-                            .child(
-                                SearchInput::new("搜索响应体…")
-                                    .theme(self.theme)
-                                    .width(220.)
-                                    .control(self.response_search.clone())
-                                    .render()
-                                    .on_key_down(cx.listener(
-                                        |this, event: &gpui::KeyDownEvent, window, cx| {
-                                            if this.response_search.read(cx).is_composing() {
-                                                return;
-                                            }
-                                            match event.keystroke.key.as_str() {
-                                                "enter" => {
-                                                    this.step_response_search(
-                                                        event.keystroke.modifiers.shift,
-                                                        cx,
-                                                    );
-                                                    cx.stop_propagation();
-                                                }
-                                                "escape" => {
-                                                    this.toggle_response_search(window, cx);
-                                                    cx.stop_propagation();
-                                                }
-                                                _ => {}
-                                            }
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(format!(
-                                        "{}/{}",
-                                        self.response_search_index.map_or(0, |i| i + 1),
-                                        self.response_search_count
-                                    )),
-                            )
-                            .child(
-                                IconButton::new(Icon::ArrowUp, "上一处（Shift+Enter）")
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.step_response_search(true, cx)
-                                    })),
-                            )
-                            .child(
-                                IconButton::new(Icon::ChevronDown, "下一处（Enter）")
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.step_response_search(false, cx)
-                                    })),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                IconButton::new(Icon::Close, "关闭搜索（Esc）")
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_response_search(window, cx)
-                                    })),
-                            ),
-                    )
-                })
                 .child(
                     div()
                         .id("response-scroll")
+                        .debug_selector(|| "response-scroll".into())
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
                         .px_3()
                         .pb_3()
-                        .child(self.response_view()),
+                        .child(self.response_view(cx)),
                 )
         };
         div()
@@ -3252,14 +3701,14 @@ impl Workbench {
             .child(head)
             .child(content)
     }
-    fn response_view(&self) -> gpui::AnyElement {
+    fn response_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         if self.html_preview {
             if let Some(view) = &self.html_webview {
                 return div().size_full().child(view.clone()).into_any_element();
             }
         }
-        self.response.clone().into_any_element()
+        self.json_response_view(cx).into_any_element()
     }
     fn workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
@@ -3357,8 +3806,7 @@ impl Workbench {
                                     .border_color(rgb(p.panel))
                                     .text_color(rgb(p.text_muted))
                                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                            )
-                            .child(self.environment.clone()),
+                            ),
                     ),
             )
             .child(
@@ -3394,17 +3842,19 @@ impl Workbench {
             "请求体",
             "请求设置",
             "前置动作",
+            "后置动作",
         ]
         .iter()
         .enumerate()
         {
-            config_tabs =
-                config_tabs.child(tab_button(label, self.config == i, self.theme).on_click(
-                    cx.listener(move |this, _, _, cx| {
+            config_tabs = config_tabs.child(
+                tab_button(label, self.config == i, self.theme)
+                    .debug_selector(move || format!("request-config-{i}").into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.config = i;
                         cx.notify();
-                    }),
-                ));
+                    })),
+            );
         }
         let content = div()
             .flex_1()
@@ -3521,6 +3971,7 @@ impl Workbench {
                 list = list.child(
                     div()
                         .id(("history-record", i))
+                        .group(gpui::SharedString::from(format!("history-record-{i}")))
                         .debug_selector(move || format!("history-record-{i}").into())
                         .rounded_md()
                         .p_3()
@@ -3554,7 +4005,8 @@ impl Workbench {
                                         .text_size(px(9.))
                                         .text_color(rgb(p.text_muted))
                                         .child(r.time.split(' ').nth(1).unwrap_or("").to_owned()),
-                                ),
+                                )
+                                .child(self.history_delete_popover(i, r, cx)),
                         )
                         .child(
                             div()
@@ -3590,7 +4042,7 @@ impl Workbench {
                                 .child(format!(
                                     "{} ms · {}",
                                     r.elapsed_ms.unwrap_or(0),
-                                    self.environment_name(r.draft.environment)
+                                    r.environment_name.as_deref().unwrap_or("未记录环境")
                                 )),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -3601,6 +4053,7 @@ impl Workbench {
                             this.selected_history = Some((this.active, i));
                             this.load(&record.draft, cx);
                             let exchange = record.exchange.as_ref();
+                            this.sent_curls[this.active] = exchange.and_then(|e| e.curl.clone());
                             this.response_data = exchange.and_then(|e| e.response.clone());
                             this.response_json =
                                 this.response_data.as_ref().and_then(|r| r.json.clone());
@@ -3640,6 +4093,8 @@ impl Workbench {
             list = list.child(
                 div()
                     .id(("version-record", i))
+                    .group(gpui::SharedString::from(format!("version-record-{i}")))
+                    .debug_selector(move || format!("version-record-{i}").into())
                     .h(px(92.))
                     .flex_shrink_0()
                     .flex()
@@ -3728,7 +4183,8 @@ impl Workbench {
                                             }))
                                             .child(if current { "当前" } else { "基线" }),
                                     )
-                                    .child(div().flex_1())
+                                    .child(div().flex_1().min_w_0())
+                                    .child(self.version_tag_popover(i, r, cx))
                                     .child(
                                         div()
                                             .font_family("Menlo")
@@ -3904,6 +4360,10 @@ impl Workbench {
 }
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.curl_import_needs_focus && self.show_curl_import {
+            window.focus(&self.curl_input.read(cx).focus_handle(cx), cx);
+            self.curl_import_needs_focus = false;
+        }
         if !self.show_registry_dialog
             && [&self.registry_name, &self.registry_url, &self.registry_key]
                 .iter()
@@ -3919,6 +4379,8 @@ impl Render for Workbench {
                 && self.response_data.is_some()
                 && !self.show_environments
                 && !self.show_plugins
+                && !self.show_curl_import
+                && self.directory_settings.is_none()
                 && self.response_tab == 0
                 && !self.commands.read(cx).is_open();
             if let Err(error) = view.update(cx, |view, cx| view.set_visible(visible, cx)) {
@@ -3936,11 +4398,16 @@ impl Render for Workbench {
                 self.plugin_workspace(cx)
             } else if self.show_environments {
                 self.environment_workspace(cx)
+            } else if let Some(editor) = &self.directory_settings {
+                div().size_full().child(editor.clone())
             } else {
                 self.workspace(cx)
             })
             .when(
-                self.show_activity && !self.show_environments && !self.show_plugins,
+                self.show_activity
+                    && !self.show_environments
+                    && !self.show_plugins
+                    && self.directory_settings.is_none(),
                 |s| s.child(self.activity_panel(cx)),
             );
         let content = div()
@@ -3955,14 +4422,30 @@ impl Render for Workbench {
                         .child(format!("SQLite 保存失败：{error}。修改尚未写入磁盘。")),
                 )
             })
-            .when(self.show_update_details, |el| {
-                el.child(self.update_banner(cx))
-            })
             .child(content);
+        let maximum_sidebar_width =
+            (f32::from(window.viewport_size().width) - 46. - 640.).clamp(180., 480.);
+        self.sidebar_width = self.sidebar_width.clamp(180., maximum_sidebar_width);
+        let resize_accent = self.theme.palette().accent;
+        let resize_handle = div()
+            .id("sidebar-resize-handle")
+            .debug_selector(|| "sidebar-resize-handle".into())
+            .size_full()
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .hover(move |style| style.bg(rgb(resize_accent)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.sidebar_resize_start = Some((event.position.x, this.sidebar_width));
+                    cx.notify();
+                }),
+            );
         let shell = AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
             .navigation_rail(self.rail(cx))
             .navigation_rail_width(46.)
-            .sidebar_width(220.)
+            .sidebar_width(self.sidebar_width)
+            .sidebar_resize_handle(resize_handle)
             .theme(self.theme);
         let overlay = self
             .commands
@@ -3973,8 +4456,41 @@ impl Render for Workbench {
             .relative()
             .size_full()
             .text_size(px(12.))
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start, width)) = this.sidebar_resize_start {
+                        if event.dragging() {
+                            this.sidebar_width = (width + f32::from(event.position.x - start))
+                                .clamp(180., maximum_sidebar_width);
+                        } else {
+                            this.sidebar_resize_start = None;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resize_start.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resize_start.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
-                if !this.show_plugins && !this.show_environments {
+                if !this.show_plugins
+                    && !this.show_environments
+                    && this.directory_settings.is_none()
+                {
                     this.send(cx);
                 }
             }))
@@ -3983,16 +4499,38 @@ impl Render for Workbench {
                     return;
                 } else if this.show_environments {
                     this.save_environment_variables(cx);
+                } else if let Some(editor) = this.directory_settings.clone() {
+                    editor.update(cx, |editor, cx| editor.save(cx));
                 } else {
                     this.save(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
+                if !this.show_plugins && !this.show_environments && this.response_data.is_some() {
+                    this.response_tab = 0;
+                    if !this.show_response_search {
+                        this.toggle_response_search(window, cx);
+                    } else {
+                        window.focus(&this.response_search.focus_handle(cx), cx);
+                    }
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &SearchCommands, w, cx| {
-                if !this.show_registry_dialog {
+                if !this.show_registry_dialog && !this.show_curl_import {
                     this.open_commands(w, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.show_curl_import {
+                    if event.keystroke.key == "escape" {
+                        this.show_curl_import = false;
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
                 if this.show_registry_dialog {
                     if event.keystroke.key == "tab" {
                         let fields = [&this.registry_name, &this.registry_url, &this.registry_key];
@@ -4018,6 +4556,33 @@ impl Render for Workbench {
                     }
                     return;
                 }
+                if event.keystroke.key == "escape" && this.history_delete.is_some() {
+                    this.history_delete = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if event.keystroke.key == "escape"
+                    && (this.json_pick.is_some() || this.json_menu.is_some())
+                {
+                    this.cancel_json_pick(cx);
+                    this.json_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.show_update_details {
+                    this.show_update_details = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.tree_delete.is_some() {
+                    this.tree_delete = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.tree_menu.is_some() {
                     this.tree_menu = None;
                     cx.stop_propagation();
@@ -4040,8 +4605,10 @@ impl Render for Workbench {
                 }
             }))
             .child(shell)
+            .child(self.toasts.clone())
             .children(overlay)
             .children(self.registry_dialog(cx))
+            .children(self.curl_import_dialog(cx))
     }
 }
 fn tab_button(label: &str, selected: bool, theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
@@ -4165,6 +4732,8 @@ fn main() {
                 KeyBinding::new("ctrl-enter", SendRequest, Some("ApiWorkbench")),
                 KeyBinding::new("cmd-s", SaveRequest, Some("ApiWorkbench")),
                 KeyBinding::new("ctrl-s", SaveRequest, Some("ApiWorkbench")),
+                KeyBinding::new("cmd-f", SearchResponse, Some("ApiWorkbench")),
+                KeyBinding::new("ctrl-f", SearchResponse, Some("ApiWorkbench")),
                 KeyBinding::new("cmd-k", SearchCommands, Some("ApiWorkbench")),
                 KeyBinding::new("ctrl-k", SearchCommands, Some("ApiWorkbench")),
             ]);
@@ -4196,6 +4765,247 @@ fn main() {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    #[gpui::test]
+    fn template_suggestions_follow_global_environment_and_extraction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            for (kind, name) in [
+                (GroupEdit::CreateCollection, "API"),
+                (GroupEdit::CreateEnvironment, "Development"),
+                (GroupEdit::CreateEnvironment, "Production"),
+            ] {
+                host.group_edit = Some(kind);
+                host.group_name
+                    .update(cx, |entry, cx| entry.set_value(name, cx));
+                host.save_group(cx);
+            }
+            host.environment_inputs[1]
+                .save(None, "token_dev", "secret-dev", true)
+                .unwrap();
+            host.environment_inputs[2]
+                .save(None, "token_prod", "secret-prod", true)
+                .unwrap();
+            host.add_request(cx);
+            host.show_activity = false;
+            let draft = Draft {
+                params: vec![Pair::new("q", "{{tok", "")],
+                ..Draft::default()
+            };
+            host.load(&draft, cx);
+            host
+        });
+        for (index, expected) in [
+            (1, "{{token_dev}}"),
+            (2, "{{token_prod}}"),
+            (0, "{{uuid()}}"),
+        ] {
+            host.update(window, |host, cx| {
+                host.environment.update(cx, |_, cx| {
+                    cx.emit(SelectEvent::Changed(index.to_string().into()))
+                });
+                host.params[0].value.update(cx, |entry, cx| {
+                    entry.set_value(if index == 0 { "{{uu" } else { "{{tok" }, cx)
+                });
+            });
+            window.update(|window, cx| {
+                host.update(cx, |host, cx| {
+                    window.focus(&host.params[0].value.read(cx).focus_handle(cx), cx)
+                });
+            });
+            window.update(|window, _| window.refresh());
+            assert!(
+                window.debug_bounds("template-completion-menu").is_some(),
+                "missing completion in environment {index}"
+            );
+            window.simulate_keystrokes("tab");
+            host.update(window, |host, cx| {
+                assert_eq!(host.params[0].value.read(cx).value(), expected)
+            });
+        }
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                let draft = Draft {
+                    extractors: vec![Pair::new("new_token", "$.token", "")],
+                    ..Draft::default()
+                };
+                let response = HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    text: String::new(),
+                    bytes: 0,
+                    json: Some(serde_json::json!({"token":"new-secret"})),
+                };
+                host.environment
+                    .update(cx, |select, cx| select.set_selected(Some("2".into()), cx));
+                host.apply_extractors(&draft, 2, &response, cx).unwrap();
+                host.params[0]
+                    .value
+                    .update(cx, |entry, cx| entry.set_value("{{new_", cx));
+                window.focus(&host.params[0].value.read(cx).focus_handle(cx), cx);
+            });
+        });
+        window.simulate_keystrokes("enter");
+        host.update(window, |host, cx| {
+            assert_eq!(host.params[0].value.read(cx).value(), "{{new_token}}")
+        });
+    }
+
+    #[gpui::test]
+    fn global_environment_survives_request_switch_versions_and_restart(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            for (kind, name) in [
+                (GroupEdit::CreateCollection, "API"),
+                (GroupEdit::CreateEnvironment, "Development"),
+                (GroupEdit::CreateEnvironment, "Production"),
+            ] {
+                host.group_edit = Some(kind);
+                host.group_name
+                    .update(cx, |entry, cx| entry.set_value(name, cx));
+                host.save_group(cx);
+            }
+            host.add_request(cx);
+            host.add_request(cx);
+            host
+        });
+        let selector = window.debug_bounds("global-environment-selector").unwrap();
+        assert!(selector.top() < px(42.));
+        host.update(window, |host, cx| {
+            host.environment
+                .update(cx, |_, cx| cx.emit(SelectEvent::Changed("2".into())));
+        });
+        host.update(window, |host, cx| {
+            let drafts: Vec<_> = host
+                .requests
+                .iter()
+                .map(|request| request.draft.clone())
+                .collect();
+            host.choose(0, cx);
+            assert_eq!(host.selected_environment(cx), 2);
+            host.save(cx);
+            assert_eq!(
+                host.requests[0].versions.len(),
+                1,
+                "global environment changes must not create request versions"
+            );
+            // A legacy draft's request-local environment must no longer change the selector.
+            let mut legacy = serde_json::to_value(&drafts[0]).unwrap();
+            legacy["environment"] = 1.into();
+            let legacy: Draft = serde_json::from_value(legacy).unwrap();
+            host.load(&legacy, cx);
+            assert_eq!(host.selected_environment(cx), 2);
+            host.choose(1, cx);
+            assert_eq!(host.selected_environment(cx), 2);
+            assert_eq!(host.snapshot(cx), drafts[1]);
+            host.persist(cx);
+        });
+        let data = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(data.selected_environment, 2);
+        assert!(
+            serde_json::to_value(&data.requests[0].draft)
+                .unwrap()
+                .get("environment")
+                .is_none()
+        );
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, cx| {
+            assert_eq!(host.selected_environment(cx), 2);
+            host.choose(1, cx);
+            assert_eq!(host.selected_environment(cx), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_resize_drags_across_content_clamps_and_stops_on_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            Workbench::with_store(storage::Store::open(&path).unwrap(), cx)
+        });
+        let initial = window.debug_bounds("sidebar-resize-handle").unwrap();
+        let initial_search = window.debug_bounds("sidebar-search-input").unwrap();
+        let drag = |window: &mut gpui::VisualTestContext, target_x: f32| {
+            let source = window
+                .debug_bounds("sidebar-resize-handle")
+                .unwrap()
+                .center();
+            let target = point(px(target_x), source.y);
+            window.simulate_event(gpui::MouseDownEvent {
+                position: source,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            window.simulate_event(gpui::MouseMoveEvent {
+                position: target,
+                pressed_button: Some(gpui::MouseButton::Left),
+                ..Default::default()
+            });
+            window.simulate_event(gpui::MouseUpEvent {
+                position: target,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+        };
+        drag(window, f32::from(initial.center().x) + 50.);
+        let widened = window.debug_bounds("sidebar-resize-handle").unwrap();
+        assert_eq!(widened.left() - initial.left(), px(50.));
+        let widened_search = window.debug_bounds("sidebar-search-input").unwrap();
+        assert_eq!(widened_search.left(), initial_search.left());
+        assert_eq!(
+            widened_search.size.width - initial_search.size.width,
+            px(50.)
+        );
+        assert_eq!(
+            widened.left() - widened_search.right(),
+            initial.left() - initial_search.right()
+        );
+        host.update(window, |host, _| {
+            assert_eq!(host.sidebar_width, 270.);
+            assert!(host.sidebar_resize_start.is_none());
+        });
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: point(px(700.), initial.center().y),
+            ..Default::default()
+        });
+        assert_eq!(
+            window.debug_bounds("sidebar-resize-handle").unwrap(),
+            widened
+        );
+        drag(window, 900.);
+        host.update(window, |host, _| assert!(host.sidebar_width <= 480.));
+        drag(window, 10.);
+        host.update(window, |host, _| {
+            assert_eq!(host.sidebar_width, 180.);
+        });
+        let narrow_search = window.debug_bounds("sidebar-search-input").unwrap();
+        assert_eq!(
+            narrow_search.size.width,
+            initial_search.size.width - px(40.)
+        );
+        assert_eq!(narrow_search.left(), initial_search.left());
+        host.update(window, |host, cx| {
+            host.show_environments = true;
+            cx.notify();
+        });
+        assert_eq!(
+            window.debug_bounds("sidebar-resize-handle").unwrap().left(),
+            initial.left() - px(40.)
+        );
+    }
+
     #[gpui::test]
     fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
         let path = std::env::temp_dir().join(format!(
@@ -4336,6 +5146,7 @@ mod persistence_tests {
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{text}");
                 record.exchange = Some(model::Exchange {
+                    curl: None,
                     response: Some(HttpResponse {
                         status,
                         headers: vec![("x-record".into(), text.into())],
@@ -4560,13 +5371,188 @@ mod persistence_tests {
     }
 
     #[gpui::test]
+    fn form_body_mode_edits_switches_versions_and_survives_restart(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.body
+                .update(cx, |body, cx| body.set_content(r#"{"raw":true}"#, cx));
+            host.config = 3;
+            host.show_activity = false;
+            host
+        });
+        let format = window.debug_bounds("request-body-format").unwrap();
+        window.simulate_click(
+            point(format.right() - px(20.), format.center().y),
+            gpui::Modifiers::default(),
+        );
+        host.update(window, |host, cx| {
+            assert_eq!(host.body_format, BodyFormat::UrlEncoded);
+            host.form_table
+                .update(cx, |_, cx| cx.emit(TableEvent::AddRow));
+        });
+        host.update(window, |host, cx| {
+            assert_eq!(host.form.len(), 1);
+            host.form[0]
+                .key
+                .update(cx, |entry, cx| entry.set_value("token", cx));
+            host.form[0]
+                .value
+                .update(cx, |entry, cx| entry.set_value("{{api_token}}", cx));
+            host.save(cx);
+        });
+        let format = window.debug_bounds("request-body-format").unwrap();
+        window.simulate_click(
+            point(format.left() + px(20.), format.center().y),
+            gpui::Modifiers::default(),
+        );
+        host.update(window, |host, cx| {
+            assert_eq!(host.body_format, BodyFormat::Raw);
+            assert_eq!(host.body.read(cx).content(), r#"{"raw":true}"#);
+            let saved = host.requests[0].versions[0].draft.clone();
+            host.load(&saved, cx);
+            assert_eq!(host.snapshot(cx).body_format, BodyFormat::UrlEncoded);
+            assert_eq!(host.snapshot(cx).form[0].value, "{{api_token}}");
+            host.add_request(cx);
+            assert_eq!(host.body_format, BodyFormat::Raw);
+            assert!(host.form.is_empty());
+            host.choose(0, cx);
+            assert_eq!(host.body_format, BodyFormat::UrlEncoded);
+            host.persist(cx);
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, cx| {
+            assert_eq!(host.snapshot(cx).body_format, BodyFormat::UrlEncoded);
+            assert_eq!(host.snapshot(cx).form[0].key, "token");
+        });
+        let mut legacy = serde_json::to_value(Draft::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("body_format");
+        legacy.as_object_mut().unwrap().remove("form");
+        let draft: Draft = serde_json::from_value(legacy).unwrap();
+        assert_eq!(draft.body_format, BodyFormat::Raw);
+        assert!(draft.form.is_empty());
+    }
+
+    #[gpui::test]
+    fn send_validation_shows_specific_error_toasts_without_starting_network(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&directory.path().join("workspace.sqlite3")).unwrap(),
+                cx,
+            );
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host
+        });
+        host.update(window, |host, cx| {
+            host.endpoint.update(cx, |field, cx| {
+                field.set_text("{{missing_base_url}}/test", cx)
+            });
+            host.send(cx);
+            assert!(host.sending.is_none());
+            let toast = host.toasts.read(cx).toasts().last().unwrap();
+            assert_eq!(toast.kind, ToastKind::Error);
+            assert_eq!(toast.message.as_ref(), "无法发送请求");
+            assert!(
+                toast
+                    .description
+                    .as_ref()
+                    .unwrap()
+                    .contains("missing_base_url")
+            );
+            host.endpoint.update(cx, |field, cx| {
+                field.set_text("https://example.invalid/", cx)
+            });
+            let plugin = host
+                .plugin_catalog
+                .iter()
+                .find(|plugin| plugin.manifest.id == "com.wps.kso1")
+                .unwrap();
+            host.requests[0].draft.plugins = vec![model::BeforeAction {
+                approval: gpui_glint::plugins::Approval::for_plugin(plugin),
+                action_id: "sign-request".into(),
+                enabled: true,
+            }];
+            host.send(cx);
+            assert!(host.sending.is_none());
+            let toast = host.toasts.read(cx).toasts().last().unwrap();
+            let description = toast.description.as_ref().unwrap();
+            assert!(description.contains("WPS KSO-1 签名"));
+            assert!(description.contains("wps_app_id") && description.contains("wps_app_key"));
+            assert!(description.contains("不使用环境"));
+            assert!(host.requests[0].history.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn response_search_shortcuts_open_and_focus_inline_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new("cmd-f", SearchResponse, Some("ApiWorkbench")),
+                KeyBinding::new("ctrl-f", SearchResponse, Some("ApiWorkbench")),
+            ])
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&directory.path().join("workspace.sqlite3")).unwrap(),
+                cx,
+            );
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.response_data = Some(HttpResponse {
+                status: 200,
+                headers: vec![],
+                text: "response".into(),
+                bytes: 8,
+                json: None,
+            });
+            host.update_response(cx);
+            host
+        });
+        for shortcut in ["cmd-f", "ctrl-f"] {
+            window.update(|window, cx| {
+                let focus = host.read(cx).focus.clone();
+                window.focus(&focus, cx);
+            });
+            window.simulate_keystrokes(shortcut);
+            let focus = host.update(window, |host, cx| {
+                assert!(host.show_response_search);
+                assert_eq!(host.response_tab, 0);
+                host.response_search.focus_handle(cx)
+            });
+            window.update(|window, _| assert!(focus.is_focused(window)));
+            window.simulate_keystrokes(shortcut);
+            host.update(window, |host, _| assert!(host.show_response_search));
+            window.simulate_keystrokes("escape");
+            host.update(window, |host, _| assert!(!host.show_response_search));
+        }
+    }
+
+    #[gpui::test]
     fn response_search_opens_cycles_refreshes_and_closes(cx: &mut gpui::TestAppContext) {
         cx.update(bind_text_entry_keys);
-        struct ResponsePanel(Entity<Workbench>);
+        struct ResponsePanel(Entity<Workbench>, f32);
         impl Render for ResponsePanel {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
-                    .w(px(850.))
+                    .w(px(self.1))
                     .h(px(300.))
                     .flex()
                     .flex_col()
@@ -4587,9 +5573,36 @@ mod persistence_tests {
             host.update_response(cx);
             host
         });
-        let (_, window) = cx.add_window_view(|_, _| ResponsePanel(host.clone()));
+        let (panel, window) = cx.add_window_view(|_, _| ResponsePanel(host.clone(), 850.));
+        let original_code_bounds = window.debug_bounds("response-scroll").unwrap();
         let toggle = window.debug_bounds("response-search-toggle").unwrap();
         window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        let toolbar = window.debug_bounds("response-body-toolbar").unwrap();
+        let search = window.debug_bounds("response-search-bar").unwrap();
+        assert!(search.top() >= toolbar.top() && search.bottom() <= toolbar.bottom());
+        assert!(search.right() <= toolbar.right());
+        assert_eq!(
+            window.debug_bounds("response-scroll").unwrap(),
+            original_code_bounds,
+            "opening search must not move or shrink the code viewport"
+        );
+        panel.update(window, |panel, cx| {
+            panel.1 = 480.;
+            cx.notify();
+        });
+        let toolbar = window.debug_bounds("response-body-toolbar").unwrap();
+        let search = window.debug_bounds("response-search-bar").unwrap();
+        assert!(
+            search.right() <= toolbar.right(),
+            "search must fit a narrow toolbar"
+        );
+        assert!(
+            window
+                .debug_bounds("response-search-close")
+                .unwrap()
+                .right()
+                <= toolbar.right()
+        );
         let focus = host.update(window, |host, cx| {
             assert!(host.show_response_search);
             host.response_search.focus_handle(cx)

@@ -1,6 +1,7 @@
 use crate::theme::ThemePreset;
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, ElementId, InteractiveElement, IntoElement, ParentElement,
+    Anchor, AnyElement, App, ElementId, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px, rgb,
 };
 use std::rc::Rc;
@@ -17,6 +18,7 @@ pub struct Popover {
     width: f32,
     trigger_height: f32,
     gap: f32,
+    right_trigger_width: Option<f32>,
     theme: ThemePreset,
     on_open_change: Option<OpenHandler>,
 }
@@ -34,6 +36,7 @@ impl Popover {
             width: 280.,
             trigger_height: 30.,
             gap: 6.,
+            right_trigger_width: None,
             theme: ThemePreset::default(),
             on_open_change: None,
         }
@@ -53,6 +56,11 @@ impl Popover {
     }
     pub fn gap(mut self, gap: f32) -> Self {
         self.gap = gap.max(0.);
+        self
+    }
+    /// Open to the right of a trigger of this width, with aligned bottom edges.
+    pub fn right_of_trigger(mut self, width: f32) -> Self {
+        self.right_trigger_width = Some(width.max(0.));
         self
     }
     pub fn theme(mut self, theme: ThemePreset) -> Self {
@@ -107,8 +115,13 @@ impl Popover {
             // The outside-click bounds include the trigger and its gap, so clicking the
             // trigger again closes it without a mouse-down/click reopen race.
             let popup = div()
-                .pt(px(self.trigger_height + self.gap))
-                .w(px(self.width))
+                .when_some(self.right_trigger_width, |el, width| {
+                    el.pl(px(width + self.gap))
+                        .w(px(self.width + width + self.gap))
+                })
+                .when(self.right_trigger_width.is_none(), |el| {
+                    el.pt(px(self.trigger_height + self.gap)).w(px(self.width))
+                })
                 .on_mouse_down_out(move |_, window, cx| {
                     if let Some(handler) = &dismiss {
                         handler(false, window, cx);
@@ -133,10 +146,23 @@ impl Popover {
                 deferred(
                     div()
                         .absolute()
-                        .top_0()
-                        .right_0()
+                        .when(self.right_trigger_width.is_some(), |el| {
+                            el.bottom_0().left_0()
+                        })
+                        .when(self.right_trigger_width.is_none(), |el| {
+                            el.top_0().right_0()
+                        })
                         .w(px(self.width))
-                        .child(anchored().snap_to_window_with_margin(px(8.)).child(popup)),
+                        .child(
+                            anchored()
+                                .anchor(if self.right_trigger_width.is_some() {
+                                    Anchor::BottomLeft
+                                } else {
+                                    Anchor::TopLeft
+                                })
+                                .snap_to_window_with_margin(px(8.))
+                                .child(popup),
+                        ),
                 )
                 .with_priority(20),
             );

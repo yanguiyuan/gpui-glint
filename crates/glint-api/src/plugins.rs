@@ -262,12 +262,62 @@ fn isolated_at(
         .cloned()
         .ok_or_else(|| "插件执行失败，请检查所需环境变量、权限与脚本".into())
 }
+/// Validate declared environment inputs without running plugin code or exposing values.
+pub fn validate_variables(
+    ids: &[super::model::BeforeAction],
+    catalog: &[Plugin],
+    variables: &super::environment::EnvironmentValues,
+) -> Result<(), String> {
+    for approval in ids.iter().filter(|action| action.enabled) {
+        let plugin = catalog
+            .iter()
+            .find(|plugin| plugin.identity() == approval.id)
+            .ok_or("启用的前置动作所属插件已被移除，请重新选择动作")?;
+        let title = plugin
+            .manifest
+            .contributions
+            .iter()
+            .find(|action| action.id == approval.action_id)
+            .map(|action| action.title.as_str())
+            .unwrap_or(&plugin.manifest.name);
+        let mut missing = vec![];
+        let mut empty = vec![];
+        for name in plugin
+            .manifest
+            .capabilities
+            .iter()
+            .filter_map(|permission| permission.strip_prefix("environment.read."))
+        {
+            match variables.0.get(name) {
+                None => missing.push(name),
+                Some(value) if value.trim().is_empty() => empty.push(name),
+                _ => {}
+            }
+        }
+        let mut reasons = vec![];
+        if !missing.is_empty() {
+            reasons.push(format!("缺少环境变量：{}", missing.join("、")));
+        }
+        if !empty.is_empty() {
+            reasons.push(format!("环境变量未填写：{}", empty.join("、")));
+        }
+        if !reasons.is_empty() {
+            return Err(format!(
+                "前置动作「{title}」{}。请在当前环境中配置后重试",
+                reasons.join("；")
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn apply(
     mut request: super::http::PreparedRequest,
     ids: &[super::model::BeforeAction],
     catalog: &[Plugin],
     variables: &super::environment::EnvironmentValues,
 ) -> Result<super::http::PreparedRequest, String> {
+    validate_variables(ids, catalog, variables)?;
     let mut seen = BTreeSet::new();
     let mut families = BTreeMap::new();
     for approval in ids.iter().filter(|a| a.enabled) {
@@ -304,8 +354,17 @@ pub fn apply(
             request: request.plugin_payload()?,
             variables,
         };
-        let output = isolated(&job)?;
-        request.apply_plugin_headers(&output, &plugin.manifest.capabilities)?;
+        let title = plugin
+            .manifest
+            .contributions
+            .iter()
+            .find(|action| action.id == approval.action_id)
+            .map(|action| action.title.as_str())
+            .unwrap_or(&plugin.manifest.name);
+        let output = isolated(&job).map_err(|error| format!("前置动作「{title}」失败：{error}"))?;
+        request
+            .apply_plugin_headers(&output, &plugin.manifest.capabilities)
+            .map_err(|error| format!("前置动作「{title}」无法应用请求头：{error}"))?;
     }
     Ok(request)
 }
@@ -313,6 +372,40 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_and_empty_action_variables_are_named_without_exposing_values() {
+        let plugin = catalog()
+            .0
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "com.wps.kso1")
+            .unwrap();
+        let mut action = super::super::model::BeforeAction {
+            approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
+            action_id: "sign-request".into(),
+            enabled: true,
+        };
+        let catalog = vec![plugin];
+        let mut variables = super::super::environment::EnvironmentValues(BTreeMap::new());
+        let error = validate_variables(&[action.clone()], &catalog, &variables).unwrap_err();
+        assert!(error.contains("WPS KSO-1 签名"));
+        assert!(error.contains("wps_app_id") && error.contains("wps_app_key"));
+        variables
+            .0
+            .insert("wps_app_id".into(), "private-app-id".into());
+        variables.0.insert("wps_app_key".into(), "  ".into());
+        let error = validate_variables(&[action.clone()], &catalog, &variables).unwrap_err();
+        assert!(error.contains("未填写：wps_app_key"));
+        assert!(!error.contains("private-app-id"));
+        assert!(!error.contains("wps_app_id"));
+        action.enabled = false;
+        assert!(validate_variables(&[action.clone()], &catalog, &variables).is_ok());
+        action.enabled = true;
+        variables
+            .0
+            .insert("wps_app_key".into(), "private-key".into());
+        assert!(validate_variables(&[action], &catalog, &variables).is_ok());
+    }
+
     #[test]
     fn registered_action_dispatches_its_own_hook() {
         let mut plugin = catalog().0.remove(0);

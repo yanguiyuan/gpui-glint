@@ -1,6 +1,6 @@
+use super::text_completion::{CompletionKey, CompletionState, TextCompletion, completion_menu};
 use super::text_reference::{TextReferenceResolver, reference_colors, references};
 use crate::theme::ThemePreset;
-use gpui::prelude::FluentBuilder;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -56,6 +56,7 @@ pub fn bind_text_entry_keys(cx: &mut App) {
 /// A single-line native text entry with IME composition, selection, clipboard, and caret support.
 pub struct TextEntry {
     read_only: bool,
+    completions: CompletionState,
     fit_content: bool,
     reference_resolver: Option<TextReferenceResolver>,
     focus_subscriptions: Vec<Subscription>,
@@ -70,10 +71,62 @@ pub struct TextEntry {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    scroll_x: Pixels,
     is_selecting: bool,
 }
 
 impl TextEntry {
+    /// Offer template expressions after `{{`; empty by default.
+    pub fn set_completions(&mut self, items: Vec<TextCompletion>, cx: &mut Context<Self>) {
+        if self.completions.set_items(items) {
+            cx.notify();
+        }
+    }
+    fn choose_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only || self.marked_range.is_some() {
+            return;
+        }
+        if let Some(active) = self
+            .completions
+            .active(&self.content, &self.selected_range, false)
+            && let Some(item) = active.items.get(index)
+        {
+            self.selected_range = active.range;
+            self.replace_selection(&format!("{{{{{}}}}}", item.expression), cx);
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+    fn completion_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = &event.keystroke.modifiers;
+        if self.read_only
+            || modifiers.platform
+            || modifiers.control
+            || modifiers.alt
+            || modifiers.shift
+        {
+            return;
+        }
+        if let Some(action) = self.completions.key(
+            &self.content,
+            &self.selected_range,
+            self.marked_range.is_some(),
+            &event.keystroke.key,
+        ) {
+            if let CompletionKey::Insert(range, text) = action {
+                self.selected_range = range;
+                self.replace_selection(&text, cx);
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            cx.notify();
+        }
+    }
+
     /// Allow selection and copying while preventing keyboard and IME edits.
     pub fn read_only(mut self, value: bool) -> Self {
         self.read_only = value;
@@ -117,6 +170,14 @@ impl TextEntry {
         self.font_size = size.max(1.);
         self
     }
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
     /// Returns the current input, including edits made through the native input handler.
     pub fn value(&self) -> &str {
         &self.content
@@ -134,6 +195,7 @@ impl TextEntry {
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.scroll_x = px(0.);
         cx.notify();
     }
 
@@ -146,6 +208,7 @@ impl TextEntry {
         let end = content.len();
         Self {
             read_only: false,
+            completions: CompletionState::default(),
             fit_content: false,
             reference_resolver: None,
             focus_subscriptions: vec![],
@@ -160,6 +223,7 @@ impl TextEntry {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: px(0.),
             is_selecting: false,
         }
     }
@@ -384,13 +448,7 @@ impl TextEntry {
         let (Some(bounds), Some(line)) = (&self.last_bounds, &self.last_layout) else {
             return 0;
         };
-        if position.x <= bounds.left() {
-            return 0;
-        }
-        if position.x >= bounds.right() {
-            return self.content.len();
-        }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
     }
 }
 
@@ -508,8 +566,14 @@ impl EntityInputHandler for TextEntry {
         let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+            point(
+                bounds.left() + line.x_for_index(range.start) - self.scroll_x,
+                bounds.top(),
+            ),
+            point(
+                bounds.left() + line.x_for_index(range.end) - self.scroll_x,
+                bounds.bottom(),
+            ),
         ))
     }
 
@@ -521,7 +585,9 @@ impl EntityInputHandler for TextEntry {
     ) -> Option<usize> {
         let bounds = self.last_bounds?;
         let line = self.last_layout.as_ref()?;
-        Some(self.offset_to_utf16(line.closest_index_for_x(point.x - bounds.left())))
+        Some(
+            self.offset_to_utf16(line.closest_index_for_x(point.x - bounds.left() + self.scroll_x)),
+        )
     }
 }
 
@@ -530,6 +596,7 @@ struct TextEntryElement {
 }
 
 struct TextEntryPrepaint {
+    scroll_x: Pixels,
     reference_highlights: Vec<gpui::PaintQuad>,
     search_highlights: Vec<gpui::PaintQuad>,
     line: Option<ShapedLine>,
@@ -664,6 +731,22 @@ impl Element for TextEntryElement {
             &runs,
             None,
         );
+        let scroll_x = if focused && !input.fit_content {
+            let caret = line.x_for_index(input.cursor_offset().min(line.len()));
+            let available = (bounds.size.width - px(2.)).max(px(1.));
+            let maximum = (line.width - available).max(px(0.));
+            let mut offset = input.scroll_x.min(maximum);
+            if caret < offset {
+                offset = caret;
+            }
+            if caret > offset + available {
+                offset = caret - available;
+            }
+            offset.clamp(px(0.), maximum)
+        } else {
+            px(0.)
+        };
+        let bounds = Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
         let show_cursor = !input.read_only
             && input.focus_handle.is_focused(window)
             && input.selected_range.is_empty();
@@ -704,6 +787,7 @@ impl Element for TextEntryElement {
             )
         };
         TextEntryPrepaint {
+            scroll_x,
             reference_highlights: refs
                 .iter()
                 .map(|reference| {
@@ -773,7 +857,7 @@ impl Element for TextEntryElement {
         }
         let line = prepaint.line.take().unwrap();
         line.paint(
-            bounds.origin,
+            bounds.origin - point(prepaint.scroll_x, px(0.)),
             window.line_height(),
             gpui::TextAlign::Left,
             None,
@@ -786,9 +870,17 @@ impl Element for TextEntryElement {
                 window.paint_quad(cursor);
             }
         }
-        self.input.update(cx, |input, _cx| {
+        self.input.update(cx, |input, cx| {
+            let first_layout = input.last_bounds.is_none();
+            input.scroll_x = prepaint.scroll_x;
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            if first_layout
+                && !input.completions.items.is_empty()
+                && focus_handle.is_focused(window)
+            {
+                cx.notify();
+            }
         });
     }
 }
@@ -796,7 +888,8 @@ impl Element for TextEntryElement {
 impl Render for TextEntry {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        if self.reference_resolver.is_some() && self.focus_subscriptions.is_empty() {
+
+        if self.focus_subscriptions.is_empty() {
             self.focus_subscriptions
                 .push(cx.on_focus(&self.focus_handle, window, |_, _, cx| cx.notify()));
             self.focus_subscriptions
@@ -813,10 +906,11 @@ impl Render for TextEntry {
             .flex_1()
             .min_w_0()
             .h_full()
-            .when(self.reference_resolver.is_some(), |el| el.overflow_hidden())
+            .overflow_hidden()
             .flex()
             .items_center()
             .key_context("GlassTextEntry")
+            .capture_key_down(cx.listener(Self::completion_key))
             .track_focus(&self.focus_handle)
             .cursor(gpui::CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -938,6 +1032,39 @@ impl Render for TextEntry {
         } else {
             root = root.child(TextEntryElement { input: cx.entity() });
         }
+        if self.focus_handle.is_focused(window)
+            && !self.read_only
+            && let Some(active) = self.completions.active(
+                &self.content,
+                &self.selected_range,
+                self.marked_range.is_some(),
+            )
+            && let Some(bounds) = self.last_bounds
+        {
+            let x = self.last_layout.as_ref().map_or(px(0.), |line| {
+                line.x_for_index(self.cursor_offset().min(line.len()))
+            });
+            let owner = cx.entity().downgrade();
+            let dismiss_owner = owner.clone();
+            root = root.child(completion_menu(
+                active,
+                self.completions.selected,
+                point(
+                    (bounds.left() + x - self.scroll_x).clamp(bounds.left(), bounds.right()),
+                    bounds.bottom() + px(4.),
+                ),
+                theme,
+                move |index, window, cx| {
+                    let _ = owner.update(cx, |this, cx| this.choose_completion(index, window, cx));
+                },
+                move |_, cx| {
+                    let _ = dismiss_owner.update(cx, |this, cx| {
+                        this.completions.dismiss();
+                        cx.notify();
+                    });
+                },
+            ));
+        }
         root
     }
 }
@@ -979,6 +1106,112 @@ fn text_run_boundaries(text: &str, offsets: impl IntoIterator<Item = usize>) -> 
 mod selection_tests {
     use super::*;
     use gpui::AppContext;
+    #[gpui::test]
+    fn long_text_scrolls_with_caret_and_preserves_unicode_copy(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_text_entry_keys);
+        struct Input(Entity<TextEntry>);
+        impl Render for Input {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(140.)).h(px(32.)).child(self.0.clone())
+            }
+        }
+        let text = "前缀_".to_owned() + &"long_token_中🦀".repeat(60);
+        let input = cx.new(|cx| TextEntry::new(cx, "", text.clone()));
+        let (_, window) = cx.add_window_view(|_, _| Input(input.clone()));
+        window.update(|window, cx| {
+            let focus = input.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        window.update(|window, _| window.refresh());
+        input.update(window, |input, _| {
+            let bounds = input.last_bounds.unwrap();
+            let caret = input
+                .last_layout
+                .as_ref()
+                .unwrap()
+                .x_for_index(input.cursor_offset())
+                - input.scroll_x;
+            assert!(input.scroll_x > px(0.));
+            assert!(caret >= px(0.) && caret <= bounds.size.width);
+            let offset = input.index_for_mouse_position(bounds.center());
+            assert!(offset > 0 && text.is_char_boundary(offset));
+        });
+        window.simulate_keystrokes("home");
+        input.update(window, |input, _| {
+            assert_eq!(input.selected_range, 0..0);
+            assert_eq!(input.scroll_x, px(0.));
+        });
+        window.simulate_keystrokes("end");
+        input.update(window, |input, _| assert!(input.scroll_x > px(0.)));
+        window.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(window.read_from_clipboard().unwrap().text().unwrap(), text);
+        window.update(|window, _| window.blur());
+        input.update(window, |input, _| assert_eq!(input.scroll_x, px(0.)));
+    }
+
+    #[gpui::test]
+    fn template_completion_keyboard_mouse_and_ime(cx: &mut gpui::TestAppContext) {
+        struct Input(Entity<TextEntry>);
+        impl Render for Input {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().p_4().w(px(400.)).h(px(32.)).child(self.0.clone())
+            }
+        }
+        let input = cx.new(|cx| {
+            let mut input = TextEntry::new(cx, "", "中文/{{");
+            input.set_completions(
+                vec![
+                    TextCompletion::new("base_url", "环境变量"),
+                    TextCompletion::new("token", "敏感变量"),
+                ],
+                cx,
+            );
+            input
+        });
+        let (_, window) = cx.add_window_view(|_, _| Input(input.clone()));
+        window.update(|window, cx| {
+            window.focus(&input.read(cx).focus_handle(cx), cx);
+        });
+        assert!(window.debug_bounds("template-completion-menu").is_some());
+        window.simulate_keystrokes("down enter");
+        input.update(window, |input, _| {
+            assert_eq!(input.value(), "中文/{{token}}")
+        });
+        assert!(window.debug_bounds("template-completion-menu").is_none());
+        window.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("前缀/{{ba}}/后缀", cx);
+                input.move_to("前缀/{{ba".len(), cx);
+                window.focus(&input.focus_handle, cx);
+            });
+        });
+        let row = window.debug_bounds("template-completion-0").unwrap();
+        window.simulate_click(row.center(), gpui::Modifiers::default());
+        input.update(window, |input, _| {
+            assert_eq!(input.value(), "前缀/{{base_url}}/后缀")
+        });
+        window.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("{{", cx);
+                input.replace_and_mark_text_in_range(None, "中", None, window, cx);
+            });
+        });
+        assert!(window.debug_bounds("template-completion-menu").is_none());
+        input.update(window, |input, cx| {
+            input.set_value("{{ba", cx);
+        });
+        assert!(window.debug_bounds("template-completion-menu").is_some());
+        window.simulate_keystrokes("escape");
+        assert!(window.debug_bounds("template-completion-menu").is_none());
+        window.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.replace_text_in_range(None, "s", window, cx)
+            });
+        });
+        window.simulate_keystrokes("tab");
+        input.update(window, |input, _| assert_eq!(input.value(), "{{base_url}}"));
+    }
+
     #[gpui::test]
     fn read_only_allows_copy_and_blocks_actions_and_ime(cx: &mut gpui::TestAppContext) {
         let (input, window) =
