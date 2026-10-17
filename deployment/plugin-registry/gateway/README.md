@@ -44,3 +44,11 @@ The edge-to-edge web catalogue is served at `https://gateway.yanguiyuan.cn/plugi
 The registry includes support for declarative contribution `data` and inert OAuth preset manifests. Existing signing identity and published package bytes are preserved. `glint-plugin-registry:before-web` is the previous runtime image, and `backups/pre-web-data.tar.gz` is the consistent data snapshot taken during this upgrade. The directory remains public read-only; management still requires the private token.
 
 The catalogue and developer guide are independent sidebar views. Branding reuses the Glint API software icon, including the favicon. The full-viewport shell has no clipping scroll ancestor, so its header and sidebar stay aligned during scrolling. The current service build context is `build-source/`; `source/` is the initial upload snapshot.
+
+## Software distribution (2026-10-17)
+
+The same deployment now serves the independent software download view at `https://gateway.yanguiyuan.cn/plugins/#software`, plus signed `/v1/apps/{app}/releases` feeds and immutable installer downloads. Configure the same base URL and trusted public key in Glint API 0.1.4's **软件更新 → 更新源设置** to replace GitHub for checks and downloads.
+
+The upgrade preserved the plugin key, source ID, index sequence and package metadata. Before upgrade, a consistent backup was taken as `backups/pre-distribution-data.tar.gz`; the previous image is `glint-plugin-registry:before-distribution`. The runtime image ID after this upgrade is `sha256:6e0a31f2212d033cfb3695ce2c2712612910666382834d1d19653544f8060b1f`. `build-source/Dockerfile.distribution` and the offline vendored workspace reproduce the service build. Installer uploads have a dedicated larger Caddy body limit; JSON APIs remain bounded.
+
+Use `glint-pluginctl software publish/list/yank/restore` with the private publishing token to manage software releases; see [the protocol and CLI guide](../../../docs/plugin-registry.md#software-distribution). Publish all platform installers together because existing release versions are immutable. GitHub releases and this distribution source are separate publishing destinations.
