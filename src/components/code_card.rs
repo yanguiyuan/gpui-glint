@@ -484,6 +484,14 @@ impl CodeCard {
         self.prose = value;
         self
     }
+    /// Switch between soft-wrapped prose and the code layout without changing content.
+    pub fn set_prose(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.prose != value {
+            self.prose = value;
+            self.last_lines.clear();
+            cx.notify();
+        }
+    }
     pub fn block_editing(mut self, value: bool) -> Self {
         self.block_editing = value;
         self

@@ -117,6 +117,7 @@ impl Workbench {
             collections: self.collections.clone(),
             environments: self.environment_names.clone(),
             variables: self.environment_inputs.clone(),
+            proxies: self.proxies.clone(),
             traces: self.traces.clone(),
             responses: self.responses.clone(),
             previews: self.sent_requests.clone(),
@@ -153,7 +154,9 @@ impl Workbench {
     }
     fn mcp_select(&mut self, index: usize, cx: &mut Context<Self>) -> Result<(), String> {
         if index != self.active {
-            self.mcp_idle()?;
+            if !self.ws_active {
+                self.mcp_idle()?;
+            }
             self.choose(index, cx);
         }
         Ok(())
@@ -193,8 +196,9 @@ impl Workbench {
     fn mcp_status(&self, index: usize) -> Value {
         let active = index == self.active;
         let response = self.responses[index].as_ref();
-        json!({"request_id":self.requests[index].id,"active":active,"running":active&&self.sending.is_some(),
-            "websocket_connected":active&&self.ws_connected,"sse":response.is_some_and(HttpResponse::is_event_stream),
+        let background = self.ws_background.get(&self.requests[index].id);
+        json!({"request_id":self.requests[index].id,"active":active,"running":if active { self.sending.is_some() || self.ws_active } else { background.is_some_and(|state| state.active) },
+            "websocket_connected":if active { self.ws_connected } else { background.is_some_and(|state| state.connected) },"sse":response.is_some_and(HttpResponse::is_event_stream),
             "status":response.map(|r| r.status),"bytes":response.map(|r| r.bytes),
             "notice":if active {Some(&self.notice)} else {None},"error":if active {self.error.as_ref()} else {None}})
     }
@@ -234,11 +238,11 @@ impl Workbench {
             )
             .map_err(|e| e.to_string())?,
             "workspace_get" => {
-                json!({"version":updater::VERSION,"active_request_id":self.requests.get(self.active).map(|r| &r.id),
+                json!({"version":updater::VERSION,"workspace_id":self.storage.workspace_id,"workspace_name":self.workspace_label(),"active_request_id":self.requests.get(self.active).map(|r| &r.id),
                 "selected_environment":self.environment_name(self.selected_environment(cx)),"environments":self.environment_names,
                 "collections":self.collections.iter().map(|c| json!({"name":c.collection,"directories":c.names})).collect::<Vec<_>>(),
                 "requests":self.requests.iter().map(|r| json!({"id":r.id,"name":r.name,"collection":r.collection,"path":r.group,"method":r.draft.method,"url":r.draft.url})).collect::<Vec<_>>(),
-                "running":self.sending.is_some(),"notice":self.notice,"error":self.error,"storage_error":self.storage_error,"mcp_error":self.mcp_error,
+                "running":!self.running_request_tasks().is_empty(),"background_tasks":self.running_request_tasks().into_iter().map(|(request_id,label)|json!({"request_id":request_id,"label":label})).collect::<Vec<_>>(),"notice":self.notice,"error":self.error,"storage_error":self.storage_error,"mcp_error":self.mcp_error,
                 "registry_running":self.registry_task.is_some()})
             }
             "workspace_export" => {
@@ -248,10 +252,12 @@ impl Workbench {
                 if !flag(&args, "replace") {
                     return Err("替换工作区必须显式设置 replace=true".into());
                 }
-                let workspace: storage::Workspace =
+                let mut workspace: storage::Workspace =
                     serde_json::from_value(args["workspace"].clone()).map_err(|e| e.to_string())?;
                 workspace.validate()?;
+                workspace.migrate_proxies();
                 self.sending = None;
+                self.ws_background.clear();
                 self.ws_commands = None;
                 self.ws_active = false;
                 self.ws_connected = false;
@@ -260,6 +266,8 @@ impl Workbench {
                 self.environment_names = workspace.environments;
                 self.editing_variable_collection = None;
                 self.environment_inputs = workspace.variables;
+                self.proxies = workspace.proxies;
+                self.reset_proxy_profiles(cx);
                 self.traces = workspace.traces;
                 self.responses = workspace.responses;
                 self.sent_requests = workspace.previews;
@@ -518,8 +526,17 @@ impl Workbench {
                 json!({"deleted":true})
             }
             "request_send" => {
-                self.mcp_idle()?;
                 let i = self.mcp_request_index(&args)?;
+                if i == self.active || !self.ws_active {
+                    self.mcp_idle()?;
+                }
+                if self
+                    .ws_background
+                    .get(&self.requests[i].id)
+                    .is_some_and(|state| state.active)
+                {
+                    return Err("该请求的 WebSocket 已在后台运行".into());
+                }
                 let selected = args
                     .get("environment")
                     .map(|_| self.mcp_environment(&args))
@@ -539,7 +556,10 @@ impl Workbench {
             "request_cancel" => {
                 let i = self.mcp_request_index(&args)?;
                 if i != self.active {
-                    return Err("该请求没有正在执行的操作".into());
+                    let id = self.requests[i].id.clone();
+                    self.with_ws_request(&id, cx, |this, cx| this.disconnect_websocket(cx))
+                        .ok_or("该请求没有正在执行的操作")?;
+                    return Ok(self.mcp_status(i));
                 }
                 if self.sending.is_some() {
                     if self.ws_active {
@@ -559,7 +579,7 @@ impl Workbench {
             }
             "request_preview" => {
                 let i = self.mcp_request_index(&args)?;
-                let inputs = &self.environment_inputs[self.selected_environment(cx)];
+                let proxy = self.effective_proxy(self.selected_environment(cx));
                 let mut request = PreparedRequest::new(
                     &self.requests[i].draft,
                     &self.environment_values(
@@ -567,7 +587,7 @@ impl Workbench {
                         Some(&self.requests[i].collection),
                     ),
                 )?
-                .with_proxy(&inputs.proxy)?;
+                .with_proxy(&proxy)?;
                 if self.requests[i].draft.oauth.is_some() {
                     request = request.with_oauth_token("[已隐藏]")?;
                 }
@@ -740,7 +760,7 @@ impl Workbench {
                 } else {
                     self.environment_inputs[i].clone()
                 };
-                json!({"name":self.environment_names[i],"collection":scope,"variables":variables.variables,"proxy":self.environment_inputs[i].proxy,"editor":if self.editing_variable_collection.as_deref()==scope { self.mcp_environment_editor(i,cx) } else { Value::Null }})
+                json!({"name":self.environment_names[i],"collection":scope,"variables":variables.variables,"proxy_id":self.environment_inputs[i].proxy_id,"proxy":self.effective_proxy(i),"available_proxies":self.proxies,"editor":if self.editing_variable_collection.as_deref()==scope { self.mcp_environment_editor(i,cx) } else { Value::Null }})
             }
             "environment_select" => {
                 let i = self.mcp_environment(&args)?;
@@ -883,13 +903,66 @@ impl Workbench {
                                 .replace(&rows)?;
                         }
                         _ => {
-                            let proxy = environment::ProxySettings {
-                                enabled: flag(&args, "enabled"),
-                                url: text(&args, "url")?.into(),
-                                skip_tls_verification: flag(&args, "skip_tls_verification"),
-                            };
-                            proxy.validate()?;
-                            self.environment_inputs[i].proxy = proxy;
+                            if let Some(binding) = args.get("proxy_id") {
+                                let id = if binding.is_null() {
+                                    None
+                                } else {
+                                    Some(
+                                        binding
+                                            .as_str()
+                                            .ok_or("proxy_id 必须为字符串或 null")?
+                                            .to_owned(),
+                                    )
+                                };
+                                if id
+                                    .as_ref()
+                                    .is_some_and(|id| !self.proxies.iter().any(|p| &p.id == id))
+                                {
+                                    return Err("代理不存在".into());
+                                }
+                                self.environment_inputs[i].proxy_id = id;
+                                self.environment_inputs[i].proxy = Default::default();
+                            } else {
+                                let proxy = environment::ProxySettings {
+                                    enabled: flag(&args, "enabled"),
+                                    built_in: flag(&args, "built_in"),
+                                    mappings: serde_json::from_value(
+                                        args.get("mappings").cloned().unwrap_or(json!([])),
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                                    url: args
+                                        .get("url")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .into(),
+                                    skip_tls_verification: flag(&args, "skip_tls_verification"),
+                                };
+                                proxy.validate()?;
+                                if self.has_unsaved_proxies(cx) {
+                                    return Err("代理管理中有未保存修改，请先保存或丢弃".into());
+                                }
+                                let id = self.environment_inputs[i]
+                                    .proxy_id
+                                    .clone()
+                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                if let Some(profile) = self.proxies.iter_mut().find(|p| p.id == id)
+                                {
+                                    profile.settings = proxy;
+                                } else {
+                                    self.proxies.push(environment::ProxyProfile {
+                                        id: id.clone(),
+                                        name: format!(
+                                            "{} 代理 {}",
+                                            self.environment_names[i],
+                                            &id[..8]
+                                        ),
+                                        settings: proxy,
+                                    });
+                                }
+                                self.environment_inputs[i].proxy_id = Some(id);
+                                self.environment_inputs[i].proxy = Default::default();
+                                self.reset_proxy_profiles(cx);
+                            }
                         }
                     }
                     if self.editing_variable_collection == scope {
@@ -901,19 +974,18 @@ impl Workbench {
             }
             "websocket_send" | "websocket_read" | "websocket_clear" => {
                 let i = self.mcp_request_index(&args)?;
-                if i != self.active {
-                    return Err("该请求没有当前 WebSocket 会话".into());
-                }
-                match operation {
+                let request_id = self.requests[i].id.clone();
+                self.with_ws_request(&request_id, cx, |this, cx| -> Result<Value, String> {
+                Ok(match operation {
                     "websocket_send" => {
-                        if !self.ws_connected {
+                        if !this.ws_connected {
                             return Err("WebSocket 尚未连接".into());
                         }
                         let message = text(&args, "text")?;
                         let message = if args["resolve_templates"] != false {
                             template::TemplateResolver::for_request(
-                                &self.active_environment_values(cx),
-                                &self.snapshot(cx),
+                                &this.websocket_variables(cx),
+                                &if this.ws_background_update { this.requests[this.active].draft.clone() } else { this.snapshot(cx) },
                             )?
                             .resolve(message)?
                         } else {
@@ -922,7 +994,7 @@ impl Workbench {
                         if message.len() > 1024 * 1024 {
                             return Err("消息超过 1 MiB".into());
                         }
-                        self.ws_commands
+                        this.ws_commands
                             .as_ref()
                             .ok_or("WebSocket 未连接")?
                             .try_send(websocket::Command::Text(message))
@@ -931,19 +1003,17 @@ impl Workbench {
                     }
                     "websocket_read" => {
                         let after = args["after"].as_u64().unwrap_or(0);
-                        let first = self.ws_sequence.saturating_sub(self.ws_log.len() as u64) + 1;
-                        json!({"connected":self.ws_connected,"next_after":self.ws_sequence,"messages":self.ws_log.iter().enumerate().filter_map(|(i,message)|{let sequence=first+i as u64;(sequence>after).then(||json!({"sequence":sequence,"message":message}))}).collect::<Vec<_>>()})
+                        json!({"connected":this.ws_connected,"next_after":this.ws_sequence,"messages":this.ws_log.iter().filter(|event| event.id > after).map(|event| event.mcp_value()).collect::<Vec<_>>()})
                     }
                     _ => {
-                        self.ws_log.clear();
-                        self.ws_output
-                            .update(cx, |editor, cx| editor.set_content("", cx));
+                        this.clear_websocket_messages(cx);
                         json!({"cleared":true})
                     }
-                }
+                })
+                }).ok_or("该请求没有 WebSocket 会话")??
             }
             "plugins_list" => {
-                json!({"plugins":self.plugin_catalog.iter().map(|p|json!({"identity":p.identity(),"manifest":p.manifest,"origin":p.origin})).collect::<Vec<_>>(),"errors":self.plugin_errors,"sources":self.registry_sources,"releases":self.registry_releases,"running":self.registry_task.is_some(),"message":self.registry_message})
+                json!({"plugins":self.plugin_catalog.iter().map(|p|json!({"identity":p.identity(),"manifest":p.manifest,"origin":p.origin,"enabled":self.plugin_enabled(p)})).collect::<Vec<_>>(),"errors":self.plugin_errors,"sources":self.registry_sources,"releases":self.registry_releases,"running":self.registry_task.is_some(),"message":self.registry_message})
             }
             "plugin_bind" | "plugin_bindings_reorder" => {
                 let i = self.mcp_request_index(&args)?;
@@ -1079,6 +1149,7 @@ impl Workbench {
                     );
                 }
                 if let Some(section) = args["section"].as_str() {
+                    self.show_proxies = section == "proxies";
                     self.show_mcp = section == "mcp";
                     self.show_plugins = section == "plugins";
                     self.show_environments = section == "environments";
@@ -1368,7 +1439,7 @@ mod tests {
             let (sender,receiver)=async_channel::bounded(16);host.ws_commands=Some(sender);host.ws_connected=true;host.ws_active=true;
             call(host,"websocket_send",json!({"request_id":id,"text":"hello"}),cx);
             assert!(matches!(receiver.try_recv().unwrap(),websocket::Command::Text(text) if text=="hello"));
-            host.ws_log.push_back("received".into());host.ws_sequence=8;
+            host.ws_sequence=7;host.ws_append("received".into(),cx);
             let log=call(host,"websocket_read",json!({"request_id":id,"after":7}),cx);
             assert_eq!(log["messages"][0]["sequence"],8);
             assert!(call(host,"websocket_read",json!({"request_id":id,"after":8}),cx)["messages"].as_array().unwrap().is_empty());

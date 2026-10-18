@@ -1,13 +1,14 @@
-Glint API 0.1.4 — 自定义更新源与 macOS 分发
+Glint API 0.1.5 — 多工作区与后台 WebSocket
 
-- 软件更新支持保存自定义分发源地址和可信公钥，可一键填入 gateway 分发源或恢复 GitHub 默认源。自建源校验 Ed25519 签名、版本序号和安装包 SHA-256，检查与下载均不访问 GitHub API。
-- 新增 macOS Apple Silicon / Intel DMG，包含软件图标及拖入 Applications 的安装入口；GitHub Actions 同时构建 Windows 和两个 Mac 架构。
-- 插件管理采用独立页面、添加源对话框和可拖拽排序的前置动作；支持声明式插件 data 与 OAuth 授权预设。
-- 增加 OAuth 授权、SSE / WebSocket 请求及 MCP 连接能力；完善目录模板、变量提取、请求历史和 cURL 工作流。
-- gateway 插件服务新增独立软件下载页、签名软件版本目录、安装包分发及 CLI 发布/撤回/恢复管理，保留现有插件源身份。
+- 新增独立工作区，可分别保存集合、目录、请求、环境、代理、响应与历史及 MCP 调用记录；旧数据自动迁移至“个人工作区”，数据库升级到版本 3。
+- WebSocket 会话按请求独立运行，可同时保持多个连接；切换请求后继续收发，并从后台任务入口跳转。消息事件、连接状态及插件生成的摘要写入请求历史，支持重启后回放。
+- 新增 WebSocket 事件解码插件接口和内置 WPS 事件解密插件，校验 HMAC-SHA256 后解密 AES-256-CBC；解密结果只显示在事件详情中，不写入历史或原始日志。
+- 环境可绑定共享代理配置，支持多个代理档案和内置域名到 IP 映射；旧环境内联代理自动迁移。
+- 插件可单独启用或停用；扩展受权限控制的通用密码学能力，并改进插件调用、事件处理和工作区隔离。
+- 完善工作区、代理、插件和后台任务界面，统一对话框与下拉菜单交互，增加请求参数行的删除确认。
 
-Windows：下载 `Glint-API-0.1.4-windows-x64-setup.exe`。已安装版本可通过 GitHub 更新；遇到限流时手动安装本版一次，然后在左下角“软件更新 → 更新源设置”中填入 gateway 并保存检查，后续可自动下载、安装和重启。
+Windows：下载 `Glint-API-0.1.5-windows-x64-setup.exe`。已安装版本可通过 GitHub 更新；遇到限流时手动安装本版一次，然后在左下角“软件更新 → 更新源设置”中填入 gateway 并保存检查，后续可自动下载、安装和重启。
 
-macOS：Apple Silicon 下载 `Glint-API-0.1.4-macos-arm64.dmg`，Intel 下载 `Glint-API-0.1.4-macos-x86_64.dmg`，将应用拖入 Applications。Mac 通过下载 DMG 手动替换升级，尚未提供自动安装。Mac 包使用 ad-hoc 签名，尚无 Developer ID 签名和 Apple 公证；Windows 包也未进行代码签名。安装包均附 `.sha256` 文件。
+macOS：Apple Silicon 下载 `Glint-API-0.1.5-macos-arm64.dmg`，Intel 下载 `Glint-API-0.1.5-macos-x86_64.dmg`，将应用拖入 Applications。Mac 通过下载 DMG 手动替换升级，尚未提供自动安装。Mac 包使用 ad-hoc 签名，尚无 Developer ID 签名和 Apple 公证；Windows 包也未进行代码签名。安装包均附 `.sha256` 文件。
 
 升级保留工作区数据。使用自定义更新源前，请通过可信渠道核对公钥。

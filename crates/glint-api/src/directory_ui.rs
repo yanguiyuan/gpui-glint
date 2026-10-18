@@ -19,6 +19,7 @@ pub(super) struct DirectorySettings {
     body_format: BodyFormat,
     rows: BTreeMap<Section, Vec<PairInput>>,
     form: Vec<PairInput>,
+    pair_delete: Option<(Section, bool, gpui::EntityId)>,
     actions: Vec<(String, model::BeforeAction)>,
     tls: bool,
     completions: Vec<TextCompletion>,
@@ -231,6 +232,7 @@ impl DirectorySettings {
             body_format: draft.body_format,
             rows,
             form,
+            pair_delete: None,
             actions,
             tls: draft.skip_tls_verification,
             completions,
@@ -290,6 +292,7 @@ impl DirectorySettings {
                 .collect()
         };
         let draft = Draft {
+            event_decoder: None,
             method: self
                 .endpoint
                 .read(cx)
@@ -313,6 +316,7 @@ impl DirectorySettings {
             form: pairs(&self.form),
             plugins: self.actions.iter().map(|(_, a)| a.clone()).collect(),
             skip_tls_verification: self.tls,
+            ..Draft::default()
         };
         let mut active = Draft::default();
         for section in &self.sections {
@@ -383,20 +387,45 @@ impl DirectorySettings {
                     .child(div().flex_1().min_w_0().child(row.key.clone()))
                     .child(div().flex_1().min_w_0().child(row.value.clone()))
                     .child(div().flex_1().min_w_0().child(row.note.clone()))
-                    .child(
-                        IconButton::new(Icon::Close, "删除规则")
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let rows = if form {
-                                    &mut this.form
-                                } else {
-                                    this.rows.get_mut(&section).unwrap()
-                                };
-                                rows.remove(i);
-                                cx.notify();
-                            })),
-                    ),
+                    .child({
+                        let row_id = row.key.entity_id();
+                        let target = (section, form, row_id);
+                        let focus = row.key.read(cx).focus_handle(cx);
+                        let toggle_owner = cx.entity().downgrade();
+                        let confirm_owner = toggle_owner.clone();
+                        pair_ui::delete_popover(
+                            format!("directory-delete-{section:?}-{form}-{i}"),
+                            row.key.read(cx).value().to_owned(),
+                            self.pair_delete == Some(target),
+                            self.theme,
+                            move |open, window, cx| {
+                                let _ = toggle_owner.update(cx, |this, cx| {
+                                    this.pair_delete = open.then_some(target);
+                                    window.focus(&focus, cx);
+                                    cx.notify();
+                                });
+                            },
+                            move |_, _, cx| {
+                                let _ = confirm_owner.update(cx, |this, cx| {
+                                    if this.pair_delete != Some(target) {
+                                        return;
+                                    }
+                                    let rows = if form {
+                                        &mut this.form
+                                    } else {
+                                        this.rows.get_mut(&section).unwrap()
+                                    };
+                                    if let Some(index) =
+                                        rows.iter().position(|row| row.key.entity_id() == row_id)
+                                    {
+                                        rows.remove(index);
+                                    }
+                                    this.pair_delete = None;
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
             );
         }
         view.child(
@@ -478,6 +507,7 @@ impl Render for DirectorySettings {
                     .debug_selector(move || format!("directory-section-{s:?}").into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = s;
+                        this.pair_delete = None;
                         cx.notify();
                     })),
             );
@@ -651,7 +681,10 @@ impl Render for DirectorySettings {
                 }
             });
         }
-        div().debug_selector(|| "directory-settings".into()).size_full().flex().flex_col().bg(rgb(p.surface)).p_5().gap_4()
+        div().debug_selector(|| "directory-settings".into())
+            .on_key_down(cx.listener(|this,event: &gpui::KeyDownEvent,_,cx| {
+                if event.keystroke.key=="escape" && this.pair_delete.is_some() {this.pair_delete=None;cx.stop_propagation();cx.notify();}
+            })).size_full().flex().flex_col().bg(rgb(p.surface)).p_5().gap_4()
             .child(div().flex().items_center().gap_3().child(div().flex_1().min_w_0().truncate().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(format!("{} · 目录设置",self.title)))
                 .child(Button::new("保存默认配置").theme(self.theme).render().debug_selector(|| "save-directory-defaults".into()).on_click(cx.listener(|this,_,_,cx| this.save(cx)))))
             .child(div().text_color(rgb(p.text_muted)).child("保存后，仅在此目录及子目录新建请求时使用。各项独立继承；开启覆盖后，空配置会清除父目录的对应默认值。"))
@@ -979,6 +1012,60 @@ mod tests {
             assert!(h.snapshot(cx).auth);
             assert_eq!(h.snapshot(cx).token, "{{token}}");
             assert_eq!(h.requests[1].draft.url, "{{child_baseurl}}/custom");
+        });
+    }
+}
+
+#[cfg(test)]
+mod row_delete_tests {
+    use super::*;
+    #[gpui::test]
+    fn directory_row_delete_confirms_and_cancels_without_losing_other_fields(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&dir.path().join("test.sqlite3")).unwrap(),
+                cx,
+            );
+            host.collections
+                .push(RequestGroups::create_collection("API", &[]).unwrap());
+            host.open_directory_settings(0, String::new(), cx);
+            host
+        });
+        let editor = host.read_with(window, |host, _| host.directory_settings.clone().unwrap());
+        editor.update(window, |editor, cx| {
+            editor.selected = Section::Params;
+            editor.sections.insert(Section::Params);
+            let one = DirectorySettings::row(&Pair::new("one", "1", ""), editor.theme, cx);
+            let two = DirectorySettings::row(&Pair::new("two", "2", ""), editor.theme, cx);
+            editor.rows.insert(Section::Params, vec![one, two]);
+            cx.notify();
+        });
+        let click = |window: &mut gpui::VisualTestContext, selector: &'static str| {
+            let bounds = window.debug_bounds(selector).unwrap();
+            window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        click(window, "directory-delete-Params-false-0");
+        editor.update(window, |editor, _| {
+            assert_eq!(editor.rows[&Section::Params].len(), 2)
+        });
+        click(window, "directory-delete-Params-false-0-cancel");
+        editor.update(window, |editor, _| {
+            assert!(editor.pair_delete.is_none());
+            assert_eq!(editor.rows[&Section::Params].len(), 2);
+        });
+        click(window, "directory-delete-Params-false-0");
+        window.simulate_keystrokes("escape");
+        editor.update(window, |editor, _| assert!(editor.pair_delete.is_none()));
+        click(window, "directory-delete-Params-false-0");
+        click(window, "directory-delete-Params-false-0-confirm");
+        editor.update(window, |editor, cx| {
+            assert!(editor.pair_delete.is_none());
+            assert_eq!(editor.rows[&Section::Params].len(), 1);
+            assert_eq!(editor.rows[&Section::Params][0].key.read(cx).value(), "two");
+            assert_eq!(editor.rows[&Section::Params][0].value.read(cx).value(), "2");
         });
     }
 }

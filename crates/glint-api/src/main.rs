@@ -4,6 +4,7 @@
 )]
 
 mod app_icon;
+mod background_tasks_ui;
 mod curl;
 mod curl_ui;
 mod directory_ui;
@@ -20,9 +21,11 @@ mod mcp_ui;
 mod model;
 mod oauth;
 mod oauth_ui;
+mod pair_ui;
 mod plugin_ui;
 mod plugins;
 mod post_actions;
+mod proxy_ui;
 mod registry_ui;
 mod sse;
 mod storage;
@@ -33,9 +36,10 @@ mod updater;
 mod version_tags;
 mod websocket;
 mod websocket_ui;
+mod workspace_ui;
 
 use environment::EnvironmentVariables;
-use environment_ui::{ProxyInput, VariableInput};
+use environment_ui::{ProxyBindingInput, VariableInput};
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
     KeyBinding, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img,
@@ -44,16 +48,18 @@ use gpui::{
 use gpui_glint::{
     components::{
         AppLayout, Button, ButtonKind, ButtonSize, Checkbox, ClosableTab, ClosableTabs, CodeCard,
-        CommandItem, CommandPalette, CommandPaletteEvent, DataTable, GlintAssets, Icon, IconButton,
-        Popover, SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectField,
-        SelectFieldEvent, SelectOption, Separator, Switch, TableCell, TableColumn, TableEvent,
-        TableRow, TextCompletion, TextEntry, TextReferenceResolver, Toast, ToastHost, ToastKind,
-        TreeDrop, TreeListItem, bind_code_card_keys, bind_text_entry_keys,
+        CommandItem, CommandPalette, CommandPaletteEvent, DataTable, Dialog, DropdownMenu,
+        GlintAssets, Icon, IconButton, MenuItem, Popover, SearchInput, SegmentOption,
+        SegmentedControl, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption,
+        Separator, Switch, TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
+        TextReferenceResolver, Toast, ToastHost, ToastKind, TreeDrop, TreeListItem,
+        bind_code_card_keys, bind_text_entry_keys,
     },
     theme::ThemePreset,
 };
 use http::{HttpResponse, PreparedRequest};
 use model::{BodyFormat, Draft, Pair, Record, Request, RequestGroups};
+use proxy_ui::ProxyInput;
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -95,6 +101,12 @@ struct Workbench {
     update_source_key: Entity<TextEntry>,
     show_update_source_settings: bool,
     storage: storage::Store,
+    workspace_list: Vec<storage::WorkspaceInfo>,
+    show_workspaces: bool,
+    workspace_name_input: Entity<TextEntry>,
+    workspace_edit: Option<String>,
+    workspace_delete: Option<String>,
+    workspace_error: Option<String>,
     environment_names: Vec<String>,
     responses: Vec<Option<HttpResponse>>,
     storage_error: Option<String>,
@@ -114,6 +126,7 @@ struct Workbench {
     tree_menu: Option<(usize, String)>,
     tree_delete: Option<model::TreeNode>,
     group_edit: Option<GroupEdit>,
+    group_dialog_open: bool,
     group_name: Entity<TextEntry>,
     group_error: Option<String>,
     request_name: Entity<TextEntry>,
@@ -123,6 +136,7 @@ struct Workbench {
     tabs: Vec<usize>,
     config: usize,
     plugin_catalog: Vec<gpui_glint::plugins::Plugin>,
+    disabled_plugins: HashSet<String>,
     plugin_errors: Vec<String>,
     registry_name: Entity<TextEntry>,
     registry_url: Entity<TextEntry>,
@@ -159,7 +173,12 @@ struct Workbench {
     variable_search: Entity<TextEntry>,
     variable_error: Option<String>,
     variable_rows: Vec<Vec<VariableInput>>,
-    proxy_inputs: Vec<ProxyInput>,
+    proxy_inputs: Vec<ProxyBindingInput>,
+    proxies: Vec<environment::ProxyProfile>,
+    profile_inputs: Vec<ProxyInput>,
+    profile_names: Vec<Entity<TextEntry>>,
+    editing_proxy: usize,
+    show_proxies: bool,
     variable_table: Entity<DataTable>,
     next_variable_row: u64,
     history_filter: usize,
@@ -176,6 +195,7 @@ struct Workbench {
     environment: Entity<Select>,
     saved_environment: usize,
     environment_inputs: Vec<EnvironmentVariables>,
+    pair_delete: Option<(usize, gpui::EntityId)>,
     params: Vec<PairInput>,
     headers: Vec<PairInput>,
     cookies: Vec<PairInput>,
@@ -225,11 +245,29 @@ struct Workbench {
     mcp_server: Option<mcp::Server>,
     mcp_task: Option<Task<()>>,
     mcp_error: Option<String>,
+    ws_background: std::collections::HashMap<String, background_tasks_ui::WsSessionState>,
+    ws_background_update: bool,
+    show_background_tasks: bool,
+    ws_environment: Option<environment::EnvironmentValues>,
     ws_sequence: u64,
+    ws_history: Option<(String, String, Instant)>,
     ws_commands: Option<async_channel::Sender<websocket::Command>>,
     ws_connected: bool,
     ws_active: bool,
-    ws_log: std::collections::VecDeque<String>,
+    ws_log: std::collections::VecDeque<websocket_ui::WsMessage>,
+    ws_scroll: gpui::ScrollHandle,
+    ws_detail_scroll: gpui::ScrollHandle,
+    ws_selected: Option<u64>,
+    ws_follow: bool,
+    ws_follow_latest: bool,
+    ws_raw: bool,
+    ws_detail_tab: usize,
+    ws_menu: Option<websocket_ui::WsMenu>,
+    ws_decoder_select: Entity<Select>,
+    ws_format_select: Entity<Select>,
+    ws_decrypted: Option<Result<String, String>>,
+    ws_decode_task: Option<Task<()>>,
+    ws_decode_generation: u64,
     ws_output: Entity<CodeCard>,
     sending: Option<Task<()>>,
     notice: String,
@@ -267,6 +305,15 @@ impl Workbench {
         let data = storage
             .load()
             .expect("无法加载 SQLite 工作区，已保留原文件");
+        Self::with_workspace(storage, data, cx)
+    }
+    fn with_workspace(
+        storage: storage::Store,
+        mut data: storage::Workspace,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let migrated_proxies = data.migrate_proxies();
+        let workspace_list = storage.workspaces().expect("无法读取工作区列表");
         let update_source = data.update_source;
         let update_source_url = Self::entry(
             update_source.as_ref().map(|s| s.url.as_str()).unwrap_or(""),
@@ -299,6 +346,11 @@ impl Workbench {
             .and_then(|path| std::fs::canonicalize(path).ok())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let oauth_namespace = if storage.workspace_id == "default" {
+            oauth_namespace
+        } else {
+            format!("{oauth_namespace}:{}", storage.workspace_id)
+        };
         let oauth = oauth_ui::Inputs::new(cx);
         let authentication = cx.new(|cx| {
             SelectField::new(
@@ -403,6 +455,8 @@ impl Workbench {
                     this.environment_name(value.parse::<usize>().unwrap_or(0))
                 );
                 this.sync_reference_inputs(cx);
+                this.ws_invalidate_titles();
+                this.ws_select_sync(cx);
                 cx.notify();
             },
         ));
@@ -554,6 +608,69 @@ impl Workbench {
         let current_versions = vec![0; requests.len()];
         let sent_requests = data.previews;
         let (plugin_catalog, plugin_errors) = plugins::catalog();
+        let disabled_plugins = storage.disabled_plugins().expect("无法读取插件启用状态");
+        let available_plugins = plugin_catalog
+            .iter()
+            .filter(|p| !disabled_plugins.contains(&p.family_identity()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ws_format_select = cx.new(|cx| {
+            Select::new(
+                [
+                    SelectOption::new("pretty", "格式化"),
+                    SelectOption::new("raw", "原文"),
+                ],
+                cx,
+            )
+            .selected("pretty")
+            .width(90.)
+        });
+        subscriptions.push(cx.subscribe(
+            &ws_format_select,
+            |this: &mut Self, select, event: &SelectEvent, cx| {
+                let SelectEvent::Changed(value) = event;
+                this.ws_raw = value.as_ref() == "raw";
+                this.capture_draft(cx);
+                select.update(cx, |select, cx| {
+                    select.set_selected(Some(value.clone()), cx)
+                });
+                this.ws_sync_detail(cx);
+                cx.notify();
+            },
+        ));
+        let ws_decoder_select = cx.new(|cx| {
+            Select::new(websocket_ui::decoder_options(&available_plugins), cx)
+                .selected("")
+                .width(210.)
+        });
+        subscriptions.push(cx.subscribe(
+            &ws_decoder_select,
+            |this: &mut Self, select, event: &SelectEvent, cx| {
+                let SelectEvent::Changed(value) = event;
+                let binding = if value.is_empty() {
+                    None
+                } else {
+                    let Some((_, binding, _)) =
+                        websocket_ui::decoder_bindings(&this.enabled_plugin_catalog())
+                            .into_iter()
+                            .find(|(v, _, _)| v == value.as_ref())
+                    else {
+                        return;
+                    };
+                    Some(binding)
+                };
+                if let Some(request) = this.requests.get_mut(this.active) {
+                    request.draft.event_decoder = binding;
+                }
+                select.update(cx, |select, cx| {
+                    select.set_selected(Some(value.clone()), cx)
+                });
+                this.storage_dirty = true;
+                this.ws_invalidate_titles();
+                this.ws_select_sync(cx);
+                cx.notify();
+            },
+        ));
         let registry_name = Self::entry("", "源名称，如 company", cx);
         let registry_url = Self::entry("", "https://plugins.example.com", cx);
         let registry_key = Self::entry("", "服务公钥（Base64，需从可信渠道确认）", cx);
@@ -572,6 +689,12 @@ impl Workbench {
             update_source_url,
             update_source_key,
             show_update_source_settings: false,
+            workspace_list,
+            show_workspaces: false,
+            workspace_name_input: Self::entry("", "工作区名称", cx),
+            workspace_edit: None,
+            workspace_delete: None,
+            workspace_error: None,
             storage,
             storage_error: None,
             storage_dirty: true,
@@ -597,6 +720,7 @@ impl Workbench {
             tree_delete: None,
             group_name,
             group_edit: None,
+            group_dialog_open: false,
             group_error: None,
             request_name,
             editing_request_name: false,
@@ -605,6 +729,7 @@ impl Workbench {
             tabs,
             config: 0,
             plugin_catalog,
+            disabled_plugins,
             plugin_errors,
             registry_name,
             registry_url,
@@ -639,6 +764,11 @@ impl Workbench {
             variable_error: None,
             variable_rows: vec![vec![]; environment_count],
             proxy_inputs: vec![],
+            proxies: data.proxies,
+            profile_inputs: vec![],
+            profile_names: vec![],
+            editing_proxy: 0,
+            show_proxies: false,
             variable_table,
             next_variable_row: 0,
             history_filter: 0,
@@ -655,6 +785,7 @@ impl Workbench {
             environment,
             saved_environment: selected_environment,
             environment_inputs,
+            pair_delete: None,
             params: vec![],
             headers: vec![],
             cookies: vec![],
@@ -709,15 +840,34 @@ impl Workbench {
             mcp_server: None,
             mcp_task: None,
             mcp_error: None,
+            ws_background: Default::default(),
+            ws_background_update: false,
+            show_background_tasks: false,
+            ws_environment: None,
             ws_sequence: 0,
+            ws_history: None,
             ws_commands: None,
             ws_connected: false,
             ws_active: false,
             ws_log: Default::default(),
+            ws_scroll: gpui::ScrollHandle::new(),
+            ws_detail_scroll: gpui::ScrollHandle::new(),
+            ws_selected: None,
+            ws_follow: true,
+            ws_follow_latest: true,
+            ws_raw: false,
+            ws_detail_tab: 0,
+            ws_menu: None,
+            ws_decoder_select,
+            ws_format_select,
+            ws_decrypted: None,
+            ws_decode_task: None,
+            ws_decode_generation: 0,
             ws_output: cx.new(|cx| {
                 CodeCard::new(cx, "text", "")
                     .read_only(true)
                     .show_header(false)
+                    .prose(true)
                     .viewport()
             }),
             sending: None,
@@ -738,6 +888,8 @@ impl Workbench {
                 }
             }),
         );
+        this.reset_proxy_profiles(cx);
+        this.storage_dirty |= migrated_proxies;
         this.reset_variable_rows(cx);
         this.load(&initial, cx);
         this.restore_response(cx);
@@ -949,6 +1101,7 @@ impl Workbench {
             collections: self.collections.clone(),
             environments: self.environment_names.clone(),
             variables: self.environment_inputs.clone(),
+            proxies: self.proxies.clone(),
             traces: self.traces.clone(),
             responses: self.responses.clone(),
             previews: self.sent_requests.clone(),
@@ -983,6 +1136,12 @@ impl Workbench {
                 .collect()
         };
         Draft {
+            websocket_follow_latest: self.ws_follow_latest,
+            websocket_raw: self.ws_raw,
+            event_decoder: self
+                .requests
+                .get(self.active)
+                .and_then(|r| r.draft.event_decoder.clone()),
             plugins: self
                 .requests
                 .get(self.active)
@@ -1129,18 +1288,28 @@ impl Workbench {
         }
     }
     fn load(&mut self, draft: &Draft, cx: &mut Context<Self>) {
+        self.pair_delete = None;
         if self.ws_active || self.ws_commands.is_some() {
             self.sending = None;
             self.ws_commands = None;
             self.ws_active = false;
         }
+        self.ws_finish_history("WS 已结束");
+        self.ws_history = None;
         self.ws_connected = false;
-        self.ws_log.clear();
-        self.ws_output
-            .update(cx, |output, cx| output.set_content("", cx));
+        self.ws_environment = None;
+        self.ws_follow_latest = draft.websocket_follow_latest;
+        self.ws_raw = draft.websocket_raw;
+        self.clear_websocket_messages(cx);
+        self.ws_format_select.update(cx, |select, cx| {
+            select.close(cx);
+            select.set_selected(Some(if self.ws_raw { "raw" } else { "pretty" }.into()), cx);
+        });
         if let Some(request) = self.requests.get_mut(self.active) {
             request.draft.plugins = draft.plugins.clone();
+            request.draft.event_decoder = draft.event_decoder.clone();
         }
+        self.ws_refresh_decoder_select(cx);
         self.oauth.load(draft.oauth.clone().unwrap_or_default(), cx);
         self.skip_tls_verification = draft.skip_tls_verification;
         self.authentication.update(cx, |field, cx| {
@@ -1186,6 +1355,7 @@ impl Workbench {
         self.version_tag_edit = None;
         self.directory_settings = None;
         self.tree_delete = None;
+        self.show_proxies = false;
         self.show_mcp = false;
         self.show_plugins = false;
         self.show_environments = false;
@@ -1195,6 +1365,7 @@ impl Workbench {
         if !self.requests.is_empty() {
             self.capture_draft(cx);
         }
+        self.park_websocket(cx);
         if self.sending.take().is_some() {
             self.push_trace("切换请求，已取消等待中的请求", cx);
         }
@@ -1237,6 +1408,7 @@ impl Workbench {
         self.load(&draft, cx);
         self.restore_response(cx);
         self.error = None;
+        self.unpark_websocket(cx);
     }
     fn save(&mut self, cx: &mut Context<Self>) {
         if self.show_curl_import {
@@ -1341,13 +1513,17 @@ impl Workbench {
         self.response_data = None;
         self.status = None;
         self.error = None;
-        let inputs = &self.environment_inputs[environment_index];
+        let proxy = self.effective_proxy(environment_index);
         let variables = self.active_environment_values(cx);
         let request = match PreparedRequest::new(&draft, &variables)
             .and_then(|request| self.oauth_attach(request, &draft, cx))
-            .and_then(|request| request.with_proxy(&inputs.proxy))
+            .and_then(|request| request.with_proxy(&proxy))
             .and_then(|request| {
-                plugins::validate_variables(&draft.plugins, &self.plugin_catalog, &variables)?;
+                plugins::validate_variables(
+                    &self.enabled_before_actions(&draft.plugins),
+                    &self.plugin_catalog,
+                    &variables,
+                )?;
                 Ok(request)
             }) {
             Ok(request) => request,
@@ -1383,7 +1559,7 @@ impl Workbench {
         self.notice = "正在发送 HTTP 请求".into();
         let index = self.active;
         let started = Instant::now();
-        let plugin_ids = draft.plugins.clone();
+        let plugin_ids = self.enabled_before_actions(&draft.plugins);
         let plugin_catalog = self.plugin_catalog.clone();
         let plugin_variables = variables.clone();
         self.sending = Some(cx.spawn(async move |this, cx| {
@@ -1475,6 +1651,8 @@ impl Workbench {
                         time: record_time(),
                         elapsed_ms: Some(elapsed_ms),
                         exchange: Some(model::Exchange {
+                            websocket_connected: false,
+                            websocket_events: vec![],
                             curl: this.sent_curls[index].clone(),
                             response: result.as_ref().ok().cloned().or_else(|| {
                                 this.response_data
@@ -1861,6 +2039,10 @@ impl Workbench {
             .update(cx, |entry, cx| entry.set_theme(theme, cx));
         self.mcp_history_detail
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
+        self.ws_decoder_select
+            .update(cx, |select, cx| select.set_theme(theme, cx));
+        self.ws_format_select
+            .update(cx, |select, cx| select.set_theme(theme, cx));
         self.ws_output
             .update(cx, |output, cx| output.set_theme(theme, cx));
         self.theme = theme;
@@ -1884,6 +2066,7 @@ impl Workbench {
             &self.group_name,
             &self.request_name,
             &self.version_tag_input,
+            &self.workspace_name_input,
         ] {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }
@@ -1895,8 +2078,26 @@ impl Workbench {
             row.kind
                 .update(cx, |select, cx| select.set_theme(theme, cx));
         }
-        for proxy in &self.proxy_inputs {
+        for input in &self.proxy_inputs {
+            input
+                .select
+                .update(cx, |select, cx| select.set_theme(theme, cx));
+        }
+        for proxy in &self.profile_inputs {
+            proxy
+                .table
+                .update(cx, |table, cx| table.set_theme(theme, cx));
             proxy.url.update(cx, |entry, cx| entry.set_theme(theme, cx));
+            for row in &proxy.mappings {
+                row.name.update(cx, |entry, cx| entry.set_theme(theme, cx));
+                row.value.update(cx, |entry, cx| entry.set_theme(theme, cx));
+            }
+        }
+        for index in 0..self.profile_inputs.len() {
+            self.sync_proxy_table(index, cx);
+        }
+        for name in &self.profile_names {
+            name.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }
         self.sync_variable_table(cx);
         for row in self
@@ -1954,16 +2155,19 @@ impl Workbench {
             .text_size(px(12.))
             .child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
             .child(div().font_weight(FontWeight::SEMIBOLD).child("Glint API"))
+            .child(self.workspace_trigger(cx))
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
-                    .child(if self.show_mcp {
-                        "个人工作区  ›  MCP".into()
+                    .child(if self.show_proxies {
+                        "›  代理管理".into()
+                    } else if self.show_mcp {
+                        "›  MCP".into()
                     } else if self.show_plugins {
-                        "个人工作区  ›  插件管理".into()
+                        "›  插件管理".into()
                     } else if self.show_environments {
                         format!(
-                            "个人工作区  ›  环境管理  ›  {}",
+                            "›  环境管理  ›  {}",
                             self.environment_name(self.editing_environment)
                         )
                     } else {
@@ -1971,16 +2175,16 @@ impl Workbench {
                             .get(self.active)
                             .map(|request| {
                                 if request.group.is_empty() {
-                                    format!("个人工作区  ›  {}", request.collection)
+                                    format!("›  {}", request.collection)
                                 } else {
                                     format!(
-                                        "个人工作区  ›  {}  ›  {}",
+                                        "›  {}  ›  {}",
                                         request.collection,
                                         request.group.replace('/', "  ›  ")
                                     )
                                 }
                             })
-                            .unwrap_or_else(|| "个人工作区  ›  暂无请求".into())
+                            .unwrap_or_else(|| "›  暂无请求".into())
                     }),
             )
             .child(gpui_glint::components::window_drag_region())
@@ -2019,6 +2223,7 @@ impl Workbench {
                     .debug_selector(|| "global-environment-selector".into())
                     .child(self.environment.clone()),
             )
+            .child(self.background_tasks_menu(cx))
             .when(
                 !self.show_environments && !self.show_plugins && !self.show_mcp,
                 |bar| {
@@ -2032,16 +2237,6 @@ impl Workbench {
                             })),
                     )
                 },
-            )
-            .child(
-                div()
-                    .rounded_full()
-                    .bg(rgb(self.theme.palette().accent_tint))
-                    .text_color(rgb(0x007aff))
-                    .px_2()
-                    .py_1()
-                    .text_size(px(10.))
-                    .child("YG"),
             )
     }
     fn rail(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2057,6 +2252,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_environments = false;
                         this.show_plugins = false;
@@ -2069,6 +2265,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_plugins = false;
                         this.show_environments = true;
@@ -2079,6 +2276,23 @@ impl Workbench {
                         this.variable_search
                             .update(cx, |entry, cx| entry.set_value("", cx));
                         this.show_collection_menu = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new(Icon::Shuffle, "代理管理")
+                    .theme(self.theme)
+                    .render()
+                    .when(self.show_proxies, |button| {
+                        button.bg(rgb(self.theme.palette().accent_tint))
+                    })
+                    .debug_selector(|| "open-proxy-manager".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_proxies = true;
+                        this.show_environments = false;
+                        this.show_plugins = false;
+                        this.show_mcp = false;
+                        this.variable_error = None;
                         cx.notify();
                     })),
             )
@@ -2094,6 +2308,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_plugins = false;
                         this.show_environments = false;
@@ -2237,24 +2452,23 @@ impl Workbench {
                     .id("environment-list-scroll")
                     .overflow_y_scroll()
                     .child(list)
-                    .child(
-                        Button::new("创建环境")
-                            .icon(Icon::Plus)
-                            .kind(ButtonKind::Gray)
-                            .size(ButtonSize::Mini)
-                            .theme(self.theme)
-                            .render()
-                            .mx_2()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.group_name.update(cx, |e, cx| e.set_value("", cx));
-                                this.group_edit = Some(GroupEdit::CreateEnvironment);
-                                this.group_error = None;
-                                cx.notify();
-                            })),
-                    )
                     .when(
-                        matches!(self.group_edit, Some(GroupEdit::CreateEnvironment)),
-                        |el| el.child(self.group_editor(cx)),
+                        self.environment_names.len() > 1 || !self.collections.is_empty(),
+                        |list| {
+                            list.child(
+                                Button::new("创建环境")
+                                    .icon(Icon::Plus)
+                                    .kind(ButtonKind::Gray)
+                                    .size(ButtonSize::Mini)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "sidebar-create-environment".into())
+                                    .mx_2()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.begin_create_environment(window, cx);
+                                    })),
+                            )
+                        },
                     ),
             )
             .child(
@@ -2278,6 +2492,9 @@ impl Workbench {
             )
     }
     fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.show_proxies {
+            return self.proxy_sidebar(cx);
+        }
         if self.show_mcp {
             return self.mcp_history_sidebar(cx);
         }
@@ -2356,10 +2573,6 @@ impl Workbench {
                         .debug_selector(|| "sidebar-search-input".into()),
                 ),
             )
-            .when(
-                self.group_edit.is_some() && !self.show_environments,
-                |sidebar| sidebar.child(self.group_editor(cx)),
-            )
             .child(tree)
             .child(
                 div()
@@ -2372,80 +2585,51 @@ impl Workbench {
             )
     }
     fn collection_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = self.theme.palette();
-        let mut trigger = div().relative().child(
-            IconButton::new(Icon::More, "更多集合操作")
-                .theme(self.theme)
-                .render()
-                .debug_selector(|| "collection-more".into())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.show_collection_menu = !this.show_collection_menu;
+        let owner = cx.entity().downgrade();
+        let menu = div()
+            .flex()
+            .flex_col()
+            .occlude()
+            .child(
+                MenuItem::new("create-request-collection", "创建集合")
+                    .icon(Icon::Folders)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, window, cx| this.edit_collection(window, cx))),
+            )
+            .child(
+                MenuItem::new("import-curl-menu", "从 cURL 导入")
+                    .icon(Icon::Download)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "open-curl-import".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.open_curl_import(cx))),
+            );
+        div().child(
+            DropdownMenu::new(
+                "collection-actions-menu",
+                IconButton::new(Icon::More, "更多集合操作")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "collection-more".into()),
+                menu,
+            )
+            .open(self.show_collection_menu)
+            .width(160.)
+            .theme(self.theme)
+            .on_open_change(move |open, window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.show_collection_menu = open;
                     window.focus(&this.focus, cx);
                     cx.notify();
-                })),
-        );
-        if self.show_collection_menu {
-            let popup = div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .w(px(160.))
-                .pt(px(34.))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.show_collection_menu = false;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(p.border))
-                        .bg(rgb(p.panel))
-                        .shadow_md()
-                        .child(
-                            div()
-                                .id("create-request-collection")
-                                .h(px(32.))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(p.accent_tint)))
-                                .child(Icon::Folders.render(14.))
-                                .child("创建集合")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.edit_collection(window, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("import-curl-menu")
-                                .debug_selector(|| "open-curl-import".into())
-                                .h(px(32.))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(p.accent_tint)))
-                                .child(Icon::Download.render(14.))
-                                .child("从 cURL 导入")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.open_curl_import(cx);
-                                })),
-                        ),
-                );
-            trigger = trigger.child(gpui::deferred(popup).with_priority(20));
-        }
-        trigger
+                });
+            })
+            .render(),
+        )
     }
+
     fn edit_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_proxies = false;
         self.show_mcp = false;
         self.show_collection_menu = false;
         self.tree_menu = None;
@@ -2472,6 +2656,7 @@ impl Workbench {
             self.current_directory.clear();
         }
         self.current_collection = collection;
+        self.show_proxies = false;
         self.show_mcp = false;
         self.show_environments = false;
         self.show_plugins = false;
@@ -2985,6 +3170,7 @@ impl Workbench {
                                     }
                                     this.show_environments = true;
                                     this.show_plugins = false;
+                                    this.show_proxies = false;
                                     this.show_mcp = false;
                                     this.sync_variable_table(cx);
                                     cx.notify();
@@ -3153,13 +3339,6 @@ impl Workbench {
         let p = self.theme.palette();
         div()
             .debug_selector(|| "group-name-editor".into())
-            .mx_3()
-            .mb_2()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.surface))
             .flex()
             .flex_col()
             .gap_2()
@@ -3230,6 +3409,22 @@ impl Workbench {
                     ),
             )
     }
+    fn group_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.group_edit.as_ref()?;
+        Some(
+            Dialog::new("group-dialog", self.group_editor(cx))
+                .focus_handles([self.group_name.read(cx).focus_handle(cx)])
+                .theme(self.theme)
+                .width(360.)
+                .on_close(cx.listener(|this, _, window, cx| {
+                    this.group_edit = None;
+                    this.group_error = None;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }))
+                .render(),
+        )
+    }
     fn add_request(&mut self, cx: &mut Context<Self>) {
         self.add_request_to(self.current_directory.clone(), cx);
     }
@@ -3296,6 +3491,11 @@ impl Workbench {
         }
         self.cancel_request_name(cx);
         self.capture_draft(cx);
+        if index != self.active {
+            self.park_websocket(cx);
+        }
+        let deleted_id = self.requests[index].id.clone();
+        self.ws_background.remove(&deleted_id);
         // Any removal changes captured indices in a pending response task.
         if self.sending.take().is_some() {
             self.push_trace("删除请求，已取消等待中的请求", cx);
@@ -3343,6 +3543,7 @@ impl Workbench {
             self.restore_response(cx);
             self.error = None;
         }
+        self.unpark_websocket(cx);
         self.sync_request_preview(cx);
         self.sync_groups(cx);
         self.notice = format!("已删除请求 {name}");
@@ -3405,7 +3606,25 @@ impl Workbench {
         }
         view
     }
+    fn pair_rows_mut(&mut self, kind: usize) -> &mut Vec<PairInput> {
+        match kind {
+            1 => &mut self.headers,
+            2 => &mut self.cookies,
+            3 => &mut self.extractors,
+            4 => &mut self.form,
+            _ => &mut self.params,
+        }
+    }
     fn sync_pair_tables(&mut self, cx: &mut Context<Self>) {
+        if let Some((kind, id)) = self.pair_delete {
+            if !self
+                .pair_rows_mut(kind)
+                .iter()
+                .any(|row| row.key.entity_id() == id)
+            {
+                self.pair_delete = None;
+            }
+        }
         for kind in [0, 1, 2, 3, 4] {
             let rows = match kind {
                 1 => &self.headers,
@@ -3450,30 +3669,45 @@ impl Workbench {
                     let extractor_cell = (kind == 3)
                         .then(|| cx.new(|cx| json_picker::ExtractorCell::new(workbench, i, cx)));
                     let owner = cx.entity().downgrade();
+                    let row_id = row.key.entity_id();
+                    let open = self.pair_delete == Some((kind, row_id));
+                    let label = row.key.read(cx).value().to_owned();
                     let delete = TableCell::custom(move || {
-                        let owner = owner.clone();
-                        div()
-                            .id(("pair-delete", i))
-                            .cursor_pointer()
-                            .child(Icon::Close.render(12.))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let _ = owner.update(cx, |this, cx| {
-                                    let rows = match kind {
-                                        1 => &mut this.headers,
-                                        2 => &mut this.cookies,
-                                        3 => &mut this.extractors,
-                                        4 => &mut this.form,
-                                        _ => &mut this.params,
-                                    };
-                                    rows.remove(i);
+                        let toggle_owner = owner.clone();
+                        let confirm_owner = owner.clone();
+                        pair_ui::delete_popover(
+                            format!("pair-delete-{kind}-{i}"),
+                            label.clone(),
+                            open,
+                            theme,
+                            move |open, window, cx| {
+                                let _ = toggle_owner.update(cx, |this, cx| {
+                                    this.pair_delete = open.then_some((kind, row_id));
+                                    window.focus(&this.focus, cx);
+                                    this.sync_pair_tables(cx);
+                                    cx.notify();
+                                });
+                            },
+                            move |_, _, cx| {
+                                let _ = confirm_owner.update(cx, |this, cx| {
+                                    if this.pair_delete != Some((kind, row_id)) {
+                                        return;
+                                    }
+                                    let rows = this.pair_rows_mut(kind);
+                                    if let Some(index) =
+                                        rows.iter().position(|row| row.key.entity_id() == row_id)
+                                    {
+                                        rows.remove(index);
+                                    }
+                                    this.pair_delete = None;
                                     if kind == 3 {
                                         this.cancel_json_pick(cx);
                                     }
                                     this.sync_pair_tables(cx);
                                     cx.notify();
                                 });
-                            })
+                            },
+                        )
                     });
                     TableRow::new(
                         i.to_string(),
@@ -3687,6 +3921,24 @@ impl Workbench {
                         });
                     })
                     .render().debug_selector(|| "skip-tls-verification".into())))
+                .when(self.requests.get(self.active).is_some_and(|request| request.draft.method == "WS"), |settings| settings
+                    .child(self.request_setting_row("事件解密插件", "用于解密当前请求接收的 WebSocket 事件，配置随请求保存。",
+                        div().id("websocket-event-decoder").debug_selector(|| "websocket-event-decoder".into()).child(self.ws_decoder_select.clone())))
+                    .child(self.request_setting_row("跟随最新事件", "收到新事件时自动选中并滚动到最新一条；手动查看历史事件时临时暂停。",
+                        Switch::new("").checked(self.ws_follow_latest).theme(self.theme)
+                            .on_change({ let owner = cx.entity().downgrade(); move |follow, _, cx| { let _ = owner.update(cx, |this, cx| {
+                                this.ws_follow_latest = follow;
+                                this.ws_follow = follow;
+                                if follow {
+                                    this.ws_selected = this.ws_log.back().map(|event| event.id);
+                                    this.ws_scroll.scroll_to_item(this.ws_log.len().saturating_sub(1));
+                                    this.ws_select_sync(cx);
+                                }
+                                this.capture_draft(cx);
+                                cx.notify();
+                            }); } }).render().id("websocket-follow-setting").debug_selector(|| "websocket-follow-setting".into())))
+                    .child(self.request_setting_row("事件显示格式", "选择事件体的默认显示格式，原始事件和解密结果共用此设置。",
+                        div().id("websocket-body-format").debug_selector(|| "websocket-body-format".into()).child(self.ws_format_select.clone()))))
                 .child(self.request_setting_row("连接超时", "建立连接时的最长等待时间。", div().text_size(px(12.)).child("10 秒")))
                 .child(self.request_setting_row("请求超时", "包含连接和接收响应的总等待时间。", div().text_size(px(12.)).child("30 秒")))
                 .child(self.request_setting_row("重定向", "保留服务器返回的原始 3xx 响应。", div().text_size(px(12.)).child("不自动跟随")))
@@ -3694,6 +3946,7 @@ impl Workbench {
         };
         div()
             .id("configuration")
+            .debug_selector(|| "request-config-scroll".into())
             .h(px(
                 if self.config == 1
                     && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")
@@ -4241,6 +4494,9 @@ impl Workbench {
                         } else {
                             "发送  ↗"
                         })
+                        .when(self.ws_commands.is_some(), |button| {
+                            button.kind(ButtonKind::Danger)
+                        })
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
@@ -4272,6 +4528,11 @@ impl Workbench {
                     .debug_selector(move || format!("request-config-{i}").into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.config = i;
+                        if i == 4 {
+                            this.ws_refresh_decoder_select(cx);
+                        }
+                        this.pair_delete = None;
+                        this.sync_pair_tables(cx);
                         cx.notify();
                     })),
             );
@@ -4328,8 +4589,8 @@ impl Workbench {
             .enumerate()
             .filter(|(_, r)| {
                 r.draft.url.to_lowercase().contains(&query)
-                    && (self.history_filter != 1 || r.label.starts_with('2'))
-                    && (self.history_filter != 2 || !r.label.starts_with('2'))
+                    && (self.history_filter != 1 || r.is_success())
+                    && (self.history_filter != 2 || !r.is_success())
             })
             .collect();
         if self.activity == 1 {
@@ -4344,8 +4605,8 @@ impl Workbench {
         for (i, r) in records.iter().enumerate() {
             if self.activity == 1
                 && (!r.draft.url.to_lowercase().contains(&query)
-                    || (self.history_filter == 1 && !r.label.starts_with('2'))
-                    || (self.history_filter == 2 && r.label.starts_with('2')))
+                    || (self.history_filter == 1 && !r.is_success())
+                    || (self.history_filter == 2 && r.is_success()))
             {
                 continue;
             }
@@ -4380,13 +4641,15 @@ impl Workbench {
                     .next()
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(0);
-                let color = self.theme.color(if (200..400).contains(&status) {
-                    0x24864c
-                } else if (400..500).contains(&status) {
-                    0xb87508
-                } else {
-                    0xd9342b
-                });
+                let color = self
+                    .theme
+                    .color(if r.is_success() || (200..400).contains(&status) {
+                        0x24864c
+                    } else if (400..500).contains(&status) {
+                        0xb87508
+                    } else {
+                        0xd9342b
+                    });
                 let selected = self.selected_history == Some((self.active, i));
                 list = list.child(
                     div()
@@ -4486,6 +4749,14 @@ impl Workbench {
                             this.responses[this.active] = this.response_data.clone();
                             this.sync_request_preview(cx);
                             this.update_response(cx);
+                            if record.draft.method == "WS" {
+                                this.restore_ws_history(
+                                    exchange
+                                        .map(|e| e.websocket_events.as_slice())
+                                        .unwrap_or_default(),
+                                    cx,
+                                );
+                            }
                             this.notice = if exchange.is_some() {
                                 format!("已恢复 {} 的请求与响应", record.label)
                             } else {
@@ -4780,6 +5051,10 @@ impl Workbench {
 }
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.group_edit.is_some() && !self.group_dialog_open {
+            window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
+        }
+        self.group_dialog_open = self.group_edit.is_some();
         if self.curl_import_needs_focus && self.show_curl_import {
             window.focus(&self.curl_input.read(cx).focus_handle(cx), cx);
             self.curl_import_needs_focus = false;
@@ -4797,10 +5072,13 @@ impl Render for Workbench {
                 && self.sending.is_none()
                 && self.error.is_none()
                 && self.response_data.is_some()
+                && !self.show_proxies
                 && !self.show_environments
                 && !self.show_plugins
                 && !self.show_mcp
                 && !self.show_curl_import
+                && !self.show_workspaces
+                && self.group_edit.is_none()
                 && self.directory_settings.is_none()
                 && self.response_tab == 0
                 && !self.commands.read(cx).is_open();
@@ -4815,7 +5093,9 @@ impl Render for Workbench {
             .min_h_0()
             .min_w_0()
             .flex()
-            .child(if self.show_mcp {
+            .child(if self.show_proxies {
+                self.proxy_workspace(cx)
+            } else if self.show_mcp {
                 self.mcp_history_workspace(cx)
             } else if self.show_plugins {
                 self.plugin_workspace(cx)
@@ -4828,6 +5108,7 @@ impl Render for Workbench {
             })
             .when(
                 self.show_activity
+                    && !self.show_proxies
                     && !self.show_environments
                     && !self.show_plugins
                     && !self.show_mcp
@@ -4911,6 +5192,9 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
+                if this.show_workspaces || this.group_edit.is_some() {
+                    return;
+                }
                 if !this.show_mcp
                     && !this.show_plugins
                     && !this.show_environments
@@ -4924,6 +5208,9 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
+                if this.show_workspaces || this.group_edit.is_some() {
+                    return;
+                }
                 if this.show_plugins || this.show_mcp {
                     return;
                 } else if this.show_environments {
@@ -4935,7 +5222,9 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
-                if !this.show_mcp
+                if this.group_edit.is_none()
+                    && !this.show_workspaces
+                    && !this.show_mcp
                     && !this.show_plugins
                     && !this.show_environments
                     && this.response_data.is_some()
@@ -4950,11 +5239,37 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchCommands, w, cx| {
-                if !this.show_registry_dialog && !this.show_curl_import {
+                if this.group_edit.is_none()
+                    && !this.show_workspaces
+                    && !this.show_registry_dialog
+                    && !this.show_curl_import
+                {
                     this.open_commands(w, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.show_workspaces {
+                    match event.keystroke.key.as_str() {
+                        "escape" => {
+                            this.show_workspaces = false;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                        "enter"
+                            if this
+                                .workspace_name_input
+                                .read(cx)
+                                .focus_handle(cx)
+                                .is_focused(window) =>
+                        {
+                            this.submit_workspace(window, cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 if this.show_curl_import {
                     if event.keystroke.key == "escape" {
                         this.show_curl_import = false;
@@ -4987,6 +5302,13 @@ impl Render for Workbench {
                         }
                         cx.stop_propagation();
                     }
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.pair_delete.is_some() {
+                    this.pair_delete = None;
+                    this.sync_pair_tables(cx);
+                    cx.stop_propagation();
+                    cx.notify();
                     return;
                 }
                 if event.keystroke.key == "escape" && this.history_delete.is_some() {
@@ -5042,6 +5364,8 @@ impl Render for Workbench {
             .children(overlay)
             .children(self.registry_dialog(cx))
             .children(self.curl_import_dialog(cx))
+            .children(self.workspace_dialog(cx))
+            .children(self.group_dialog(cx))
     }
 }
 fn tab_button(label: &str, selected: bool, theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
@@ -5601,6 +5925,8 @@ mod persistence_tests {
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{text}");
                 record.exchange = Some(model::Exchange {
+                    websocket_connected: false,
+                    websocket_events: vec![],
                     curl: None,
                     response: Some(HttpResponse {
                         status,

@@ -62,8 +62,33 @@ impl PreparedRequest {
             args.push("--insecure".into());
         }
         if let Some(proxy) = &self.proxy {
-            args.push(format!("--proxy {}", super::curl::quote(proxy.url.trim())?));
-            args.push("--noproxy ''".into());
+            if proxy.built_in {
+                args.push("--noproxy '*'".into());
+                for mapping in &proxy.mappings {
+                    let ip = if mapping.ip.contains(':') {
+                        format!("[{}]", mapping.ip.trim())
+                    } else {
+                        mapping.ip.trim().to_owned()
+                    };
+                    let domain = mapping
+                        .domain
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    let mut ports = vec![80, 443, self.url.port_or_known_default().unwrap_or(80)];
+                    ports.sort_unstable();
+                    ports.dedup();
+                    for port in ports {
+                        args.push(format!(
+                            "--resolve {}",
+                            super::curl::quote(&format!("{domain}:{port}:{ip}"))?
+                        ));
+                    }
+                }
+            } else {
+                args.push(format!("--proxy {}", super::curl::quote(proxy.url.trim())?));
+                args.push("--noproxy ''".into());
+            }
         } else {
             args.push("--noproxy '*'".into());
         }
@@ -400,10 +425,7 @@ pub async fn execute_stream(
     let client = clients[usize::from(request.skip_tls_verification)].clone();
     let task = runtime.spawn(async move {
         let client = if let Some(proxy) = &request.proxy {
-            streaming_client_builder(request.skip_tls_verification)
-                .proxy(
-                    reqwest::Proxy::all(proxy.url.trim()).map_err(|_| "代理地址无效".to_owned())?,
-                )
+            proxy.apply(streaming_client_builder(request.skip_tls_verification))?
                 .build()
                 .map_err(|_| "无法初始化代理客户端".to_owned())?
         } else {
@@ -642,12 +664,81 @@ mod tests {
         server.join().unwrap();
     }
     #[test]
+    fn built_in_proxy_connects_mapped_ip_preserves_host_port_and_tls_sni() {
+        for tls in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut stream: Box<dyn ReadWrite> = if tls {
+                    let mut stream = rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(tls_server_config()).unwrap(),
+                        socket,
+                    );
+                    stream.conn.complete_io(&mut stream.sock).unwrap();
+                    assert_eq!(stream.conn.server_name(), Some("mapped.invalid"));
+                    Box::new(stream)
+                } else {
+                    Box::new(socket)
+                };
+                let request = read_mapped_request(&mut stream);
+                assert!(request.starts_with("GET /mapped HTTP/1.1"));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains(&format!("host: mapped.invalid:{port}"))
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+            });
+            let proxy = ProxySettings {
+                enabled: true,
+                built_in: true,
+                skip_tls_verification: tls,
+                mappings: vec![super::super::environment::HostMapping {
+                    domain: "mapped.invalid".into(),
+                    ip: "127.0.0.1".into(),
+                }],
+                ..Default::default()
+            };
+            let draft = Draft {
+                url: format!(
+                    "{}://mapped.invalid:{port}/mapped",
+                    if tls { "https" } else { "http" }
+                ),
+                ..Default::default()
+            };
+            let request = PreparedRequest::new(&draft, &variables(""))
+                .unwrap()
+                .with_proxy(&proxy)
+                .unwrap();
+            let curl = request.to_curl().unwrap();
+            assert!(
+                curl.contains("--resolve")
+                    && curl.contains(&format!("mapped.invalid:{port}:127.0.0.1"))
+            );
+            let result = runtime().block_on(execute(request)).unwrap();
+            assert_eq!(result.status, 200);
+            server.join().unwrap();
+        }
+    }
+    trait ReadWrite: std::io::Read + std::io::Write {}
+    impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+    #[test]
     fn proxy_routes_http_and_https_and_applies_tls_setting() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = ProxySettings {
             enabled: true,
             url: format!("http://{}", listener.local_addr().unwrap()),
             skip_tls_verification: true,
+            ..ProxySettings::default()
         };
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -739,6 +830,7 @@ mod tests {
                 enabled: true,
                 url: proxy_url.clone(),
                 skip_tls_verification: skip,
+                ..ProxySettings::default()
             };
             let prepared = PreparedRequest::new(&draft, &variables(""))
                 .unwrap()
@@ -752,6 +844,9 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
+        read_mapped_request(stream)
+    }
+    fn read_mapped_request(stream: &mut impl std::io::Read) -> String {
         let mut bytes = Vec::new();
         let mut chunk = [0; 2048];
         loop {

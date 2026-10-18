@@ -2,6 +2,7 @@ mod badge;
 mod button;
 mod closable_tabs;
 mod code_card;
+mod dialog;
 mod dropdown;
 mod icon;
 mod inputs;
@@ -30,6 +31,7 @@ pub use badge::{
 };
 pub use button::{Button, ButtonKind, ButtonSize};
 pub use closable_tabs::{ClosableTab, ClosableTabs};
+pub use dialog::{Dialog, DialogDismiss};
 pub use dropdown::{DropdownGroup, DropdownItem, GroupedDropdown};
 pub use icon::{GlintAssets, Icon, IconButton, IconSvg};
 pub use inputs::{
@@ -116,3 +118,6 @@ pub use webview::{WebView, wry};
 mod plugin_page;
 #[cfg(feature = "plugins")]
 pub use plugin_page::{PluginPage, PluginPageEvent};
+
+mod menu;
+pub use menu::{DropdownMenu, MenuItem};

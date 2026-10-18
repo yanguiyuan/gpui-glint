@@ -4,12 +4,108 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProxySettings {
     pub enabled: bool,
+    #[serde(default)]
+    pub built_in: bool,
+    #[serde(default)]
+    pub mappings: Vec<HostMapping>,
     pub url: String,
     pub skip_tls_verification: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProxyProfile {
+    pub id: String,
+    pub name: String,
+    pub settings: ProxySettings,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HostMapping {
+    pub domain: String,
+    pub ip: String,
+}
+impl HostMapping {
+    /// Parse hosts syntax atomically. Later entries for the same domain win.
+    pub fn parse_hosts(text: &str) -> Result<Vec<Self>, String> {
+        let mut mappings: Vec<Self> = Vec::new();
+        let mut indices = std::collections::HashMap::new();
+        for (line_index, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let ip = fields.next().unwrap();
+            let domains: Vec<_> = fields.collect();
+            if domains.is_empty() {
+                return Err(format!("第 {} 行：IP 后缺少域名", line_index + 1));
+            }
+            for domain in domains {
+                let mapping = Self {
+                    domain: domain.into(),
+                    ip: ip.into(),
+                };
+                let (domain, address) = mapping
+                    .address()
+                    .map_err(|error| format!("第 {} 行：{error}", line_index + 1))?;
+                let mapping = Self {
+                    domain: domain.clone(),
+                    ip: address.ip().to_string(),
+                };
+                if let Some(&index) = indices.get(&domain) {
+                    mappings[index] = mapping;
+                } else {
+                    indices.insert(domain, mappings.len());
+                    mappings.push(mapping);
+                }
+            }
+        }
+        if mappings.is_empty() {
+            return Err("未找到映射，请复制 IP 域名 格式的 Hosts 文本".into());
+        }
+        Ok(mappings)
+    }
+
+    fn address(&self) -> Result<(String, std::net::SocketAddr), String> {
+        let domain = self
+            .domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if domain.is_empty()
+            || domain.len() > 253
+            || domain.parse::<std::net::IpAddr>().is_ok()
+            || domain.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+            })
+        {
+            return Err("映射域名无效，请填写纯域名，不包含协议、端口或路径".into());
+        }
+        let ip = self
+            .ip
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "映射 IP 无效，请填写 IPv4 或 IPv6 地址")?;
+        Ok((domain, std::net::SocketAddr::new(ip, 0)))
+    }
 }
 impl ProxySettings {
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
+            return Ok(());
+        }
+        if self.built_in {
+            let mut domains = std::collections::HashSet::new();
+            for mapping in &self.mappings {
+                let (domain, _) = mapping.address()?;
+                if !domains.insert(domain) {
+                    return Err("映射表中存在重复域名".into());
+                }
+            }
             return Ok(());
         }
         let url = reqwest::Url::parse(self.url.trim())
@@ -24,6 +120,42 @@ impl ProxySettings {
         }
         Ok(())
     }
+    pub fn apply(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, String> {
+        self.validate()?;
+        if self.enabled {
+            if self.built_in {
+                for mapping in &self.mappings {
+                    let (domain, address) = mapping.address()?;
+                    builder = builder.resolve(&domain, address);
+                }
+            } else {
+                builder = builder
+                    .proxy(reqwest::Proxy::all(self.url.trim()).map_err(|_| "代理地址无效")?);
+            }
+        }
+        Ok(builder)
+    }
+    pub fn apply_blocking(
+        &self,
+        mut builder: reqwest::blocking::ClientBuilder,
+    ) -> Result<reqwest::blocking::ClientBuilder, String> {
+        self.validate()?;
+        if self.enabled {
+            if self.built_in {
+                for mapping in &self.mappings {
+                    let (domain, address) = mapping.address()?;
+                    builder = builder.resolve(&domain, address);
+                }
+            } else {
+                builder = builder
+                    .proxy(reqwest::Proxy::all(self.url.trim()).map_err(|_| "代理地址无效")?);
+            }
+        }
+        Ok(builder)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Variable {
@@ -35,6 +167,8 @@ pub struct Variable {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EnvironmentVariables {
     pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub proxy_id: Option<String>,
     #[serde(default)]
     pub proxy: ProxySettings,
     next_id: u64,
@@ -64,6 +198,7 @@ impl EnvironmentVariables {
         let mut replacement = Self {
             variables: vec![],
             proxy: self.proxy.clone(),
+            proxy_id: self.proxy_id.clone(),
             next_id: 0,
         };
         for (name, value, secret) in rows {
@@ -77,6 +212,7 @@ impl EnvironmentVariables {
         let mut environment = Self {
             variables: vec![],
             proxy: ProxySettings::default(),
+            proxy_id: None,
             next_id: 0,
         };
         for (name, value, secret) in [
@@ -257,5 +393,91 @@ mod tests {
         assert!(a.values().resolve("{{missing}}").is_err());
         assert!(a.values().resolve("{{host").is_err());
         assert!(a.values().resolve("{{api_token}}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    #[test]
+    fn built_in_proxy_validates_domains_ipv4_ipv6_and_legacy_defaults() {
+        let mut settings = ProxySettings {
+            enabled: true,
+            built_in: true,
+            mappings: vec![
+                HostMapping {
+                    domain: "API.Example.test".into(),
+                    ip: "127.0.0.1".into(),
+                },
+                HostMapping {
+                    domain: "ipv6.test".into(),
+                    ip: "::1".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(settings.validate().is_ok());
+        settings.mappings.push(HostMapping {
+            domain: "api.example.test.".into(),
+            ip: "10.0.0.1".into(),
+        });
+        assert!(settings.validate().is_err());
+        settings.mappings.pop();
+        for domain in [
+            "https://api.test",
+            "api.test:80",
+            "*.test",
+            "bad/path",
+            "a..test",
+            "-bad.test",
+            "127.0.0.1",
+        ] {
+            settings.mappings[0].domain = domain.into();
+            assert!(settings.validate().is_err(), "{domain}");
+        }
+        settings.mappings[0].domain = "api.test".into();
+        settings.mappings[0].ip = "127.0.0.1:8080".into();
+        assert!(settings.validate().is_err());
+        let legacy: ProxySettings = serde_json::from_str(
+            r#"{"enabled":true,"url":"http://127.0.0.1:7890","skip_tls_verification":false}"#,
+        )
+        .unwrap();
+        assert!(!legacy.built_in && legacy.mappings.is_empty());
+        assert!(legacy.validate().is_ok());
+    }
+    #[test]
+    fn hosts_import_expands_aliases_comments_ipv6_and_last_entry_wins() {
+        let mappings = HostMapping::parse_hosts("\u{feff}# hosts\r\n10.13.34.11 c.kdocs.cn www.kdocs.cn kdocs.cn # aliases\r\n\r\n::1\tLOCAL.test. ipv6.test\n119.3.170.233 www.kdocs.cn\n").unwrap();
+        assert_eq!(mappings.len(), 5);
+        assert_eq!(
+            mappings[0],
+            HostMapping {
+                domain: "c.kdocs.cn".into(),
+                ip: "10.13.34.11".into()
+            }
+        );
+        assert_eq!(mappings[1].ip, "119.3.170.233");
+        assert_eq!(
+            mappings[3],
+            HostMapping {
+                domain: "local.test".into(),
+                ip: "::1".into()
+            }
+        );
+    }
+    #[test]
+    fn hosts_import_rejects_bad_rows_with_line_numbers_and_empty_input() {
+        for line in [
+            "bad-ip api.test",
+            "127.0.0.1",
+            "127.0.0.1 https://api.test",
+            "127.0.0.1 *.test",
+        ] {
+            let error =
+                HostMapping::parse_hosts(&format!("# comment\n127.0.0.1 valid.test\n{line}"))
+                    .unwrap_err();
+            assert!(error.contains("第 3 行"), "{error}");
+        }
+        assert!(HostMapping::parse_hosts("# only comments\n\n").is_err());
     }
 }

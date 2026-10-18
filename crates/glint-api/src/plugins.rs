@@ -12,9 +12,23 @@ use std::{
 use wait_timeout::ChildExt;
 
 pub const HOOK: &str = "request.before-send";
+pub const EVENT_DECODE: &str = "websocket.message.decode";
 pub const OAUTH_PRESET: &str = "oauth.preset";
 const MAX_JOB: u64 = 12 * 1024 * 1024;
 const MAX_OUTPUT: u64 = 64 * 1024;
+fn output_limit(job: &Job) -> u64 {
+    if job
+        .plugin
+        .manifest
+        .contributions
+        .iter()
+        .any(|c| c.id == job.action_id && c.kind == EVENT_DECODE)
+    {
+        2 * 1024 * 1024
+    } else {
+        MAX_OUTPUT
+    }
+}
 #[derive(Serialize, Deserialize)]
 pub struct Job {
     pub plugin: Plugin,
@@ -52,7 +66,12 @@ pub fn catalog() -> (Vec<Plugin>, Vec<String>) {
         include_str!("../plugins/feishu-oauth/main.js"),
     )
     .expect("valid bundled Feishu OAuth plugin");
-    let mut plugins = vec![builtin, oauth, feishu];
+    let decoder = Plugin::from_source(
+        include_str!("../plugins/wps-event-decrypt/glint-plugin.json"),
+        include_str!("../plugins/wps-event-decrypt/main.js"),
+    )
+    .expect("valid bundled event decoder");
+    let mut plugins = vec![builtin, oauth, feishu, decoder];
     let mut errors = vec![];
     if let Ok(directory) = directory() {
         if let Ok(entries) = std::fs::read_dir(directory) {
@@ -102,15 +121,23 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
     manifest.validate()?;
     let actions =
         manifest.contributions.iter().any(|c| c.kind == HOOK) || manifest.contributions.is_empty();
-    if (actions && !manifest.capabilities.contains("request.read"))
+    let events = manifest
+        .contributions
+        .iter()
+        .any(|c| c.kind == EVENT_DECODE);
+    if (events && !manifest.capabilities.contains("event.read"))
+        || (actions && !manifest.capabilities.contains("request.read"))
         || (manifest.contributions.is_empty() && manifest.hooks != BTreeSet::from([HOOK.into()]))
-        || (!actions && (!manifest.hooks.is_empty() || !manifest.capabilities.is_empty()))
+        || (!actions
+            && !events
+            && (!manifest.hooks.is_empty() || !manifest.capabilities.is_empty()))
     {
         return Err(PluginError("Unsupported API plugin extension".into()));
     }
     for contribution in &manifest.contributions {
         match contribution.kind.as_str() {
-            HOOK if !contribution.hook.is_empty() && contribution.data.is_none() => {}
+            HOOK | EVENT_DECODE if !contribution.hook.is_empty() && contribution.data.is_none() => {
+            }
             OAUTH_PRESET if contribution.hook.is_empty() => {
                 let preset: OAuthPreset = serde_json::from_value(
                     contribution
@@ -127,7 +154,7 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
         }
     }
     for c in &manifest.capabilities {
-        if c == "crypto" || c == "request.read" {
+        if c == "crypto" || c == "request.read" || c == "event.read" {
             continue;
         }
         if let Some(name) = c.strip_prefix("environment.read.") {
@@ -247,8 +274,13 @@ pub fn oauth_presets(catalog: &[Plugin]) -> Vec<PresetEntry> {
 }
 pub fn is_bundled(plugin: &Plugin) -> bool {
     plugin.origin.is_none()
-        && ["com.wps.kso1", "com.wps.oauth", "com.feishu.oauth"]
-            .contains(&plugin.manifest.id.as_str())
+        && [
+            "com.wps.kso1",
+            "com.wps.oauth",
+            "com.feishu.oauth",
+            "com.wps.event-decrypt",
+        ]
+        .contains(&plugin.manifest.id.as_str())
 }
 #[cfg(test)]
 pub fn test_oauth_config() -> super::oauth::Config {
@@ -261,7 +293,17 @@ pub fn test_oauth_config() -> super::oauth::Config {
 }
 pub fn run_job(job: Job) -> Result<Value, String> {
     validate(&job.plugin).map_err(|e| e.to_string())?;
-    let hook = action_hook(&job.plugin, &job.action_id)?;
+    let event_hook = job
+        .plugin
+        .manifest
+        .contributions
+        .iter()
+        .find(|c| c.id == job.action_id && c.kind == EVENT_DECODE);
+    let hook = if let Some(action) = event_hook {
+        action.hook.as_str()
+    } else {
+        action_hook(&job.plugin, &job.action_id)?
+    };
     let allowed: BTreeSet<String> = job
         .plugin
         .manifest
@@ -272,20 +314,28 @@ pub fn run_job(job: Job) -> Result<Value, String> {
     let mut host = HostRegistry::default().with_crypto();
     // Per-name access is checked here, beyond the generic host-call capability gate.
     let variables = job.variables;
-    host.register("environment.get", "request.read", move |args| {
-        let key = args
-            .get(0)
-            .and_then(Value::as_str)
-            .ok_or_else(|| PluginError("Invalid variable name".into()))?;
-        if !allowed.contains(key) {
-            return Err(PluginError("Variable access denied".into()));
-        }
-        variables
-            .get(key)
-            .cloned()
-            .map(Value::String)
-            .ok_or_else(|| PluginError("Missing environment variable".into()))
-    })
+    host.register(
+        "environment.get",
+        if event_hook.is_some() {
+            "event.read"
+        } else {
+            "request.read"
+        },
+        move |args| {
+            let key = args
+                .get(0)
+                .and_then(Value::as_str)
+                .ok_or_else(|| PluginError("Invalid variable name".into()))?;
+            if !allowed.contains(key) {
+                return Err(PluginError("Variable access denied".into()));
+            }
+            variables
+                .get(key)
+                .cloned()
+                .map(Value::String)
+                .ok_or_else(|| PluginError("Missing environment variable".into()))
+        },
+    )
     .map_err(|e| e.to_string())?;
     let grants = job.plugin.manifest.capabilities.clone();
     let mut runtime = PluginRuntime::activate(&job.plugin, host, grants, Limits::default())
@@ -297,6 +347,7 @@ pub fn run_job(job: Job) -> Result<Value, String> {
 /// Early CLI path: no GPUI initialization, database access, or credential-bearing diagnostics.
 pub fn worker() -> bool {
     let mut text = String::new();
+    let mut limit = MAX_OUTPUT;
     let result = std::io::stdin()
         .take(MAX_JOB + 1)
         .read_to_string(&mut text)
@@ -308,13 +359,16 @@ pub fn worker() -> bool {
                 serde_json::from_str::<Job>(&text).map_err(|_| "插件任务无效".into())
             }
         })
-        .and_then(run_job);
+        .and_then(|job| {
+            limit = output_limit(&job);
+            run_job(job)
+        });
     let response = match result {
         Ok(data) => json!({"ok":data}),
         Err(_) => json!({"error":"插件执行失败，请检查变量、权限与脚本"}),
     };
     let text = serde_json::to_string(&response).expect("JSON data");
-    if text.len() as u64 > MAX_OUTPUT {
+    if text.len() as u64 > limit {
         print!("{{\"error\":\"插件输出过大\"}}");
         return false;
     }
@@ -338,6 +392,7 @@ fn isolated_at(
     executable: &std::path::Path,
     timeout: Duration,
 ) -> Result<Value, String> {
+    let limit = output_limit(job);
     let input = serde_json::to_vec(job).map_err(|_| "无法编码插件任务")?;
     if input.len() as u64 > MAX_JOB {
         return Err("插件任务过大".into());
@@ -364,7 +419,7 @@ fn isolated_at(
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
         stdout
-            .take(MAX_OUTPUT + 1)
+            .take(limit + 1)
             .read_to_string(&mut text)
             .map(|_| text)
     });
@@ -385,7 +440,7 @@ fn isolated_at(
         return Err("插件执行超时（3 秒），已终止，请求未发送".into());
     }
     wrote.map_err(|_| "插件输入失败")?;
-    if !status.is_some_and(|s| s.success()) || text.len() as u64 > MAX_OUTPUT {
+    if !status.is_some_and(|s| s.success()) || text.len() as u64 > limit {
         return Err("插件执行失败".into());
     }
     let response: Value = serde_json::from_str(&text).map_err(|_| "插件输出无效")?;
@@ -500,6 +555,98 @@ pub fn apply(
             .map_err(|error| format!("前置动作「{title}」无法应用请求头：{error}"))?;
     }
     Ok(request)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedEvent {
+    pub data: String,
+    pub title: Option<String>,
+}
+impl From<String> for DecodedEvent {
+    fn from(data: String) -> Self {
+        Self { data, title: None }
+    }
+}
+#[cfg(test)]
+pub fn decode_event(
+    binding: &super::model::BeforeAction,
+    catalog: &[Plugin],
+    variables: &super::environment::EnvironmentValues,
+    text: &str,
+) -> Result<String, String> {
+    decode_event_presentation(binding, catalog, variables, text).map(|event| event.data)
+}
+/// An event decoder runs in the same isolated worker, with its own pinned approval.
+pub fn decode_event_presentation(
+    binding: &super::model::BeforeAction,
+    catalog: &[Plugin],
+    variables: &super::environment::EnvironmentValues,
+    text: &str,
+) -> Result<DecodedEvent, String> {
+    let plugin = catalog
+        .iter()
+        .find(|p| p.identity() == binding.id)
+        .ok_or("事件解密插件已被移除，请重新选择")?;
+    if !binding.enabled || !binding.matches(plugin) {
+        return Err("事件解密插件或权限已变化，请重新选择插件".into());
+    }
+    if !plugin
+        .manifest
+        .contributions
+        .iter()
+        .any(|c| c.id == binding.action_id && c.kind == EVENT_DECODE)
+    {
+        return Err("插件不支持事件解密".into());
+    }
+    let mut inputs = BTreeMap::new();
+    for key in plugin
+        .manifest
+        .capabilities
+        .iter()
+        .filter_map(|c| c.strip_prefix("environment.read."))
+    {
+        let value = variables
+            .0
+            .get(key)
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| format!("请在当前环境配置 {key}"))?;
+        inputs.insert(key.to_owned(), value.clone());
+    }
+    let request = serde_json::from_str(text).map_err(|_| "接收消息不是有效 JSON，无法解密")?;
+    let output = isolated(&Job {
+        plugin: plugin.clone(),
+        action_id: binding.action_id.clone(),
+        request,
+        variables: inputs,
+    })?;
+    event_presentation(output)
+}
+#[cfg(test)]
+fn event_output(output: Value) -> Result<String, String> {
+    event_presentation(output).map(|event| event.data)
+}
+fn event_presentation(output: Value) -> Result<DecodedEvent, String> {
+    if let Some(error) = output.get("error").and_then(Value::as_str) {
+        return Err(error.chars().take(300).collect());
+    }
+    let data = output.get("data").ok_or("事件解密插件没有返回 data")?;
+    let title = output
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| {
+            title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(160)
+                .collect::<String>()
+        })
+        .filter(|title| !title.is_empty());
+    Ok(DecodedEvent {
+        data: serde_json::to_string(data).map_err(|_| "无法读取事件解密结果")?,
+        title,
+    })
 }
 
 #[cfg(test)]
@@ -788,5 +935,167 @@ mod oauth_preset_tests {
         assert_eq!(copied.scope, "kso.user_base.read");
         assert!(oauth_presets(&[]).is_empty());
         assert_eq!(copied.scope, "kso.user_base.read");
+    }
+}
+
+#[cfg(test)]
+mod event_decode_tests {
+    use super::*;
+    pub(super) fn fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../plugins/wps-event-decrypt/tests/fixture.json"
+        ))
+        .unwrap()
+    }
+    fn job(event: Value) -> Job {
+        let fixture = fixture();
+        Job {
+            plugin: catalog()
+                .0
+                .into_iter()
+                .find(|p| p.manifest.id == "com.wps.event-decrypt")
+                .unwrap(),
+            action_id: "decrypt-event".into(),
+            request: event,
+            variables: BTreeMap::from([
+                (
+                    "wps_app_id".into(),
+                    fixture["app_id"].as_str().unwrap().into(),
+                ),
+                (
+                    "wps_app_key".into(),
+                    fixture["app_key"].as_str().unwrap().into(),
+                ),
+            ]),
+        }
+    }
+    #[test]
+    fn wps_event_decrypts_independent_openssl_fixture_after_verification() {
+        let fixture = fixture();
+        let output = run_job(job(fixture["event"].clone())).unwrap();
+        assert_eq!(output["data"]["data"], fixture["data"]);
+        assert_eq!(output["data"]["signature_verified"], true);
+        assert!(
+            output["title"]
+                .as_str()
+                .unwrap()
+                .contains("kso.app_chat.message.create")
+        );
+        assert!(event_output(output).unwrap().contains("事件解密测试"));
+    }
+    #[test]
+    fn decoder_title_is_optional_bounded_and_separate_from_body() {
+        let result =
+            event_presentation(json!({"data": {"id": 7}, "title": "  hello\nworld \t"})).unwrap();
+        assert_eq!(result.title.as_deref(), Some("hello world"));
+        assert_eq!(result.data, r#"{"id":7}"#);
+        for title in [Value::Null, json!(7), json!("  ")] {
+            assert!(
+                event_presentation(json!({"data": {}, "title": title}))
+                    .unwrap()
+                    .title
+                    .is_none()
+            );
+        }
+        assert!(
+            event_presentation(json!({"data": {}}))
+                .unwrap()
+                .title
+                .is_none()
+        );
+        assert_eq!(
+            event_presentation(json!({"data": {}, "title": "文".repeat(300)}))
+                .unwrap()
+                .title
+                .unwrap()
+                .chars()
+                .count(),
+            160
+        );
+        assert!(event_presentation(json!({"error":"bad", "title":"ignored", "data":{}})).is_err());
+    }
+    #[test]
+    fn wps_event_rejects_tampered_envelope_and_bad_key_without_plaintext() {
+        let fixture = fixture();
+        for field in ["signature", "nonce", "topic", "encrypted_data"] {
+            let mut event = fixture["event"].clone();
+            event[field] = "tampered".into();
+            let output = run_job(job(event)).unwrap();
+            assert!(output.get("data").is_none());
+            assert!(event_output(output).is_err());
+        }
+        let mut wrong = job(fixture["event"].clone());
+        wrong
+            .variables
+            .insert("wps_app_key".into(), "wrong-secret".into());
+        let error = event_output(run_job(wrong).unwrap()).unwrap_err();
+        assert!(error.contains("签名"));
+        assert!(!error.contains("wrong-secret"));
+    }
+    #[test]
+    fn signed_malformed_ciphertext_and_nonce_are_rejected_without_panics() {
+        for event in fixture()["bad_cases"].as_array().unwrap() {
+            let output = run_job(job(event.clone())).unwrap();
+            assert!(output.get("data").is_none());
+            assert!(event_output(output).unwrap_err().contains("解密失败"));
+        }
+    }
+    #[test]
+    fn decoder_requires_approval_and_named_variables_without_affecting_request_hooks() {
+        let plugin = job(fixture()["event"].clone()).plugin;
+        let mut binding = super::super::model::BeforeAction {
+            approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
+            action_id: "decrypt-event".into(),
+            enabled: true,
+        };
+        let variables = super::super::environment::EnvironmentValues(BTreeMap::new());
+        let error = decode_event(&binding, &[plugin.clone()], &variables, "{}").unwrap_err();
+        assert!(error.contains("wps_app_"));
+        binding.approval.fingerprint = "changed".into();
+        assert!(
+            decode_event(&binding, &[plugin.clone()], &variables, "{}")
+                .unwrap_err()
+                .contains("权限")
+        );
+        assert!(action_hook(&plugin, "decrypt-event").is_err());
+    }
+}
+
+#[cfg(test)]
+mod event_process_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires cargo build and GLINT_API_TEST_EXECUTABLE"]
+    fn native_event_decoder_worker_verifies_and_decrypts_full_payload() {
+        let executable = PathBuf::from(std::env::var_os("GLINT_API_TEST_EXECUTABLE").unwrap());
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../plugins/wps-event-decrypt/tests/fixture.json"
+        ))
+        .unwrap();
+        let mut job = Job {
+            plugin: catalog()
+                .0
+                .into_iter()
+                .find(|p| p.manifest.id == "com.wps.event-decrypt")
+                .unwrap(),
+            action_id: "decrypt-event".into(),
+            request: fixture["event"].clone(),
+            variables: BTreeMap::from([
+                (
+                    "wps_app_id".into(),
+                    fixture["app_id"].as_str().unwrap().into(),
+                ),
+                (
+                    "wps_app_key".into(),
+                    fixture["app_key"].as_str().unwrap().into(),
+                ),
+            ]),
+        };
+        let output = isolated_at(&job, &executable, Duration::from_secs(3)).unwrap();
+        assert_eq!(output["data"]["data"], fixture["data"]);
+        job.plugin.source =
+            "glint.on('websocket.message.decode',()=>({data:{text:'x'.repeat(100000)}}));".into();
+        let output = isolated_at(&job, &executable, Duration::from_secs(3)).unwrap();
+        assert_eq!(output["data"]["text"].as_str().unwrap().len(), 100000);
     }
 }

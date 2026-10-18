@@ -332,16 +332,6 @@ impl Workbench {
         let mut form = div()
             .id("registry-source-dialog")
             .debug_selector(|| "registry-source-dialog".into())
-            .w(px(480.))
-            .max_w_full()
-            .max_h_full()
-            .overflow_y_scroll()
-            .p_5()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.surface))
-            .shadow_lg()
             .flex()
             .flex_col()
             .gap_4()
@@ -463,33 +453,21 @@ impl Workbench {
                 ),
         );
         Some(
-            gpui::deferred(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .size_full()
-                    .bg(gpui::rgba(0x0c121c48))
-                    .occlude()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_5()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            if !this.registry_adding_source {
-                                this.show_registry_dialog = false;
-                                window.focus(&this.focus, cx);
-                                cx.notify();
-                            }
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(form),
-            )
-            .with_priority(110)
-            .into_any_element(),
+            Dialog::new("registry_ui-modal", form)
+                .focus_handles(
+                    [&self.registry_name, &self.registry_url, &self.registry_key]
+                        .map(|e| e.read(cx).focus_handle(cx)),
+                )
+                .theme(self.theme)
+                .width(480.)
+                .priority(110)
+                .dismissible(!self.registry_adding_source)
+                .on_close(cx.listener(|this, _, window, cx| {
+                    this.show_registry_dialog = false;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }))
+                .render(),
         )
     }
 }

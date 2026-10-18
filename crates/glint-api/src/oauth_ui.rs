@@ -57,6 +57,9 @@ impl Inputs {
         config.scope = self.fields[4].read(cx).value().trim().into();
         config
     }
+    pub fn is_busy(&self) -> bool {
+        self.task.is_some() || self.pending.is_some()
+    }
     pub fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         if let Some(session) = self.pending.take() {
@@ -143,7 +146,7 @@ impl Workbench {
         }
         let request_id = self.requests[self.active].id.clone();
         let environment = self.selected_environment(cx);
-        let proxy = self.environment_inputs[environment].proxy.clone();
+        let proxy = self.effective_proxy(environment);
         self.notice = "检查 OAuth 授权及有效期…".into();
         self.sending = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -247,9 +250,7 @@ impl Workbench {
             self.oauth
                 .secret
                 .update(cx, |entry, cx| entry.set_value("", cx));
-            let proxy = self.environment_inputs[self.selected_environment(cx)]
-                .proxy
-                .clone();
+            let proxy = self.effective_proxy(self.selected_environment(cx));
             let generation = self.oauth.generation;
             self.oauth.task = Some(cx.spawn(async move |this, cx| {
                 let result = cx
@@ -308,9 +309,7 @@ impl Workbench {
             .callback
             .update(cx, |entry, cx| entry.set_value("", cx));
         self.oauth.message = "正在换取 Token…".into();
-        let proxy = self.environment_inputs[self.selected_environment(cx)]
-            .proxy
-            .clone();
+        let proxy = self.effective_proxy(self.selected_environment(cx));
         let generation = self.oauth.generation;
         self.oauth.task = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -374,9 +373,7 @@ impl Workbench {
             }
         };
         let key = self.oauth_key(&config, cx);
-        let proxy = self.environment_inputs[self.selected_environment(cx)]
-            .proxy
-            .clone();
+        let proxy = self.effective_proxy(self.selected_environment(cx));
         let generation = self.oauth.generation;
         self.oauth.message = if forget {
             "正在清除本地授权…"
@@ -418,7 +415,7 @@ impl Workbench {
         if self.sending.is_some() || self.oauth.task.is_some() || self.oauth.pending.is_some() {
             return;
         }
-        let preset = plugins::oauth_presets(&self.plugin_catalog)
+        let preset = plugins::oauth_presets(&self.enabled_plugin_catalog())
             .into_iter()
             .find(|entry| entry.key == key);
         let result = preset
@@ -434,7 +431,7 @@ impl Workbench {
         cx.notify();
     }
     fn oauth_preset_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let presets = plugins::oauth_presets(&self.plugin_catalog);
+        let presets = plugins::oauth_presets(&self.enabled_plugin_catalog());
         if presets.is_empty() {
             return None;
         }

@@ -49,6 +49,8 @@ stdio 进程通过带随机令牌的本机 TCP 桥访问 GPUI 主线程，不向
 | 界面 | `ui_set` |
 | 应用更新 | `update_check`, `update_status`, `update_download`, `update_cancel`, `update_install` |
 
+所有工具作用于 GUI 当前选择的工作区；`workspace_get` 返回 `workspace_id` 与 `workspace_name`。工作区通过顶部入口管理，切换后请重新获取请求 ID；MCP 连接保持有效，调用记录按工作区隔离。
+
 请求使用持久 UUID `request_id`，版本和历史使用 `record_id`。新建接口返回 ID；`workspace_get` / `request_get` 可列出已有 ID。目录使用集合名称和完整路径，如 `{"collection":"API","path":"用户/认证"}`，空路径表示集合根目录。环境按名称选择。
 
 旧工作区首次加载时会给请求、版本和历史补上 ID，并在验证通过后保存；之后删除、排序和重启不会改变剩余对象的 ID。不要把列表下标当作请求或记录 ID。
@@ -100,7 +102,7 @@ stdio 进程通过带随机令牌的本机 TCP 桥访问 GPUI 主线程，不向
 - HTTP 响应自动识别 `text/event-stream`，SSE 未结束时 `request_send` 同样已经返回。用 `request_status` 和 `response_read` 读取进展，不需要等流结束。`request_cancel` 断开后保留已接收结果。
 - SSE 保留最近 1 MiB，`bytes` 是累计接收字节数，`offset` 是当前保留文本的偏移；长流滚动截断后不能将它当作跨快照的持久游标。需要完整内容的调用方应及时保存快照。
 
-GUI 和 agent 共用一个当前网络执行。发送另一个请求或切换请求的工具会返回忙错误，要求先显式取消，避免一次读取或错误的重复发送中断当前流。`request_get`、`request_status`、`response_read` 不会切换当前请求。GUI 直接切换请求仍按原有行为取消执行。
+HTTP/SSE 仍共用一个前台执行；忙时 agent 需要先显式取消再切换，GUI 切换会取消该前台执行。WebSocket 按请求独立运行，GUI 或 agent 切换请求后继续后台收发，可通过 request_id 读取或取消对应会话。`request_get`、`request_status`、`response_read` 不会切换当前请求。
 
 ## 环境、插件和持久化
 
@@ -147,3 +149,7 @@ python3 crates/glint-api/tests/mcp_smoke.py
 ### OAuth 2.0 配置
 
 `request_create`、`request_update` 与目录默认配置的 `draft.oauth` 可设置 `{ id, authorization_url, token_url, client_id, redirect_uri, scope, pkce, basic_auth, manual_callback }`；`oauth: null` 清除 OAuth 配置。凭据不通过此对象传入，`client_secret` 等未知字段会被拒绝。设置 OAuth 会关闭旧的 Bearer 模式；显式修改 `auth` 而未提供 `oauth` 会切回旧模式。浏览器授权和首次 Client Secret 输入在原生身份验证界面完成，发送工具会读取凭据库并按需刷新。`request_preview` 展示脱敏的 OAuth Authorization，不触发授权或刷新；OAuth 凭据不随工作区导出。
+
+环境代理现为工作区内共享配置：`environment_get` 返回 `proxy_id`、生效的 `proxy` 和 `available_proxies`。`environment_proxy_set` 可传入 `proxy_id` 绑定已有代理，传 `null` 解除绑定；也可继续传 `enabled`、`url`、`skip_tls_verification` 创建或更新已绑定代理，更新会影响所有绑定环境。内置模式使用 `built_in: true` 和 `mappings: [{"domain":"api.example.com","ip":"127.0.0.1"}]`。工作区导出包含 `proxies`，旧内联代理导入时自动迁移。
+
+WebSocket 会话按 `request_id` 独立运行，切换前台请求不会断开后台连接。`glint_request_status` 可读取后台会话状态，`glint_websocket_send/read/clear` 与 `glint_request_cancel` 可直接操作后台会话；读取事件额外返回原始 `payload`、方向、时间及插件生成的 `title`，保留原有 `message` 字段。`glint_workspace_get` 的 `background_tasks` 列出运行中的请求。

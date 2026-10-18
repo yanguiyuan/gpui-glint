@@ -1,6 +1,8 @@
 //! Reusable plugin contracts. This crate has no GPUI, HTTP or database dependency.
 //! Hosts own installation, grants, persistence and process isolation.
 #[cfg(feature = "boa")]
+mod crypto;
+#[cfg(feature = "boa")]
 mod engine;
 mod manifest;
 mod page;

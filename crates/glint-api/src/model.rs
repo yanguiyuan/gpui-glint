@@ -50,6 +50,12 @@ pub struct Draft {
     #[serde(default)]
     pub plugins: Vec<BeforeAction>,
     #[serde(default)]
+    pub event_decoder: Option<BeforeAction>,
+    #[serde(default = "action_enabled")]
+    pub websocket_follow_latest: bool,
+    #[serde(default)]
+    pub websocket_raw: bool,
+    #[serde(default)]
     pub extractors: Vec<Pair>,
     pub method: String,
     pub url: String,
@@ -70,6 +76,10 @@ pub struct Draft {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Exchange {
+    #[serde(default)]
+    pub websocket_connected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub websocket_events: Vec<super::websocket_ui::WsMessage>,
     #[serde(default)]
     pub curl: Option<String>,
     pub response: Option<super::http::HttpResponse>,
@@ -96,6 +106,22 @@ pub struct Record {
     pub elapsed_ms: Option<u128>,
     #[serde(default)]
     pub exchange: Option<Exchange>,
+}
+impl Record {
+    pub fn is_success(&self) -> bool {
+        if self.draft.method == "WS" {
+            self.exchange.as_ref().is_some_and(|exchange| {
+                exchange.error.is_none()
+                    && (exchange.websocket_connected
+                        || exchange
+                            .websocket_events
+                            .iter()
+                            .any(|event| event.was_connected()))
+            })
+        } else {
+            self.label.starts_with('2')
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -726,6 +752,9 @@ impl Default for Draft {
     fn default() -> Self {
         Self {
             plugins: vec![],
+            event_decoder: None,
+            websocket_follow_latest: true,
+            websocket_raw: false,
             extractors: vec![],
             method: "GET".into(),
             url: String::new(),

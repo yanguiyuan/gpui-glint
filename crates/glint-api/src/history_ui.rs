@@ -163,6 +163,8 @@ mod tests {
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{i}");
                 record.exchange = Some(model::Exchange {
+                    websocket_connected: false,
+                    websocket_events: vec![],
                     curl: None,
                     response: Some(HttpResponse {
                         status,

@@ -1,0 +1,10 @@
+{
+  "id": "com.wps.event-decrypt",
+  "name": "WPS 事件解密",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": ["crypto", "event.read", "environment.read.wps_app_id", "environment.read.wps_app_key"],
+  "hooks": ["websocket.message.decode"],
+  "contributions": [{"id":"decrypt-event","kind":"websocket.message.decode","title":"WPS 事件解密","hook":"websocket.message.decode"}]
+}

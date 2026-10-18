@@ -210,7 +210,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "request_send",
-        "Start real HTTP/SSE or WS execution and return immediately. Optional environment selects by name. Poll request_status/response_read/websocket_read. One active execution per workbench.",
+        "Start real HTTP/SSE or WS execution and return immediately. Optional environment selects by name. Poll request_status/response_read/websocket_read. WebSocket sessions remain connected across request switches; target them by request_id.",
         json!({"request_id":string(),"environment":string()}),
         &["request_id"],
         false,
@@ -393,9 +393,9 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "environment_proxy_set",
-        "Replace an environment's HTTP/HTTPS proxy and TLS skip policy.",
-        json!({"environment":string(),"enabled":boolean(),"url":string(),"skip_tls_verification":boolean()}),
-        &["environment", "enabled", "url"],
+        "Bind an existing shared proxy via proxy_id (null detaches), or create/update the bound external or built-in proxy. Updating a shared proxy affects all bound environments.",
+        json!({"environment":string(),"enabled":boolean(),"url":string(),"proxy_id":{"anyOf":[{"type":"string"},{"type":"null"}]},"built_in":boolean(),"mappings":{"type":"array","items":{"type":"object","properties":{"domain":string(),"ip":string()},"required":["domain","ip"],"additionalProperties":false}},"skip_tls_verification":boolean()}),
+        &["environment"],
         false,
         false,
     );
@@ -498,7 +498,7 @@ pub fn catalog() -> Vec<Value> {
     add(
         "ui_set",
         "Set GUI theme, editor/response tabs, sidebar visibility, or open a workbench section.",
-        json!({"theme":enumeration(&["light","dark"]),"section":enumeration(&["requests","environments","plugins","mcp"]),"config_tab":json!({"type":"integer","minimum":0,"maximum":6}),"response_tab":json!({"type":"integer","minimum":0,"maximum":4}),"show_activity":boolean(),"activity":json!({"type":"integer","minimum":0,"maximum":1}),"filter":string()}),
+        json!({"theme":enumeration(&["light","dark"]),"section":enumeration(&["requests","environments","proxies","plugins","mcp"]),"config_tab":json!({"type":"integer","minimum":0,"maximum":6}),"response_tab":json!({"type":"integer","minimum":0,"maximum":4}),"show_activity":boolean(),"activity":json!({"type":"integer","minimum":0,"maximum":1}),"filter":string()}),
         &[],
         false,
         false,

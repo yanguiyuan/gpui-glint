@@ -1,0 +1,46 @@
+{
+  "app_id": "fixture-app",
+  "app_key": "fixture-secret-only",
+  "event": {
+    "topic": "kso.app_chat",
+    "operation": "enter",
+    "time": 1792329194,
+    "nonce": "a08df09737a174d2",
+    "encrypted_data": "Vid8IkO2D7raOUxyDaJ4tDseO3K7e5O/cbX60A+rO9K3WTqaBCtcuN+lLMFgYAWo1AlAJFG6ejcTTfKr0Q3LRZCtR976eT6VWEBM6GlFV9PY7y9aFrBqIes0afVEC8DbgYwkwmnm7ajlgsO1NoAW6A==",
+    "signature": "uUbOHqQ2A8pHrZ142Lk652nfTnYL2mI-XWH63p_VmYU"
+  },
+  "data": {
+    "event_code": "kso.app_chat.message.create",
+    "message": {
+      "text": "事件解密测试",
+      "id": "fixture-1"
+    }
+  },
+  "generator": "Python hashlib/hmac + OpenSSL AES-256-CBC with PKCS7",
+  "bad_cases": [
+    {
+      "topic": "kso.app_chat",
+      "operation": "enter",
+      "time": 1792329194,
+      "nonce": "short",
+      "encrypted_data": "!bad-base64",
+      "signature": "qRy2SY8DZ-CGBGibLPrDxYRrmfbMDXR_zvZh_pKgK7k"
+    },
+    {
+      "topic": "kso.app_chat",
+      "operation": "enter",
+      "time": 1792329194,
+      "nonce": "a08df09737a174d2",
+      "encrypted_data": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "signature": "Ero6ObNVLVTnRipoh1TyoL8YQ7062H8kN-5WG6GMogg"
+    },
+    {
+      "topic": "kso.app_chat",
+      "operation": "enter",
+      "time": 1792329194,
+      "nonce": "a08df09737a174d2",
+      "encrypted_data": "!bad-base64",
+      "signature": "01WdTwaim4Q6Wr3r_Q5bALfAgD8WH-el0liESAWQX4E"
+    }
+  ]
+}

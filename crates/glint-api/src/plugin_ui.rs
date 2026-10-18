@@ -51,13 +51,71 @@ impl gpui::Render for ActionDrag {
 }
 
 impl Workbench {
+    pub(super) fn plugin_enabled(&self, plugin: &gpui_glint::plugins::Plugin) -> bool {
+        !self.disabled_plugins.contains(&plugin.family_identity())
+    }
+    pub(super) fn enabled_plugin_catalog(&self) -> Vec<gpui_glint::plugins::Plugin> {
+        self.plugin_catalog
+            .iter()
+            .filter(|p| self.plugin_enabled(p))
+            .cloned()
+            .collect()
+    }
+    pub(super) fn plugin_identity_disabled(&self, identity: &str) -> bool {
+        self.disabled_plugins.contains(identity)
+            || identity
+                .rsplit_once("::")
+                .is_some_and(|(family, _)| self.disabled_plugins.contains(family))
+    }
+    /// Keep bindings in drafts so re-enabling restores them; skip disabled providers at execution.
+    pub(super) fn enabled_before_actions(
+        &self,
+        actions: &[model::BeforeAction],
+    ) -> Vec<model::BeforeAction> {
+        actions
+            .iter()
+            .filter(|binding| !self.plugin_identity_disabled(&binding.id))
+            .cloned()
+            .collect()
+    }
+    pub(super) fn set_plugin_enabled(
+        &mut self,
+        identity: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let plugin = self
+            .plugin_catalog
+            .iter()
+            .find(|p| p.identity() == identity)
+            .ok_or("插件不存在，请刷新列表")?;
+        let family = plugin.family_identity();
+        let name = plugin.manifest.name.clone();
+        self.storage.set_plugin_enabled(&family, enabled)?;
+        if enabled {
+            self.disabled_plugins.remove(&family);
+        } else {
+            self.disabled_plugins.insert(family);
+        }
+        self.ws_refresh_decoder_select(cx);
+        self.ws_invalidate_titles();
+        self.ws_select_sync(cx);
+        self.notice = format!("{name}已{}", if enabled { "启用" } else { "禁用" });
+        cx.notify();
+        Ok(())
+    }
+
     fn before_action_bindings(&self) -> Vec<model::BeforeAction> {
         let mut actions = self
             .requests
             .get(self.active)
             .map(|r| r.draft.plugins.clone())
             .unwrap_or_default();
-        for plugin in &self.plugin_catalog {
+        for plugin in self
+            .plugin_catalog
+            .iter()
+            .filter(|p| self.plugin_enabled(p))
+        {
             let family = plugin.family_identity();
             let chosen = actions.iter().find(|a| {
                 self.plugin_catalog
@@ -165,10 +223,14 @@ impl Workbench {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child("按启用顺序执行；动作失败或超时会停止发送。"),
+                    .child("按启用顺序执行；全局禁用的插件不执行，动作失败或超时会停止发送。"),
             );
         let mut cards = Vec::new();
-        for plugin in &self.plugin_catalog {
+        for plugin in self
+            .plugin_catalog
+            .iter()
+            .filter(|p| self.plugin_enabled(p))
+        {
             let id = plugin.identity();
             let family = plugin.family_identity();
             // A request selects one installed version per provider, without showing version controls here.
@@ -625,6 +687,7 @@ mod remote_tests {
 
 impl Workbench {
     pub(super) fn open_plugin_manager(&mut self, cx: &mut Context<Self>) {
+        self.show_proxies = false;
         self.show_mcp = false;
         self.show_plugins = true;
         self.show_environments = false;
@@ -665,7 +728,7 @@ impl Workbench {
                 .mt_3()
                 .text_size(px(10.))
                 .text_color(rgb(p.text_muted))
-                .child("插件属于应用资源；请求仅配置前置动作。"),
+                .child("插件开关对所有工作区生效；禁用后保留绑定配置。"),
         )
     }
     pub(super) fn plugin_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -698,15 +761,21 @@ impl Workbench {
                         .text_size(px(11.))
                         .text_color(rgb(p.text_muted))
                         .child(
-                            "请求动作需在“前置动作”中启用；授权预设在“身份验证 → OAuth 2.0”中选择。",
+                            "请求动作在“前置动作”中启用；事件解密在“WebSocket 消息 → 解密后”中选择；授权预设在 OAuth 2.0 中选择。",
                         ),
                 );
             for plugin in &self.plugin_catalog {
                 let id = plugin.identity();
+                let enabled = self.plugin_enabled(plugin);
+                let toggle_id = id.clone();
+                let toggle_owner = cx.entity().downgrade();
                 let uses = self
                     .requests
                     .iter()
-                    .filter(|r| r.draft.plugins.iter().any(|a| a.id == id))
+                    .filter(|r| {
+                        r.draft.plugins.iter().any(|a| a.id == id)
+                            || r.draft.event_decoder.as_ref().is_some_and(|a| a.id == id)
+                    })
                     .count();
                 let mut card = div()
                     .id(gpui::SharedString::from(format!("installed-{id}")))
@@ -731,11 +800,9 @@ impl Workbench {
                             .child(metadata_badge(origin_label(plugin), self.theme))
                             .when(
                                 plugin.manifest.contributions.is_empty()
-                                    || plugin
-                                        .manifest
-                                        .contributions
-                                        .iter()
-                                        .any(|c| c.kind == plugins::HOOK),
+                                    || plugin.manifest.contributions.iter().any(|c| {
+                                        c.kind == plugins::HOOK || c.kind == plugins::EVENT_DECODE
+                                    }),
                                 |row| {
                                     row.child(metadata_badge(
                                         format!("绑定 {uses} 个请求"),
@@ -748,8 +815,45 @@ impl Workbench {
                                     .manifest
                                     .contributions
                                     .iter()
+                                    .any(|c| c.kind == plugins::EVENT_DECODE),
+                                |row| row.child(metadata_badge("事件解密", self.theme)),
+                            )
+                            .when(
+                                plugin
+                                    .manifest
+                                    .contributions
+                                    .iter()
                                     .any(|c| c.kind == plugins::OAUTH_PRESET),
                                 |row| row.child(metadata_badge("授权预设", self.theme)),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(if enabled { "已启用" } else { "已禁用" }),
+                            )
+                            .child(
+                                Switch::new("")
+                                    .checked(enabled)
+                                    .theme(self.theme)
+                                    .on_change(move |enabled, _, cx| {
+                                        let _ = toggle_owner.update(cx, |this, cx| {
+                                            if let Err(error) =
+                                                this.set_plugin_enabled(&toggle_id, enabled, cx)
+                                            {
+                                                this.notice = error.clone();
+                                                this.plugin_errors.push(error);
+                                                cx.notify();
+                                            }
+                                        });
+                                    })
+                                    .render()
+                                    .id(format!("plugin-enabled-{id}"))
+                                    .debug_selector({
+                                        let id = id.clone();
+                                        move || format!("plugin-enabled-{id}")
+                                    }),
                             ),
                     )
                     .child(
@@ -938,5 +1042,170 @@ mod navigation_tests {
         let back = window.debug_bounds("close-plugin-manager").unwrap();
         window.simulate_click(back.center(), gpui::Modifiers::default());
         host.update(window, |host, _| assert!(!host.show_plugins));
+    }
+}
+
+#[cfg(test)]
+mod enable_tests {
+    use super::*;
+    #[gpui::test]
+    fn builtin_plugin_switch_persists_and_skips_bound_actions_until_enabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enabled.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name.update(cx, |e, cx| e.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            let plugin = host
+                .plugin_catalog
+                .iter()
+                .find(|p| p.manifest.id == "com.wps.kso1")
+                .unwrap();
+            host.requests[0].draft.plugins = vec![model::BeforeAction {
+                approval: gpui_glint::plugins::Approval::for_plugin(plugin),
+                action_id: "sign-request".into(),
+                enabled: true,
+            }];
+            host.storage_dirty = true;
+            host.persist(cx);
+            host.open_plugin_manager(cx);
+            host
+        });
+        let bounds = window.debug_bounds("plugin-enabled-com.wps.kso1").unwrap();
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            let actions = host.enabled_before_actions(&host.snapshot(cx).plugins);
+            assert!(actions.is_empty());
+            assert_eq!(host.requests[0].draft.plugins.len(), 1);
+            assert!(
+                plugins::validate_variables(
+                    &actions,
+                    &host.plugin_catalog,
+                    &environment::EnvironmentValues(Default::default())
+                )
+                .is_ok()
+            );
+            let prepared = PreparedRequest::new(
+                &Draft {
+                    url: "https://example.test".into(),
+                    ..Default::default()
+                },
+                &environment::EnvironmentValues(Default::default()),
+            )
+            .unwrap();
+            assert!(
+                plugins::apply(
+                    prepared,
+                    &actions,
+                    &host.plugin_catalog,
+                    &environment::EnvironmentValues(Default::default())
+                )
+                .is_ok()
+            );
+            host.open_plugin_manager(cx);
+            assert!(host.disabled_plugins.contains("com.wps.kso1"));
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, cx| {
+            assert!(host.disabled_plugins.contains("com.wps.kso1"));
+            assert_eq!(host.requests[0].draft.plugins.len(), 1);
+            host.set_plugin_enabled("com.wps.kso1", true, cx).unwrap();
+            assert_eq!(
+                host.enabled_before_actions(&host.snapshot(cx).plugins)
+                    .len(),
+                1
+            );
+            assert!(
+                !host
+                    .storage
+                    .disabled_plugins()
+                    .unwrap()
+                    .contains("com.wps.kso1")
+            );
+        });
+    }
+    #[gpui::test]
+    fn disabled_presets_and_decoder_are_unavailable_and_save_failure_is_atomic(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            Workbench::with_store(
+                storage::Store::open(&dir.path().join("plugins.sqlite3")).unwrap(),
+                cx,
+            )
+        });
+        host.update(window,|host,cx| {
+            let preset_count=plugins::oauth_presets(&host.enabled_plugin_catalog()).len();
+            host.set_plugin_enabled("com.wps.oauth",false,cx).unwrap();
+            assert_eq!(plugins::oauth_presets(&host.enabled_plugin_catalog()).len(),preset_count-1);
+            assert!(plugins::oauth_presets(&host.enabled_plugin_catalog()).iter().all(|p|!p.title.contains("WPS")));
+            host.group_edit=Some(GroupEdit::CreateCollection);
+            host.group_name.update(cx,|e,cx|e.set_value("WS",cx));
+            host.save_group(cx);host.add_request(cx);
+            let decoder=host.plugin_catalog.iter().find(|p|p.manifest.id=="com.wps.event-decrypt").unwrap();
+            host.requests[0].draft.event_decoder=Some(model::BeforeAction {approval:gpui_glint::plugins::Approval::for_plugin(decoder),action_id:"decrypt-event".into(),enabled:true});
+            host.ws_detail_tab=1;
+            host.set_plugin_enabled("com.wps.event-decrypt",false,cx).unwrap();
+            assert!(host.ws_decrypted.as_ref().unwrap().as_ref().unwrap_err().contains("已禁用"));
+            assert!(host.requests[0].draft.event_decoder.is_some());
+            assert!(websocket_ui::decoder_bindings(&host.enabled_plugin_catalog()).is_empty());
+            assert_eq!(host.plugin_catalog.len(),plugins::catalog().0.len());
+            host.storage.connection.execute_batch("CREATE TRIGGER reject_enable BEFORE DELETE ON disabled_plugins BEGIN SELECT RAISE(FAIL,'test failure'); END;").unwrap();
+            assert!(host.set_plugin_enabled("com.wps.event-decrypt",true,cx).is_err());
+            assert!(host.disabled_plugins.contains("com.wps.event-decrypt"));
+        });
+    }
+    #[gpui::test]
+    fn disabling_provider_covers_versions_but_preserves_other_sources(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            Workbench::with_store(
+                storage::Store::open(&dir.path().join("families.sqlite3")).unwrap(),
+                cx,
+            )
+        });
+        host.update(window, |host, cx| {
+            let mut first = host.plugin_catalog[0].clone();
+            first.origin = Some(gpui_glint::plugins::Origin {
+                source_id: "a".repeat(64),
+                package_sha256: "b".repeat(64),
+            });
+            let mut next = first.clone();
+            next.manifest.version = "2.0.0".into();
+            let mut other = first.clone();
+            other.origin.as_mut().unwrap().source_id = "c".repeat(64);
+            host.plugin_catalog
+                .extend([first.clone(), next.clone(), other.clone()]);
+            host.set_plugin_enabled(&first.identity(), false, cx)
+                .unwrap();
+            assert!(!host.plugin_enabled(&first));
+            assert!(!host.plugin_enabled(&next));
+            assert!(host.plugin_enabled(&other));
+            host.plugin_catalog
+                .retain(|p| p.identity() != first.identity());
+            let old_binding = model::BeforeAction {
+                approval: gpui_glint::plugins::Approval::for_plugin(&first),
+                action_id: "sign-request".into(),
+                enabled: true,
+            };
+            assert!(host.enabled_before_actions(&[old_binding]).is_empty());
+            assert!(host.plugin_enabled(&host.plugin_catalog[0]));
+            let id = host.storage.create_workspace("Other").unwrap();
+            let (store, _) = host.storage.prepare_workspace(&id).unwrap();
+            assert!(
+                store
+                    .disabled_plugins()
+                    .unwrap()
+                    .contains(&first.family_identity())
+            );
+        });
     }
 }

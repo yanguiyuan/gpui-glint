@@ -55,6 +55,7 @@ impl HostRegistry {
             Ok(Value::String(format!("{:x}", mac.finalize().into_bytes())))
         })
         .expect("unique builtin");
+        crate::crypto::extend(&mut self);
         self
     }
 }

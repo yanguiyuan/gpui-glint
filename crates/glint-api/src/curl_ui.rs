@@ -77,7 +77,7 @@ impl Workbench {
                 }
             })
             .unwrap_or("导入的请求（新建集合）".into());
-        let form = div().id("curl-import-dialog").debug_selector(|| "curl-import-dialog".into()).w(px(680.)).max_w_full().max_h_full().p_5().rounded_lg().border_1().border_color(rgb(p.border)).bg(rgb(p.surface)).shadow_lg().flex().flex_col().gap_3()
+        let form = div().id("curl-import-dialog").debug_selector(|| "curl-import-dialog".into()).flex().flex_col().gap_3()
             .on_mouse_down(gpui::MouseButton::Left,|_,_,cx| cx.stop_propagation())
             .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("从 cURL 导入请求"))
             .child(div().text_color(rgb(p.text_muted)).child(format!("导入到 {destination}")))
@@ -88,30 +88,17 @@ impl Workbench {
                 .child(Button::new("取消").kind(ButtonKind::Plain).theme(self.theme).render().debug_selector(|| "cancel-curl-import".into()).on_click(cx.listener(|this,_,window,cx| { this.show_curl_import=false; window.focus(&this.focus,cx); cx.notify(); })))
                 .child(Button::new("导入请求").theme(self.theme).render().debug_selector(|| "submit-curl-import".into()).on_click(cx.listener(|this,_,window,cx| this.import_curl(window,cx)))));
         Some(
-            gpui::deferred(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .size_full()
-                    .bg(gpui::rgba(0x0c121c48))
-                    .occlude()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_5()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.show_curl_import = false;
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(form),
-            )
-            .with_priority(30)
-            .into_any_element(),
+            Dialog::new("curl_ui-modal", form)
+                .focus_handles([self.curl_input.read(cx).focus_handle(cx)])
+                .theme(self.theme)
+                .width(680.)
+                .priority(110)
+                .on_close(cx.listener(|this, _, window, cx| {
+                    this.show_curl_import = false;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }))
+                .render(),
         )
     }
 }
@@ -224,6 +211,8 @@ mod tests {
                 record.id = model::new_id();
                 record.label = "200 OK".into();
                 record.exchange = Some(model::Exchange {
+                    websocket_connected: false,
+                    websocket_events: vec![],
                     curl: Some(curl),
                     response: Some(HttpResponse {
                         status: 200,

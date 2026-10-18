@@ -85,7 +85,7 @@ async fn run(
         .map_err(|_| "WebSocket 地址无效")?;
     let mut builder = client_builder(request.skip_tls_verification);
     if let Some(proxy) = request.proxy {
-        builder = builder.proxy(reqwest::Proxy::all(proxy.url.trim()).map_err(|e| e.to_string())?);
+        builder = proxy.apply(builder)?;
     }
     let client = builder.build().map_err(|e| e.to_string())?;
     let mut headers = reqwest::header::HeaderMap::new();
@@ -286,6 +286,49 @@ mod tests {
             assert!(matches!(next(&session).await, Event::Sent(text) if text == "你好 🌏"));
             assert!(matches!(next(&session).await, Event::Text(text) if text == "你好 🌏"));
             assert!(matches!(next(&session).await, Event::Binary(bytes) if bytes == [0, 255, 1]));
+            assert!(matches!(next(&session).await, Event::Closed(_)));
+            server.await.unwrap();
+        });
+    }
+    #[test]
+    fn built_in_proxy_maps_websocket_host_and_keeps_upgrade_hostname() {
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &tungstenite::handshake::server::Request, response| {
+                        assert_eq!(
+                            request.headers()["host"],
+                            format!("mapped.invalid:{}", address.port())
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    socket.next().await.unwrap().unwrap(),
+                    Message::Close(_)
+                ));
+            });
+            let proxy = ProxySettings {
+                enabled: true,
+                built_in: true,
+                mappings: vec![super::super::environment::HostMapping {
+                    domain: "mapped.invalid".into(),
+                    ip: "127.0.0.1".into(),
+                }],
+                ..Default::default()
+            };
+            let request = prepare(format!("ws://mapped.invalid:{}/echo", address.port()))
+                .with_proxy(&proxy)
+                .unwrap();
+            let session = start(request).unwrap();
+            assert!(matches!(next(&session).await, Event::Connected));
+            session.commands.send(Command::Close).await.unwrap();
             assert!(matches!(next(&session).await, Event::Closed(_)));
             server.await.unwrap();
         });

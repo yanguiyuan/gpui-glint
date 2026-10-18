@@ -64,8 +64,8 @@ pub fn bounded(value: Value) -> Value {
 impl super::storage::Store {
     pub fn append_mcp_call(&mut self, record: &Record) -> Result<i64, String> {
         let summary = &record.summary;
-        self.connection.execute("INSERT INTO mcp_calls(started_at_ms,client,rpc_id,tool,duration_ms,success,arguments,result) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![summary.started_at_ms,summary.client,summary.rpc_id,summary.tool,summary.duration_ms.min(i64::MAX as u64) as i64,summary.success,record.arguments.to_string(),record.result.to_string()])
+        self.connection.execute("INSERT INTO mcp_calls(started_at_ms,client,rpc_id,tool,duration_ms,success,arguments,result,workspace_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            rusqlite::params![summary.started_at_ms,summary.client,summary.rpc_id,summary.tool,summary.duration_ms.min(i64::MAX as u64) as i64,summary.success,record.arguments.to_string(),record.result.to_string(),self.workspace_id])
             .map_err(|e|e.to_string())?;
         Ok(self.connection.last_insert_rowid())
     }
@@ -84,21 +84,22 @@ impl super::storage::Store {
                 .replace('%', "!%")
                 .replace('_', "!_")
         );
-        let filter = "(?1 IS NULL OR success=?1) AND (tool LIKE ?2 ESCAPE '!' OR client LIKE ?2 ESCAPE '!' OR (success=0 AND result LIKE ?2 ESCAPE '!'))";
+        let filter = "workspace_id=?3 AND (?1 IS NULL OR success=?1) AND (tool LIKE ?2 ESCAPE '!' OR client LIKE ?2 ESCAPE '!' OR (success=0 AND result LIKE ?2 ESCAPE '!'))";
         let total = self
             .connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM mcp_calls WHERE {filter}"),
-                rusqlite::params![success, query],
+                rusqlite::params![success, query, self.workspace_id],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|e| e.to_string())? as usize;
-        let mut statement=self.connection.prepare(&format!("SELECT id,started_at_ms,client,rpc_id,tool,duration_ms,success FROM mcp_calls WHERE {filter} AND (?3 IS NULL OR started_at_ms<(SELECT started_at_ms FROM mcp_calls WHERE id=?3) OR (started_at_ms=(SELECT started_at_ms FROM mcp_calls WHERE id=?3) AND id<?3)) ORDER BY started_at_ms DESC,id DESC LIMIT ?4")).map_err(|e|e.to_string())?;
+        let mut statement=self.connection.prepare(&format!("SELECT id,started_at_ms,client,rpc_id,tool,duration_ms,success FROM mcp_calls WHERE {filter} AND (?4 IS NULL OR started_at_ms<(SELECT started_at_ms FROM mcp_calls WHERE id=?4 AND workspace_id=?3) OR (started_at_ms=(SELECT started_at_ms FROM mcp_calls WHERE id=?4 AND workspace_id=?3) AND id<?4)) ORDER BY started_at_ms DESC,id DESC LIMIT ?5")).map_err(|e|e.to_string())?;
         let mut rows = statement
             .query_map(
                 rusqlite::params![
                     success,
                     query,
+                    self.workspace_id,
                     before,
                     limit.saturating_add(1).min(i64::MAX as usize) as i64
                 ],
@@ -116,7 +117,7 @@ impl super::storage::Store {
         })
     }
     pub fn mcp_call_record(&self, id: i64) -> Result<Record, String> {
-        self.connection.query_row("SELECT id,started_at_ms,client,rpc_id,tool,duration_ms,success,arguments,result FROM mcp_calls WHERE id=?1",[id],|row|{
+        self.connection.query_row("SELECT id,started_at_ms,client,rpc_id,tool,duration_ms,success,arguments,result FROM mcp_calls WHERE id=?1 AND workspace_id=?2",rusqlite::params![id,self.workspace_id],|row|{
             let parse=|index|->rusqlite::Result<Value>{
                 let text:String=row.get(index)?;
                 serde_json::from_str(&text).map_err(|error|rusqlite::Error::FromSqlConversionFailure(index,rusqlite::types::Type::Text,Box::new(error)))
@@ -138,7 +139,7 @@ fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
     pub fn record(time: i64, tool: &str, success: bool) -> Record {

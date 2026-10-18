@@ -1,10 +1,9 @@
 use super::*;
 use std::rc::Rc;
 
-pub(super) struct ProxyInput {
-    pub(super) url: Entity<TextEntry>,
-    enabled: bool,
-    skip_tls_verification: bool,
+pub(super) struct ProxyBindingInput {
+    pub(super) binding: Option<String>,
+    pub(super) select: Entity<Select>,
     _subscription: Subscription,
 }
 #[derive(Clone)]
@@ -138,8 +137,13 @@ impl Workbench {
                 })
             })
             .collect::<Vec<_>>();
-        let proxy = &self.proxy_inputs[index];
-        serde_json::json!({"variables":rows,"proxy":{"enabled":proxy.enabled,"url":proxy.url.read(cx).value(),"skip_tls_verification":proxy.skip_tls_verification}})
+        let binding = &self.proxy_inputs[index].binding;
+        let proxy = binding
+            .as_ref()
+            .and_then(|id| self.proxies.iter().find(|p| &p.id == id))
+            .map(|p| p.settings.clone())
+            .unwrap_or_default();
+        serde_json::json!({"variables":rows,"proxy_id":binding,"proxy":proxy})
     }
 
     fn variable_input(
@@ -207,29 +211,40 @@ impl Workbench {
         }
     }
     pub(super) fn add_proxy_input(&mut self, cx: &mut Context<Self>) {
-        let saved = &self.environment_inputs[self.proxy_inputs.len()].proxy;
-        let enabled = saved.enabled;
-        let skip_tls_verification = saved.skip_tls_verification;
-        let url = Self::entry(&saved.url, "http://127.0.0.1:7890", cx);
-        url.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
-        let subscription = cx.observe(&url, |this, _, cx| {
-            this.variable_error = None;
-            cx.notify();
+        let binding = self.environment_inputs[self.proxy_inputs.len()]
+            .proxy_id
+            .clone();
+        let options = self.proxy_binding_options();
+        let theme = self.theme;
+        let select = cx.new(|cx| {
+            Select::new(options, cx)
+                .selected(binding.clone().unwrap_or_default())
+                .width(180.)
+                .theme(theme)
         });
-        self.proxy_inputs.push(ProxyInput {
-            url,
-            enabled,
-            skip_tls_verification,
+        let subscription = cx.subscribe(&select, |this, select, event: &SelectEvent, cx| {
+            let SelectEvent::Changed(value) = event;
+            if !value.is_empty() && !this.proxies.iter().any(|p| p.id == value.as_ref()) {
+                return;
+            }
+            if let Some(input) = this
+                .proxy_inputs
+                .iter_mut()
+                .find(|input| input.select == select)
+            {
+                input.binding = (!value.is_empty()).then(|| value.to_string());
+                select.update(cx, |select, cx| {
+                    select.set_selected(Some(value.clone()), cx)
+                });
+                this.variable_error = None;
+                cx.notify();
+            }
+        });
+        self.proxy_inputs.push(ProxyBindingInput {
+            binding,
+            select,
             _subscription: subscription,
         });
-    }
-    fn proxy_draft(&self, cx: &App) -> environment::ProxySettings {
-        let input = &self.proxy_inputs[self.editing_environment];
-        environment::ProxySettings {
-            enabled: input.enabled,
-            url: input.url.read(cx).value().trim().into(),
-            skip_tls_verification: input.skip_tls_verification,
-        }
     }
     pub(super) fn merge_extracted_variables(
         &mut self,
@@ -257,13 +272,12 @@ impl Workbench {
         self.sync_variable_table(cx);
     }
     pub(super) fn reset_environment_rows(&mut self, index: usize, cx: &mut Context<Self>) {
-        let saved = self.environment_inputs[index].proxy.clone();
-        let input = &mut self.proxy_inputs[index];
-        input.enabled = saved.enabled;
-        input.skip_tls_verification = saved.skip_tls_verification;
-        input
-            .url
-            .update(cx, |entry, cx| entry.set_value(saved.url, cx));
+        self.proxy_inputs[index].binding = self.environment_inputs[index].proxy_id.clone();
+        let binding = self.proxy_inputs[index].binding.clone().unwrap_or_default();
+        self.proxy_inputs[index].select.update(cx, |select, cx| {
+            select.set_selected(Some(binding.into()), cx);
+            select.close(cx);
+        });
         let variables = self.editor_environment(index).variables;
         self.variable_rows[index] = variables
             .iter()
@@ -289,7 +303,7 @@ impl Workbench {
             })
             .collect()
     }
-    fn environment_dirty(&self, cx: &App) -> bool {
+    pub(super) fn environment_dirty(&self, cx: &App) -> bool {
         let saved: Vec<_> = self
             .editor_environment(self.editing_environment)
             .variables
@@ -297,7 +311,8 @@ impl Workbench {
             .map(|v| (v.name.clone(), v.value.clone(), v.secret))
             .collect();
         self.variable_draft(cx) != saved
-            || self.proxy_draft(cx) != self.environment_inputs[self.editing_environment].proxy
+            || self.proxy_inputs[self.editing_environment].binding
+                != self.environment_inputs[self.editing_environment].proxy_id
     }
     pub(super) fn has_unsaved_environment(&self, cx: &App) -> bool {
         self.environment_inputs
@@ -324,10 +339,7 @@ impl Workbench {
                     .map(|v| (v.name.clone(), v.value.clone(), v.secret))
                     .collect();
                 let proxy = &self.proxy_inputs[index];
-                rows != variables
-                    || proxy.enabled != saved.proxy.enabled
-                    || proxy.skip_tls_verification != saved.proxy.skip_tls_verification
-                    || proxy.url.read(cx).value().trim() != saved.proxy.url
+                rows != variables || proxy.binding != saved.proxy_id
             })
     }
     pub(super) fn add_variable(&mut self, cx: &mut Context<Self>) {
@@ -342,22 +354,60 @@ impl Workbench {
         self.sync_variable_table(cx);
         cx.notify();
     }
+    /// Validate all editor drafts before changing saved workspace variables.
+    pub(super) fn save_workspace_environment_drafts(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let editing = self.editing_environment;
+        let scope = self.editing_variable_collection.clone();
+        let drafts = (|| {
+            let mut drafts = Vec::new();
+            for index in 0..self.environment_inputs.len() {
+                self.editing_environment = index;
+                let mut environment = self.editor_environment(index);
+                let result = environment.replace(&self.variable_draft(cx)).and_then(|_| {
+                    if scope.is_none() {
+                        self.validate_proxy_binding(index)?;
+                        environment.proxy_id = self.proxy_inputs[index].binding.clone();
+                    }
+                    Ok(())
+                });
+                result.map_err(|error| {
+                    format!("请先修正环境“{}”：{error}", self.environment_name(index))
+                })?;
+                drafts.push(environment);
+            }
+            Ok::<_, String>(drafts)
+        })();
+        self.editing_environment = editing;
+        for (index, environment) in drafts?.into_iter().enumerate() {
+            *self.scoped_environment_mut(index, scope.as_deref())? = environment;
+        }
+        self.storage_dirty = true;
+        self.variable_error = None;
+        self.reset_variable_rows(cx);
+        self.sync_reference_inputs(cx);
+        Ok(())
+    }
     pub(super) fn save_environment_variables(&mut self, cx: &mut Context<Self>) {
         let rows = self.variable_draft(cx);
         let index = self.editing_environment;
-        let proxy = self.proxy_draft(cx);
         let scope = self.editing_variable_collection.clone();
-        match proxy.validate().and_then(|_| {
+        match self.validate_proxy_binding(index).and_then(|_| {
             self.scoped_environment_mut(index, scope.as_deref())?
                 .replace(&rows)
         }) {
             Ok(()) => {
                 if scope.is_none() {
-                    self.environment_inputs[index].proxy = proxy;
+                    self.environment_inputs[index].proxy_id =
+                        self.proxy_inputs[index].binding.clone();
                 }
                 self.storage_dirty = true;
                 self.reset_environment_rows(index, cx);
                 self.sync_reference_inputs(cx);
+                self.ws_invalidate_titles();
+                self.ws_select_sync(cx);
                 self.notice = format!(
                     "已保存{}的环境设置",
                     self.environment_name(index).to_owned()
@@ -572,64 +622,6 @@ impl Workbench {
             table.set_rows(rows, cx);
         });
     }
-    fn environment_proxy_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let index = self.editing_environment;
-        let input = &self.proxy_inputs[index];
-        let owner = cx.entity().downgrade();
-        let tls_owner = owner.clone();
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("代理"),
-            )
-            .child(
-                self.request_setting_row(
-                    "启用代理",
-                    "当前环境下的所有请求使用此代理，保存后生效。",
-                    Switch::new("")
-                        .checked(input.enabled)
-                        .theme(self.theme)
-                        .on_change(move |enabled, _, cx| {
-                            let _ = owner.update(cx, |this, cx| {
-                                this.proxy_inputs[index].enabled = enabled;
-                                this.variable_error = None;
-                                cx.notify();
-                            });
-                        })
-                        .render()
-                        .id("environment-proxy-enabled")
-                        .debug_selector(|| "environment-proxy-enabled".into()),
-                ),
-            )
-            .child(self.request_setting_row(
-                "代理地址",
-                "支持 HTTP / HTTPS 代理，例如 http://127.0.0.1:7890。",
-                input.url.clone(),
-            ))
-            .child(
-                self.request_setting_row(
-                    "跳过 TLS 证书校验",
-                    "使用此代理时跳过目标服务及 HTTPS 代理的证书校验。",
-                    Switch::new("")
-                        .checked(input.skip_tls_verification)
-                        .theme(self.theme)
-                        .on_change(move |skip, _, cx| {
-                            let _ = tls_owner.update(cx, |this, cx| {
-                                this.proxy_inputs[index].skip_tls_verification = skip;
-                                cx.notify();
-                            });
-                        })
-                        .render()
-                        .id("environment-proxy-skip-tls")
-                        .debug_selector(|| "environment-proxy-skip-tls".into()),
-                ),
-            )
-    }
     fn variable_scope_tabs(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut tabs = div().flex().items_center().gap_2();
         let collection = self.editing_variable_collection.clone().or_else(|| {
@@ -637,9 +629,10 @@ impl Workbench {
                 .get(self.current_collection)
                 .map(|c| c.collection.clone())
         });
-        for (scope, title) in [
-            (None, "全局变量".to_owned()),
+        for (local, scope, title) in [
+            (false, None, "全局变量".to_owned()),
             (
+                true,
                 collection.clone(),
                 format!(
                     "集合变量 · {}",
@@ -647,7 +640,7 @@ impl Workbench {
                 ),
             ),
         ] {
-            if title.starts_with("集合") && scope.is_none() {
+            if local && scope.is_none() || !local && self.environment_names.len() <= 1 {
                 continue;
             }
             let active = self.editing_variable_collection == scope;
@@ -679,15 +672,52 @@ impl Workbench {
                     })),
             );
         }
-        tabs.child(
-            div()
-                .text_size(px(10.))
-                .text_color(rgb(self.theme.palette().text_muted))
-                .child("集合优先于全局，仅在所属集合生效"),
+        tabs.when(
+            self.environment_names.len() > 1 && collection.is_some(),
+            |tabs| {
+                tabs.child(
+                    div()
+                        .debug_selector(|| "variable-scope-hint".into())
+                        .text_size(px(10.))
+                        .text_color(rgb(self.theme.palette().text_muted))
+                        .child("集合优先于全局，仅在所属集合生效"),
+                )
+            },
         )
     }
+
+    pub(super) fn begin_create_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.group_name
+            .update(cx, |entry, cx| entry.set_value("", cx));
+        self.group_edit = Some(GroupEdit::CreateEnvironment);
+        self.group_error = None;
+        window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
     pub(super) fn environment_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
+        if self.environment_names.len() <= 1 && self.collections.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .debug_selector(|| "environment-empty".into())
+                .text_color(rgb(p.text_muted))
+                .child("暂无环境")
+                .child(
+                    Button::new("创建环境")
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "empty-create-environment".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.begin_create_environment(window, cx)
+                        })),
+                );
+        }
         if self.editing_environment == 0 && self.editing_variable_collection.is_none() {
             return div()
                 .size_full()
@@ -702,7 +732,11 @@ impl Workbench {
                         .items_center()
                         .justify_center()
                         .text_color(rgb(p.text_muted))
-                        .child("请选择或创建环境来管理全局变量；集合变量可单独设置。"),
+                        .child(if self.environment_names.len() <= 1 {
+                            "选择集合变量来管理当前集合的变量，或创建请求环境。"
+                        } else {
+                            "请选择环境来管理全局变量；集合变量可单独设置。"
+                        }),
                 );
         }
         let index = self.editing_environment;
@@ -805,7 +839,7 @@ impl Workbench {
                     .child(div().text_size(px(10.)).text_color(rgb(p.text_muted))
                         .child("用于 URL、参数、请求头、Cookie、认证和请求体；同次发送复用相同表达式，时间为 UTC。"))
             )
-            .when(self.editing_variable_collection.is_none() && index != 0, |body| body.child(self.environment_proxy_settings(cx)))
+            .when(self.editing_variable_collection.is_none() && index != 0, |body| body.child(self.environment_proxy_binding(cx)))
             .when_some(self.variable_error.clone(), |el, error| {
                 el.child(
                     div()
@@ -1074,91 +1108,5 @@ mod scope_tests {
         legacy.as_object_mut().unwrap().remove("id");
         let legacy: RequestGroups = serde_json::from_value(legacy).unwrap();
         assert!(legacy.environments.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[gpui::test]
-    fn proxy_edits_save_atomically_discard_and_survive_restart(cx: &mut gpui::TestAppContext) {
-        let path = std::env::temp_dir().join(format!(
-            "glint-api-proxy-{}-{}.sqlite3",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let (host, window) = cx.add_window_view(|_, cx| {
-            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
-            host.group_edit = Some(GroupEdit::CreateEnvironment);
-            host.group_name
-                .update(cx, |entry, cx| entry.set_value("Development", cx));
-            host.save_group(cx);
-            host.show_environments = true;
-            host
-        });
-        let bounds = window.debug_bounds("environment-proxy-enabled").unwrap();
-        window.simulate_click(bounds.center(), gpui::Modifiers::default());
-        let bounds = window.debug_bounds("environment-proxy-skip-tls").unwrap();
-        window.simulate_click(bounds.center(), gpui::Modifiers::default());
-        host.update(window, |host, cx| {
-            assert!(host.proxy_draft(cx).enabled && host.proxy_draft(cx).skip_tls_verification);
-            assert!(
-                !host.environment_inputs[1].proxy.enabled,
-                "unsaved drafts must not affect requests"
-            );
-            host.add_variable(cx);
-            host.variable_rows[1][0]
-                .name
-                .update(cx, |entry, cx| entry.set_value("name", cx));
-            host.save_environment_variables(cx);
-            assert!(host.variable_error.is_some());
-            assert!(
-                host.environment_inputs[1].variables.is_empty(),
-                "invalid proxy must not partially save variables"
-            );
-            host.proxy_inputs[1].url.update(cx, |entry, cx| {
-                entry.set_value(" http://127.0.0.1:7890 ", cx)
-            });
-            host.save_environment_variables(cx);
-            assert!(host.variable_error.is_none());
-            assert!(host.environment_inputs[1].proxy.enabled);
-            assert_eq!(
-                host.environment_inputs[1].proxy.url,
-                "http://127.0.0.1:7890"
-            );
-            assert!(!host.environment_dirty(cx));
-            host.proxy_inputs[1].enabled = false;
-            host.reset_environment_rows(1, cx);
-            assert!(host.proxy_draft(cx).enabled);
-            host.group_edit = Some(GroupEdit::CreateEnvironment);
-            host.group_name
-                .update(cx, |entry, cx| entry.set_value("Production", cx));
-            host.save_group(cx);
-            assert!(!host.proxy_draft(cx).enabled);
-            host.editing_environment = 1;
-            assert!(host.proxy_draft(cx).enabled);
-            host.persist(cx);
-        });
-        let reopened =
-            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
-        reopened.update(window, |host, _| {
-            assert!(
-                host.environment_inputs[1].proxy.enabled
-                    && host.environment_inputs[1].proxy.skip_tls_verification
-            );
-            assert!(!host.environment_inputs[2].proxy.enabled);
-        });
-        let mut legacy = serde_json::to_value(EnvironmentVariables::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("proxy");
-        assert!(
-            !serde_json::from_value::<EnvironmentVariables>(legacy)
-                .unwrap()
-                .proxy
-                .enabled
-        );
-        std::fs::remove_file(path).unwrap();
     }
 }

@@ -836,6 +836,7 @@ impl Render for DataTable {
             let selected = self.selected.contains(&row.id);
             let mut element = div()
                 .id(row.id.clone())
+                .group(row.id.clone())
                 .flex()
                 .items_center()
                 .min_h(px(if self.compact { 34. } else { 53. }))

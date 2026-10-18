@@ -11,7 +11,7 @@ Reusable plugin contracts and a synchronous Boa 0.22 runtime. No GPUI, HTTP, SQL
 
 `glint.on("database.page", callback)` declares a synchronous hook. `glint.host.call("database.describe", table)` invokes a host API. Promises are rejected by this first version. Relative/ES-module loading, Node APIs, networking, filesystem, process execution and dynamic native extensions are not provided. Generic diagnostic messages omit script-thrown values and host callback errors, which may contain secrets.
 
-`HostRegistry::with_crypto()` offers `crypto.sha256Hex(text)` and `crypto.hmacSha256Hex(key, text)`, gated by `crypto`. Business signing algorithms remain in application plugins. Registry callbacks must capture ordinary host data, not engine/GC values; callbacks must not re-enter a runtime.
+`HostRegistry::with_crypto()` offers `crypto.sha256Hex(text)`, `crypto.hmacSha256Hex(key, text)`, `crypto.md5Hex(text)`, `crypto.hmacSha256VerifyBase64Url(key, text, signature)` (constant-time MAC verification), and `crypto.aes256CbcPkcs7DecryptBase64(key, iv, ciphertext)` (UTF-8 key bytes, first 16 IV bytes, strict PKCS7 validation, standard Base64 input), gated by `crypto`. Business signing algorithms remain in application plugins. Registry callbacks must capture ordinary host data, not engine/GC values; callbacks must not re-enter a runtime.
 
 ## Pages across applications
 

@@ -14,6 +14,8 @@ Windows 下 `AppLayout` 默认在顶栏右侧显示最小化、最大化／还�
 
 `GroupedDropdown` 通过触发按钮展开或收起，支持带标题的分组和可选图标，选择后自动关闭。使用 `on_select` 接收所选标签，并将其连接到应用状态。
 
+`DropdownMenu` 用于受控操作菜单：传入稳定 ID、触发元素及菜单内容，通过 `.open(...)` 和 `.on_open_change(...)` 管理开合，复用 Popover 的外部点击、Escape 和窗口避让行为。搭配 `MenuItem::new(id, label).icon(Icon::Copy).theme(theme).render()` 渲染统一的 32px 菜单行，点击回调由宿主连接；可用 `.disabled(true)` 显示禁用状态，业务回调也应检查操作是否可用。集合操作和 WebSocket 即时操作共用这组组件。
+
 `Separator::horizontal()` 和 `Separator::vertical()` 提供随主题变化的 1px 分隔线，不参与拖拽；用于分隔上下或左右相邻区域。
 
 ## 通用树列表
@@ -663,3 +665,22 @@ selector.update(cx, |selector, cx| {
 `CodeCard::source_offset_at(position)` 返回可见源码行中指针对应的 UTF-8 字节偏移，支持虚拟化只读视图；`set_source_highlight(Some(range), cx)` 添加临时背景高亮，不修改选区、正文和查找结果，传入 `None` 清除。Glint API 的响应 JSONPath 选取使用这两个接口。
 
 `CodeCard::json_folding(true)` 为只读 JSON 的 `.viewport()` 开启对象／数组折叠（默认关闭）；行号旁箭头控制各个多行块，收起行展示隐藏行数和结束括号，行号始终对应完整源码。`set_json_folding(false, cx)` 临时显示全部内容，重新启用恢复折叠状态；正文变化时清空折叠状态。查找跳转自动展开包含命中的折叠块，复制与源码命中偏移保持完整原文。
+
+## Dialog
+
+`Dialog` 是受控模态容器，用于创建、编辑和导入表单。宿主在打开时将其渲染到覆盖整个窗口的 `relative` 根容器中，关闭时停止渲染；表单内容、校验、提交状态和初始／返回焦点由宿主管理。
+
+```rust,ignore
+Dialog::new("create-environment", form)
+    .width(360.)
+    .theme(theme)
+    .focus_handles([name_input.read(cx).focus_handle(cx)])
+    .on_close(cx.listener(|this, _: &DialogDismiss, window, cx| {
+        this.show_create = false;
+        window.focus(&this.focus, cx);
+        cx.notify();
+    }))
+    .render()
+```
+
+容器统一提供居中面板、主题配色、遮罩和内容滚动，拦截背景点击与滚轮传播。Esc 和点击遮罩触发 `on_close`，不会自动提交；`dismissible(false)` 在提交期间禁止这两种关闭方式。`focus_handles` 按顺序循环处理 Tab／Shift-Tab，宿主应传入当前可用表单控件；初次打开时由宿主聚焦首个控件。`priority` 默认 110，可用于安排嵌套弹层的显示顺序。

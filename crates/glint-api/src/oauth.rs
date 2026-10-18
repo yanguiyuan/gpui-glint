@@ -525,9 +525,7 @@ fn token_request_via<'a>(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10));
-    if proxy.enabled {
-        builder = builder.proxy(reqwest::Proxy::all(&proxy.url).map_err(|_| "OAuth 代理地址无效")?);
-    }
+    builder = proxy.apply_blocking(builder)?;
     // OAuth credentials always require certificate validation, even if a business request opts out.
     let client = builder.build().map_err(|_| "无法创建 OAuth 客户端")?;
     let mut request = client.post(endpoint(&config.token_url)?);
