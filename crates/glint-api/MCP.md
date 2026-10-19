@@ -26,7 +26,9 @@ cargo build -p glint-api
 
 `--mcp` 提供标准 [MCP stdio 传输](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)。它连接现有应用；没有可连接的窗口时会启动应用，最多等待 15 秒。GUI 启动输出不会写入 MCP stdout。关闭 agent 的 stdio 会话不会关闭工作台或取消已启动的网络请求。
 
-使用自定义数据库时，GUI 与 MCP 客户端都应设置相同的 `GLINT_API_DB_PATH`；从该 GUI 复制的配置会带上此环境变量。设置 `GLINT_API_MCP_NO_AUTOSTART=1` 可禁用自动打开应用。当前连接同一数据库最近启动的窗口，请避免同时开启多个窗口进程编辑同一数据库。
+使用自定义数据库时，GUI 与 MCP 客户端都应设置相同的 `GLINT_API_DB_PATH`；从该 GUI 复制的配置会带上此环境变量。设置 `GLINT_API_MCP_NO_AUTOSTART=1` 可禁用自动打开应用。相同数据库路径的工作台使用系统文件锁保证单实例；重复启动会直接退出，多个 MCP stdio 进程共享该工作台，并协调自动启动过程。锁文件会保留，锁在进程退出时由系统释放，无需手动删除。
+
+工作台连接中断时，stdio 进程保持运行，将当前调用报告为 JSON-RPC 错误。该调用可能已经执行，因此不会自动重发，请先确认结果。后续请求会重新连接工作台并恢复 MCP 初始化状态；允许自动启动时，工作台已退出也会重新启动。
 
 stdio 进程通过带随机令牌的本机 TCP 桥访问 GPUI 主线程，不向局域网提供监听端口。发现文件位于数据库旁，例如 `workspace.mcp.json`，Unix 权限为 `0600`；它属于运行时文件，不应加入版本库或共享给他人。agent 配置中无需保存连接令牌。
 

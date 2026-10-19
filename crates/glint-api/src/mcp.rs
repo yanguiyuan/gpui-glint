@@ -56,6 +56,31 @@ impl Drop for Server {
 pub fn discovery_path() -> Result<PathBuf, String> {
     Ok(super::storage::Store::default_path()?.with_extension("mcp.json"))
 }
+// OS locks are released on process exit, including a crash. Keep the file: unlinking
+// it would let two processes lock different files with the same name on Unix.
+fn lock_file(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())
+}
+pub fn workbench_guard() -> Result<Option<std::fs::File>, String> {
+    instance_guard(&discovery_path()?.with_extension("instance.lock"))
+}
+fn instance_guard(path: &Path) -> Result<Option<std::fs::File>, String> {
+    let file = lock_file(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
 fn read_info(path: &Path) -> Result<ConnectionInfo, String> {
     let bytes = std::fs::read(path).map_err(|_| "Glint API 尚未运行，请先打开工作台".to_owned())?;
     let info: ConnectionInfo =
@@ -395,53 +420,155 @@ fn connect(path: &Path) -> Result<(TcpStream, BufReader<TcpStream>), String> {
 }
 pub fn proxy() -> Result<(), String> {
     let path = discovery_path()?;
-    let connection = match connect(&path) {
-        Ok(connection) => connection,
-        Err(initial) => {
-            if std::env::var_os("GLINT_API_MCP_NO_AUTOSTART").is_some() {
-                return Err(initial);
-            }
-            std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-                .arg("--mcp-host")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("无法启动 Glint API：{e}"))?;
-            let deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                if let Ok(connection) = connect(&path) {
-                    break connection;
-                }
-                if Instant::now() >= deadline {
-                    return Err("Glint API 未能启动 MCP，请手动打开应用后重试".into());
-                }
+    proxy_io(std::io::stdin().lock(), std::io::stdout().lock(), || {
+        connect_or_start(&path)
+    })
+}
+fn connect_or_start(path: &Path) -> Result<(TcpStream, BufReader<TcpStream>), String> {
+    match connect(path) {
+        Ok(connection) => return Ok(connection),
+        Err(error) if std::env::var_os("GLINT_API_MCP_NO_AUTOSTART").is_some() => {
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let lock = lock_file(&path.with_extension("startup.lock"))?;
+    loop {
+        // Another proxy may already have started the workbench.
+        if let Ok(connection) = connect(path) {
+            return Ok(connection);
+        }
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
+            Err(error) => return Err(format!("等待 Glint API 启动锁失败：{error}")),
         }
-    };
-    proxy_io(
-        std::io::stdin().lock(),
-        std::io::stdout().lock(),
-        connection,
-    )
+    }
+    if let Ok(connection) = connect(path) {
+        return Ok(connection);
+    }
+    let mut command =
+        std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    command
+        .arg("--mcp-host")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB.
+        // MCP clients can clean up a proxy's entire job when refreshing tools.
+        command.creation_flags(0x00000200 | 0x00000008 | 0x01000000);
+    }
+    let child = command.spawn();
+    #[cfg(windows)]
+    let child = child.or_else(|error| {
+        use std::os::windows::process::CommandExt;
+        if error.raw_os_error() != Some(5) {
+            return Err(error);
+        }
+        // Some client jobs forbid breakaway. Still allow startup, with a useful
+        // diagnostic rather than silently failing to open the workbench.
+        eprintln!("Glint API: 客户端禁止脱离进程作业；工作台可能随 MCP 客户端退出");
+        command.creation_flags(0x00000200 | 0x00000008).spawn()
+    });
+    let mut child = child.map_err(|e| format!("无法启动 Glint API：{e}"))?;
+    loop {
+        if let Ok(connection) = connect(path) {
+            return Ok(connection);
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            // An existing instance can win the instance lock before publishing
+            // discovery. Keep waiting when the duplicate exits successfully.
+            if !status.success() {
+                return Err(format!("Glint API 启动失败：{status}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("Glint API 未能启动 MCP，请手动打开应用后重试".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+fn exchange(
+    (stream, reader): &mut (TcpStream, BufReader<TcpStream>),
+    bytes: &[u8],
+) -> Result<Value, String> {
+    stream.write_all(bytes).map_err(|e| e.to_string())?;
+    if !bytes.ends_with(b"\n") {
+        stream.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    stream.flush().map_err(|e| e.to_string())?;
+    let envelope: Value = serde_json::from_slice(&line(reader)?.ok_or("Glint API 已关闭")?)
+        .map_err(|_| "MCP bridge response invalid")?;
+    Ok(envelope["response"].clone())
 }
 fn proxy_io(
     mut input: impl BufRead,
     mut output: impl Write,
-    (mut stream, mut reader): (TcpStream, BufReader<TcpStream>),
+    mut connector: impl FnMut() -> Result<(TcpStream, BufReader<TcpStream>), String>,
 ) -> Result<(), String> {
+    let mut connection = None;
+    let mut initialization: Option<Vec<u8>> = None;
+    let mut initialized = false;
     while let Some(bytes) = line(&mut input)? {
-        stream.write_all(&bytes).map_err(|e| e.to_string())?;
-        if !bytes.ends_with(b"\n") {
-            stream.write_all(b"\n").map_err(|e| e.to_string())?;
+        let request = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        // This notification has no client response. Preserve the client's ready
+        // state even if its bridge acknowledgement is lost.
+        let ready_notification =
+            request["method"] == "notifications/initialized" && initialization.is_some();
+        let result = (|| {
+            if connection.is_none() {
+                let mut next = connector()?;
+                if let Some(init) = &initialization {
+                    let reply = exchange(&mut next, init)?;
+                    if reply.get("error").is_some() {
+                        return Err("MCP 重新初始化失败".into());
+                    }
+                    if initialized {
+                        exchange(
+                            &mut next,
+                            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                        )?;
+                    }
+                }
+                connection = Some(next);
+            }
+            exchange(connection.as_mut().unwrap(), &bytes)
+        })();
+        match result {
+            Ok(response) => {
+                if request["method"] == "initialize" && response.get("result").is_some() {
+                    initialization = Some(bytes);
+                }
+                if !response.is_null() {
+                    write_json(&mut output, &response)?;
+                }
+            }
+            Err(error) => {
+                // The GUI can outlive or restart independently of the client.
+                // Keep stdio alive, but never replay a possibly executed tool.
+                connection = None;
+                if let Some(id) = request.get("id") {
+                    write_json(
+                        &mut output,
+                        &rpc_error(
+                            id.clone(),
+                            -32000,
+                            &format!(
+                                "MCP 工作台连接中断；请求可能已执行，请确认结果后重试：{error}"
+                            ),
+                        ),
+                    )?;
+                }
+                eprintln!("Glint API MCP bridge: {error}");
+            }
         }
-        stream.flush().map_err(|e| e.to_string())?;
-        let envelope: Value =
-            serde_json::from_slice(&line(&mut reader)?.ok_or("Glint API 已关闭")?)
-                .map_err(|_| "MCP bridge response invalid")?;
-        if !envelope["response"].is_null() {
-            write_json(&mut output, &envelope["response"])?;
-        }
+        initialized |= ready_notification;
     }
     Ok(())
 }
@@ -544,11 +671,9 @@ mod tests {
         });
         let input=[initialize(),json!({"jsonrpc":"2.0","method":"notifications/initialized"}),json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"glint_workspace_get","arguments":{}}})].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")+"\n";
         let mut output = vec![];
-        proxy_io(
-            std::io::Cursor::new(input.as_bytes()),
-            &mut output,
-            connect(&path).unwrap(),
-        )
+        proxy_io(std::io::Cursor::new(input.as_bytes()), &mut output, || {
+            connect(&path)
+        })
         .unwrap();
         let replies = String::from_utf8(output)
             .unwrap()
@@ -563,6 +688,90 @@ mod tests {
         worker.join().unwrap();
         drop(server);
         assert!(!path.exists());
+    }
+    #[test]
+    fn workbench_instance_lock_is_exclusive_and_released_on_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("instance.lock");
+        let guard = instance_guard(&path).unwrap().unwrap();
+        let other_path = path.clone();
+        assert!(
+            std::thread::spawn(move || instance_guard(&other_path).unwrap().is_none())
+                .join()
+                .unwrap()
+        );
+        drop(guard);
+        assert!(instance_guard(&path).unwrap().is_some());
+    }
+    #[test]
+    fn proxy_reconnects_and_reinitializes_without_replaying_failed_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let init: Value =
+                    serde_json::from_slice(&line(&mut reader).unwrap().unwrap()).unwrap();
+                assert_eq!(init["method"], "initialize");
+                write_json(
+                    &mut stream,
+                    &json!({"response":{"jsonrpc":"2.0","id":1,"result":{}}}),
+                )
+                .unwrap();
+                let ready: Value =
+                    serde_json::from_slice(&line(&mut reader).unwrap().unwrap()).unwrap();
+                assert_eq!(ready["method"], "notifications/initialized");
+                write_json(&mut stream, &json!({"response":null})).unwrap();
+                let call: Value =
+                    serde_json::from_slice(&line(&mut reader).unwrap().unwrap()).unwrap();
+                assert_eq!(call["id"], if attempt == 0 { 2 } else { 3 });
+                if attempt == 0 {
+                    // Simulate a tool having executed just before the bridge dies.
+                    stream.shutdown(Shutdown::Both).unwrap();
+                } else {
+                    write_json(
+                        &mut stream,
+                        &json!({"response":{"jsonrpc":"2.0","id":3,"result":{"reconnected":true}}}),
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let input = [
+            initialize(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call"}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let mut output = vec![];
+        proxy_io(std::io::Cursor::new(input), &mut output, || {
+            let stream = TcpStream::connect(address).map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            Ok((stream, reader))
+        })
+        .unwrap();
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[1]["id"], 2);
+        assert_eq!(replies[1]["error"]["code"], -32000);
+        assert_eq!(replies[2]["result"]["reconnected"], true);
+        worker.join().unwrap();
     }
     #[test]
     fn mcp_bridge_rejects_missing_auth_and_non_loopback_discovery() {

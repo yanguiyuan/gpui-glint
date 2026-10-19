@@ -3831,16 +3831,23 @@ impl Workbench {
     fn body_configuration(&self, cx: &mut Context<Self>) -> gpui::Div {
         if self.snapshot(cx).method == "WS" {
             return div()
-                .h_full()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(
                     div()
+                        .flex_shrink_0()
                         .text_size(px(11.))
                         .child("待发送的文本消息 · 连接后点击发送消息"),
                 )
-                .child(div().flex_1().min_h_0().child(self.body.clone()));
+                .child(
+                    div()
+                        .debug_selector(|| "request-body-editor".into())
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .child(self.body.clone()),
+                );
         }
         let owner = cx.entity().downgrade();
         let mut head = div().flex().items_center().gap_3().child(
@@ -3883,12 +3890,26 @@ impl Workbench {
                     })),
             );
         }
-        let content = div().h_full().flex().flex_col().gap_2().child(head);
+        // Editable code cards grow with their content. Keep their full height in
+        // the configuration scroll area rather than shrinking a wrapper around
+        // them, which hides the bottom of the card behind the response panel.
+        let content = div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(head.flex_shrink_0());
         if self.body_format == BodyFormat::UrlEncoded {
             content.child(self.form_table.clone()).child(div().text_size(px(10.)).text_color(rgb(self.theme.palette().text_muted))
                 .child("仅发送已启用字段，支持同名字段和模板变量；无需手动编码。自动使用 application/x-www-form-urlencoded，显式 Content-Type 优先。"))
         } else {
-            content.child(div().flex_1().min_h_0().child(self.body.clone()))
+            content.child(
+                div()
+                    .debug_selector(|| "request-body-editor".into())
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .child(self.body.clone()),
+            )
         }
     }
     fn configuration(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -5482,6 +5503,14 @@ fn main() {
         }
         return;
     }
+    let _instance_guard = match mcp::workbench_guard() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("无法锁定 Glint API 工作台：{error}");
+            std::process::exit(1);
+        }
+    };
     gpui_platform::application()
         .with_assets(GlintAssets)
         .run(|cx: &mut App| {
@@ -6277,6 +6306,76 @@ mod persistence_tests {
             assert!(description.contains("不使用环境"));
             assert!(host.requests[0].history.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn request_body_card_scrolls_fully_above_response_panel(cx: &mut gpui::TestAppContext) {
+        struct BodyPanel(Entity<Workbench>, gpui::ScrollHandle);
+        impl Render for BodyPanel {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(700.))
+                    .h(px(400.))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        self.0
+                            .update(cx, |host, cx| host.configuration(cx))
+                            .track_scroll(&self.1),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "body-test-response".into())
+                            .h(px(42.))
+                            .flex_shrink_0(),
+                    )
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for method in ["POST", "WS"] {
+            let host = cx.new(|cx| {
+                let mut host = Workbench::with_store(
+                    storage::Store::open(&directory.path().join(format!("{method}.sqlite3")))
+                        .unwrap(),
+                    cx,
+                );
+                let mut draft = host.snapshot(cx);
+                draft.method = method.into();
+                draft.body = (0..40).map(|i| format!("line {i}\n")).collect();
+                host.load(&draft, cx);
+                host.config = 3;
+                host
+            });
+            let scroll = gpui::ScrollHandle::new();
+            let (_, window) = cx.add_window_view(|_, _| BodyPanel(host, scroll.clone()));
+            let viewport = window.debug_bounds("request-config-scroll").unwrap();
+            let editor = window.debug_bounds("request-body-editor").unwrap();
+            let response = window.debug_bounds("body-test-response").unwrap();
+            assert!(
+                editor.size.height > viewport.size.height,
+                "{method}: card must retain its content height"
+            );
+            assert!(viewport.bottom() <= response.top());
+            window.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-10000.))),
+                ..Default::default()
+            });
+            assert!(
+                scroll.offset().y < px(0.),
+                "{method}: body must scroll vertically"
+            );
+            let bottom = window.debug_bounds("request-body-editor").unwrap().bottom();
+            assert!(
+                bottom <= viewport.bottom(),
+                "{method}: card bottom must be reachable"
+            );
+            assert!(
+                bottom > viewport.top(),
+                "{method}: card must remain inside its viewport"
+            );
+            assert_eq!(window.debug_bounds("body-test-response").unwrap(), response);
+        }
     }
 
     #[gpui::test]
