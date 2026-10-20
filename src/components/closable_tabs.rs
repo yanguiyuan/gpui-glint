@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px,
-    rgb, rgba,
+    AnyElement, App, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    SharedString, Styled, Window, div, prelude::*, px, rgb, rgba,
 };
 
 use super::{Icon, IconButton};
@@ -10,6 +10,13 @@ use crate::theme::ThemePreset;
 
 type TabHandler = Rc<dyn Fn(u64, &mut Window, &mut App)>;
 type AddHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+/// 右键点击标签时回调：(标签 id, 鼠标位置)，菜单由调用方渲染。
+type ContextHandler = Rc<dyn Fn(u64, Point<Pixels>, &mut Window, &mut App)>;
+
+/// 空间不足时标签可压缩到的最小宽度，保证关闭按钮仍然可见。
+const MIN_TAB_WIDTH: f32 = 64.;
+/// 标签在空间充足时的最大宽度。
+const MAX_TAB_WIDTH: f32 = 240.;
 
 /// A tab with a stable identity, label, and optional leading icon.
 pub struct ClosableTab {
@@ -50,6 +57,7 @@ pub struct ClosableTabs {
     theme: ThemePreset,
     on_select: Option<TabHandler>,
     on_close: Option<TabHandler>,
+    on_context: Option<ContextHandler>,
     on_add: Option<AddHandler>,
     contents: Vec<(u64, AnyElement)>,
     fill_height: bool,
@@ -64,6 +72,7 @@ impl ClosableTabs {
             theme: ThemePreset::default(),
             on_select: None,
             on_close: None,
+            on_context: None,
             on_add: None,
             contents: Vec::new(),
             fill_height: false,
@@ -109,6 +118,15 @@ impl ClosableTabs {
         self
     }
 
+    /// 右键点击标签时回调，调用方负责在给定位置渲染上下文菜单。
+    pub fn on_context(
+        mut self,
+        handler: impl Fn(u64, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_context = Some(Rc::new(handler));
+        self
+    }
+
     /// Shows a trailing plus button. The caller owns creating or opening the new tab.
     /// The button remains available when all tabs are closed.
     pub fn on_add(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
@@ -142,6 +160,8 @@ impl ClosableTabs {
             })
             .pt(px(6.))
             .px(px(6.))
+            // 标签变多时优先压缩自身宽度，只有压缩到最小宽度仍然放不下时才横向滚动。
+            .max_w_full()
             .overflow_x_scroll()
             .flex()
             .items_end()
@@ -154,9 +174,9 @@ impl ClosableTabs {
             let close = self.on_close.clone();
             let mut label = div().min_w_0().flex().items_center().gap_2();
             if let Some(icon) = tab.icon {
-                label = label.child(icon.render(14.));
+                label = label.child(icon.render(14.).flex_shrink_0());
             }
-            label = label.child(div().min_w_0().text_ellipsis().child(tab.label));
+            label = label.child(div().min_w_0().truncate().child(tab.label));
             if tab.modified {
                 label = label.child(
                     div()
@@ -169,14 +189,16 @@ impl ClosableTabs {
             let mut item = div()
                 .id(("glass-closable-tab", tab.id))
                 .h(px(40.))
-                .min_w(px(128.))
-                .max_w(px(240.))
+                // 不再固定宽度：标签多时按比例压缩，标签少时最多 240px。
+                .min_w(px(MIN_TAB_WIDTH))
+                .max_w(px(MAX_TAB_WIDTH))
                 .px(px(12.))
-                .flex_shrink_0()
+                .flex_shrink_1()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_2()
+                .overflow_hidden()
                 .rounded_t(px(10.))
                 .when(active, |item| {
                     item.bg(if dark {
@@ -213,6 +235,17 @@ impl ClosableTabs {
             if let Some(handler) = select {
                 let id = tab.id;
                 item = item.on_click(move |_, window, cx| handler(id, window, cx));
+            }
+
+            if let Some(handler) = self.on_context.clone() {
+                let id = tab.id;
+                item = item.on_mouse_down(
+                    MouseButton::Right,
+                    move |event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        handler(id, event.position, window, cx);
+                    },
+                );
             }
 
             let id = tab.id;

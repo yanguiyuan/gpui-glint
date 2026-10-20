@@ -214,12 +214,14 @@ impl AppLayout {
         let content = div()
             .flex_1()
             .h_full()
+            .min_w_0()
             .overflow_hidden()
             .child(self.content);
 
         let workspace = div()
             .flex_1()
             .h_full()
+            .min_w_0()
             .flex()
             .overflow_hidden()
             .rounded_tl(px(16.))

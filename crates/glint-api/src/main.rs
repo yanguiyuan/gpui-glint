@@ -78,6 +78,15 @@ enum GroupEdit {
     Create(String),
     Rename(String),
 }
+/// 标签页右键菜单的批量关闭方式。
+enum TabCloseMode {
+    /// 只保留被点击的标签
+    Others,
+    /// 保留被点击标签及其右侧标签
+    Left,
+    /// 保留被点击标签及其左侧标签
+    Right,
+}
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TraceEntry {
     elapsed_ms: u128,
@@ -139,6 +148,8 @@ struct Workbench {
     request_name_error: Option<String>,
     active: usize,
     tabs: Vec<usize>,
+    /// 标签页右键菜单：(请求下标, 鼠标位置)
+    tab_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     config: usize,
     plugin_catalog: Vec<gpui_glint::plugins::Plugin>,
     disabled_plugins: HashSet<String>,
@@ -744,6 +755,7 @@ impl Workbench {
             request_name_error: None,
             active: 0,
             tabs,
+            tab_menu: None,
             config: 0,
             plugin_catalog,
             disabled_plugins,
@@ -1379,6 +1391,7 @@ impl Workbench {
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
         self.history_delete = None;
         self.version_tag_edit = None;
+        self.tab_menu = None;
         self.directory_settings = None;
         self.tree_delete = None;
         self.show_proxies = false;
@@ -4469,6 +4482,7 @@ impl Workbench {
             .is_none_or(|r| r.draft != draft);
         let select_owner = cx.entity();
         let close_owner = select_owner.clone();
+        let context_owner = select_owner.clone();
         let add_owner = select_owner.clone();
         let tabs = ClosableTabs::new(self.tabs.iter().map(|&i| {
             let r = &self.requests[i];
@@ -4497,6 +4511,15 @@ impl Workbench {
                     }
                     cx.notify();
                 }
+            });
+        })
+        .on_context(move |id, position, window, app| {
+            context_owner.update(app, |this, cx| {
+                this.tab_menu = Some((id as usize, position));
+                this.show_collection_menu = false;
+                this.tree_menu = None;
+                window.focus(&this.focus, cx);
+                cx.notify();
             });
         })
         .on_add(move |window, app| {
@@ -4647,6 +4670,99 @@ impl Workbench {
                     .child(self.notice.clone()),
             );
         tabs.content(self.active as u64, content).render()
+    }
+    /// 按方向批量关闭标签页，被点击的标签始终保留；若当前标签被关闭则切到被点击的标签。
+    fn close_tabs_around(&mut self, keep: usize, mode: TabCloseMode, cx: &mut Context<Self>) {
+        self.tab_menu = None;
+        let Some(position) = self.tabs.iter().position(|&i| i == keep) else {
+            cx.notify();
+            return;
+        };
+        let before = self.tabs.len();
+        self.tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| match mode {
+                TabCloseMode::Others => *index == position,
+                TabCloseMode::Left => *index >= position,
+                TabCloseMode::Right => *index <= position,
+            })
+            .map(|(_, &i)| i)
+            .collect();
+        let closed = before - self.tabs.len();
+        if closed == 0 {
+            cx.notify();
+            return;
+        }
+        if !self.tabs.contains(&self.active) {
+            self.choose(keep, cx);
+        }
+        self.notice = format!("已关闭 {closed} 个标签页");
+        cx.notify();
+    }
+    /// 标签页右键菜单。
+    fn tab_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (index, position) = self.tab_menu?;
+        let tab_position = self.tabs.iter().position(|&i| i == index)?;
+        let p = self.theme.palette();
+        let menu = div()
+            .id("request-tab-context-menu")
+            .w(px(200.))
+            .p_1()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.tab_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .child(
+                MenuItem::new("tab-close-others", "关闭其他标签页")
+                    .disabled(self.tabs.len() <= 1)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tab-close-others".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_tabs_around(index, TabCloseMode::Others, cx);
+                    })),
+            )
+            .child(
+                MenuItem::new("tab-close-left", "关闭左侧标签页")
+                    .disabled(tab_position == 0)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tab-close-left".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_tabs_around(index, TabCloseMode::Left, cx);
+                    })),
+            )
+            .child(
+                MenuItem::new("tab-close-right", "关闭右侧标签页")
+                    .disabled(tab_position + 1 == self.tabs.len())
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tab-close-right".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_tabs_around(index, TabCloseMode::Right, cx);
+                    })),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .with_priority(50)
+            .into_any_element(),
+        )
     }
     fn activity_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
@@ -5406,6 +5522,12 @@ impl Render for Workbench {
                     }
                     return;
                 }
+                if event.keystroke.key == "escape" && this.tab_menu.is_some() {
+                    this.tab_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.pair_delete.is_some() {
                     this.pair_delete = None;
                     this.sync_pair_tables(cx);
@@ -5464,6 +5586,7 @@ impl Render for Workbench {
             .child(shell)
             .child(self.toasts.clone())
             .children(overlay)
+            .children(self.tab_context_menu(cx))
             .children(self.registry_dialog(cx))
             .children(self.curl_import_dialog(cx))
             .children(self.workspace_dialog(cx))
