@@ -81,7 +81,7 @@ impl Workbench {
             .on_mouse_down(gpui::MouseButton::Left,|_,_,cx| cx.stop_propagation())
             .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("从 cURL 导入请求"))
             .child(div().text_color(rgb(p.text_muted)).child(format!("导入到 {destination}")))
-            .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("粘贴 Bash / POSIX 格式的 cURL 命令，支持多行、请求头、鉴权、Cookie 和正文。导入后可编辑，不会自动发送。"))
+            .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("粘贴 Bash / POSIX 格式的 cURL 命令，支持多行、请求头、鉴权、Cookie 和正文。不支持的参数会自动忽略。导入后可编辑，不会自动发送。"))
             .child(div().h(px(280.)).min_h_0().child(self.curl_input.clone()))
             .when_some(self.curl_error.clone(),|s,error| s.child(div().text_size(px(11.)).text_color(rgb(self.theme.color(0xd9342b))).child(error)))
             .child(div().flex().justify_end().gap_2()
@@ -112,6 +112,8 @@ mod tests {
     }
     #[gpui::test]
     fn import_menu_palette_and_response_export_preserve_snapshots(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_text_entry_keys);
+        cx.update(bind_code_card_keys);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspace.sqlite3");
         let (host, window) = cx.add_window_view(|_, cx| {
@@ -123,7 +125,7 @@ mod tests {
         assert!(window.debug_bounds("curl-import-dialog").is_some());
         host.update(window, |h, cx| {
             h.curl_input.update(cx, |e, cx| {
-                e.set_content("curl https://example.test --unsupported", cx)
+                e.set_content("curl https://example.test -X", cx)
             })
         });
         click(window, "submit-curl-import");
@@ -133,8 +135,13 @@ mod tests {
             assert!(h.requests.is_empty() && h.collections.is_empty());
         });
         let source = "curl 'https://example.test/v1?q=two%20words' -H 'Authorization: Bearer synthetic' --json '{\"name\":\"导入\"}'";
+        let pasted = format!("{source} --proxy http://127.0.0.1:7890 --location");
+        window.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(pasted.clone()));
+        });
+        window.simulate_keystrokes("ctrl-a ctrl-v");
         host.update(window, |h, cx| {
-            h.curl_input.update(cx, |e, cx| e.set_content(source, cx))
+            assert_eq!(h.curl_input.read(cx).content(), pasted);
         });
         click(window, "submit-curl-import");
         host.update(window, |h, cx| {

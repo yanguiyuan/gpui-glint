@@ -65,6 +65,10 @@ pub fn bind_code_card_keys(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, Some("GlassCodeCard")),
         KeyBinding::new("cmd-x", Cut, Some("GlassCodeCard")),
         KeyBinding::new("cmd-c", Copy, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-a", SelectAll, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-v", Paste, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-x", Cut, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-c", Copy, Some("GlassCodeCard")),
         KeyBinding::new("up", Up, Some("GlassCodeCard")),
         KeyBinding::new("down", Down, Some("GlassCodeCard")),
         KeyBinding::new("shift-up", SelectUp, Some("GlassCodeCard")),
@@ -74,6 +78,8 @@ pub fn bind_code_card_keys(cx: &mut App) {
         KeyBinding::new("tab", Indent, Some("GlassCodeCard")),
         KeyBinding::new("cmd-z", Undo, Some("GlassCodeCard")),
         KeyBinding::new("cmd-shift-z", Redo, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-z", Undo, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-shift-z", Redo, Some("GlassCodeCard")),
         KeyBinding::new("cmd-enter", Continue, Some("GlassCodeCard")),
         KeyBinding::new("ctrl-enter", Continue, Some("GlassCodeCard")),
     ]);
@@ -3126,6 +3132,43 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn clipboard_shortcuts_support_cmd_and_ctrl(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_code_card_keys);
+        let source = "curl https://example.test \\\r\n  --data '中文'";
+        let normalized = source.replace("\r\n", "\n");
+        for modifier in ["cmd", "ctrl"] {
+            let (editor, window) =
+                cx.add_window_view(|_, cx| CodeCard::new(cx, "bash", "original"));
+            window.update(|window, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(source.into()));
+                window.focus(&editor.read(cx).focus_handle(cx), cx);
+            });
+            window.simulate_keystrokes(&format!("{modifier}-a {modifier}-v"));
+            editor.update(window, |editor, _| assert_eq!(editor.content(), normalized));
+            window.simulate_keystrokes(&format!("{modifier}-z"));
+            editor.update(window, |editor, _| assert_eq!(editor.content(), "original"));
+            window.simulate_keystrokes(&format!("{modifier}-shift-z"));
+            editor.update(window, |editor, _| assert_eq!(editor.content(), normalized));
+            window.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".into()));
+            });
+            window.simulate_keystrokes(&format!("{modifier}-a {modifier}-c"));
+            assert_eq!(
+                window.read_from_clipboard().unwrap().text().unwrap(),
+                normalized
+            );
+            window.simulate_keystrokes(&format!("{modifier}-x"));
+            editor.update(window, |editor, _| assert_eq!(editor.content(), ""));
+            assert_eq!(
+                window.read_from_clipboard().unwrap().text().unwrap(),
+                normalized
+            );
+            window.simulate_keystrokes(&format!("{modifier}-v"));
+            editor.update(window, |editor, _| assert_eq!(editor.content(), normalized));
+        }
+    }
 
     #[gpui::test]
     fn double_click_selects_and_copies_words_in_editable_and_readonly_cards(

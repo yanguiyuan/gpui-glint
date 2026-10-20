@@ -1,6 +1,46 @@
 //! Parse cURL as data. Never invoke a shell or read referenced files.
 use super::model::{BodyFormat, Draft, Pair};
 use base64::Engine;
+use std::collections::VecDeque;
+
+// cURL options with an argument, including options the workbench does not import.
+// Keep their values out of URL detection (a proxy or DoH server can itself be a URL).
+fn option_takes_value(flag: &str) -> bool {
+    const OPTIONS: &str = "
+        -E -K -C -b -c -d -D -F -P -H -h -m -o -x -U -Q -r -e -X -Y -y -t -z -T -u -A -w
+        --abstract-unix-socket --alt-svc --aws-sigv4 --cacert --capath --cert --cert-type
+        --ciphers --config --connect-timeout --connect-to --continue-at --cookie --cookie-jar
+        --create-file-mode --crlfile --curves --data --data-ascii --data-binary --data-raw
+        --data-urlencode --delegation --dns-interface --dns-ipv4-addr --dns-ipv6-addr
+        --dns-servers --doh-url --dump-header --ech --egd-file --engine --etag-compare
+        --etag-save --expect100-timeout --form --form-string --ftp-account
+        --ftp-alternative-to-user --ftp-method --ftp-port --ftp-ssl-ccc-mode
+        --happy-eyeballs-timeout-ms --haproxy-clientip --header --help --hostpubmd5
+        --hostpubsha256 --hsts --interface --ip-tos --ipfs-gateway --json --keepalive-cnt
+        --keepalive-time --key --key-type --krb --libcurl --limit-rate --local-port
+        --login-options --mail-auth --mail-from --mail-rcpt --max-filesize --max-redirs
+        --max-time --netrc-file --noproxy --oauth2-bearer --output --output-dir
+        --parallel-max --pass --pinnedpubkey --preproxy --proto --proto-default --proto-redir
+        --proxy --proxy-cacert --proxy-capath --proxy-cert --proxy-cert-type --proxy-ciphers
+        --proxy-crlfile --proxy-header --proxy-key --proxy-key-type --proxy-pass
+        --proxy-pinnedpubkey --proxy-service-name --proxy-tls13-ciphers --proxy-tlsauthtype
+        --proxy-tlspassword --proxy-tlsuser --proxy-user --proxy1.0 --pubkey --quote
+        --random-file --range --rate --referer --request --request-target --resolve --retry
+        --retry-delay --retry-max-time --sasl-authzid --service-name --socks4 --socks4a
+        --socks5 --socks5-gssapi-service --socks5-hostname --speed-limit --speed-time
+        --ssl-sessions --stderr --telnet-option --tftp-blksize --time-cond --tls-max
+        --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii
+        --trace-config --unix-socket --upload-file --upload-flags --url --url-query
+        --user --user-agent --variable --vlan-priority --write-out
+    ";
+    OPTIONS
+        .split_ascii_whitespace()
+        .any(|option| option == flag)
+}
+
+fn is_request_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://") || value.starts_with("{{")
+}
 
 pub fn quote(value: &str) -> Result<String, String> {
     if value.contains('\0') {
@@ -93,6 +133,7 @@ pub fn parse(source: &str) -> Result<Draft, String> {
     if !matches!(args.first().map(String::as_str), Some("curl" | "curl.exe")) {
         return Err("请粘贴以 curl 开头的命令".into());
     }
+    let mut args: VecDeque<_> = args.into_iter().skip(1).collect();
     let mut draft = Draft::default();
     let mut url = None;
     let mut method = None;
@@ -104,16 +145,13 @@ pub fn parse(source: &str) -> Result<Draft, String> {
     let mut head = false;
     let mut json = false;
     let mut end = false;
-    let mut i = 1;
-    while i < args.len() {
-        let arg = &args[i];
-        i += 1;
+    while let Some(arg) = args.pop_front() {
         if !end && arg == "--" {
             end = true;
             continue;
         }
         if end || !arg.starts_with('-') {
-            if url.replace(arg.clone()).is_some() {
+            if url.replace(arg).is_some() {
                 return Err("一次只能导入一个请求 URL，不能包含其他命令".into());
             }
             continue;
@@ -121,13 +159,26 @@ pub fn parse(source: &str) -> Result<Draft, String> {
         let (flag, attached) = if arg.starts_with("--") {
             arg.split_once('=')
                 .map_or((arg.as_str(), None), |(a, b)| (a, Some(b.to_owned())))
-        } else if arg.len() > 2
-            && matches!(
-                arg.get(..2).unwrap_or(""),
-                "-X" | "-H" | "-d" | "-b" | "-u" | "-A" | "-e"
-            )
-        {
-            (&arg[..2], Some(arg[2..].to_owned()))
+        } else if arg.len() > 2 && arg.as_bytes()[1].is_ascii() {
+            let flag = &arg[..2];
+            if option_takes_value(flag) {
+                (flag, Some(arg[2..].to_owned()))
+            } else {
+                // Expand grouped switches without changing an attached option value.
+                let mut switches = Vec::new();
+                for (offset, ch) in arg[2..].char_indices() {
+                    let next = format!("-{ch}");
+                    if option_takes_value(&next) {
+                        switches.push(format!("-{}", &arg[2 + offset..]));
+                        break;
+                    }
+                    switches.push(next);
+                }
+                for switch in switches.into_iter().rev() {
+                    args.push_front(switch);
+                }
+                (flag, None)
+            }
         } else {
             (arg.as_str(), None)
         };
@@ -153,19 +204,46 @@ pub fn parse(source: &str) -> Result<Draft, String> {
                 | "--user-agent"
                 | "-e"
                 | "--referer"
-                | "--noproxy"
         );
+        let supported_switch = matches!(
+            flag,
+            "-G" | "--get"
+                | "-I"
+                | "--head"
+                | "-k"
+                | "--insecure"
+                | "--compressed"
+                | "-s"
+                | "--silent"
+                | "-S"
+                | "--show-error"
+                | "-v"
+                | "--verbose"
+                | "-i"
+                | "--include"
+                | "--globoff"
+                | "-g"
+        );
+        if !needs_value && !supported_switch {
+            if attached.is_none()
+                && args.front().is_some_and(|value| {
+                    // Unknown future options may also have a separate argument.
+                    // Preserve a bare request URL when the option's arity is unknown.
+                    let looks_like_value = !value.starts_with('-')
+                        && !is_request_url(value)
+                        && !matches!(value.as_str(), ";" | "|" | "||" | "&" | "&&");
+                    (option_takes_value(flag) || looks_like_value)
+                        && (!value.starts_with('-') || value.parse::<f64>().is_ok())
+                })
+            {
+                args.pop_front();
+            }
+            continue;
+        }
         let value = if needs_value {
             match attached {
                 Some(value) => value,
-                None => {
-                    let value = args
-                        .get(i)
-                        .ok_or_else(|| format!("{flag} 缺少参数"))?
-                        .clone();
-                    i += 1;
-                    value
-                }
+                None => args.pop_front().ok_or_else(|| format!("{flag} 缺少参数"))?,
             }
         } else {
             if attached.is_some() {
@@ -232,18 +310,11 @@ pub fn parse(source: &str) -> Result<Draft, String> {
             "-k" | "--insecure" => draft.skip_tls_verification = true,
             "--compressed" | "-s" | "--silent" | "-S" | "--show-error" | "-v" | "--verbose"
             | "-i" | "--include" | "--globoff" | "-g" => {}
-            "--noproxy" if value == "*" => {}
-            "-F" | "--form" | "--form-string" => {
-                return Err("暂不支持 multipart/form-data，请使用表单或原始请求体".into());
-            }
-            "-L" | "--location" => {
-                return Err("当前应用不会自动跟随重定向，请移除 --location / -L 后导入".into());
-            }
-            _ => return Err(format!("暂不支持 cURL 参数 {flag}，请移除后重试")),
+            _ => unreachable!("unsupported options are filtered above"),
         }
     }
     let mut url = url.ok_or("命令中缺少请求 URL")?;
-    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("{{") {
+    if !is_request_url(&url) {
         return Err("URL 需使用 http://、https:// 或 {{环境变量}}".into());
     }
     draft.method = method.unwrap_or_else(|| {
@@ -389,6 +460,59 @@ mod tests {
         );
     }
     #[test]
+    fn filters_unsupported_options_without_changing_request_fields() {
+        let source = "curl https://example.test/api -X POST -H 'X-Test: keep' -H 'Authorization: Bearer token' --json '{\"text\":\"你好\"}'";
+        let expected = parse(source).unwrap();
+        for options in [
+            "--proxy http://127.0.0.1:7890",
+            "--proxy=http://127.0.0.1:7890",
+            "-x http://127.0.0.1:7890",
+            "-xhttp://127.0.0.1:7890",
+            "--proxy-user 'user:pass' --noproxy '*'",
+            "--doh-url https://dns.example.test/query",
+            "--location --http2 --ipv4 --no-progress-meter",
+            "-sSL --retry 3 --max-time 10 --max-redirs -1",
+            "-o result.json --output-dir 'some folder' -w '%{http_code}'",
+            "--cacert cert.pem --cert client.pem --key key.pem",
+            "--config @config --upload-file @body --form file=@/secret",
+            "--future-option=value --future-option 'separate value'",
+        ] {
+            let suffix = parse(&format!("{source} {options}")).unwrap();
+            let prefix = parse(&format!("curl {options} {}", &source[5..])).unwrap();
+            assert_eq!(suffix, expected, "{options}");
+            assert_eq!(prefix, expected, "{options}");
+        }
+    }
+    #[test]
+    fn ignored_switches_preserve_url_and_supported_grouped_options() {
+        let expected = parse("curl https://example.test -k -X POST -d 'a=1'").unwrap();
+        assert_eq!(
+            parse("curl -sSLkXPOST https://example.test -d 'a=1'").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse("curl --location --proxy --header 'X-Test: keep' https://example.test").unwrap(),
+            parse("curl --header 'X-Test: keep' https://example.test").unwrap()
+        );
+        for source in [
+            "curl --location https://example.test",
+            "curl --http2 https://example.test --proxy",
+            "curl --unknown --url https://example.test",
+            "curl --unknown https://example.test",
+            "curl --unknown=value -- https://example.test",
+            "curl -中文 https://example.test",
+        ] {
+            assert_eq!(
+                parse(source).unwrap().url,
+                "https://example.test",
+                "{source}"
+            );
+        }
+        assert!(parse("curl --proxy http://127.0.0.1:7890").is_err());
+        assert!(parse("curl --location https://a.test https://b.test").is_err());
+        assert!(parse("curl https://a.test -- --proxy ignored").is_err());
+    }
+    #[test]
     fn export_round_trip_preserves_resolved_signed_request_and_shell_literals() {
         let mut environment = EnvironmentVariables::default();
         environment
@@ -433,7 +557,7 @@ mod tests {
         assert!(quote("nul\0").is_err());
     }
     #[test]
-    fn malformed_or_unsupported_commands_fail_without_execution_or_file_reads() {
+    fn malformed_commands_fail_without_execution_or_file_reads() {
         for source in [
             "",
             "echo hi",
@@ -441,13 +565,10 @@ mod tests {
             "curl 'unclosed",
             "curl https://a.test https://b.test",
             "curl https://a.test -X",
-            "curl https://a.test -F file=@/secret",
             "curl https://a.test --data @/secret",
             "curl https://a.test --data-urlencode name@/secret",
             "curl https://a.test -b /secret",
-            "curl https://a.test -L",
             "curl https://a.test -X GET -d value",
-            "curl https://a.test -中文",
             "curl file:///secret",
             "curl https://a.test ; touch /file",
         ] {
