@@ -10,12 +10,12 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, InteractiveElement,
-    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, ScrollHandle, ShapedLine, SharedString,
-    StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, px, rgb, rgba, size,
+    App, Bounds, ColorExt, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, ShapedLine,
+    SharedString, StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, px, rgb, rgba, size,
 };
 
 actions!(
@@ -1052,7 +1052,21 @@ impl CodeCard {
                 extend: event.modifiers.shift,
             });
         }
-        if event.modifiers.shift {
+        if event.click_count >= 2 {
+            // Limit word boundaries to this source line, including clicks past its end.
+            let start = self.content[..offset]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let end = self.content[offset..]
+                .find('\n')
+                .map_or(self.content.len(), |index| offset + index);
+            let range = super::text_entry::word_range_at(&self.content[start..end], offset - start);
+            self.selected_range = start + range.start..start + range.end;
+            self.selection_reversed = false;
+            self.is_selecting = false;
+            self.reveal_cursor = true;
+            cx.notify();
+        } else if event.modifiers.shift {
             self.select_to(offset, cx);
         } else {
             self.move_to(offset, cx);
@@ -2802,6 +2816,8 @@ impl Render for CodeCard {
             .flex_col();
         for (index, (start, line)) in shaped.iter().cloned().enumerate() {
             let current = focused
+                && self.selected_range.is_empty()
+                && self.document_selection.is_none()
                 && self.cursor_offset() >= start
                 && self.cursor_offset() <= start + line.len();
             let background = if self.prose {
@@ -2815,6 +2831,9 @@ impl Render for CodeCard {
             } else {
                 colors.surface
             };
+            // Keep the caret row subtler than a text selection in both themes.
+            let background =
+                rgb(background).opacity(if current && !self.prose { 0.35 } else { 1. });
             gutter = gutter.child(
                 div()
                     .h(px(LINE_HEIGHT))
@@ -2822,7 +2841,7 @@ impl Render for CodeCard {
                     .text_right()
                     .border_r_1()
                     .border_color(rgb(colors.border))
-                    .bg(rgb(background))
+                    .bg(background)
                     .child((index + 1).to_string()),
             );
             let mut row = div()
@@ -2831,7 +2850,7 @@ impl Render for CodeCard {
                 .pl(px(if rich_mode { 0. } else { 8. }))
                 .pr(px(if rich_mode { 0. } else { 18. }));
             if !rich_mode {
-                row = row.bg(rgb(background));
+                row = row.bg(background);
             }
             lines = lines.child(
                 row.child(CodeLine {
@@ -3107,6 +3126,93 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn double_click_selects_and_copies_words_in_editable_and_readonly_cards(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_code_card_keys);
+        let source =
+            "{\n  \"chat_id_list\": [\"chat_example_001\"],\n  \"label\": \"中文 👨‍👩‍👧‍👦\"\n}\n\n";
+        for (readonly, viewport) in [(false, false), (true, false), (true, true)] {
+            let (editor, window) = cx.add_window_view(|_, cx| {
+                let editor = CodeCard::new(cx, "json", source).read_only(readonly);
+                if viewport { editor.viewport() } else { editor }
+            });
+            let position_at = |offset, window: &mut gpui::VisualTestContext| {
+                editor.update(window, |editor, _| {
+                    let (start, line, bounds) = editor
+                        .last_lines
+                        .iter()
+                        .find(|(start, line, _)| *start <= offset && offset <= start + line.len())
+                        .unwrap();
+                    point(
+                        bounds.left() + line.x_for_index(offset - start),
+                        bounds.center().y,
+                    )
+                })
+            };
+            for (offset, expected) in [
+                (source.find("chat_id_list").unwrap() + 4, "chat_id_list"),
+                (
+                    source.find("chat_example_001").unwrap() + 6,
+                    "chat_example_001",
+                ),
+                (source.find("中文").unwrap(), "中"),
+                (source.find("👨").unwrap(), "👨‍👩‍👧‍👦"),
+                (source.find('"').unwrap(), "\""),
+                (3, "  "),
+                (1, "{"), // Clicking at a line's end must not select the newline.
+                (source.len(), ""),
+            ] {
+                let position = position_at(offset, window);
+                window.simulate_event(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    ..Default::default()
+                });
+                // Small pointer motion before release must preserve the whole word.
+                window.simulate_mouse_move(position, MouseButton::Left, gpui::Modifiers::default());
+                window.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+                editor.update(window, |editor, _| {
+                    assert_eq!(&editor.content[editor.selected_range.clone()], expected);
+                    assert!(!editor.selection_reversed);
+                    assert_eq!(editor.content(), source);
+                    assert!(editor.history.is_empty());
+                });
+                if !expected.is_empty() {
+                    window.simulate_keystrokes("cmd-c");
+                    assert_eq!(
+                        window.read_from_clipboard().unwrap().text().unwrap(),
+                        expected
+                    );
+                }
+            }
+
+            let offset = source.find("chat_id_list").unwrap();
+            let from = position_at(offset + 1, window);
+            let to = position_at(offset + 5, window);
+            window.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+            window.simulate_mouse_move(to, MouseButton::Left, gpui::Modifiers::default());
+            window.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+            editor.update(window, |editor, _| {
+                assert_eq!(editor.selected_range, offset + 1..offset + 5);
+            });
+            let to = position_at(offset + 7, window);
+            window.simulate_click(
+                to,
+                gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+            editor.update(window, |editor, _| {
+                assert_eq!(editor.selected_range, offset + 1..offset + 7);
+            });
+        }
+    }
+
     #[gpui::test]
     fn template_completion_in_json_preserves_suffix_and_undo(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| bind_code_card_keys(cx));

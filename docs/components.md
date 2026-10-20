@@ -154,7 +154,7 @@ let headerless = cx.new(|cx| {
 
 代码卡和 Diff 卡的语言栏自动使用内置单色 SVG 图标，支持 Markdown、Rust、Go、JavaScript / TypeScript、Python、Java、C / C++、HTML / CSS、JSON、Shell、SQL、YAML，兼容 `md`、`rs`、`js`、`tsx` 等常用别名。图标继承文字颜色，随主题变化；未知语言回退到通用代码图标。也可通过 `Icon::for_language("md")` 获取图标，或直接使用 `Icon::Markdown` 等枚举。
 
-代码卡同时支持原生输入法、选区、剪贴板、缩进，以及局部撤销和重做。订阅 `CodeCardEvent::Changed` 接入文档历史，订阅 `CodeCardEvent::ContinueAfter` 处理 ⌘ / Ctrl + Enter。通过 `set_language` / `set_dark` 修改语言或代码配色时保留编辑器状态；使用 `.theme(theme)` 初始化主题，`set_theme(theme, cx)` 在运行时同步亮暗配色。`.dark(true)` 可显式启用深色代码配色。该组件负责源码卡片，不包含 Mermaid 渲染或 Front Matter 预览。
+代码卡同时支持原生输入法、选区、剪贴板、缩进，以及局部撤销和重做。双击按 Unicode 单词边界选中文本（如 `chat_example_001`），也可选中标点或连续空白；选区不跨源码行，可编辑和只读模式均支持。订阅 `CodeCardEvent::Changed` 接入文档历史，订阅 `CodeCardEvent::ContinueAfter` 处理 ⌘ / Ctrl + Enter。通过 `set_language` / `set_dark` 修改语言或代码配色时保留编辑器状态；使用 `.theme(theme)` 初始化主题，`set_theme(theme, cx)` 在运行时同步亮暗配色。`.dark(true)` 可显式启用深色代码配色。该组件负责源码卡片，不包含 Mermaid 渲染或 Front Matter 预览。
 
 ## 数据表格
 

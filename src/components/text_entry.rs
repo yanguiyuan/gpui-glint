@@ -1077,7 +1077,7 @@ impl Focusable for TextEntry {
 
 /// Unicode word boundaries keep selection inside UTF-8 characters, including
 /// punctuation and whitespace when those are double-clicked.
-fn word_range_at(text: &str, offset: usize) -> Range<usize> {
+pub(super) fn word_range_at(text: &str, offset: usize) -> Range<usize> {
     let offset = offset.min(text.len());
     text.split_word_bound_indices()
         .find_map(|(start, segment)| {

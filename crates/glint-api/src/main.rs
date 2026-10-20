@@ -756,7 +756,7 @@ impl Workbench {
             request_preview,
             trace_started: None,
             activity: 0,
-            show_activity: true,
+            show_activity: false,
             show_environments: false,
             show_plugins: false,
             plugin_manager_tab: 0,
