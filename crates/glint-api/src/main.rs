@@ -51,7 +51,7 @@ use gpui_glint::{
         CommandItem, CommandPalette, CommandPaletteEvent, DataTable, Dialog, DropdownMenu,
         GlintAssets, Icon, IconButton, MenuItem, Popover, SearchInput, SegmentOption,
         SegmentedControl, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption,
-        Separator, Switch, TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
+        Switch, TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
         TextReferenceResolver, Toast, ToastHost, ToastKind, TreeDrop, TreeListItem,
         bind_code_card_keys, bind_text_entry_keys,
     },
@@ -120,6 +120,8 @@ struct Workbench {
     current_directory: String,
     sidebar_width: f32,
     sidebar_resize_start: Option<(gpui::Pixels, f32)>,
+    request_config_height: Option<f32>,
+    request_resize_start: Option<(gpui::Pixels, f32)>,
     collapsed_directories: HashSet<(usize, String)>,
     hovered_tree_row: Option<String>,
     tree_drop: Option<(model::TreeNode, model::Placement)>,
@@ -713,6 +715,8 @@ impl Workbench {
             current_directory: String::new(),
             sidebar_width: 220.,
             sidebar_resize_start: None,
+            request_config_height: None,
+            request_resize_start: None,
             collapsed_directories: HashSet::new(),
             hovered_tree_row: None,
             tree_drop: None,
@@ -3912,6 +3916,21 @@ impl Workbench {
             )
         }
     }
+    fn default_configuration_height(&self, cx: &Context<Self>) -> f32 {
+        if self.config == 1
+            && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")
+        {
+            384.
+        } else if matches!(self.config, 5 | 6) {
+            360.
+        } else {
+            218.
+        }
+    }
+    fn configuration_height(&self, cx: &Context<Self>) -> f32 {
+        self.request_config_height
+            .unwrap_or_else(|| self.default_configuration_height(cx))
+    }
     fn configuration(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
         let owner = cx.entity().downgrade();
@@ -3968,17 +3987,7 @@ impl Workbench {
         div()
             .id("configuration")
             .debug_selector(|| "request-config-scroll".into())
-            .h(px(
-                if self.config == 1
-                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")
-                {
-                    384.
-                } else if matches!(self.config, 5 | 6) {
-                    360.
-                } else {
-                    218.
-                },
-            ))
+            .h(px(self.configuration_height(cx)))
             .flex_shrink_0()
             .when(
                 self.config == 1
@@ -4568,7 +4577,31 @@ impl Workbench {
             .child(top)
             .child(config_tabs)
             .child(self.configuration(cx))
-            .child(Separator::horizontal().theme(self.theme).render())
+            .child(
+                div()
+                    .id("request-response-resize-handle")
+                    .debug_selector(|| "request-response-resize-handle".into())
+                    .w_full()
+                    .h(px(8.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .cursor(gpui::CursorStyle::ResizeUpDown)
+                    .hover(move |style| style.bg(rgb(p.surface_subtle)))
+                    .child(div().w_full().h(px(1.)).bg(rgb(p.border)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.request_resize_start = Some((
+                                event.position.y,
+                                this.request_config_height
+                                    .unwrap_or_else(|| this.default_configuration_height(cx)),
+                            ));
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(self.response_panel(cx))
             .child(
                 div()
@@ -5151,6 +5184,8 @@ impl Render for Workbench {
             .child(content);
         let maximum_sidebar_width =
             (f32::from(window.viewport_size().width) - 46. - 640.).clamp(180., 480.);
+        let maximum_request_config_height =
+            (f32::from(window.viewport_size().height) - 360.).max(110.);
         self.sidebar_width = self.sidebar_width.clamp(180., maximum_sidebar_width);
         let resize_accent = self.theme.palette().accent;
         let resize_handle = div()
@@ -5193,6 +5228,17 @@ impl Render for Workbench {
                         }
                         cx.stop_propagation();
                         cx.notify();
+                    } else if let Some((start, height)) = this.request_resize_start {
+                        if event.dragging() {
+                            this.request_config_height = Some(
+                                (height + f32::from(event.position.y - start))
+                                    .clamp(110., maximum_request_config_height),
+                            );
+                        } else {
+                            this.request_resize_start = None;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
                     }
                 }),
             )
@@ -5202,12 +5248,18 @@ impl Render for Workbench {
                     if this.sidebar_resize_start.take().is_some() {
                         cx.notify();
                     }
+                    if this.request_resize_start.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_up_out(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.sidebar_resize_start.take().is_some() {
+                        cx.notify();
+                    }
+                    if this.request_resize_start.take().is_some() {
                         cx.notify();
                     }
                 }),
