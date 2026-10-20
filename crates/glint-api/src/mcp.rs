@@ -419,12 +419,14 @@ fn connect(path: &Path) -> Result<(TcpStream, BufReader<TcpStream>), String> {
     Ok((stream, reader))
 }
 pub fn proxy() -> Result<(), String> {
+    super::updater::ensure_not_installing()?;
     let path = discovery_path()?;
     proxy_io(std::io::stdin().lock(), std::io::stdout().lock(), || {
         connect_or_start(&path)
     })
 }
 fn connect_or_start(path: &Path) -> Result<(TcpStream, BufReader<TcpStream>), String> {
+    super::updater::ensure_not_installing()?;
     match connect(path) {
         Ok(connection) => return Ok(connection),
         Err(error) if std::env::var_os("GLINT_API_MCP_NO_AUTOSTART").is_some() => {
@@ -452,6 +454,7 @@ fn connect_or_start(path: &Path) -> Result<(TcpStream, BufReader<TcpStream>), St
     }
     let mut command =
         std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    super::updater::ensure_not_installing()?;
     command
         .arg("--mcp-host")
         .stdin(std::process::Stdio::null())

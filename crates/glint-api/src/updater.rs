@@ -538,6 +538,39 @@ pub struct UpdateReport {
     pub message: String,
 }
 
+#[cfg(any(windows, test))]
+fn installation_guard(path: &Path, shared: bool) -> Result<Option<File>, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let result = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    match result {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Also checked by MCP proxies, which bypass the GUI's single-instance lock.
+pub fn ensure_not_installing() -> Result<(), String> {
+    #[cfg(windows)]
+    if installation_guard(&cache_directory()?.join("installation.lock"), true)?.is_none() {
+        return Err("Glint API 正在安装更新，请稍后重新连接或打开应用".into());
+    }
+    Ok(())
+}
+
 pub fn launch_installer(update: &Update, installer: &Path) -> Result<(), String> {
     if !can_install() {
         return Err("自动安装仅支持通过 setup 安装的 Windows x64 发布版".into());
@@ -559,12 +592,68 @@ pub fn launch_installer(update: &Update, installer: &Path) -> Result<(), String>
     let path = directory.join("job.json");
     fs::write(&path, serde_json::to_vec(&job).unwrap())
         .map_err(|error| format!("无法准备更新任务：{error}"))?;
-    std::process::Command::new(helper)
+    let ready = path.with_extension("ready");
+    let _ = fs::remove_file(&ready);
+    let mut child = std::process::Command::new(helper)
         .arg("--apply-update")
-        .arg(path)
+        .arg(&path)
         .spawn()
         .map_err(|error| format!("无法启动更新助手：{error}"))?;
+    // Do not close the GUI until the helper has blocked MCP/GUI autostart.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if ready.is_file() {
+            return Ok(());
+        }
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("更新助手未能准备安装，请重试；应用尚未退出".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("更新助手准备超时，请重试；应用尚未退出".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(windows)]
+fn close_installed_auxiliaries(executable: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let script = include_str!("../packaging/windows/close-update-processes.ps1");
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("GLINT_API_UPDATE_EXECUTABLE", executable)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|error| format!("无法检查更新占用进程：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法关闭占用安装文件的辅助进程：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn installer_failure(code: Option<i32>, log: &Path) -> String {
+    let reason = match code {
+        Some(5) => "安装过程中止，程序文件可能仍被占用".to_owned(),
+        Some(code) => format!("安装失败（退出码 {code}）"),
+        None => "安装程序异常退出".to_owned(),
+    };
+    format!("{reason}；安装日志：{}", log.display())
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -638,12 +727,19 @@ pub fn run_helper(path: &Path) -> Result<(), String> {
         let bytes = fs::read(path).map_err(|error| error.to_string())?;
         let job: UpdateJob = serde_json::from_slice(&bytes).map_err(|_| "更新任务格式无效")?;
         let version = Version::parse(&job.version).map_err(|_| "更新版本无效")?;
+        let installation =
+            installation_guard(&cache_directory()?.join("installation.lock"), false)?
+                .ok_or("另一个更新助手正在安装，请稍后重试")?;
+        fs::write(path.with_extension("ready"), b"ready")
+            .map_err(|error| format!("无法确认更新助手已就绪：{error}"))?;
         let parent = wait_for_parent(job.parent_pid);
         let parent_exited = parent.is_ok();
         let result = (|| {
             parent?;
             verify_file(&job)?;
+            close_installed_auxiliaries(&job.executable)?;
             let directory = job.executable.parent().ok_or("安装路径无效")?;
+            let log = path.with_extension("install.log");
             let exit = std::process::Command::new(&job.installer)
                 .args([
                     "/VERYSILENT",
@@ -652,11 +748,12 @@ pub fn run_helper(path: &Path) -> Result<(), String> {
                     "/SP-",
                     "/CLOSEAPPLICATIONS",
                 ])
+                .arg(format!("/LOG={}", log.display()))
                 .arg(format!("/DIR={}", directory.display()))
                 .status()
                 .map_err(|error| format!("无法启动安装包：{error}"))?;
             if !matches!(exit.code(), Some(0 | 3010)) {
-                return Err(format!("安装失败（退出码 {:?}）", exit.code()));
+                return Err(installer_failure(exit.code(), &log));
             }
             Ok(())
         })();
@@ -671,6 +768,7 @@ pub fn run_helper(path: &Path) -> Result<(), String> {
         };
         let reported = fs::write(&job.report, serde_json::to_vec(&report).unwrap())
             .map_err(|error| format!("无法保存更新结果：{error}"));
+        drop(installation);
         if job.relaunch && parent_exited {
             std::process::Command::new(&job.executable)
                 .spawn()
@@ -699,6 +797,31 @@ pub fn take_report() -> Option<UpdateReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_lock_blocks_concurrent_updates_and_releases_after_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("installation.lock");
+        let guard = installation_guard(&path, false).unwrap().unwrap();
+        assert!(installation_guard(&path, false).unwrap().is_none());
+        assert!(installation_guard(&path, true).unwrap().is_none());
+        drop(guard);
+        let startup = installation_guard(&path, true).unwrap().unwrap();
+        assert!(installation_guard(&path, true).unwrap().is_some());
+        assert!(installation_guard(&path, false).unwrap().is_none());
+        drop(startup);
+        assert!(installation_guard(&path, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn installer_errors_explain_abort_and_point_to_the_log() {
+        let log = Path::new("update.install.log");
+        let message = installer_failure(Some(5), log);
+        assert!(message.contains("中止"));
+        assert!(message.contains("update.install.log"));
+        assert!(!message.contains("Some("));
+        assert!(installer_failure(Some(7), log).contains("退出码 7"));
+    }
     fn release(version: &str) -> Release {
         let name = format!("Glint-API-{version}-windows-x64-setup.exe");
         Release {

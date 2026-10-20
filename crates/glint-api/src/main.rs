@@ -5672,6 +5672,9 @@ fn main() {
         }
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-worker")) {
+        if updater::ensure_not_installing().is_err() {
+            std::process::exit(1);
+        }
         if !plugins::worker() {
             std::process::exit(1);
         }
@@ -5731,6 +5734,10 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    if let Err(error) = updater::ensure_not_installing() {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
     let _instance_guard = match mcp::workbench_guard() {
         Ok(Some(guard)) => guard,

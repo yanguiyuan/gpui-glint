@@ -59,4 +59,65 @@ try {
     if (-not $parent.HasExited) { Stop-Process -Id $parent.Id -Force }
     Remove-Item $sentinel -ErrorAction SilentlyContinue
 }
-Write-Host 'Updater checksum rejection, parent-process wait and previous-version upgrade verified.'
+# Reinstall with two MCP proxies holding the installed executable open.
+function Start-IdleProxy([string]$Executable) {
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $Executable
+    $info.ArgumentList.Add('--mcp')
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    return [Diagnostics.Process]::Start($info)
+}
+$otherDir = Join-Path $directory 'other-installation'
+New-Item -ItemType Directory $otherDir | Out-Null
+$otherExe = Join-Path $otherDir 'glint-api.exe'
+Copy-Item $installed $otherExe
+$proxies = @(Start-IdleProxy $installed; Start-IdleProxy $installed)
+$otherProxy = Start-IdleProxy $otherExe
+$blockedProxy = $null
+$secondHelper = $null
+$secondParent = $null
+try {
+    Start-Sleep -Milliseconds 500
+    foreach ($proxy in @($proxies) + @($otherProxy)) {
+        if ($proxy.HasExited) { throw 'MCP regression fixture exited before update started.' }
+    }
+    Copy-Item $Installer $package -Force
+    Remove-Item ([IO.Path]::ChangeExtension($jobFile, 'ready')) -ErrorAction SilentlyContinue
+    $secondParent = Start-Process "$PSHOME\pwsh.exe" -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120' -PassThru
+    $job.parent_pid = $secondParent.Id
+    $job | ConvertTo-Json | Set-Content $jobFile -Encoding utf8NoBOM
+    $secondHelper = Start-Process $helper -ArgumentList '--apply-update', ('"' + $jobFile + '"') -PassThru
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not (Test-Path ([IO.Path]::ChangeExtension($jobFile, 'ready')))) {
+        if ((Get-Date) -gt $deadline -or $secondHelper.HasExited) { throw 'Updater did not acquire its startup guard.' }
+        Start-Sleep -Milliseconds 100
+    }
+    $blockedProxy = Start-IdleProxy $installed
+    if (-not $blockedProxy.WaitForExit(5000) -or $blockedProxy.ExitCode -eq 0) {
+        throw 'MCP proxy was allowed to start during installation.'
+    }
+    Stop-Process -Id $secondParent.Id -Force
+    if (-not $secondHelper.WaitForExit(180000)) { throw 'Update with active MCP proxies timed out.' }
+    if ($secondHelper.ExitCode -ne 0 -or -not (Get-Content $report -Raw | ConvertFrom-Json).success) {
+        throw "Update with active MCP proxies failed: $(Get-Content $report -Raw)"
+    }
+    foreach ($proxy in $proxies) {
+        if (-not $proxy.WaitForExit(5000)) { throw 'An installed MCP proxy still holds the executable.' }
+    }
+    if ($otherProxy.HasExited) { throw 'Updater terminated a proxy belonging to another installation.' }
+    if (-not (Test-Path ([IO.Path]::ChangeExtension($jobFile, 'install.log')))) {
+        throw 'Updater did not retain the installer log.'
+    }
+} finally {
+    foreach ($process in @($proxies) + @($otherProxy, $blockedProxy, $secondHelper, $secondParent)) {
+        if ($null -ne $process) {
+            if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(10000) }
+            $process.Dispose()
+        }
+    }
+}
+Write-Host 'Updater checksum rejection, parent wait, MCP cleanup, startup guard, installation isolation and installer logging verified.'
