@@ -1107,6 +1107,42 @@ mod selection_tests {
     use super::*;
     use gpui::AppContext;
     #[gpui::test]
+    fn table_search_highlights_editable_cells_and_clears_on_reset(cx: &mut gpui::TestAppContext) {
+        use super::super::{DataTable, TableCell, TableColumn, TableRow};
+        struct Table(Entity<DataTable>);
+        impl Render for Table {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(self.0.clone())
+            }
+        }
+        let entry = cx.new(|cx| TextEntry::new(cx, "", "中文 Host.TEST"));
+        let input = entry.clone();
+        let table = cx.new(|cx| {
+            DataTable::new(
+                cx,
+                [TableColumn::new("域名", 220.)],
+                [TableRow::new(
+                    "row",
+                    [
+                        TableCell::custom(move || div().h(px(32.)).child(input.clone()))
+                            .search_input(entry.clone(), cx),
+                    ],
+                )],
+            )
+            .document()
+            .max_height(200.)
+        });
+        let (_, window) = cx.add_window_view(|_, _| Table(table.clone()));
+        for query in ["HOST", "中文", ""] {
+            table.update(window, |table, cx| table.set_search_query(query, cx));
+            window.debug_bounds("data-table").unwrap();
+            entry.read_with(window, |entry, _| {
+                assert_eq!(entry.search_query.as_ref(), query);
+                assert_eq!(entry.value(), "中文 Host.TEST");
+            });
+        }
+    }
+    #[gpui::test]
     fn long_text_scrolls_with_caret_and_preserves_unicode_copy(cx: &mut gpui::TestAppContext) {
         cx.update(bind_text_entry_keys);
         struct Input(Entity<TextEntry>);

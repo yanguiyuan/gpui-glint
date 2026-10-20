@@ -57,6 +57,9 @@ impl Workbench {
         if self.registry_task.is_some() {
             return Err("插件操作完成后可切换工作区".into());
         }
+        if self.proxy_certificate_task.is_some() {
+            return Err("代理证书操作完成后可切换工作区".into());
+        }
         if self.directory_settings.is_some()
             || self.group_edit.is_some()
             || self.editing_request_name

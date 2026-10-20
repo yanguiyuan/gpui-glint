@@ -936,6 +936,7 @@ impl Workbench {
                                         .unwrap_or("")
                                         .into(),
                                     skip_tls_verification: flag(&args, "skip_tls_verification"),
+                                    listener: Default::default(),
                                 };
                                 proxy.validate()?;
                                 if self.has_unsaved_proxies(cx) {

@@ -615,6 +615,7 @@ impl Workbench {
                     format!("environment-{environment}-{id}"),
                     [name_cell, value_cell, type_cell, actions],
                 )
+                .focus_handle(row.name.read(cx).focus_handle(cx))
             })
             .collect::<Vec<_>>();
         self.variable_table.update(cx, |table, cx| {

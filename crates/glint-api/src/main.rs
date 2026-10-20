@@ -25,6 +25,9 @@ mod pair_ui;
 mod plugin_ui;
 mod plugins;
 mod post_actions;
+mod proxy_capture_ui;
+mod proxy_listener_ui;
+mod proxy_service;
 mod proxy_ui;
 mod registry_ui;
 mod sse;
@@ -50,8 +53,8 @@ use gpui_glint::{
         AppLayout, Button, ButtonKind, ButtonSize, Checkbox, ClosableTab, ClosableTabs, CodeCard,
         CommandItem, CommandPalette, CommandPaletteEvent, DataTable, Dialog, DropdownMenu,
         GlintAssets, Icon, IconButton, MenuItem, Popover, SearchInput, SegmentOption,
-        SegmentedControl, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption,
-        Switch, TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
+        SegmentedControl, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption, Switch,
+        TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
         TextReferenceResolver, Toast, ToastHost, ToastKind, TreeDrop, TreeListItem,
         bind_code_card_keys, bind_text_entry_keys,
     },
@@ -181,6 +184,15 @@ struct Workbench {
     profile_names: Vec<Entity<TextEntry>>,
     editing_proxy: usize,
     show_proxies: bool,
+    proxy_tab: usize,
+    proxy_settings_scroll: gpui::ScrollHandle,
+    proxy_services: std::collections::HashMap<String, proxy_service::RunningProxy>,
+    proxy_captures: std::collections::HashMap<String, std::sync::Arc<proxy_service::CaptureStore>>,
+    proxy_capture_panel: Entity<proxy_capture_ui::CapturePanel>,
+    proxy_app_menu: bool,
+    proxy_browsers: Vec<proxy_service::browser::Browser>,
+    proxy_certificate_status: String,
+    proxy_certificate_task: Option<Task<()>>,
     variable_table: Entity<DataTable>,
     next_variable_row: u64,
     history_filter: usize,
@@ -681,6 +693,7 @@ impl Workbench {
         let registry_sources = plugins::registry_store()
             .and_then(|store| store.sources())
             .unwrap_or_default();
+        let proxy_certificate_status = proxy_listener_ui::certificate_status(&storage);
         let mut this = Self {
             toasts: cx.new(|_| ToastHost::new()),
             update_state: update_ui::UpdateState::Idle,
@@ -773,6 +786,15 @@ impl Workbench {
             profile_names: vec![],
             editing_proxy: 0,
             show_proxies: false,
+            proxy_tab: 0,
+            proxy_settings_scroll: gpui::ScrollHandle::new(),
+            proxy_services: Default::default(),
+            proxy_captures: Default::default(),
+            proxy_capture_panel: cx.new(proxy_capture_ui::CapturePanel::new),
+            proxy_app_menu: false,
+            proxy_browsers: proxy_service::browser::discover(),
+            proxy_certificate_status,
+            proxy_certificate_task: None,
             variable_table,
             next_variable_row: 0,
             history_filter: 0,
@@ -2092,6 +2114,12 @@ impl Workbench {
                 .table
                 .update(cx, |table, cx| table.set_theme(theme, cx));
             proxy.url.update(cx, |entry, cx| entry.set_theme(theme, cx));
+            proxy
+                .listener_port
+                .update(cx, |entry, cx| entry.set_theme(theme, cx));
+            proxy
+                .search
+                .update(cx, |entry, cx| entry.set_theme(theme, cx));
             for row in &proxy.mappings {
                 row.name.update(cx, |entry, cx| entry.set_theme(theme, cx));
                 row.value.update(cx, |entry, cx| entry.set_theme(theme, cx));
@@ -3750,6 +3778,7 @@ impl Workbench {
                             delete,
                         ],
                     )
+                    .focus_handle(row.key.read(cx).focus_handle(cx))
                 })
                 .collect();
             let table = match kind {

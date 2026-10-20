@@ -291,6 +291,84 @@ mod tests {
         });
     }
     #[test]
+    #[ignore = "uses real 31-second heartbeat intervals to check an idle WSS connection"]
+    fn idle_wss_replies_to_periodic_pings_past_ninety_seconds() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let interval = std::env::var("GLINT_TEST_WS_HEARTBEAT_MS")
+            .map(|value| Duration::from_millis(value.parse().unwrap()))
+            .unwrap_or(Duration::from_secs(31));
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                include_bytes!("tests/fixtures/self-signed-cert.der").to_vec(),
+            )],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                include_bytes!("tests/fixtures/test-only-key.der").to_vec(),
+            )),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let tls = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap(),
+                tcp,
+            );
+            let mut socket = tungstenite::accept(tls).unwrap();
+            for sequence in 1..=3 {
+                // No application messages or user actions between server heartbeats.
+                std::thread::sleep(interval);
+                let payload = vec![sequence, 0, 255];
+                socket.send(Message::Ping(payload.clone().into())).unwrap();
+                assert_eq!(socket.read().unwrap(), Message::Pong(payload.into()));
+                eprintln!(
+                    "received matching Pong after {} ms",
+                    u128::from(sequence) * interval.as_millis()
+                );
+            }
+            socket
+                .send(Message::Text("still connected".into()))
+                .unwrap();
+            socket.close(None).unwrap();
+            let _ = socket.read();
+        });
+        let mut request = prepare(format!("wss://localhost:{}/", address.port()));
+        request.skip_tls_verification = true;
+        // Optional transport comparison, using only the local test server.
+        if let Ok(url) = std::env::var("GLINT_TEST_WS_PROXY_URL") {
+            request.proxy = Some(ProxySettings {
+                enabled: true,
+                url,
+                ..Default::default()
+            });
+        }
+        let session = start(request).unwrap();
+        runtime().block_on(async {
+            assert!(matches!(next(&session).await, Event::Connected));
+            let event = tokio::time::timeout(Duration::from_secs(105), session.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                Event::Text(text) => assert_eq!(text, "still connected"),
+                Event::Error(error) => panic!("idle WSS failed: {error}"),
+                Event::Closed(reason) => panic!("idle WSS closed early: {reason}"),
+                _ => panic!("unexpected idle WSS event"),
+            }
+            assert!(matches!(next(&session).await, Event::Closed(_)));
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
     fn built_in_proxy_maps_websocket_host_and_keeps_upgrade_hostname() {
         runtime().block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

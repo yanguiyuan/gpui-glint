@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProxySettings {
+    #[serde(default)]
+    pub listener: ProxyListenerSettings,
     pub enabled: bool,
     #[serde(default)]
     pub built_in: bool,
@@ -10,6 +12,29 @@ pub struct ProxySettings {
     pub mappings: Vec<HostMapping>,
     pub url: String,
     pub skip_tls_verification: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxyListenerSettings {
+    pub port: u16,
+    pub allow_lan: bool,
+}
+impl Default for ProxyListenerSettings {
+    fn default() -> Self {
+        Self {
+            port: 8899,
+            allow_lan: false,
+        }
+    }
+}
+impl ProxyListenerSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            Err("代理监听端口须为 1–65535".into())
+        } else {
+            Ok(())
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProxyProfile {

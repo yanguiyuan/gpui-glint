@@ -10,6 +10,20 @@ cargo run -p glint-api
 
 默认启用 HTML 预览；需要关闭时使用 `cargo run -p glint-api --no-default-features`。
 
+## 端口代理、浏览器与抓包
+
+代理管理分为“代理设置”和“代理抓包”两个 tab，设置面板内部滚动。域名映射表仍独立滚动，底部添加入口固定可见。每个代理配置可手动启动一个 HTTP/HTTPS 正向代理监听服务，默认仅监听 `127.0.0.1:8899`，可修改端口；启用“允许局域网访问”后监听 `0.0.0.0`，外部设备可将 HTTP 和 HTTPS 代理配置为这台机器的局域网 IP 与端口。服务不要求代理账号；应用退出、工作区切换或删除对应代理时会关闭监听和连接，重启应用不会自动开放端口。
+
+监听服务使用启动时的配置快照，复用当前代理的域名映射或外部上游代理；修改配置后需要停止并重新启动服务。外部客户端可使用 `curl --proxy http://127.0.0.1:8899 http://example.com/`，HTTPS 使用 `curl --proxy http://127.0.0.1:8899 --cacert glint-proxy-ca.pem https://example.com/`。
+
+“打开应用”下拉菜单自动检测 Chrome、Edge、Firefox 和 Brave，为所选浏览器创建独立配置并设置 HTTP/HTTPS 代理，包含本机地址，关闭 QUIC/HTTP3 以便请求通过代理。不会改动日常浏览器配置或系统全局代理。再次点击可打开另一个独立窗口；浏览器配置保存在应用数据目录的 `proxy-service/browser-sessions`。
+
+首次启动监听服务自动生成本地 CA，也可在证书区域生成、导入、导出或安装。导入支持一个合并 PEM 文件或 CA 证书与未加密私钥两个 PEM 文件，校验证书有效期、CA 用途以及私钥匹配；导入替换前需停止全部代理监听。导出 `.pem` 为 PEM，其他扩展名为 DER，均只包含公开 CA 证书；私钥独立保存在数据库同目录的 `proxy-service/ca/identity.pem`，不写入工作区。Windows 的安装操作写入当前用户受信任根证书，macOS 写入登录钥匙串；Linux 按提示将导出的 CA 手动导入系统或浏览器。其他设备也需安装这个 CA 才能解密 HTTPS；证书固定的网站可能拒绝连接。证书导入或安装后请重新打开代理浏览器窗口。
+
+抓包 tab 按当前代理显示 HTTP/HTTPS 请求、状态、耗时、响应大小、请求/响应头和正文，支持关键词过滤和高亮。转发采用流式读写，SSE、下载不会等待整体完成；WebSocket 升级后保持双向转发，抓包记录展示握手。仅在内存保留最近 1000 条记录，请求和响应各预览前 32 KiB，超出部分标记截断；清空记录不打断请求，停止监听后保留记录以供查看。
+
+相关验证：`cargo test -p glint-api --no-default-features proxy_`。
+
 ## macOS 安装包
 
 在 macOS 上安装 Rust 和 Xcode Command Line Tools 后，运行：
