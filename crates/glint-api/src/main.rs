@@ -30,6 +30,7 @@ mod proxy_listener_ui;
 mod proxy_service;
 mod proxy_ui;
 mod registry_ui;
+mod request_preview_ui;
 mod sse;
 mod storage;
 mod template;
@@ -1209,8 +1210,22 @@ impl Workbench {
         }
     }
     fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
-        let values = self.active_environment_values(cx);
-        let resolver = template::TemplateResolver::for_request(&values, &self.snapshot(cx));
+        self.request_reference_resolver(
+            &self.snapshot(cx),
+            self.requests
+                .get(self.active)
+                .map(|request| request.collection.as_str()),
+            cx,
+        )
+    }
+    fn request_reference_resolver(
+        &self,
+        draft: &Draft,
+        collection: Option<&str>,
+        cx: &App,
+    ) -> TextReferenceResolver {
+        let values = self.environment_values(self.selected_environment(cx), collection);
+        let resolver = template::TemplateResolver::for_request(&values, draft);
         std::rc::Rc::new(move |expression| match &resolver {
             Ok(resolver) => resolver.resolve(expression),
             Err(error) => Err(error.clone()),
@@ -4723,6 +4738,16 @@ impl Workbench {
                     cx.notify();
                 }
             }))
+            .child(
+                MenuItem::new("tab-open-window", "在独立窗口中打开")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tab-open-window".into())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_request_preview(index, window, cx);
+                    })),
+            )
+            .child(div().h(px(1.)).my_1().bg(rgb(p.border)))
             .child(
                 MenuItem::new("tab-close-others", "关闭其他标签页")
                     .disabled(self.tabs.len() <= 1)

@@ -52,7 +52,7 @@ powershell.exe -NoProfile -File crates/glint-api/packaging/windows/build-windows
 make win-setup
 ```
 
-Windows 下 Make 默认调用 `powershell.exe`，无需安装 `pwsh`；如需使用 PowerShell 7，可执行 `make win-setup POWERSHELL="C:/path/to/pwsh.exe"`。脚本自动查找 PATH、当前用户安装目录和 Program Files 下的 Inno Setup 6。自定义安装位置可执行 `make win-setup ISCC="C:/path/to/Inno Setup 6/ISCC.exe"`，或直接给 PowerShell 脚本传入 `-IsccPath`。默认读取应用 `Cargo.toml` 的版本号；可用 `VERSION=0.1.5` 显式校验版本，须与清单一致。
+Windows 下 Make 默认调用 `powershell.exe`，无需安装 `pwsh`；如需使用 PowerShell 7，可执行 `make win-setup POWERSHELL="C:/path/to/pwsh.exe"`。脚本自动查找 PATH、当前用户安装目录和 Program Files 下的 Inno Setup 6。自定义安装位置可执行 `make win-setup ISCC="C:/path/to/Inno Setup 6/ISCC.exe"`，或直接给 PowerShell 脚本传入 `-IsccPath`。默认读取应用 `Cargo.toml` 的版本号；可用 `VERSION=0.1.6` 显式校验版本，须与清单一致。
 
 已下载的 WebView2 bootstrapper 会复用，每次打包仍验证其微软数字签名；首次构建需要联网下载。需要重新下载时，可删除 `target/windows-installer/stage/MicrosoftEdgeWebview2Setup.exe` 后重试。
 
@@ -61,17 +61,23 @@ Windows 下 Make 默认调用 `powershell.exe`，无需安装 `pwsh`；如需使
 静默安装：
 
 ```powershell
-.\Glint-API-0.1.5-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+.\Glint-API-0.1.6-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ```
 
 更新本应用 `Cargo.toml` 的版本后，推送对应标签自动构建、验证静默安装／重装升级／快捷方式／图标／卸载，再发布到 GitHub Releases：
 
 ```sh
-git tag glint-api-v0.1.5
-git push origin glint-api-v0.1.5
+git tag glint-api-v0.1.6
+git push origin glint-api-v0.1.6
 ```
 
 手动运行 `Glint API Windows Release` workflow 只构建并上传 Actions artifact，不发布 Release。发布 workflow 检查标签与应用版本一致；库使用原来的 `v…` 标签，应用使用 `glint-api-v…` 标签。Windows CI 的安装测试不验证实际 GPU 窗口和 HTML 预览渲染。
+
+## 请求多窗口预览
+
+右键请求标签页，选择“在独立窗口中打开”，可同时打开多个只读预览窗口并排比较。窗口保留打开时的请求配置、未保存内容、最近发送报文和已有响应；WebSocket 请求展示已有消息快照。主窗口后续编辑不会改变快照。
+
+预览中的 URL、参数与请求头沿用主窗口的模板变量显示及解析规则，应用所选环境与请求所属集合的变量覆盖。JSON 响应支持对象和数组折叠，切换响应标签保留折叠状态，复制仍包含完整内容。预览不提供发送或保存操作，关闭预览不会关闭主窗口请求。
 
 ## WebSocket
 
