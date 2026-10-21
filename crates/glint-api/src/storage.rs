@@ -728,6 +728,7 @@ mod tests {
             let record = Record {
                 id: crate::model::new_id(),
                 tag: String::new(),
+                source: Default::default(),
                 environment_name: None,
                 draft: draft.clone(),
                 label: "v1".into(),
@@ -854,6 +855,7 @@ mod tests {
         let version = Record {
             id: crate::model::new_id(),
             tag: String::new(),
+            source: Default::default(),
             environment_name: None,
             draft: request.draft.clone(),
             label: "v1".into(),

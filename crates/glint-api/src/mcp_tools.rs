@@ -170,7 +170,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "request_create",
-        "Create and select a request in a collection/directory, inheriting defaults, then apply an optional draft patch.",
+        "Create and select a request in a collection/directory, inheriting defaults, then apply an optional draft patch. Saves the initial version with source=mcp and returns its version summary.",
         json!({"collection":string(),"path":string(),"name":string(),"draft":draft_schema()}),
         &["collection", "name"],
         false,
@@ -186,7 +186,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "request_update",
-        "Patch a request draft/name. Array fields replace entire tables. An active running request must be cancelled first.",
+        "Patch a request draft/name. Draft changes automatically save/select a version with source=mcp; identical effective parameters reuse an existing version without a dialog and preserve its source/tag. Returns saved, version_created and version. Name-only changes do not create versions. Array fields replace entire tables. An active running request must be cancelled first.",
         json!({"request_id":string(),"name":string(),"draft":draft_schema()}),
         &["request_id"],
         false,
@@ -282,7 +282,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "version_save",
-        "Save a changed request draft as a new version; identical drafts reuse the current latest version. Optional tag labels it.",
+        "Save a request draft with source=mcp. Matching effective parameters automatically select/reuse an existing version without a dialog, with duplicate=true and confirmation_required=false. Draft updates already save versions automatically. Optional tag labels only a newly created version; use record_tag to label a reused version.",
         json!({"request_id":string(),"tag":string()}),
         &["request_id"],
         false,
@@ -441,7 +441,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "plugin_bind",
-        "Grant/revoke an installed plugin action on a request. identity comes from plugins_list. enabled=false disables it; remove=true removes the binding. Grants are tied to exact installed code fingerprint.",
+        "Grant/revoke an installed plugin action on a request and automatically save/select its version. identity comes from plugins_list. enabled=false disables it; remove=true removes the binding. Grants are tied to exact installed code fingerprint.",
         json!({"request_id":string(),"identity":string(),"action_id":string(),"enabled":boolean(),"remove":boolean()}),
         &["request_id", "identity"],
         false,
@@ -449,7 +449,7 @@ pub fn catalog() -> Vec<Value> {
     );
     add(
         "plugin_bindings_reorder",
-        "Replace the order of existing before-send action bindings. Provide each binding index exactly once.",
+        "Replace the order of existing before-send action bindings and automatically save/select its version. Provide each binding index exactly once.",
         json!({"request_id":string(),"order":array(integer.clone())}),
         &["request_id", "order"],
         false,

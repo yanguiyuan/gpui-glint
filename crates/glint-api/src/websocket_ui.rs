@@ -556,6 +556,7 @@ impl Workbench {
             Record {
                 id: record_id.clone(),
                 tag: String::new(),
+                source: Default::default(),
                 environment_name: Some(
                     self.environment_name(self.selected_environment(cx))
                         .to_owned(),

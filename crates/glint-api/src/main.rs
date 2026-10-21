@@ -30,6 +30,7 @@ mod proxy_listener_ui;
 mod proxy_service;
 mod proxy_ui;
 mod registry_ui;
+mod request_fingerprint;
 mod request_preview_ui;
 mod sse;
 mod storage;
@@ -37,6 +38,8 @@ mod template;
 mod tree_delete_ui;
 mod update_ui;
 mod updater;
+mod version_diff;
+mod version_history;
 mod version_tags;
 mod websocket;
 mod websocket_ui;
@@ -211,6 +214,7 @@ struct Workbench {
     selected_history: Option<(usize, usize)>,
     history_delete: Option<(usize, usize)>,
     current_versions: Vec<usize>,
+    duplicate_version: Option<version_history::DuplicateVersion>,
     filter: Entity<TextEntry>,
     history_search: Entity<TextEntry>,
     authentication: Entity<SelectField>,
@@ -631,7 +635,17 @@ impl Workbench {
         ));
         let tabs = if requests.is_empty() { vec![] } else { vec![0] };
         let traces = data.traces;
-        let current_versions = vec![0; requests.len()];
+        let current_versions = requests
+            .iter()
+            .map(|request| {
+                let fingerprint = request_fingerprint::Fingerprint::new(&request.draft);
+                request
+                    .versions
+                    .iter()
+                    .position(|r| request_fingerprint::Fingerprint::new(&r.draft) == fingerprint)
+                    .unwrap_or(0)
+            })
+            .collect();
         let sent_requests = data.previews;
         let (plugin_catalog, plugin_errors) = plugins::catalog();
         let disabled_plugins = storage.disabled_plugins().expect("无法读取插件启用状态");
@@ -814,6 +828,7 @@ impl Workbench {
             selected_history: None,
             history_delete: None,
             current_versions,
+            duplicate_version: None,
             filter,
             history_search,
             authentication,
@@ -1404,6 +1419,7 @@ impl Workbench {
         cx.notify();
     }
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.duplicate_version = None;
         self.history_delete = None;
         self.version_tag_edit = None;
         self.tab_menu = None;
@@ -1480,37 +1496,20 @@ impl Workbench {
             return;
         }
         let draft = self.snapshot(cx);
-        let request = &mut self.requests[self.active];
-        if request.draft != draft {
-            request.draft = draft.clone();
-            self.storage_dirty = true;
-        }
-        if request
-            .versions
-            .first()
-            .is_some_and(|record| record.draft == draft)
-        {
-            self.current_versions[self.active] = 0;
-            self.notice = "已保存，内容未修改".into();
+        self.duplicate_version = None;
+        let request = &self.requests[self.active];
+        if let Some(index) = self.matching_version(self.active, &draft) {
+            let record = &request.versions[index];
+            self.duplicate_version = Some(version_history::DuplicateVersion {
+                request_id: request.id.clone(),
+                version_id: record.id.clone(),
+                fingerprint: request_fingerprint::Fingerprint::new(&draft),
+                focus: cx.focus_handle(),
+            });
             cx.notify();
             return;
         }
-        self.storage_dirty = true;
-        request.versions.insert(
-            0,
-            Record {
-                id: crate::model::new_id(),
-                tag: String::new(),
-                environment_name: None,
-                draft,
-                label: format!("v{}", request.versions.len() + 1),
-                time: record_time(),
-                detail: "保存请求时生成的快照".into(),
-                elapsed_ms: None,
-                exchange: None,
-            },
-        );
-        self.current_versions[self.active] = 0;
+        self.append_version(self.active, draft, model::VersionSource::Manual);
         self.notice = "已保存新版本".into();
         self.activity = 0;
         self.show_activity = true;
@@ -1698,6 +1697,7 @@ impl Workbench {
                     Record {
                         id: crate::model::new_id(),
                         tag: String::new(),
+                        source: Default::default(),
                         environment_name: Some(environment_name),
                         draft,
                         label,
@@ -3511,6 +3511,7 @@ impl Workbench {
             versions: vec![Record {
                 id: crate::model::new_id(),
                 tag: String::new(),
+                source: Default::default(),
                 environment_name: None,
                 draft,
                 label: "v1".into(),
@@ -3543,6 +3544,7 @@ impl Workbench {
         self.choose(i, cx);
     }
     fn delete_request(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.duplicate_version = None;
         self.history_delete = None;
         self.version_tag_edit = None;
         self.tree_delete = None;
@@ -4491,10 +4493,7 @@ impl Workbench {
                 );
         }
         let draft = self.snapshot(cx);
-        let dirty = self.requests[self.active]
-            .versions
-            .first()
-            .is_none_or(|r| r.draft != draft);
+        let dirty = self.version_modified(self.active, &draft);
         let select_owner = cx.entity();
         let close_owner = select_owner.clone();
         let context_owner = select_owner.clone();
@@ -5130,35 +5129,63 @@ impl Workbench {
                                             .min_w_0()
                                             .truncate()
                                             .child(r.draft.url.clone()),
+                                    )
+                                    .child(
+                                        Button::new("对比")
+                                            .kind(ButtonKind::Plain)
+                                            .size(ButtonSize::Mini)
+                                            .theme(self.theme)
+                                            .render()
+                                            .debug_selector(move || {
+                                                format!("version-diff-{i}").into()
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.open_version_diff(i, window, cx);
+                                            })),
                                     ),
                             )
                             .child(
                                 div()
-                                    .truncate()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .font_family("Menlo")
                                     .text_size(px(9.))
                                     .text_color(rgb(p.text_muted))
-                                    .child(if params.is_empty() {
-                                        format!("无查询参数 · {}", r.detail)
-                                    } else {
-                                        params
-                                    }),
+                                    .when(r.source == model::VersionSource::Mcp, |s| {
+                                        s.child(
+                                            div()
+                                                .debug_selector(move || {
+                                                    format!("version-source-{i}").into()
+                                                })
+                                                .flex_shrink_0()
+                                                .px_1()
+                                                .rounded_md()
+                                                .text_color(rgb(p.accent))
+                                                .bg(rgb(p.accent_tint))
+                                                .child("MCP"),
+                                        )
+                                    })
+                                    .child(div().min_w_0().truncate().child(
+                                        if params.is_empty() {
+                                            format!(
+                                                "#{} · 无查询参数",
+                                                request_fingerprint::Fingerprint::new(&r.draft)
+                                                    .hash
+                                            )
+                                        } else {
+                                            format!(
+                                                "#{} · {params}",
+                                                request_fingerprint::Fingerprint::new(&r.draft)
+                                                    .hash
+                                            )
+                                        },
+                                    )),
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.sending.take().is_some() {
-                            this.push_trace("恢复版本配置，已取消请求", cx);
-                        }
-                        this.trace_started = None;
-                        this.current_versions[this.active] = i;
-                        this.load(&record.draft, cx);
-                        this.notice = format!("已恢复 {} 的请求配置", record.label);
-                        this.response_json = None;
-                        this.response_data = None;
-                        this.status = None;
-                        this.error = None;
-                        this.update_response(cx);
-                        cx.notify();
+                        this.restore_version(i, cx);
                     })),
             );
         }
@@ -5275,6 +5302,11 @@ impl Workbench {
 }
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(pending) = &self.duplicate_version {
+            if !pending.focus.is_focused(window) {
+                window.focus(&pending.focus, cx);
+            }
+        }
         if self.group_edit.is_some() && !self.group_dialog_open {
             window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
         }
@@ -5303,6 +5335,7 @@ impl Render for Workbench {
                 && !self.show_curl_import
                 && !self.show_workspaces
                 && self.group_edit.is_none()
+                && self.duplicate_version.is_none()
                 && self.directory_settings.is_none()
                 && self.response_tab == 0
                 && !self.commands.read(cx).is_open();
@@ -5435,7 +5468,10 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
-                if this.show_workspaces || this.group_edit.is_some() {
+                if this.show_workspaces
+                    || this.group_edit.is_some()
+                    || this.duplicate_version.is_some()
+                {
                     return;
                 }
                 if !this.show_mcp
@@ -5451,7 +5487,10 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
-                if this.show_workspaces || this.group_edit.is_some() {
+                if this.show_workspaces
+                    || this.group_edit.is_some()
+                    || this.duplicate_version.is_some()
+                {
                     return;
                 }
                 if this.show_plugins || this.show_mcp {
@@ -5616,6 +5655,7 @@ impl Render for Workbench {
             .children(self.curl_import_dialog(cx))
             .children(self.workspace_dialog(cx))
             .children(self.group_dialog(cx))
+            .children(self.duplicate_version_dialog(cx))
     }
 }
 fn tab_button(label: &str, selected: bool, theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
@@ -6950,15 +6990,9 @@ mod persistence_tests {
     }
 
     #[gpui::test]
-    fn saving_only_versions_changes_since_latest_snapshot(cx: &mut gpui::TestAppContext) {
-        let path = std::env::temp_dir().join(format!(
-            "glint-api-save-{}-{}.sqlite3",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn saving_only_versions_unique_request_parameters(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("versions.sqlite3");
         let host = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         host.update(cx, |host, cx| {
             host.group_edit = Some(GroupEdit::CreateCollection);
@@ -6982,26 +7016,29 @@ mod persistence_tests {
             assert_eq!(host.requests[0].versions.len(), 2);
             host.load(&original, cx);
             host.save(cx);
-            assert_eq!(host.requests[0].versions.len(), 3);
-            assert_eq!(host.requests[0].versions[0].draft, original);
+            assert_eq!(host.requests[0].versions.len(), 2);
+            assert_eq!(
+                host.duplicate_version.as_ref().unwrap().version_id,
+                host.requests[0].versions[1].id
+            );
             // Editing and undoing back to the latest saved content is also unchanged.
             host.endpoint.update(cx, |entry, cx| {
                 entry.set_text("https://example.test/temporary", cx)
             });
             host.load(&original, cx);
             host.save(cx);
-            assert_eq!(host.requests[0].versions.len(), 3);
+            assert_eq!(host.requests[0].versions.len(), 2);
             host.persist(cx);
         });
         let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(cx, |host, cx| {
             host.save(cx);
-            assert_eq!(host.requests[0].versions.len(), 3);
-            assert_eq!(host.notice, "已保存，内容未修改");
+            assert_eq!(host.requests[0].versions.len(), 2);
+            assert_eq!(host.current_versions[0], 1);
+            assert!(host.duplicate_version.is_some());
         });
         drop(host);
         drop(reopened);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[gpui::test]

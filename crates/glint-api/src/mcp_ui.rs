@@ -87,7 +87,7 @@ fn name(value: &str) -> Result<String, String> {
     }
 }
 fn record_summary(record: &Record) -> Value {
-    json!({"id":record.id,"tag":record.tag,"label":record.label,"time":record.time,"detail":record.detail,"environment_name":record.environment_name,"elapsed_ms":record.elapsed_ms})
+    json!({"id":record.id,"tag":record.tag,"source":record.source,"label":record.label,"time":record.time,"detail":record.detail,"environment_name":record.environment_name,"elapsed_ms":record.elapsed_ms,"hash":request_fingerprint::Fingerprint::new(&record.draft).hash})
 }
 impl Workbench {
     pub(super) fn start_mcp(&mut self, cx: &mut Context<Self>) {
@@ -217,7 +217,7 @@ impl Workbench {
         let read_only = spec["annotations"]["readOnlyHint"] == true;
         let operation = tool.strip_prefix("glint_").ok_or("未知工具前缀")?;
         self.capture_draft(cx);
-        let result = match operation {
+        let mut result = match operation {
             "mcp_history_list" => {
                 let success = match args["outcome"].as_str() {
                     Some("success") => Some(true),
@@ -482,7 +482,9 @@ impl Workbench {
                 self.load(&draft, cx);
                 self.capture_draft(cx);
                 self.requests[self.active].versions[0].draft = draft;
-                json!({"request_id":self.requests[self.active].id})
+                self.requests[self.active].versions[0].source = model::VersionSource::Mcp;
+                self.requests[self.active].versions[0].detail = "MCP 创建的初始版本".into();
+                json!({"request_id":self.requests[self.active].id,"saved":true,"version_created":true,"version":record_summary(&self.requests[self.active].versions[0])})
             }
             "request_get" => {
                 let i = self.mcp_request_index(&args)?;
@@ -656,13 +658,18 @@ impl Workbench {
             "version_save" => {
                 self.mcp_idle()?;
                 let i = self.mcp_request_index(&args)?;
-                self.mcp_select(i, cx)?;
-                self.directory_settings = None;
-                self.save(cx);
-                if let Some(tag) = args["tag"].as_str() {
-                    self.requests[i].versions[0].tag = tag.trim().into();
+                let (version, created) = self.save_mcp_version(i);
+                if created {
+                    if let Some(tag) = args["tag"].as_str() {
+                        self.requests[i].versions[version].tag = tag.trim().into();
+                    }
                 }
-                record_summary(&self.requests[i].versions[0])
+                let mut summary = record_summary(&self.requests[i].versions[version]);
+                summary["duplicate"] = json!(!created);
+                summary["confirmation_required"] = json!(false);
+                summary["saved"] = json!(true);
+                summary["version_created"] = json!(created);
+                summary
             }
             "record_get" | "record_restore" | "record_tag" | "record_delete" => {
                 let i = self.mcp_request_index(&args)?;
@@ -684,6 +691,7 @@ impl Workbench {
                     "record_restore" => {
                         self.mcp_idle()?;
                         self.mcp_select(i, cx)?;
+                        self.duplicate_version = None;
                         self.load(&record.draft, cx);
                         self.capture_draft(cx);
                         if let Some(v) = version {
@@ -719,6 +727,7 @@ impl Workbench {
                         record_summary(&self.requests[i].versions[v])
                     }
                     _ => {
+                        self.duplicate_version = None;
                         if let Some(v) = version {
                             self.requests[i].versions.remove(v);
                             self.current_versions[i] = 0;
@@ -1210,6 +1219,15 @@ impl Workbench {
             }
             _ => return Err("工具未实现".into()),
         };
+        if (operation == "request_update" && args.get("draft").is_some())
+            || matches!(operation, "plugin_bind" | "plugin_bindings_reorder")
+        {
+            let i = self.mcp_request_index(&args)?;
+            let (version, created) = self.save_mcp_version(i);
+            result["saved"] = json!(true);
+            result["version_created"] = json!(created);
+            result["version"] = record_summary(&self.requests[i].versions[version]);
+        }
         if !read_only {
             if !matches!(
                 operation,
@@ -1231,7 +1249,6 @@ impl Workbench {
                 return Err(format!("操作已应用但持久化失败，请重试保存：{error}"));
             }
         }
-        let mut result = result;
         if !flag(&args, "include_secrets") {
             redact(&mut result);
         }
@@ -1333,6 +1350,8 @@ mod tests {
             call(host,"request_update",json!({"request_id":id,"draft":{"body":"{\"hello\":true}"}}),cx);
             let version=call(host,"version_save",json!({"request_id":id,"tag":"baseline"}),cx);
             let version_id=version["id"].as_str().unwrap().to_owned();
+            assert_eq!(version["duplicate"],true);
+            call(host,"record_tag",json!({"request_id":id,"record_id":version_id,"tag":"baseline"}),cx);
             call(host,"request_update",json!({"request_id":id,"draft":{"body":"changed"}}),cx);
             call(host,"record_restore",json!({"request_id":id,"record_id":version_id}),cx);
             assert_eq!(host.body.read(cx).content(),"{\"hello\":true}");
@@ -1434,9 +1453,15 @@ mod tests {
             let identity=plugin.identity();let action=plugin.manifest.contributions.first().map(|c|c.id.clone()).unwrap_or_default();
             let result=call(host,"plugin_bind",json!({"request_id":id,"identity":identity,"action_id":action}),cx);
             assert_eq!(result["bindings"][0]["enabled"],true);
+            assert_eq!(result["version_created"],true);
+            assert_eq!(result["version"]["source"],"mcp");
+            assert!(!host.version_modified(host.active,&host.snapshot(cx)));
             assert!(host.requests[0].draft.plugins[0].approval.matches(host.plugin_catalog.iter().find(|p|p.identity()==identity).unwrap()));
             call(host,"plugin_bind",json!({"request_id":id,"identity":identity,"action_id":action,"remove":true}),cx);
             assert!(host.requests[0].draft.plugins.is_empty());
+            assert_eq!(host.requests[0].versions.len(),2);
+            assert_eq!(host.current_versions[0],1);
+            assert!(!host.version_modified(host.active,&host.snapshot(cx)));
             let (sender,receiver)=async_channel::bounded(16);host.ws_commands=Some(sender);host.ws_connected=true;host.ws_active=true;
             call(host,"websocket_send",json!({"request_id":id,"text":"hello"}),cx);
             assert!(matches!(receiver.try_recv().unwrap(),websocket::Command::Text(text) if text=="hello"));
@@ -1451,6 +1476,183 @@ mod tests {
             let response=call(host,"response_read",json!({"request_id":id,"offset":1,"limit":4}),cx);
             assert_eq!(response["text"],"好w");assert_eq!(response["offset"],3);
             assert_eq!(response["headers"][0][1],"[REDACTED]");
+        });
+    }
+
+    #[gpui::test]
+    fn mcp_autosave_versions_persist_sources_and_reuse_existing_configs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("autosave.sqlite3");
+        let host = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        host.update(cx, |h, cx| {
+            call(h, "collection_create", json!({"name":"API"}), cx);
+            h.add_request(cx);
+            let id = h.requests[0].id.clone();
+            h.requests[0].versions[0].tag = "人工基线".into();
+            let baseline_id = h.requests[0].versions[0].id.clone();
+            let result = call(
+                h,
+                "request_update",
+                json!({"request_id":id,"draft":{"url":"https://example.test/mcp"}}),
+                cx,
+            );
+            assert_eq!(result["saved"], true);
+            assert_eq!(result["version_created"], true);
+            assert_eq!(result["version"]["source"], "mcp");
+            assert_eq!(h.requests[0].versions.len(), 2);
+            assert!(!h.version_modified(0, &h.snapshot(cx)));
+            let version_id = result["version"]["id"].clone();
+            call(
+                h,
+                "record_tag",
+                json!({"request_id":id,"record_id":version_id,"tag":"联调通过"}),
+                cx,
+            );
+            let unchanged = call(
+                h,
+                "request_update",
+                json!({"request_id":id,"draft":{"url":"https://example.test/mcp"}}),
+                cx,
+            );
+            assert_eq!(unchanged["version_created"], false);
+            assert_eq!(unchanged["version"]["id"], version_id);
+            assert_eq!(unchanged["version"]["tag"], "联调通过");
+            let inactive = call(
+                h,
+                "request_update",
+                json!({"request_id":id,"draft":{"token":"inactive"}}),
+                cx,
+            );
+            assert_eq!(inactive["version_created"], false);
+            assert!(!h.version_modified(0, &h.snapshot(cx)));
+            let restored = call(
+                h,
+                "request_update",
+                json!({"request_id":id,"draft":{"url":""}}),
+                cx,
+            );
+            assert_eq!(restored["version_created"], false);
+            assert_eq!(restored["version"]["id"], baseline_id);
+            assert_eq!(restored["version"]["source"], "manual");
+            assert_eq!(restored["version"]["tag"], "人工基线");
+            assert_eq!(h.current_versions[0], 1);
+            assert!(!h.version_modified(0, &h.snapshot(cx)));
+            assert!(h.duplicate_version.is_none());
+            call(
+                h,
+                "request_update",
+                json!({"request_id":id,"name":"renamed"}),
+                cx,
+            );
+            assert_eq!(h.requests[0].versions.len(), 2);
+            let stored = storage::Store::open(&path).unwrap().load().unwrap();
+            assert_eq!(
+                stored.requests[0].versions[0].source,
+                model::VersionSource::Mcp
+            );
+            assert_eq!(stored.requests[0].versions[0].tag, "联调通过");
+            assert_eq!(
+                stored.requests[0].versions[1].source,
+                model::VersionSource::Manual
+            );
+            let mut legacy = encode(&stored.requests[0].versions[1]);
+            legacy.as_object_mut().unwrap().remove("source");
+            assert_eq!(
+                serde_json::from_value::<Record>(legacy).unwrap().source,
+                model::VersionSource::Manual
+            );
+        });
+        let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(cx, |h, cx| {
+            assert_eq!(h.current_versions[0], 1);
+            assert!(!h.version_modified(0, &h.snapshot(cx)));
+        });
+    }
+
+    #[gpui::test]
+    fn mcp_saves_inactive_requests_and_explicit_saves_do_not_change_editors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let host = cx.new(|cx| {
+            Workbench::with_store(
+                storage::Store::open(&directory.path().join("inactive.sqlite3")).unwrap(),
+                cx,
+            )
+        });
+        host.update(cx, |h, cx| {
+            call(h, "collection_create", json!({"name":"API"}), cx);
+            let first = call(h, "request_create", json!({"collection":"API","name":"first"}), cx);
+            assert_eq!(first["version"]["source"], "mcp");
+            call(h, "request_create", json!({"collection":"API","name":"second"}), cx);
+            h.endpoint.update(cx, |e, cx| e.set_text("https://example.test/user-unsaved", cx));
+            let active_draft = h.snapshot(cx);
+            let updated = call(h, "request_update", json!({"request_id":first["request_id"],"draft":{"body":"inactive draft"}}), cx);
+            assert_eq!(updated["version_created"], true);
+            assert_eq!(h.active, 1);
+            assert_eq!(h.snapshot(cx), active_draft);
+            assert_eq!(h.requests[0].versions[0].draft.body, "inactive draft");
+            h.show_curl_import = true;
+            h.version_tag_edit = Some((1,"v1".into()));
+            let saved = call(h, "version_save", json!({"request_id":first["request_id"]}), cx);
+            assert_eq!(saved["duplicate"], true);
+            assert_eq!(saved["confirmation_required"], false);
+            assert_eq!(h.active, 1);
+            assert!(h.show_curl_import);
+            assert!(h.version_tag_edit.is_some());
+            assert!(h.duplicate_version.is_none());
+            h.show_curl_import = false;
+            h.version_tag_edit = None;
+            let saved = call(h, "version_save", json!({"request_id":h.requests[1].id,"tag":"explicit save"}), cx);
+            assert_eq!(saved["source"], "mcp");
+            assert_eq!(saved["version_created"], true);
+            assert_eq!(saved["tag"], "explicit save");
+            let imported = call(h, "curl_import", json!({"collection":"API","name":"imported","curl":"curl https://example.test/import"}), cx);
+            assert_eq!(imported["version"]["source"], "mcp");
+            assert_eq!(h.requests[2].versions.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn mcp_generated_versions_show_a_separate_source_badge(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = Workbench::with_store(
+                storage::Store::open(&directory.path().join("badge.sqlite3")).unwrap(),
+                cx,
+            );
+            call(&mut h, "collection_create", json!({"name":"API"}), cx);
+            h.add_request(cx);
+            let id = h.requests[0].id.clone();
+            call(
+                &mut h,
+                "request_update",
+                json!({"request_id":id,"draft":{"body":"MCP body"}}),
+                cx,
+            );
+            let record = h.requests[0].versions[0].id.clone();
+            call(
+                &mut h,
+                "record_tag",
+                json!({"request_id":id,"record_id":record,"tag":"自定义标签"}),
+                cx,
+            );
+            h.show_activity = true;
+            h.activity = 0;
+            h
+        });
+        assert!(window.debug_bounds("version-source-0").is_some());
+        assert!(window.debug_bounds("version-source-1").is_none());
+        host.update(window, |h, cx| {
+            assert_eq!(h.requests[0].versions[0].tag, "自定义标签");
+            assert_eq!(h.requests[0].versions[0].source, model::VersionSource::Mcp);
+            assert!(!h.version_modified(0, &h.snapshot(cx)));
+            h.endpoint.update(cx, |e, cx| {
+                e.set_text("https://example.test/manual-edit", cx)
+            });
+            assert!(h.version_modified(0, &h.snapshot(cx)));
         });
     }
 }

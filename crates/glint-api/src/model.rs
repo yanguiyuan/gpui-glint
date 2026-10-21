@@ -19,6 +19,11 @@ impl Pair {
         }
     }
 }
+impl Default for Pair {
+    fn default() -> Self {
+        Self::new("", "", "")
+    }
+}
 /// Request-local action binding; flattened approval preserves older workspace data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BeforeAction {
@@ -28,6 +33,19 @@ pub struct BeforeAction {
     pub action_id: String,
     #[serde(default = "action_enabled")]
     pub enabled: bool,
+}
+impl Default for BeforeAction {
+    fn default() -> Self {
+        Self {
+            approval: gpui_glint::plugins::Approval {
+                id: String::new(),
+                capabilities: Default::default(),
+                fingerprint: String::new(),
+            },
+            action_id: String::new(),
+            enabled: true,
+        }
+    }
 }
 fn action_enabled() -> bool {
     true
@@ -91,12 +109,22 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionSource {
+    #[default]
+    Manual,
+    Mcp,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default = "new_id")]
     pub id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
+    #[serde(default)]
+    pub source: VersionSource,
     #[serde(default)]
     pub environment_name: Option<String>,
     pub draft: Draft,
