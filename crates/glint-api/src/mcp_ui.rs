@@ -161,7 +161,7 @@ impl Workbench {
         }
         Ok(())
     }
-    fn mcp_environment_options(&mut self, selected: usize, cx: &mut Context<Self>) {
+    pub(super) fn mcp_environment_options(&mut self, selected: usize, cx: &mut Context<Self>) {
         self.oauth.cancel();
         self.oauth.ready = None;
         self.environment.update(cx, |select, cx| {
@@ -216,6 +216,33 @@ impl Workbench {
         mcp_tools::validate(&spec["inputSchema"], &args)?;
         let read_only = spec["annotations"]["readOnlyHint"] == true;
         let operation = tool.strip_prefix("glint_").ok_or("未知工具前缀")?;
+        if !matches!(operation, "request_select" | "request_delete" | "tree_move") {
+            if let Some(shared) = args["request_id"]
+                .as_str()
+                .and_then(|id| self.request_editors.get(id))
+            {
+                let editor = shared.editor.clone();
+                let mut result =
+                    editor.update(cx, |editor, cx| editor.mcp_call(tool, args.clone(), cx));
+                if let Ok(value) = &mut result {
+                    if value.get("active").is_some() {
+                        value["active"] = json!(
+                                self.requests.get(self.active).is_some_and(
+                                    |r| Some(r.id.as_str()) == args["request_id"].as_str()
+                                )
+                            );
+                    }
+                }
+                self.flush_request_editors(cx);
+                self.persist(cx);
+                cx.notify();
+                if let Some(error) = &self.storage_error {
+                    return Err(format!("操作已应用但持久化失败：{error}"));
+                }
+                return result;
+            }
+        }
+        self.flush_request_editors(cx);
         self.capture_draft(cx);
         let mut result = match operation {
             "mcp_history_list" => {
@@ -256,6 +283,11 @@ impl Workbench {
                     serde_json::from_value(args["workspace"].clone()).map_err(|e| e.to_string())?;
                 workspace.validate()?;
                 workspace.migrate_proxies();
+                for (_, shared) in self.request_editors.drain() {
+                    shared
+                        .editor
+                        .update(cx, |editor, cx| editor.detach_request_window(cx));
+                }
                 self.sending = None;
                 self.ws_background.clear();
                 self.ws_commands = None;

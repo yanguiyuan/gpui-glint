@@ -1,6 +1,126 @@
 use super::*;
 
 impl Workbench {
+    pub(super) fn request_actions_menu(
+        &self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let trigger = IconButton::new(Icon::More, "请求操作")
+            .theme(self.theme)
+            .render()
+            .size(px(20.))
+            .debug_selector(move || format!("request-more:{index}").into());
+        let target = model::TreeNode::Request(index);
+        if self.tree_delete.as_ref() == Some(&target) {
+            return self.tree_delete_popover(target, trigger, cx);
+        }
+        let menu = div()
+            .child(
+                MenuItem::new(format!("copy-request:{index}"), "复制请求")
+                    .icon(Icon::Copy)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(move || format!("copy-request:{index}").into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.request_menu = None;
+                        this.duplicate_request(index, cx);
+                    })),
+            )
+            .child(
+                MenuItem::new(format!("delete-request:{index}"), "删除请求")
+                    .icon(Icon::Trash)
+                    .theme(self.theme)
+                    .render()
+                    .text_color(rgb(self.theme.color(0xd9342b)))
+                    .debug_selector(move || format!("delete-request:{index}").into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.request_menu = None;
+                        this.tree_delete = Some(model::TreeNode::Request(index));
+                        cx.notify();
+                    })),
+            );
+        let owner = cx.entity().downgrade();
+        DropdownMenu::new(format!("request-actions:{index}"), trigger, menu)
+            .open(self.request_menu == Some(index))
+            .width(150.)
+            .theme(self.theme)
+            .on_open_change(move |open, window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.request_menu = open.then_some(index);
+                    if open {
+                        this.tree_menu = None;
+                        this.tree_delete = None;
+                        this.show_collection_menu = false;
+                    }
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                });
+            })
+            .render()
+            .into_any_element()
+    }
+
+    fn duplicate_request(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.flush_request_editors(cx);
+        self.capture_draft(cx);
+        let Some(source) = self.requests.get(index).cloned() else {
+            return;
+        };
+        let base = format!("{} 副本", source.name);
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while self
+            .requests
+            .iter()
+            .any(|r| r.collection == source.collection && r.group == source.group && r.name == name)
+        {
+            name = format!("{base} {suffix}");
+            suffix += 1;
+        }
+        let i = self.requests.len();
+        self.requests.push(Request {
+            id: model::new_id(),
+            tree_order: 0,
+            name: name.clone(),
+            collection: source.collection,
+            group: source.group,
+            draft: source.draft.clone(),
+            versions: vec![Record {
+                id: model::new_id(),
+                tag: String::new(),
+                source: Default::default(),
+                environment_name: None,
+                draft: source.draft,
+                label: "v1".into(),
+                time: record_time(),
+                detail: "复制请求".into(),
+                elapsed_ms: None,
+                exchange: None,
+            }],
+            history: vec![],
+        });
+        let _ = model::move_node(
+            &mut self.collections,
+            &mut self.requests,
+            &model::TreeNode::Request(i),
+            &model::TreeNode::Request(index),
+            model::Placement::After,
+        );
+        self.responses.push(None);
+        self.traces.push(vec![]);
+        self.sent_requests.push(None);
+        self.sent_curls.push(None);
+        self.current_versions.push(0);
+        self.storage_dirty = true;
+        self.choose(i, cx);
+        self.notice = format!("已复制请求 {name}");
+        self.sync_groups(cx);
+        cx.notify();
+    }
+
     pub(super) fn tree_delete_popover(
         &self,
         target: model::TreeNode,
@@ -135,6 +255,8 @@ mod tests {
         });
         for dismissal in ["cancel", "escape", "outside"] {
             hover(window, "request-leaf:0");
+            let more = window.debug_bounds("request-more:0").unwrap();
+            window.simulate_click(more.center(), gpui::Modifiers::default());
             let trigger = window.debug_bounds("delete-request:0").unwrap();
             window.simulate_click(trigger.center(), gpui::Modifiers::default());
             host.update(window, |host, _| {
@@ -156,6 +278,8 @@ mod tests {
             });
         }
         hover(window, "request-leaf:0");
+        let more = window.debug_bounds("request-more:0").unwrap();
+        window.simulate_click(more.center(), gpui::Modifiers::default());
         let trigger = window.debug_bounds("delete-request:0").unwrap();
         window.simulate_click(trigger.center(), gpui::Modifiers::default());
         let confirm = window.debug_bounds("confirm-tree-delete").unwrap();
@@ -178,6 +302,65 @@ mod tests {
                 .requests
                 .is_empty()
         );
+    }
+
+    #[gpui::test]
+    fn request_menu_copies_current_draft_with_new_identity(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name.update(cx, |e, cx| e.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host
+        });
+        let original = host.update(window, |host, cx| {
+            let mut draft = host.requests[0].draft.clone();
+            draft.method = "POST".into();
+            draft.url = "https://example.test/copied".into();
+            draft.body = r#"{"message":"copy me"}"#.into();
+            host.load(&draft, cx);
+            host.capture_draft(cx);
+            host.requests[0].clone()
+        });
+        hover(window, "request-leaf:0");
+        let more = window.debug_bounds("request-more:0").unwrap();
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds("delete-request:0").is_some());
+        window.simulate_keystrokes("escape");
+        host.update(window, |host, _| assert!(host.request_menu.is_none()));
+        hover(window, "request-leaf:0");
+        let more = window.debug_bounds("request-more:0").unwrap();
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        let copy = window.debug_bounds("copy-request:0").unwrap();
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: copy.center(),
+            ..Default::default()
+        });
+        window.simulate_click(copy.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            assert_eq!(host.requests.len(), 2);
+            assert_eq!(host.active, 1);
+            assert!(host.request_menu.is_none());
+            assert!(host.tree_delete.is_none());
+            let copy = &host.requests[1];
+            assert_ne!(copy.id, original.id);
+            assert_eq!(copy.draft, original.draft);
+            assert_eq!(copy.collection, original.collection);
+            assert_eq!(copy.group, original.group);
+            assert_eq!(copy.name, format!("{} 副本", original.name));
+            assert!(copy.history.is_empty());
+            assert_eq!(copy.versions.len(), 1);
+            assert_ne!(copy.versions[0].id, original.versions[0].id);
+            host.duplicate_request(0, cx);
+            assert_eq!(host.requests[2].name, format!("{} 副本 2", original.name));
+            host.persist(cx);
+        });
+        let saved = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(saved.requests.len(), 3);
+        assert!(saved.requests.iter().all(|r| r.draft == original.draft));
     }
 
     #[gpui::test]

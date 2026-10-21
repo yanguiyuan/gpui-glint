@@ -32,6 +32,7 @@ mod proxy_ui;
 mod registry_ui;
 mod request_fingerprint;
 mod request_preview_ui;
+mod request_window;
 mod sse;
 mod storage;
 mod template;
@@ -43,6 +44,8 @@ mod version_history;
 mod version_tags;
 mod websocket;
 mod websocket_ui;
+mod workspace_transfer;
+mod workspace_transfer_ui;
 mod workspace_ui;
 
 use environment::EnvironmentVariables;
@@ -67,7 +70,7 @@ use gpui_glint::{
 use http::{HttpResponse, PreparedRequest};
 use model::{BodyFormat, Draft, Pair, Record, Request, RequestGroups};
 use proxy_ui::ProxyInput;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 gpui::actions!(
@@ -103,6 +106,8 @@ struct PairInput {
     note: Entity<TextEntry>,
 }
 struct Workbench {
+    request_editors: HashMap<String, request_window::SharedRequest>,
+    request_binding: Option<request_window::Binding>,
     directory_settings: Option<Entity<directory_ui::DirectorySettings>>,
     directory_subscription: Option<Subscription>,
     version_tag_edit: Option<(usize, String)>,
@@ -123,6 +128,9 @@ struct Workbench {
     workspace_edit: Option<String>,
     workspace_delete: Option<String>,
     workspace_error: Option<String>,
+    workspace_transfer: Option<workspace_transfer_ui::TransferDialog>,
+    workspace_transfer_task: Option<Task<()>>,
+    workspace_transfer_name: Entity<TextEntry>,
     environment_names: Vec<String>,
     responses: Vec<Option<HttpResponse>>,
     storage_error: Option<String>,
@@ -142,6 +150,7 @@ struct Workbench {
     hovered_tree_row: Option<String>,
     tree_drop: Option<(model::TreeNode, model::Placement)>,
     tree_menu: Option<(usize, String)>,
+    request_menu: Option<usize>,
     tree_delete: Option<model::TreeNode>,
     group_edit: Option<GroupEdit>,
     group_dialog_open: bool,
@@ -260,6 +269,16 @@ struct Workbench {
     html_webview: Option<Entity<gpui_glint::components::WebView>>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     html_webview_source: Option<String>,
+    #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+    html_window: Option<gpui::WindowId>,
+    #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+    html_windows: HashMap<
+        gpui::WindowId,
+        (
+            Option<Entity<gpui_glint::components::WebView>>,
+            Option<String>,
+        ),
+    >,
     show_mcp: bool,
     mcp_history_search: Entity<TextEntry>,
     mcp_history_filter: usize,
@@ -496,6 +515,12 @@ impl Workbench {
                 if let CommandPaletteEvent::Executed(id) = event {
                     match id.as_ref() {
                         "import-curl" => this.open_curl_import(cx),
+                        "import-workspace" => {
+                            this.prepare_workspace_transfer(workspace_transfer_ui::Mode::Import, cx)
+                        }
+                        "export-workspace" => {
+                            this.prepare_workspace_transfer(workspace_transfer_ui::Mode::Export, cx)
+                        }
                         "mcp-config" => match mcp::configuration() {
                             Ok(config) => {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -721,6 +746,8 @@ impl Workbench {
             .unwrap_or_default();
         let proxy_certificate_status = proxy_listener_ui::certificate_status(&storage);
         let mut this = Self {
+            request_editors: Default::default(),
+            request_binding: None,
             toasts: cx.new(|_| ToastHost::new()),
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
@@ -736,6 +763,9 @@ impl Workbench {
             workspace_edit: None,
             workspace_delete: None,
             workspace_error: None,
+            workspace_transfer: None,
+            workspace_transfer_task: None,
+            workspace_transfer_name: Self::entry("", "导入后的工作区名称", cx),
             storage,
             storage_error: None,
             storage_dirty: true,
@@ -760,6 +790,7 @@ impl Workbench {
             hovered_tree_row: None,
             tree_drop: None,
             tree_menu: None,
+            request_menu: None,
             tree_delete: None,
             group_name,
             group_edit: None,
@@ -874,6 +905,10 @@ impl Workbench {
             html_webview: None,
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             html_webview_source: None,
+            #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+            html_window: None,
+            #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+            html_windows: HashMap::new(),
             show_mcp: false,
             mcp_history_search: Self::entry("", "搜索工具、客户端或错误…", cx),
             mcp_history_filter: 0,
@@ -967,6 +1002,14 @@ impl Workbench {
                     .group("操作")
                     .keywords("import curl 导入 粘贴")
                     .icon(Icon::Download),
+                CommandItem::new("import-workspace", "导入工作区")
+                    .group("操作")
+                    .keywords("import workspace 导入 工作区 迁移 还原 备份 json")
+                    .icon(Icon::Download),
+                CommandItem::new("export-workspace", "导出当前工作区")
+                    .group("操作")
+                    .keywords("export workspace 导出 工作区 迁移 备份 json")
+                    .icon(Icon::Upload),
                 CommandItem::new("mcp-config", "复制 MCP 连接配置")
                     .group("操作")
                     .keywords("agent mcp stdio 连接 配置")
@@ -986,7 +1029,13 @@ impl Workbench {
             .collect()
     }
     fn sync_commands(&mut self, cx: &mut Context<Self>) {
-        let items = Self::command_items(&self.requests);
+        let items = Self::command_items(&self.requests)
+            .into_iter()
+            .filter(|item| {
+                self.request_binding.is_none()
+                    || !matches!(item.id.as_ref(), "import-workspace" | "export-workspace")
+            })
+            .collect::<Vec<_>>();
         self.commands
             .update(cx, |commands, cx| commands.set_items(items, cx));
     }
@@ -1143,6 +1192,12 @@ impl Workbench {
         }
     }
     fn persist(&mut self, cx: &mut Context<Self>) {
+        if self.request_binding.is_some() {
+            self.capture_draft(cx);
+            return;
+        }
+        self.flush_request_editors(cx);
+        self.refresh_request_editors(cx);
         self.capture_draft(cx);
         self.storage_dirty |= self.selected_environment(cx) != self.saved_environment;
         if !self.storage_dirty {
@@ -1179,6 +1234,9 @@ impl Workbench {
         self.update_response(cx);
     }
     fn snapshot(&self, cx: &App) -> Draft {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            return editor.read(cx).snapshot(cx);
+        }
         let pairs = |rows: &[PairInput]| {
             rows.iter()
                 .map(|r| Pair {
@@ -1419,6 +1477,7 @@ impl Workbench {
         cx.notify();
     }
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.request_menu = None;
         self.duplicate_version = None;
         self.history_delete = None;
         self.version_tag_edit = None;
@@ -1481,6 +1540,10 @@ impl Workbench {
         self.unpark_websocket(cx);
     }
     fn save(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.save(cx));
+            return;
+        }
         if self.show_curl_import {
             return;
         }
@@ -1516,6 +1579,10 @@ impl Workbench {
         cx.notify();
     }
     fn send(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.send(cx));
+            return;
+        }
         if self.show_curl_import {
             return;
         }
@@ -1611,6 +1678,7 @@ impl Workbench {
         self.requests[self.active].draft = draft.clone();
         self.notice = "正在发送 HTTP 请求".into();
         let index = self.active;
+        let request_id = self.requests[index].id.clone();
         let started = Instant::now();
         let plugin_ids = self.enabled_before_actions(&draft.plugins);
         let plugin_catalog = self.plugin_catalog.clone();
@@ -1630,13 +1698,16 @@ impl Workbench {
             let result = match prepared {
                 Ok(request) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.push_trace("发送 HTTP 请求，等待服务器响应", cx);
-                        this.sent_requests[index] = Some(request.preview.clone());
-                        this.sent_curls[index] = request.to_curl().ok();
-                        if this.active == index {
-                            this.sync_request_preview(cx);
-                        }
-                        cx.notify();
+                        this.with_request_executor(&request_id, cx, |this, cx| {
+                            let index = this.active;
+                            this.push_trace("发送 HTTP 请求，等待服务器响应", cx);
+                            this.sent_requests[index] = Some(request.preview.clone());
+                            this.sent_curls[index] = request.to_curl().ok();
+                            if this.active == index {
+                                this.sync_request_preview(cx);
+                            }
+                            cx.notify();
+                        });
                     });
                     let (progress, updates) = async_channel::bounded(1);
                     let execution = cx
@@ -1645,7 +1716,9 @@ impl Workbench {
                     while let Ok(response) = updates.recv().await {
                         if this
                             .update(cx, |this, cx| {
-                                this.apply_stream_response(index, response, cx)
+                                this.with_request_executor(&request_id, cx, |this, cx| {
+                                    this.apply_stream_response(this.active, response, cx)
+                                })
                             })
                             .is_err()
                         {
@@ -1658,120 +1731,123 @@ impl Workbench {
             };
             let elapsed_ms = started.elapsed().as_millis();
             let _ = this.update(cx, |this, cx| {
-                let (label, detail) = match &result {
-                    Ok(response) => (
-                        status_label(response.status),
-                        format!(
-                            "{elapsed_ms} ms · {} · {} B",
-                            environment_name, response.bytes
-                        ),
-                    ),
-                    Err(error) => ("请求失败".into(), format!("{elapsed_ms} ms · {error}")),
-                };
-                if let Ok(response) = &result {
-                    this.push_trace(
-                        format!(
-                            "收到响应 · {} · {} B",
+                this.with_request_executor(&request_id, cx, |this, cx| {
+                    let index = this.active;
+                    let (label, detail) = match &result {
+                        Ok(response) => (
                             status_label(response.status),
-                            response.bytes
+                            format!(
+                                "{elapsed_ms} ms · {} · {} B",
+                                environment_name, response.bytes
+                            ),
                         ),
-                        cx,
-                    );
-                }
-                let extraction = result
-                    .as_ref()
-                    .ok()
-                    .filter(|response| !response.is_event_stream())
-                    .map(|response| {
-                        this.apply_extractors_for_id(
-                            &draft,
-                            environment_index,
-                            &extraction_collection,
-                            response,
-                            cx,
-                        )
-                    });
-                this.storage_dirty = true;
-                this.prepend_history(
-                    index,
-                    Record {
-                        id: crate::model::new_id(),
-                        tag: String::new(),
-                        source: Default::default(),
-                        environment_name: Some(environment_name),
-                        draft,
-                        label,
-                        detail,
-                        time: record_time(),
-                        elapsed_ms: Some(elapsed_ms),
-                        exchange: Some(model::Exchange {
-                            websocket_connected: false,
-                            websocket_events: vec![],
-                            curl: this.sent_curls[index].clone(),
-                            response: result.as_ref().ok().cloned().or_else(|| {
-                                this.response_data
-                                    .clone()
-                                    .filter(HttpResponse::is_event_stream)
-                            }),
-                            error: result.as_ref().err().cloned(),
-                            preview: this.sent_requests[index].clone(),
-                            traces: vec![],
-                        }),
-                    },
-                );
-                match result {
-                    Ok(response) => {
+                        Err(error) => ("请求失败".into(), format!("{elapsed_ms} ms · {error}")),
+                    };
+                    if let Ok(response) = &result {
                         this.push_trace(
-                            if response.status < 400 {
-                                "请求完成"
-                            } else {
-                                "请求完成 · HTTP 错误状态"
-                            },
+                            format!(
+                                "收到响应 · {} · {} B",
+                                status_label(response.status),
+                                response.bytes
+                            ),
                             cx,
                         );
-                        this.responses[index] = Some(response.clone());
-                        this.status = Some(response.status);
-                        this.response_json = response.json.clone();
-                        this.response_data = Some(response);
-                        this.update_response(cx);
-                        this.notice = match extraction {
-                            Some(Ok(count)) if count > 0 => {
-                                format!("请求完成 · 已提取 {count} 个环境变量")
-                            }
-                            Some(Err(error)) => format!("请求完成 · 后置动作失败：{error}"),
-                            _ => "请求完成".into(),
-                        };
                     }
-                    Err(error) => {
-                        let environment = this.requests[index].history[0]
-                            .environment_name
-                            .clone()
-                            .unwrap_or_default();
-                        this.request_error_toast(failure_title, &environment, &error, cx);
-                        this.push_trace(format!("请求失败：{error}"), cx);
-                        this.error = Some(error);
-                        if !this
-                            .response_data
-                            .as_ref()
-                            .is_some_and(HttpResponse::is_event_stream)
-                        {
-                            this.responses[index] = None;
-                            this.response_data = None;
-                            this.response_json = None;
-                            this.status = None;
+                    let extraction = result
+                        .as_ref()
+                        .ok()
+                        .filter(|response| !response.is_event_stream())
+                        .map(|response| {
+                            this.apply_extractors_for_id(
+                                &draft,
+                                environment_index,
+                                &extraction_collection,
+                                response,
+                                cx,
+                            )
+                        });
+                    this.storage_dirty = true;
+                    this.prepend_history(
+                        index,
+                        Record {
+                            id: crate::model::new_id(),
+                            tag: String::new(),
+                            source: Default::default(),
+                            environment_name: Some(environment_name),
+                            draft,
+                            label,
+                            detail,
+                            time: record_time(),
+                            elapsed_ms: Some(elapsed_ms),
+                            exchange: Some(model::Exchange {
+                                websocket_connected: false,
+                                websocket_events: vec![],
+                                curl: this.sent_curls[index].clone(),
+                                response: result.as_ref().ok().cloned().or_else(|| {
+                                    this.response_data
+                                        .clone()
+                                        .filter(HttpResponse::is_event_stream)
+                                }),
+                                error: result.as_ref().err().cloned(),
+                                preview: this.sent_requests[index].clone(),
+                                traces: vec![],
+                            }),
+                        },
+                    );
+                    match result {
+                        Ok(response) => {
+                            this.push_trace(
+                                if response.status < 400 {
+                                    "请求完成"
+                                } else {
+                                    "请求完成 · HTTP 错误状态"
+                                },
+                                cx,
+                            );
+                            this.responses[index] = Some(response.clone());
+                            this.status = Some(response.status);
+                            this.response_json = response.json.clone();
+                            this.response_data = Some(response);
+                            this.update_response(cx);
+                            this.notice = match extraction {
+                                Some(Ok(count)) if count > 0 => {
+                                    format!("请求完成 · 已提取 {count} 个环境变量")
+                                }
+                                Some(Err(error)) => format!("请求完成 · 后置动作失败：{error}"),
+                                _ => "请求完成".into(),
+                            };
                         }
-                        this.update_response(cx);
-                        this.notice = "请求失败".into();
+                        Err(error) => {
+                            let environment = this.requests[index].history[0]
+                                .environment_name
+                                .clone()
+                                .unwrap_or_default();
+                            this.request_error_toast(failure_title, &environment, &error, cx);
+                            this.push_trace(format!("请求失败：{error}"), cx);
+                            this.error = Some(error);
+                            if !this
+                                .response_data
+                                .as_ref()
+                                .is_some_and(HttpResponse::is_event_stream)
+                            {
+                                this.responses[index] = None;
+                                this.response_data = None;
+                                this.response_json = None;
+                                this.status = None;
+                            }
+                            this.update_response(cx);
+                            this.notice = "请求失败".into();
+                        }
                     }
-                }
-                this.requests[index].history[0]
-                    .exchange
-                    .as_mut()
-                    .unwrap()
-                    .traces = this.traces[index].clone();
-                this.trace_started = None;
-                this.sending = None;
-                cx.notify();
+                    this.requests[index].history[0]
+                        .exchange
+                        .as_mut()
+                        .unwrap()
+                        .traces = this.traces[index].clone();
+                    this.trace_started = None;
+                    this.sending = None;
+                    cx.notify();
+                });
             });
         }));
         cx.notify();
@@ -2016,9 +2092,33 @@ impl Workbench {
         });
         self.sync_response_search(true, cx);
     }
+    #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+    fn activate_html_window(&mut self, window: &Window, cx: &App) {
+        let id = window.window_handle().window_id();
+        let Some(previous) = self.html_window.replace(id) else {
+            return;
+        };
+        if previous == id {
+            return;
+        }
+        let open = cx
+            .windows()
+            .into_iter()
+            .map(|window| window.window_id())
+            .collect::<HashSet<_>>();
+        self.html_windows.retain(|id, _| open.contains(id));
+        let mut native = self.html_windows.remove(&id).unwrap_or_default();
+        std::mem::swap(&mut self.html_webview, &mut native.0);
+        std::mem::swap(&mut self.html_webview_source, &mut native.1);
+        if open.contains(&previous) {
+            self.html_windows.insert(previous, native);
+        }
+    }
+
     fn preview_html(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         {
+            self.activate_html_window(window, cx);
             let Some(response) = self
                 .response_data
                 .as_ref()
@@ -2036,6 +2136,7 @@ impl Workbench {
                 return;
             }
             let text = response.text.clone();
+            self.html_webview_source = Some(text.clone());
             let builder = gpui_glint::components::wry::WebViewBuilder::new()
                 .with_html(&text)
                 .with_incognito(true)
@@ -2121,6 +2222,7 @@ impl Workbench {
             &self.request_name,
             &self.version_tag_input,
             &self.workspace_name_input,
+            &self.workspace_transfer_name,
         ] {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }
@@ -2292,7 +2394,14 @@ impl Workbench {
                             .theme(self.theme)
                             .render()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_activity = !this.show_activity;
+                                if let Some(editor) = this.shared_request_editor(this.active) {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.show_activity = !editor.show_activity;
+                                        cx.notify();
+                                    });
+                                } else {
+                                    this.show_activity = !this.show_activity;
+                                }
                                 cx.notify();
                             })),
                     )
@@ -3080,18 +3189,11 @@ impl Workbench {
                                 .child(request.name.clone()),
                         ),
                 );
-                if hovered || self.tree_delete.as_ref() == Some(&model::TreeNode::Request(index)) {
-                    item = item.trailing(
-                        self.tree_delete_popover(
-                            model::TreeNode::Request(index),
-                            IconButton::new(Icon::Trash, "删除请求")
-                                .theme(self.theme)
-                                .render()
-                                .size(px(20.))
-                                .debug_selector(move || format!("delete-request:{index}").into()),
-                            cx,
-                        ),
-                    );
+                if hovered
+                    || self.request_menu == Some(index)
+                    || self.tree_delete.as_ref() == Some(&model::TreeNode::Request(index))
+                {
+                    item = item.trailing(self.request_actions_menu(index, cx));
                 }
                 item.render()
                     .debug_selector(move || debug_key.clone())
@@ -3544,6 +3646,14 @@ impl Workbench {
         self.choose(i, cx);
     }
     fn delete_request(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.request_menu = None;
+        if let Some(request) = self.requests.get(index) {
+            if let Some(shared) = self.request_editors.remove(&request.id) {
+                shared
+                    .editor
+                    .update(cx, |editor, cx| editor.detach_request_window(cx));
+            }
+        }
         self.duplicate_version = None;
         self.history_delete = None;
         self.version_tag_edit = None;
@@ -4470,6 +4580,16 @@ impl Workbench {
     }
     fn workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
+        if self
+            .request_binding
+            .as_ref()
+            .is_some_and(|binding| binding.detached)
+        {
+            return div()
+                .size_full()
+                .p_5()
+                .child("请求已删除、工作区已切换或主窗口已关闭。此窗口已停止编辑和执行。");
+        }
         if self.requests.is_empty() {
             return div()
                 .size_full()
@@ -4539,6 +4659,11 @@ impl Workbench {
         .on_add(move |window, app| {
             add_owner.update(app, |this, cx| this.open_commands(window, cx));
         });
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            return tabs
+                .content(self.active as u64, div().size_full().child(editor))
+                .render();
+        }
         let top = div()
             .px_5()
             .py_4()
@@ -4565,6 +4690,7 @@ impl Workbench {
                                     .size(ButtonSize::Regular)
                                     .theme(self.theme)
                                     .render()
+                                    .debug_selector(|| "request-save".into())
                                     .text_size(px(12.))
                                     .px(px(10.))
                                     .bg(rgb(p.panel))
@@ -4595,6 +4721,7 @@ impl Workbench {
                         })
                         .theme(self.theme)
                         .render()
+                        .debug_selector(|| "request-send".into())
                         .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
                     ),
             );
@@ -4683,7 +4810,11 @@ impl Workbench {
                     .overflow_hidden()
                     .child(self.notice.clone()),
             );
-        tabs.content(self.active as u64, content).render()
+        if self.request_binding.is_some() {
+            content
+        } else {
+            tabs.content(self.active as u64, content).render()
+        }
     }
     /// 按方向批量关闭标签页，被点击的标签始终保留；若当前标签被关闭则切到被点击的标签。
     fn close_tabs_around(&mut self, keep: usize, mode: TabCloseMode, cx: &mut Context<Self>) {
@@ -4743,7 +4874,16 @@ impl Workbench {
                     .render()
                     .debug_selector(|| "tab-open-window".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_request_preview(index, window, cx);
+                        this.open_request_window(index, window, cx);
+                    })),
+            )
+            .child(
+                MenuItem::new("tab-open-snapshot", "打开只读快照")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tab-open-snapshot".into())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_request_preview(index, window, cx)
                     })),
             )
             .child(div().h(px(1.)).my_1().bg(rgb(p.border)))
@@ -5302,6 +5442,18 @@ impl Workbench {
 }
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+        {
+            self.activate_html_window(window, cx);
+            if self.html_preview
+                && self.response_data.as_ref().is_some_and(|response| {
+                    response.language() == "html"
+                        && self.html_webview_source.as_deref() != Some(response.text.as_str())
+                })
+            {
+                self.preview_html(window, cx);
+            }
+        }
         if let Some(pending) = &self.duplicate_version {
             if !pending.focus.is_focused(window) {
                 window.focus(&pending.focus, cx);
@@ -5334,6 +5486,7 @@ impl Render for Workbench {
                 && !self.show_mcp
                 && !self.show_curl_import
                 && !self.show_workspaces
+                && self.workspace_transfer.is_none()
                 && self.group_edit.is_none()
                 && self.duplicate_version.is_none()
                 && self.directory_settings.is_none()
@@ -5365,6 +5518,7 @@ impl Render for Workbench {
             })
             .when(
                 self.show_activity
+                    && self.shared_request_editor(self.active).is_none()
                     && !self.show_proxies
                     && !self.show_environments
                     && !self.show_plugins
@@ -5376,14 +5530,20 @@ impl Render for Workbench {
             .size_full()
             .flex()
             .flex_col()
-            .when_some(self.storage_error.clone(), |el, error| {
-                el.child(
-                    div()
-                        .p_2()
-                        .text_color(rgb(0xd9342b))
-                        .child(format!("SQLite 保存失败：{error}。修改尚未写入磁盘。")),
-                )
-            })
+            .when_some(
+                self.request_binding
+                    .as_ref()
+                    .and_then(|binding| binding.storage_error.clone())
+                    .or_else(|| self.storage_error.clone()),
+                |el, error| {
+                    el.child(
+                        div()
+                            .p_2()
+                            .text_color(rgb(0xd9342b))
+                            .child(format!("SQLite 保存失败：{error}。修改尚未写入磁盘。")),
+                    )
+                },
+            )
             .child(content);
         let maximum_sidebar_width =
             (f32::from(window.viewport_size().width) - 46. - 640.).clamp(180., 480.);
@@ -5405,12 +5565,17 @@ impl Render for Workbench {
                     cx.notify();
                 }),
             );
-        let shell = AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
-            .navigation_rail(self.rail(cx))
-            .navigation_rail_width(46.)
-            .sidebar_width(self.sidebar_width)
-            .sidebar_resize_handle(resize_handle)
-            .theme(self.theme);
+        let shell = if self.request_binding.is_some() {
+            content.into_any_element()
+        } else {
+            AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
+                .navigation_rail(self.rail(cx))
+                .navigation_rail_width(46.)
+                .sidebar_width(self.sidebar_width)
+                .sidebar_resize_handle(resize_handle)
+                .theme(self.theme)
+                .into_any_element()
+        };
         let overlay = self
             .commands
             .update(cx, |commands, cx| commands.overlay(cx));
@@ -5468,7 +5633,11 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
+                if this.request_binding.is_some() {
+                    cx.stop_propagation();
+                }
                 if this.show_workspaces
+                    || this.workspace_transfer.is_some()
                     || this.group_edit.is_some()
                     || this.duplicate_version.is_some()
                 {
@@ -5487,7 +5656,11 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
+                if this.request_binding.is_some() {
+                    cx.stop_propagation();
+                }
                 if this.show_workspaces
+                    || this.workspace_transfer.is_some()
                     || this.group_edit.is_some()
                     || this.duplicate_version.is_some()
                 {
@@ -5504,8 +5677,12 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
+                if this.request_binding.is_some() {
+                    cx.stop_propagation();
+                }
                 if this.group_edit.is_none()
                     && !this.show_workspaces
+                    && this.workspace_transfer.is_none()
                     && !this.show_mcp
                     && !this.show_plugins
                     && !this.show_environments
@@ -5521,8 +5698,18 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchCommands, w, cx| {
+                if this.request_binding.is_some() {
+                    // An embedded shared editor uses the main window's workspace
+                    // commands; standalone request windows keep their local palette.
+                    if w.window_handle().downcast::<Workbench>().is_some() {
+                        cx.propagate();
+                        return;
+                    }
+                    cx.stop_propagation();
+                }
                 if this.group_edit.is_none()
                     && !this.show_workspaces
+                    && this.workspace_transfer.is_none()
                     && !this.show_registry_dialog
                     && !this.show_curl_import
                 {
@@ -5530,6 +5717,15 @@ impl Render for Workbench {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.workspace_transfer.is_some() {
+                    if event.keystroke.key == "escape" && this.workspace_transfer_task.is_none() {
+                        this.workspace_transfer = None;
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if this.show_workspaces {
                     match event.keystroke.key.as_str() {
                         "escape" => {
@@ -5620,6 +5816,12 @@ impl Render for Workbench {
                     cx.notify();
                     return;
                 }
+                if event.keystroke.key == "escape" && this.request_menu.is_some() {
+                    this.request_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.tree_delete.is_some() {
                     this.tree_delete = None;
                     cx.stop_propagation();
@@ -5654,6 +5856,7 @@ impl Render for Workbench {
             .children(self.registry_dialog(cx))
             .children(self.curl_import_dialog(cx))
             .children(self.workspace_dialog(cx))
+            .children(self.workspace_transfer_dialog(cx))
             .children(self.group_dialog(cx))
             .children(self.duplicate_version_dialog(cx))
     }
@@ -5712,9 +5915,6 @@ fn main() {
         }
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-worker")) {
-        if updater::ensure_not_installing().is_err() {
-            std::process::exit(1);
-        }
         if !plugins::worker() {
             std::process::exit(1);
         }

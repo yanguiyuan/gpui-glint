@@ -201,6 +201,10 @@ impl Workbench {
     }
 
     pub(super) fn restore_version(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.restore_version(index, cx));
+            return;
+        }
         let Some(record) = self
             .requests
             .get(self.active)

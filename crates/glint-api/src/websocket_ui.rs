@@ -662,6 +662,10 @@ impl Workbench {
     }
 
     pub(super) fn connect_websocket(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.connect_websocket(cx));
+            return;
+        }
         let draft = self.snapshot(cx);
         self.ws_begin_history(&draft, cx);
         let environment_index = self.selected_environment(cx);
@@ -802,6 +806,10 @@ impl Workbench {
         cx.notify();
     }
     pub(super) fn disconnect_websocket(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.disconnect_websocket(cx));
+            return;
+        }
         if self.ws_commands.is_none() || !self.ws_connected {
             self.sending = None;
             self.ws_active = false;
@@ -825,6 +833,10 @@ impl Workbench {
         cx.notify();
     }
     pub(super) fn send_websocket_message(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = self.shared_request_editor(self.active) {
+            editor.update(cx, |editor, cx| editor.send_websocket_message(cx));
+            return;
+        }
         if !self.ws_connected {
             return;
         }
@@ -952,6 +964,17 @@ impl Workbench {
                     )
                     .child(div().flex_1())
                     .child(self.ws_menu(cx))
+                    .child(
+                        Button::new("独立窗口")
+                            .kind(ButtonKind::Plain)
+                            .size(ButtonSize::Mini)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "websocket-open-window".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_request_window(this.active, window, cx)
+                            })),
+                    )
                     .child(
                         Button::new("发送消息")
                             .when(!self.ws_connected, |button| button.disabled())

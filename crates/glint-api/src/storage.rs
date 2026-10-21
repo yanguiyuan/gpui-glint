@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
     #[serde(default)]
     pub update_source: Option<super::updater::UpdateSource>,
@@ -268,6 +268,12 @@ impl Store {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| e.to_string())?;
         }
+        Self::from_connection(connection)
+    }
+    pub(super) fn memory() -> Result<Self, String> {
+        Self::from_connection(Connection::open_in_memory().map_err(|e| e.to_string())?)
+    }
+    fn from_connection(connection: Connection) -> Result<Self, String> {
         connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(|e| e.to_string())?;
@@ -300,9 +306,9 @@ impl Store {
             .map_err(|e| e.to_string())?;
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspaces (
             id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, data TEXT);
-            INSERT OR IGNORE INTO workspaces(id,name) VALUES ('default','个人工作区');
+            INSERT INTO workspaces(id,name) SELECT 'default','个人工作区' WHERE NOT EXISTS (SELECT 1 FROM workspaces);
             CREATE TABLE IF NOT EXISTS workspace_selection (id INTEGER PRIMARY KEY CHECK(id=1), workspace_id TEXT NOT NULL);
-            INSERT OR IGNORE INTO workspace_selection VALUES(1,'default');").map_err(|e| e.to_string())?;
+            INSERT OR IGNORE INTO workspace_selection SELECT 1,id FROM workspaces ORDER BY rowid LIMIT 1;").map_err(|e| e.to_string())?;
         let has_workspace_column = connection
             .prepare("PRAGMA table_info(mcp_calls)")
             .map_err(|e| e.to_string())?
@@ -347,7 +353,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
-    fn workspace_name(&self, name: &str, except: &str) -> Result<String, String> {
+    pub(super) fn workspace_name(&self, name: &str, except: &str) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 64 {
             return Err("名称须为 1–64 个字符".into());
@@ -389,10 +395,27 @@ impl Store {
         Ok(())
     }
     pub fn delete_workspace(&mut self, id: &str) -> Result<(), String> {
-        if id == "default" || id == self.workspace_id {
-            return Err("请保留默认工作区，并先切换再删除当前工作区".into());
-        }
         let tx = self.connection.transaction().map_err(|e| e.to_string())?;
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if count <= 1 {
+            return Err("至少保留一个工作区，无法删除最后一个工作区".into());
+        }
+        let selected: String = tx
+            .query_row(
+                "SELECT workspace_id FROM workspace_selection WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if id == self.workspace_id || id == selected {
+            return Err("请先切换再删除当前工作区".into());
+        }
+        if id == "default" {
+            tx.execute("DELETE FROM workspace WHERE id=1", [])
+                .map_err(|e| e.to_string())?;
+        }
         tx.execute("DELETE FROM mcp_calls WHERE workspace_id=?1", [id])
             .map_err(|e| e.to_string())?;
         if tx
@@ -949,7 +972,7 @@ mod workspace_tests {
         second.rename_workspace(&second_id, "项目 B 改名").unwrap();
         assert!(second.rename_workspace(&second_id, "个人工作区").is_err());
         assert!(second.delete_workspace(&second_id).is_err());
-        assert!(second.delete_workspace("default").is_err());
+        assert!(second.delete_workspace("missing").is_err());
         let mut reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.workspace_id, second_id);
         assert_eq!(

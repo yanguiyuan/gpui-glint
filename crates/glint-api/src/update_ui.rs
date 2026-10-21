@@ -137,7 +137,7 @@ mod tests {
     }
 }
 impl UpdateState {
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         matches!(self, Self::Checking | Self::Downloading { .. })
     }
 }
@@ -230,7 +230,10 @@ impl Workbench {
     }
 
     fn update_can_restart(&mut self, cx: &mut Context<Self>) -> bool {
-        let reason = if self.sending.is_some() {
+        self.flush_request_editors(cx);
+        let reason = if self.sending.is_some()
+            || self.request_editors.values().any(|shared| shared.running)
+        {
             Some("请求正在执行，请完成或取消请求后更新")
         } else if self.has_unsaved_environment(cx) {
             Some("环境设置有未保存修改，请保存或放弃修改后更新")

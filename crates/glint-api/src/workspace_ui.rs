@@ -42,7 +42,14 @@ impl Workbench {
                 cx.notify();
             }))
     }
-    fn workspace_switch_ready(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+    pub(super) fn workspace_switch_ready(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.workspace_transfer_task.is_some() {
+            return Err("工作区导入或导出完成后可切换工作区".into());
+        }
+        self.flush_request_editors(cx);
+        if self.request_editors.values().any(|shared| shared.running) {
+            return Err("请先结束独立窗口中的请求或 WebSocket 连接，再切换工作区".into());
+        }
         if self
             .ws_background
             .values()
@@ -86,6 +93,15 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.switch_workspace_with_settings(id, false, window, cx)
+    }
+    pub(super) fn switch_workspace_with_settings(
+        &mut self,
+        id: &str,
+        restore_settings: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         if id == self.storage.workspace_id {
             self.show_workspaces = false;
             window.focus(&self.focus, cx);
@@ -104,13 +120,18 @@ impl Workbench {
         next.update_state = std::mem::replace(&mut self.update_state, update_ui::UpdateState::Idle);
         next.show_update_details = self.show_update_details;
         next.update_error = self.update_error.take();
-        next.update_source = self.update_source.clone();
-        next.update_source_url.update(cx, |e, cx| {
-            e.set_value(self.update_source_url.read(cx).value().to_owned(), cx)
-        });
-        next.update_source_key.update(cx, |e, cx| {
-            e.set_value(self.update_source_key.read(cx).value().to_owned(), cx)
-        });
+        if restore_settings {
+            next.update_state = update_ui::UpdateState::Idle;
+            next.update_error = None;
+        } else {
+            next.update_source = self.update_source.clone();
+            next.update_source_url.update(cx, |e, cx| {
+                e.set_value(self.update_source_url.read(cx).value().to_owned(), cx)
+            });
+            next.update_source_key.update(cx, |e, cx| {
+                e.set_value(self.update_source_key.read(cx).value().to_owned(), cx)
+            });
+        }
         next.sidebar_width = self.sidebar_width;
         next.show_activity = self.show_activity;
         next.set_theme(self.theme, cx);
@@ -139,6 +160,36 @@ impl Workbench {
         self.workspace_error = result.err();
         cx.notify();
     }
+    fn confirm_workspace_deletion(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let list = self.storage.workspaces()?;
+        if list.len() <= 1 {
+            return Err("至少保留一个工作区，无法删除最后一个工作区".into());
+        }
+        if !list.iter().any(|w| w.id == id) {
+            return Err("工作区不存在".into());
+        }
+        if id == self.storage.workspace_id {
+            let next = list.iter().find(|w| w.id != id).unwrap();
+            self.switch_workspace(&next.id, window, cx)?;
+            self.show_workspaces = true;
+        }
+        self.storage.delete_workspace(id)?;
+        self.workspace_list = self.storage.workspaces()?;
+        self.workspace_delete = None;
+        if self.workspace_edit.as_deref() == Some(id) {
+            self.workspace_edit = None;
+            self.workspace_name_input
+                .update(cx, |e, cx| e.set_value("", cx));
+        }
+        self.notice = "已删除工作区".into();
+        Ok(())
+    }
+
     pub(super) fn workspace_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.show_workspaces {
             return None;
@@ -158,6 +209,7 @@ impl Workbench {
             let name = workspace.name.clone();
             let selected = id == self.storage.workspace_id;
             let mut row = div()
+                .id(format!("workspace-row-{id}"))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -214,18 +266,22 @@ impl Workbench {
                             cx.notify();
                         })),
                 );
-            if !selected && workspace.id != "default" {
+            {
                 row = row.child(
                     Button::new("删除")
                         .kind(ButtonKind::Plain)
                         .size(ButtonSize::Small)
                         .theme(self.theme)
+                        .when(self.workspace_list.len() <= 1, |button| button.disabled())
                         .render()
                         .debug_selector({
                             let id = delete_id.clone();
                             move || format!("delete-workspace-{id}")
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.workspace_list.len() <= 1 {
+                                return;
+                            }
                             this.workspace_delete = Some(delete_id.clone());
                             this.workspace_error = None;
                             cx.notify();
@@ -272,6 +328,41 @@ impl Workbench {
                     .child("按项目隔离请求、环境、版本与历史，切换前自动保存。"),
             )
             .child(list);
+        form = form.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("导入工作区")
+                        .kind(ButtonKind::Plain)
+                        .size(ButtonSize::Small)
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "open-workspace-import".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_workspace_transfer(
+                                workspace_transfer_ui::Mode::Import,
+                                window,
+                                cx,
+                            )
+                        })),
+                )
+                .child(
+                    Button::new("导出当前工作区")
+                        .kind(ButtonKind::Plain)
+                        .size(ButtonSize::Small)
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "open-workspace-export".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_workspace_transfer(
+                                workspace_transfer_ui::Mode::Export,
+                                window,
+                                cx,
+                            )
+                        })),
+                ),
+        );
         if let Some(id) = self.workspace_delete.clone() {
             let name = self
                 .workspace_list
@@ -300,21 +391,10 @@ impl Workbench {
                                     .theme(self.theme)
                                     .render()
                                     .debug_selector(|| "confirm-delete-workspace".into())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         let result =
-                                            this.storage.delete_workspace(&id).and_then(|_| {
-                                                this.workspace_list = this.storage.workspaces()?;
-                                                Ok(())
-                                            });
+                                            this.confirm_workspace_deletion(&id, window, cx);
                                         this.workspace_error = result.err();
-                                        if this.workspace_error.is_none() {
-                                            this.workspace_delete = None;
-                                            if this.workspace_edit.as_deref() == Some(id.as_str()) {
-                                                this.workspace_edit = None;
-                                                this.workspace_name_input
-                                                    .update(cx, |e, cx| e.set_value("", cx));
-                                            }
-                                        }
                                         cx.notify();
                                     })),
                             )
@@ -324,6 +404,7 @@ impl Workbench {
                                     .size(ButtonSize::Small)
                                     .theme(self.theme)
                                     .render()
+                                    .debug_selector(|| "cancel-delete-workspace".into())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.workspace_delete = None;
                                         cx.notify();
@@ -601,7 +682,8 @@ mod tests {
             .unwrap();
         window.simulate_click(delete.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspaces().unwrap().len(), 2)
+            assert_eq!(host.storage.workspaces().unwrap().len(), 2);
+            assert_eq!(host.workspace_delete.as_deref(), Some(other_id.as_str()));
         });
         let confirm = window.debug_bounds("confirm-delete-workspace").unwrap();
         window.simulate_click(confirm.center(), gpui::Modifiers::default());
@@ -611,6 +693,73 @@ mod tests {
             assert!(host.workspace_delete.is_none());
             assert!(host.workspace_error.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn deleting_current_default_requires_confirmation_and_preserves_last_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        let mut store = storage::Store::open(&path).unwrap();
+        let other_id = store.create_workspace("保留工作区").unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| Workbench::with_store(store, cx));
+        let trigger = window.debug_bounds("workspace-switcher").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        for confirm in [false, true] {
+            let delete = window.debug_bounds("delete-workspace-default").unwrap();
+            window.simulate_click(delete.center(), gpui::Modifiers::default());
+            host.update(window, |h, _| {
+                assert_eq!(h.storage.workspace_id, "default");
+                assert_eq!(h.storage.workspaces().unwrap().len(), 2);
+            });
+            let action = window
+                .debug_bounds(if confirm {
+                    "confirm-delete-workspace"
+                } else {
+                    "cancel-delete-workspace"
+                })
+                .unwrap();
+            window.simulate_click(action.center(), gpui::Modifiers::default());
+        }
+        host.update(window, |h, _| {
+            assert_eq!(h.storage.workspace_id, other_id);
+            assert_eq!(h.workspace_list.len(), 1);
+            assert!(h.workspace_error.is_none());
+            assert!(h.workspace_delete.is_none());
+        });
+        let selector: &'static str =
+            Box::leak(format!("delete-workspace-{other_id}").into_boxed_str());
+        let delete = window.debug_bounds(selector).unwrap();
+        window.simulate_click(delete.center(), gpui::Modifiers::default());
+        host.update(window, |h, cx| {
+            assert!(h.workspace_delete.is_none());
+            // Also reject a stale confirmation and a direct storage call.
+            assert!(h.storage.delete_workspace(&other_id).is_err());
+            h.workspace_delete = Some(other_id.clone());
+            cx.notify();
+        });
+        let confirm = window.debug_bounds("confirm-delete-workspace").unwrap();
+        window.simulate_click(confirm.center(), gpui::Modifiers::default());
+        host.update(window, |h, _| {
+            assert!(
+                h.workspace_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("至少保留一个工作区")
+            );
+            assert_eq!(h.storage.workspaces().unwrap().len(), 1);
+        });
+        let reopened = storage::Store::open(&path).unwrap();
+        assert_eq!(reopened.workspace_id, other_id);
+        assert_eq!(reopened.workspaces().unwrap().len(), 1);
+        assert!(
+            reopened
+                .workspaces()
+                .unwrap()
+                .iter()
+                .all(|w| w.id != "default")
+        );
     }
 
     #[gpui::test]

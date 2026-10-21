@@ -135,7 +135,7 @@ impl PreparedRequest {
             None => self.url.path().to_owned(),
         };
         Ok(
-            serde_json::json!({"method":self.method.as_str(), "uri":uri, "body":self.body, "headers":headers}),
+            serde_json::json!({"method":self.method.as_str(), "scheme":self.url.scheme(), "uri":uri, "body":self.body, "headers":headers}),
         )
     }
     /// Validate the complete patch before changing the request; scripts cannot mutate body/URL.

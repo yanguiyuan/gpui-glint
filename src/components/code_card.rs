@@ -157,10 +157,24 @@ enum ScrollAxis {
     Vertical,
 }
 
+#[derive(Default)]
+struct WindowLayout {
+    wrap_width: Pixels,
+    line_cache: Option<LineCache>,
+    viewport_cache: Option<ViewportCache>,
+    viewport_scroll: gpui::UniformListScrollHandle,
+    scroll: ScrollHandle,
+    last_lines: Vec<(usize, EditorLine, Bounds<Pixels>)>,
+    scroll_axis: Option<ScrollAxis>,
+    last_scroll: Option<std::time::Instant>,
+}
+
 /// An inline code editor with line numbers, restrained syntax colors and JSON validation.
 /// Unknown fence languages render as plain text. Create with `cx.new(...)` and
 /// subscribe to [`CodeCardEvent`] to integrate with a document.
 pub struct CodeCard {
+    active_window: Option<gpui::WindowId>,
+    window_layouts: HashMap<gpui::WindowId, WindowLayout>,
     viewport: bool,
     json_folding: bool,
     collapsed_json: HashSet<usize>,
@@ -203,6 +217,35 @@ pub struct CodeCard {
 }
 
 impl CodeCard {
+    // Shared editor content can appear in several windows. Geometry and scroll
+    // caches must remain local to each window to avoid resize/paint feedback.
+    fn activate_window(&mut self, window: &Window, cx: &App) {
+        let id = window.window_handle().window_id();
+        let Some(previous) = self.active_window.replace(id) else {
+            return;
+        };
+        if previous == id {
+            return;
+        }
+        let open = cx
+            .windows()
+            .into_iter()
+            .map(|window| window.window_id())
+            .collect::<HashSet<_>>();
+        self.window_layouts.retain(|id, _| open.contains(id));
+        let mut layout = self.window_layouts.remove(&id).unwrap_or_default();
+        std::mem::swap(&mut self.wrap_width, &mut layout.wrap_width);
+        std::mem::swap(&mut self.line_cache, &mut layout.line_cache);
+        std::mem::swap(&mut self.viewport_cache, &mut layout.viewport_cache);
+        std::mem::swap(&mut self.viewport_scroll, &mut layout.viewport_scroll);
+        std::mem::swap(&mut self.scroll, &mut layout.scroll);
+        std::mem::swap(&mut self.last_lines, &mut layout.last_lines);
+        std::mem::swap(&mut self.scroll_axis, &mut layout.scroll_axis);
+        std::mem::swap(&mut self.last_scroll, &mut layout.last_scroll);
+        if open.contains(&previous) {
+            self.window_layouts.insert(previous, layout);
+        }
+    }
     /// Enable object/array folding in a read-only JSON viewport. Disabled by default.
     pub fn json_folding(mut self, enabled: bool) -> Self {
         self.json_folding = enabled;
@@ -369,6 +412,8 @@ impl CodeCard {
         let content = value.into();
         let end = content.len();
         Self {
+            active_window: None,
+            window_layouts: HashMap::new(),
             viewport: false,
             json_folding: false,
             collapsed_json: HashSet::new(),
@@ -414,9 +459,10 @@ impl CodeCard {
     fn scroll_wheel(
         &mut self,
         event: &gpui::ScrollWheelEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_window(window, cx);
         let now = std::time::Instant::now();
         if matches!(event.touch_phase, gpui::TouchPhase::Started)
             || self
@@ -832,22 +878,26 @@ impl CodeCard {
         }
     }
 
-    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+    fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_window(window, cx);
         if self.handle_completion_key("up", cx) {
             return;
         }
         self.vertical(false, false, cx);
     }
-    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+    fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_window(window, cx);
         if self.handle_completion_key("down", cx) {
             return;
         }
         self.vertical(true, false, cx);
     }
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_window(window, cx);
         self.vertical(false, true, cx);
     }
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_window(window, cx);
         self.vertical(true, true, cx);
     }
 
@@ -1046,6 +1096,7 @@ impl CodeCard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_window(window, cx);
         self.link_editor = None;
         cx.emit(CodeCardEvent::Focused);
         self.is_selecting = true;
@@ -1084,7 +1135,13 @@ impl CodeCard {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_window(window, cx);
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -1219,9 +1276,10 @@ impl EntityInputHandler for CodeCard {
         &mut self,
         range_utf16: Range<usize>,
         _bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        self.activate_window(window, _cx);
         let range = self.range_from_utf16(&range_utf16);
         let (start, line, bounds) = self
             .last_lines
@@ -1243,9 +1301,10 @@ impl EntityInputHandler for CodeCard {
     fn character_index_for_point(
         &mut self,
         point: gpui::Point<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        self.activate_window(window, _cx);
         Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
 }
@@ -2157,6 +2216,8 @@ impl Element for CodeLine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.input
+            .update(cx, |input, cx| input.activate_window(window, cx));
         let focus = self.input.read(cx).focus_handle.clone();
         if self.start == 0 && !self.input.read(cx).read_only {
             window.handle_input(
@@ -2209,9 +2270,10 @@ impl CodeCard {
     fn viewport_wheel(
         &mut self,
         event: &gpui::ScrollWheelEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_window(window, cx);
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
         if delta.x.abs() > delta.y.abs() {
             let (width, gutter_width) =
@@ -2351,6 +2413,7 @@ impl CodeCard {
             "code-card-viewport-lines",
             count,
             cx.processor(move |this, indexes: Range<usize>, window, cx| {
+                this.activate_window(window, cx);
                 let content = this.content.clone();
                 let input = cx.entity();
                 let offset = this.scroll.offset().x;
@@ -2538,6 +2601,7 @@ impl CodeCard {
 
 impl Render for CodeCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.activate_window(window, cx);
         let colors = if self.dark {
             CodeColors::DARK
         } else {
@@ -3132,6 +3196,54 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn shared_prose_editor_keeps_geometry_for_each_window(cx: &mut gpui::TestAppContext) {
+        struct View {
+            editor: Entity<CodeCard>,
+            width: f32,
+        }
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(self.width))
+                    .h(px(250.))
+                    .child(self.editor.clone())
+            }
+        }
+        let (view, window) = cx.add_window_view(|_, cx| View {
+            editor: cx.new(|cx| {
+                CodeCard::new(cx, "text", "长段落 shared content ".repeat(50)).prose(true)
+            }),
+            width: 420.,
+        });
+        let editor = view.read_with(window, |view, _| view.editor.clone());
+        let shared = editor.clone();
+        let other = window.update(|_, cx| {
+            cx.open_window(gpui::WindowOptions::default(), |_, cx| {
+                cx.new(|_| View {
+                    editor: shared,
+                    width: 220.,
+                })
+            })
+            .unwrap()
+        });
+        window.run_until_parked();
+        for _ in 0..3 {
+            editor.update(window, |_, cx| cx.notify());
+            window.run_until_parked();
+        }
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.window_layouts.len(), 1);
+            let other_width = editor.window_layouts.values().next().unwrap().wrap_width;
+            assert!(other_width > px(0.));
+            assert_ne!(editor.wrap_width, other_width);
+            assert_eq!(editor.content(), "长段落 shared content ".repeat(50));
+        });
+        other
+            .update(window, |_, window, _| window.remove_window())
+            .unwrap();
+    }
 
     #[gpui::test]
     fn clipboard_shortcuts_support_cmd_and_ctrl(cx: &mut gpui::TestAppContext) {

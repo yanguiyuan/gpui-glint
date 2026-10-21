@@ -30,3 +30,15 @@ jobs:
         with:
           toolchain: "1.95.0"
       - run: cargo check --lib --all-features --locked
+
+  windows-plugin-worker:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Exercise the executable entry point: unit tests use larger thread stacks
+      # and cannot catch Windows main-thread stack overflow during Boa startup.
+      - run: cargo build -p glint-api --locked
+      - run: cargo test -p glint-api plugins:: --locked -- --ignored
+        env:
+          GLINT_API_TEST_EXECUTABLE: ${{ github.workspace }}\target\debug\glint-api.exe

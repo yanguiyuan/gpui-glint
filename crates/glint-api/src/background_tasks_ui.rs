@@ -25,7 +25,7 @@ pub(super) struct WsSessionState {
     pub(super) error: Option<String>,
 }
 impl WsSessionState {
-    fn empty(theme: ThemePreset, cx: &mut Context<Workbench>) -> Self {
+    pub(super) fn empty(theme: ThemePreset, cx: &mut Context<Workbench>) -> Self {
         Self {
             sequence: 0,
             history: None,
@@ -60,7 +60,7 @@ impl WsSessionState {
     }
 }
 impl Workbench {
-    fn swap_ws_state(&mut self, state: &mut WsSessionState) {
+    pub(super) fn swap_ws_state(&mut self, state: &mut WsSessionState) {
         std::mem::swap(&mut self.ws_sequence, &mut state.sequence);
         std::mem::swap(&mut self.ws_history, &mut state.history);
         std::mem::swap(&mut self.ws_commands, &mut state.commands);
@@ -120,6 +120,13 @@ impl Workbench {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Self, &mut Context<Self>) -> R,
     ) -> Option<R> {
+        if let Some(editor) = self
+            .request_editors
+            .get(request_id)
+            .map(|shared| shared.editor.clone())
+        {
+            return Some(editor.update(cx, |editor, cx| f(editor, cx)));
+        }
         let index = self.requests.iter().position(|r| r.id == request_id)?;
         if index == self.active {
             return Some(f(self, cx));
@@ -146,6 +153,26 @@ impl Workbench {
             .iter()
             .enumerate()
             .filter_map(|(index, request)| {
+                if let Some(shared) = self.request_editors.get(&request.id) {
+                    return shared.running.then(|| {
+                        (
+                            request.id.clone(),
+                            format!(
+                                "{} · {}",
+                                request.name,
+                                if shared.websocket {
+                                    if shared.connected {
+                                        "WS 已连接"
+                                    } else {
+                                        "WS 连接中 / 断开中"
+                                    }
+                                } else {
+                                    "请求执行中"
+                                }
+                            ),
+                        )
+                    });
+                }
                 let label = if index == self.active {
                     if self.ws_active {
                         if self.ws_connected {

@@ -339,33 +339,58 @@ pub fn run_job(job: Job) -> Result<Value, String> {
     .map_err(|e| e.to_string())?;
     let grants = job.plugin.manifest.capabilities.clone();
     let mut runtime = PluginRuntime::activate(&job.plugin, host, grants, Limits::default())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("初始化插件运行时或加载脚本失败：{e}"))?;
     runtime
         .invoke(hook, &job.request)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("执行插件钩子 {hook} 失败：{e}"))
 }
 /// Early CLI path: no GPUI initialization, database access, or credential-bearing diagnostics.
 pub fn worker() -> bool {
+    // Windows gives the executable's main thread only 1 MiB. Boa initialization
+    // exceeds that in debug builds; VM recursion limits cannot guard native stack use.
+    match std::thread::Builder::new()
+        .name("plugin-worker".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(worker_inner)
+    {
+        Ok(thread) => thread.join().unwrap_or_else(|_| {
+            print!("{}", json!({"error":"插件执行线程异常终止"}));
+            false
+        }),
+        Err(error) => {
+            print!(
+                "{}",
+                json!({"error":format!("无法启动插件执行线程：{error}")})
+            );
+            false
+        }
+    }
+}
+fn worker_inner() -> bool {
     let mut text = String::new();
     let mut limit = MAX_OUTPUT;
-    let result = std::io::stdin()
-        .take(MAX_JOB + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| "无法读取插件任务".to_owned())
-        .and_then(|_| {
-            if text.len() as u64 > MAX_JOB {
-                Err("插件任务过大".into())
-            } else {
-                serde_json::from_str::<Job>(&text).map_err(|_| "插件任务无效".into())
-            }
-        })
-        .and_then(|job| {
-            limit = output_limit(&job);
-            run_job(job)
-        });
+    let result = super::updater::ensure_not_installing().and_then(|_| {
+        std::io::stdin()
+            .take(MAX_JOB + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| "无法读取插件任务".to_owned())
+            .and_then(|_| {
+                if text.len() as u64 > MAX_JOB {
+                    Err("插件任务过大".into())
+                } else {
+                    serde_json::from_str::<Job>(&text).map_err(|_| "插件任务无效".into())
+                }
+            })
+            .and_then(|job| {
+                limit = output_limit(&job);
+                run_job(job)
+            })
+    });
     let response = match result {
         Ok(data) => json!({"ok":data}),
-        Err(_) => json!({"error":"插件执行失败，请检查变量、权限与脚本"}),
+        // run_job only returns credential-safe diagnostics from PluginError;
+        // JavaScript exceptions and request/environment values never cross here.
+        Err(error) => json!({"error":error}),
     };
     let text = serde_json::to_string(&response).expect("JSON data");
     if text.len() as u64 > limit {
@@ -408,7 +433,11 @@ fn isolated_at(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = ChildGuard(command.spawn().map_err(|_| "无法启动插件执行器")?);
+    let mut child = ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("无法启动插件执行器：{error}"))?,
+    );
     let mut stdin = child.0.stdin.take().ok_or("插件输入通道不可用")?;
     let stdout = child.0.stdout.take().ok_or("插件输出通道不可用")?;
     let writer = std::thread::spawn(move || {
@@ -437,17 +466,55 @@ fn isolated_at(
         .map_err(|_| "插件输出失败")?
         .map_err(|_| "插件输出无效")?;
     if status.is_none() {
-        return Err("插件执行超时（3 秒），已终止，请求未发送".into());
+        return Err(format!(
+            "插件执行超时（{} 毫秒），执行器已终止",
+            timeout.as_millis()
+        ));
+    }
+    if text.len() as u64 > limit {
+        return Err("插件输出过大".into());
+    }
+    let status = status.expect("worker exited");
+    if !status.success() {
+        return parse_worker_response(status, &text);
     }
     wrote.map_err(|_| "插件输入失败")?;
-    if !status.is_some_and(|s| s.success()) || text.len() as u64 > limit {
-        return Err("插件执行失败".into());
+    parse_worker_response(status, &text)
+}
+fn parse_worker_response(status: std::process::ExitStatus, text: &str) -> Result<Value, String> {
+    if !status.success() {
+        let reason = match status.code() {
+            Some(code) if code as u32 == 0xC00000FD => {
+                "插件执行器栈溢出（0xC00000FD），签名或解密未完成，请更新应用后重试".into()
+            }
+            Some(code) => format!(
+                "插件执行器异常退出（退出码 {code} / 0x{:08X}）",
+                code as u32
+            ),
+            None => format!("插件执行器被系统终止（{status}）"),
+        };
+        // A controlled worker failure can still return a useful JSON diagnostic.
+        if let Ok(response) = serde_json::from_str::<Value>(text)
+            && let Some(error) = response.get("error").and_then(Value::as_str)
+        {
+            return Err(format!("{reason}：{error}"));
+        }
+        return Err(reason);
     }
-    let response: Value = serde_json::from_str(&text).map_err(|_| "插件输出无效")?;
+    let response: Value = serde_json::from_str(text).map_err(|_| {
+        if text.is_empty() {
+            "插件执行器未返回结果"
+        } else {
+            "插件执行器返回的结果不是有效 JSON"
+        }
+    })?;
+    if let Some(error) = response.get("error").and_then(Value::as_str) {
+        return Err(error.to_owned());
+    }
     response
         .get("ok")
         .cloned()
-        .ok_or_else(|| "插件执行失败，请检查所需环境变量、权限与脚本".into())
+        .ok_or_else(|| "插件执行器返回的结果缺少 ok / error 字段".into())
 }
 /// Validate declared environment inputs without running plugin code or exposing values.
 pub fn validate_variables(
@@ -758,6 +825,150 @@ mod tests {
         }
     }
     #[test]
+    fn kso_private_openapi_strips_gateway_prefix_and_preserves_wire_request() {
+        // Independent HMAC-SHA256 vectors, with UTF-8 body bytes and a fixed date.
+        for (url, expected) in [
+            (
+                "https://example.test/v7/messages/create",
+                "ddac2226ab4bd05a4eca84a39a20474dcceb7f83e93dc0d1dfc1607a16a629ca",
+            ),
+            (
+                "https://example.test/openapi/v7/messages/create",
+                "ddac2226ab4bd05a4eca84a39a20474dcceb7f83e93dc0d1dfc1607a16a629ca",
+            ),
+            (
+                "https://example.test/path3/path4/openapi/v7/messages/create",
+                "ddac2226ab4bd05a4eca84a39a20474dcceb7f83e93dc0d1dfc1607a16a629ca",
+            ),
+            (
+                "http://example.test/custom/deployment/openapi/v7/messages/create",
+                "ddac2226ab4bd05a4eca84a39a20474dcceb7f83e93dc0d1dfc1607a16a629ca",
+            ),
+            (
+                "https://example.test/path3/path4/openapi/v7/messages/create?key=a%20b&key=a%2Fb&empty=",
+                "95baba3fa1d81fa7c47222b2ebb0fd421bbcaeff13f27452fc6f4155f78bc148",
+            ),
+            (
+                "https://example.test/path3/path4/openapix/v7/messages/create",
+                "e75b98da28497ebf825e16989338c5c386ed154de025959ca198837b6843f1cf",
+            ),
+            (
+                "https://example.test/path3/path4/openapi/custom/messages/create",
+                "851de1bdc88270668c4518ad5bcbd9985df4205a954d808ef00a84c62387c9cd",
+            ),
+            (
+                "https://example.test/v7/messages/create?next=/openapi/v7/test",
+                "ce5873ca1ca1ba1cfac75b9518a8d161dfbbdc6608d29e083e3b1c5ba3baef8a",
+            ),
+        ] {
+            let body = r#"{"type":"text","content":{"text":"测试消息"}}"#;
+            let draft = super::super::model::Draft {
+                method: "POST".into(),
+                url: url.into(),
+                body: body.into(),
+                ..Default::default()
+            };
+            let mut request = super::super::http::PreparedRequest::new(
+                &draft,
+                &super::super::environment::EnvironmentValues(BTreeMap::new()),
+            )
+            .unwrap();
+            let original_payload = request.plugin_payload().unwrap();
+            let mut plugin = catalog().0.remove(0);
+            plugin.source = format!(
+                "const Date = class {{ toUTCString() {{ return 'Mon, 02 Jan 2006 15:04:05 GMT'; }} }};\n{}",
+                plugin.source
+            );
+            let output = run_job(Job {
+                plugin: plugin.clone(),
+                action_id: String::new(),
+                request: original_payload.clone(),
+                variables: BTreeMap::from([
+                    ("wps_app_id".into(), "AK123456".into()),
+                    ("wps_app_key".into(), "sk098765".into()),
+                ]),
+            })
+            .unwrap();
+            assert_eq!(
+                output["setHeaders"]["X-Kso-Authorization"],
+                format!("KSO-1 AK123456:{expected}"),
+                "{url}"
+            );
+            request
+                .apply_plugin_headers(&output, &plugin.manifest.capabilities)
+                .unwrap();
+            assert_eq!(request.url.as_str(), url);
+            let signed_payload = request.plugin_payload().unwrap();
+            assert_eq!(signed_payload["uri"], original_payload["uri"]);
+            assert_eq!(signed_payload["body"], body);
+        }
+    }
+    #[test]
+    fn event_websocket_signs_fixed_path_without_changing_connection_url() {
+        for (method, url, expected) in [
+            (
+                "WS",
+                "wss://example.test/path3/path4/openws/v7/event/ws",
+                "508022d88aeef0c7bcdabf43eb51fcdd4aecda53fb608779a3acd4848e8ca81c",
+            ),
+            (
+                "WS",
+                "ws://example.test/openws/v7/event/ws?key=a%20b",
+                "508022d88aeef0c7bcdabf43eb51fcdd4aecda53fb608779a3acd4848e8ca81c",
+            ),
+            (
+                "WS",
+                "wss://example.test/v7/event/ws",
+                "508022d88aeef0c7bcdabf43eb51fcdd4aecda53fb608779a3acd4848e8ca81c",
+            ),
+            (
+                "GET",
+                "https://example.test/path3/path4/openws/v7/event/ws?key=a%20b",
+                "87404bd00fdd2f320d0eb8bf4a1acf9b6198a93edb6366523f3e37e1138040d4",
+            ),
+            (
+                "WS",
+                "wss://example.test/path3/path4/other/ws?key=a%20b",
+                "d8af566ea1e498439748c3f8b930d3d32bb818aa06297946484624a5e33a4a98",
+            ),
+        ] {
+            let draft = super::super::model::Draft {
+                method: method.into(),
+                url: url.into(),
+                ..Default::default()
+            };
+            let mut request = super::super::http::PreparedRequest::new(
+                &draft,
+                &super::super::environment::EnvironmentValues(BTreeMap::new()),
+            )
+            .unwrap();
+            let mut plugin = catalog().0.remove(0);
+            plugin.source = format!(
+                "const Date = class {{ toUTCString() {{ return 'Mon, 02 Jan 2006 15:04:05 GMT'; }} }};\n{}",
+                plugin.source
+            );
+            let output = run_job(Job {
+                plugin: plugin.clone(),
+                action_id: String::new(),
+                request: request.plugin_payload().unwrap(),
+                variables: BTreeMap::from([
+                    ("wps_app_id".into(), "AK123456".into()),
+                    ("wps_app_key".into(), "sk098765".into()),
+                ]),
+            })
+            .unwrap();
+            assert_eq!(
+                output["setHeaders"]["X-Kso-Authorization"],
+                format!("KSO-1 AK123456:{expected}"),
+                "{url}"
+            );
+            request
+                .apply_plugin_headers(&output, &plugin.manifest.capabilities)
+                .unwrap();
+            assert_eq!(request.url.as_str(), url);
+        }
+    }
+    #[test]
     fn undeclared_variable_cannot_be_read() {
         let mut plugin = catalog().0.remove(0);
         plugin.source="glint.on('request.before-send', () => glint.host.call('environment.get', 'other_secret'));".into();
@@ -811,6 +1022,59 @@ mod tests {
 #[cfg(test)]
 mod process_tests {
     use super::*;
+    #[cfg(windows)]
+    fn exit_status(code: u32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code)
+    }
+    #[cfg(unix)]
+    fn exit_status(code: u32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw((code as i32) << 8)
+    }
+    #[test]
+    fn worker_protocol_preserves_safe_diagnostics_and_reports_missing_results() {
+        assert_eq!(
+            parse_worker_response(exit_status(0), r#"{"ok":{"value":1}}"#).unwrap(),
+            json!({"value":1})
+        );
+        let detail = "执行插件钩子 request.before-send 失败：Plugin hook failed";
+        let text = json!({"error":detail}).to_string();
+        assert_eq!(
+            parse_worker_response(exit_status(0), &text).unwrap_err(),
+            detail
+        );
+        let error = parse_worker_response(exit_status(1), &text).unwrap_err();
+        assert!(error.contains("0x00000001"));
+        assert!(error.contains(detail));
+        assert!(
+            parse_worker_response(exit_status(0), "")
+                .unwrap_err()
+                .contains("未返回结果")
+        );
+        assert!(
+            parse_worker_response(exit_status(0), "invalid")
+                .unwrap_err()
+                .contains("JSON")
+        );
+        assert!(
+            parse_worker_response(exit_status(0), "{}")
+                .unwrap_err()
+                .contains("字段")
+        );
+        assert!(
+            parse_worker_response(exit_status(2), "")
+                .unwrap_err()
+                .contains("0x00000002")
+        );
+    }
+    #[test]
+    #[cfg(windows)]
+    fn worker_stack_overflow_has_an_actionable_diagnostic() {
+        let error = parse_worker_response(exit_status(0xC00000FD), "").unwrap_err();
+        assert!(error.contains("栈溢出"));
+        assert!(error.contains("0xC00000FD"));
+    }
     #[test]
     #[ignore = "requires cargo build -p glint-api and GLINT_API_TEST_EXECUTABLE"]
     fn native_plugin_worker_and_watchdog() {
@@ -838,6 +1102,17 @@ mod process_tests {
             "glint.on('request.before-send', () => { throw new Error('secret-fixture'); });".into();
         let error = isolated_at(&job, &executable, Duration::from_secs(3)).unwrap_err();
         assert!(!error.contains("secret-fixture"));
+        assert!(
+            error.contains("执行插件钩子 request.before-send"),
+            "{error}"
+        );
+        job.plugin.source = "const invalid = ;".into();
+        let error = isolated_at(&job, &executable, Duration::from_secs(3)).unwrap_err();
+        assert!(error.contains("初始化插件运行时或加载脚本"), "{error}");
+        job.plugin.source =
+            "glint.on('request.before-send', () => ({text:'x'.repeat(100000)}));".into();
+        let error = isolated_at(&job, &executable, Duration::from_secs(3)).unwrap_err();
+        assert!(error.contains("插件输出过大"), "{error}");
         // Catastrophic native regex work is beyond VM loop guards.
         job.plugin.source = "/(a+)+b/.test('a'.repeat(32));".into();
         let started = std::time::Instant::now();

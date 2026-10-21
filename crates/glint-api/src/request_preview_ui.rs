@@ -25,6 +25,9 @@ struct Snapshot {
 
 impl Workbench {
     fn request_window_snapshot(&self, index: usize, cx: &App) -> Option<Snapshot> {
+        if let Some(editor) = self.shared_request_editor(index) {
+            return editor.read(cx).request_window_snapshot(0, cx);
+        }
         let request = self.requests.get(index)?;
         let active = index == self.active;
         let draft = if active {
@@ -618,7 +621,7 @@ mod tests {
             cx.notify();
         });
         window.run_until_parked();
-        let menu_item = window.debug_bounds("tab-open-window").unwrap();
+        let menu_item = window.debug_bounds("tab-open-snapshot").unwrap();
         window.simulate_click(menu_item.center(), gpui::Modifiers::default());
         window.update(|window, cx| {
             host.update(cx, |host, cx| {

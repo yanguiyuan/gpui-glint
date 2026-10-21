@@ -53,8 +53,17 @@ pub fn bind_text_entry_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Default)]
+struct WindowLayout {
+    last_layout: Option<ShapedLine>,
+    last_bounds: Option<Bounds<Pixels>>,
+    scroll_x: Pixels,
+}
+
 /// A single-line native text entry with IME composition, selection, clipboard, and caret support.
 pub struct TextEntry {
+    active_window: Option<gpui::WindowId>,
+    window_layouts: std::collections::HashMap<gpui::WindowId, WindowLayout>,
     read_only: bool,
     completions: CompletionState,
     fit_content: bool,
@@ -76,6 +85,28 @@ pub struct TextEntry {
 }
 
 impl TextEntry {
+    fn activate_window(&mut self, window: &Window, cx: &App) {
+        let id = window.window_handle().window_id();
+        let Some(previous) = self.active_window.replace(id) else {
+            return;
+        };
+        if previous == id {
+            return;
+        }
+        let open = cx
+            .windows()
+            .into_iter()
+            .map(|window| window.window_id())
+            .collect::<std::collections::HashSet<_>>();
+        self.window_layouts.retain(|id, _| open.contains(id));
+        let mut layout = self.window_layouts.remove(&id).unwrap_or_default();
+        std::mem::swap(&mut self.last_layout, &mut layout.last_layout);
+        std::mem::swap(&mut self.last_bounds, &mut layout.last_bounds);
+        std::mem::swap(&mut self.scroll_x, &mut layout.scroll_x);
+        if open.contains(&previous) {
+            self.window_layouts.insert(previous, layout);
+        }
+    }
     /// Offer template expressions after `{{`; empty by default.
     pub fn set_completions(&mut self, items: Vec<TextCompletion>, cx: &mut Context<Self>) {
         if self.completions.set_items(items) {
@@ -207,6 +238,8 @@ impl TextEntry {
         let content = value.into();
         let end = content.len();
         Self {
+            active_window: None,
+            window_layouts: Default::default(),
             read_only: false,
             completions: CompletionState::default(),
             fit_content: false,
@@ -412,6 +445,7 @@ impl TextEntry {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_window(window, cx);
         self.is_selecting = true;
         window.focus(&self.focus_handle, cx);
         let offset = self.index_for_mouse_position(event.position);
@@ -435,7 +469,13 @@ impl TextEntry {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_window(window, cx);
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -560,9 +600,10 @@ impl EntityInputHandler for TextEntry {
         &mut self,
         range_utf16: Range<usize>,
         bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        self.activate_window(window, _cx);
         let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
@@ -580,9 +621,10 @@ impl EntityInputHandler for TextEntry {
     fn character_index_for_point(
         &mut self,
         point: gpui::Point<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        self.activate_window(window, _cx);
         let bounds = self.last_bounds?;
         let line = self.last_layout.as_ref()?;
         Some(
@@ -840,6 +882,8 @@ impl Element for TextEntryElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.input
+            .update(cx, |input, cx| input.activate_window(window, cx));
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
@@ -887,6 +931,7 @@ impl Element for TextEntryElement {
 
 impl Render for TextEntry {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.activate_window(window, cx);
         let theme = self.theme;
 
         if self.focus_subscriptions.is_empty() {
@@ -1106,6 +1151,77 @@ fn text_run_boundaries(text: &str, offsets: impl IntoIterator<Item = usize>) -> 
 mod selection_tests {
     use super::*;
     use gpui::AppContext;
+
+    #[gpui::test]
+    fn shared_text_entry_uses_the_clicked_windows_geometry(cx: &mut gpui::TestAppContext) {
+        struct View {
+            entry: Entity<TextEntry>,
+            inset: f32,
+        }
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .pl(px(self.inset))
+                    .child(div().w(px(300.)).h(px(32.)).child(self.entry.clone()))
+            }
+        }
+        let (view, window) = cx.add_window_view(|_, cx| View {
+            entry: cx.new(|cx| TextEntry::new(cx, "", "abcdef")),
+            inset: 10.,
+        });
+        let entry = view.read_with(window, |view, _| view.entry.clone());
+        let shared = entry.clone();
+        let other = window.update(|_, cx| {
+            cx.open_window(gpui::WindowOptions::default(), |_, cx| {
+                cx.new(|_| View {
+                    entry: shared,
+                    inset: 200.,
+                })
+            })
+            .unwrap()
+        });
+        window.run_until_parked();
+        let bounds = window.update(|window, cx| {
+            entry.update(cx, |entry, _| {
+                // The other window paints last; input must restore this window's cache.
+                let id = window.window_handle().window_id();
+                if entry.active_window == Some(id) {
+                    entry.last_bounds.unwrap()
+                } else {
+                    entry.window_layouts[&id].last_bounds.unwrap()
+                }
+            })
+        });
+        window.simulate_click(
+            gpui::point(bounds.left() + px(1.), bounds.center().y),
+            gpui::Modifiers::default(),
+        );
+        window.simulate_input("X");
+        assert_eq!(
+            entry.read_with(window, |entry, _| entry.value().to_owned()),
+            "Xabcdef"
+        );
+        let mut child = gpui::VisualTestContext::from_window(other.into(), window);
+        let bounds = child.update(|window, cx| {
+            entry.update(cx, |entry, _| {
+                let id = window.window_handle().window_id();
+                if entry.active_window == Some(id) {
+                    entry.last_bounds.unwrap()
+                } else {
+                    entry.window_layouts[&id].last_bounds.unwrap()
+                }
+            })
+        });
+        child.simulate_click(
+            gpui::point(bounds.left() + px(1.), bounds.center().y),
+            gpui::Modifiers::default(),
+        );
+        child.simulate_input("Y");
+        assert_eq!(
+            entry.read_with(window, |entry, _| entry.value().to_owned()),
+            "YXabcdef"
+        );
+    }
     #[gpui::test]
     fn table_search_highlights_editable_cells_and_clears_on_reset(cx: &mut gpui::TestAppContext) {
         use super::super::{DataTable, TableCell, TableColumn, TableRow};
