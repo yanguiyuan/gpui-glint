@@ -2,6 +2,42 @@ use super::*;
 use chrono::Timelike;
 use gpui_glint::components::{InputField, Switch};
 
+fn memory_controls(
+    time: Entity<TextEntry>,
+    theme: ThemePreset,
+    save: impl IntoElement,
+    run: impl IntoElement,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_end()
+        .gap_3()
+        .child(
+            InputField::new("HH:MM")
+                .label("每日整理时间（本地）")
+                .width(180.)
+                .control(time)
+                .theme(theme)
+                .render()
+                .flex_shrink_0()
+                .debug_selector(|| "memory-time-field".into()),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .debug_selector(|| "memory-save-control".into())
+                .child(save),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .debug_selector(|| "memory-run-control".into())
+                .child(run),
+        )
+}
+
 pub struct State {
     pub settings: memory::Settings,
     pub cards: Vec<memory::Card>,
@@ -148,9 +184,12 @@ impl AgentWorkspace {
                 .child(div().flex().items_center().justify_between().child(Switch::new("自动语义回忆").checked(state.settings.automatic_recall).theme(self.theme).on_change(move |checked,_,cx|{let _=recall_weak.update(cx,|this,cx|{this.memory_ui.settings.automatic_recall=checked;this.save_memory_settings(cx);});}).render()))
                 .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("先理解问题意图，再筛选记忆摘要；模型按需读取全文。使用当前模型进行语义判断。"))
                 .child(div().flex().items_center().justify_between().child(Switch::new("每天整理对话").checked(state.settings.nightly_enabled).theme(self.theme).on_change(move |checked,_,cx|{let _=nightly_weak.update(cx,|this,cx|{this.memory_ui.settings.nightly_enabled=checked;this.save_memory_settings(cx);});}).render()))
-                .child(div().flex().items_end().gap_3().child(div().w(px(180.)).child(InputField::new("每日整理时间（本地）").control(state.time.clone()).theme(self.theme).render()))
-                    .child(Button::new("保存记忆设置").kind(ButtonKind::Gray).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|this.save_memory_settings(cx))))
-                    .child(Button::new(if self.memory_task.is_some(){"正在整理…"}else{"立即整理"}).theme(self.theme).when(self.memory_task.is_some(),|button|button.disabled()).render().on_click(cx.listener(|this,_,_,cx|this.tick_memory(true,cx)))))
+                .child(memory_controls(
+                    state.time.clone(),
+                    self.theme,
+                    Button::new("保存记忆设置").kind(ButtonKind::Gray).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|this.save_memory_settings(cx))),
+                    Button::new(if self.memory_task.is_some(){"正在整理…"}else{"立即整理"}).theme(self.theme).when(self.memory_task.is_some(),|button|button.disabled()).render().on_click(cx.listener(|this,_,_,cx|this.tick_memory(true,cx))),
+                ))
                 .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child(format!("下次：{} · 应用运行且对话空闲时执行；退出后在下次启动补处理。",state.settings.next_run.format("%m-%d %H:%M"))))
                 .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(state.last_archive.clone())))
             .when_some(state.notice.clone(),|page,notice|page.child(div().p_3().rounded(px(8.)).bg(rgb(p.surface_subtle)).child(notice)))
@@ -165,6 +204,10 @@ impl AgentWorkspace {
         }
         for card in &state.cards {
             let id = card.id;
+            let selected = state
+                .selected
+                .as_ref()
+                .filter(|record| record.card.id == id);
             let read = id;
             let weak = cx.entity().downgrade();
             let confirm = div()
@@ -253,12 +296,24 @@ impl AgentWorkspace {
                             .child(card.summary.clone()),
                     )
                     .child(
-                        Button::new("查看记忆和来源")
-                            .kind(ButtonKind::Plain)
-                            .size(ButtonSize::Small)
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                        Button::new(if selected.is_some() {
+                            "收起记忆和来源"
+                        } else {
+                            "查看记忆和来源"
+                        })
+                        .kind(ButtonKind::Plain)
+                        .size(ButtonSize::Small)
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this
+                                .memory_ui
+                                .selected
+                                .as_ref()
+                                .is_some_and(|record| record.card.id == read)
+                            {
+                                this.memory_ui.selected = None;
+                            } else {
                                 match this
                                     .memory
                                     .read(read, this.history.active().project.as_deref())
@@ -266,32 +321,31 @@ impl AgentWorkspace {
                                     Ok(record) => this.memory_ui.selected = Some(record),
                                     Err(error) => this.memory_ui.notice = Some(error),
                                 }
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-        if let Some(record) = &state.selected {
-            page = page.child(
-                div()
-                    .p_4()
-                    .rounded(px(10.))
-                    .bg(rgb(p.surface_subtle))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(record.card.title.clone()),
+                            }
+                            cx.notify();
+                        })),
                     )
-                    .child(record.content.clone())
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!("来源：{}", record.source)),
-                    ),
+                    .when_some(selected, |card, record| {
+                        card.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .mt_2()
+                                .p_3()
+                                .rounded(px(8.))
+                                .bg(rgb(p.surface_subtle))
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(record.content.clone())
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(format!("来源：{}", record.source)),
+                                ),
+                        )
+                    }),
             );
         }
         div().size_full().child(
@@ -302,5 +356,50 @@ impl AgentWorkspace {
                 .p_6()
                 .child(page),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ControlsPreview {
+        time: Entity<TextEntry>,
+        width: f32,
+    }
+    impl Render for ControlsPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).child(memory_controls(
+                self.time.clone(),
+                ThemePreset::default(),
+                Button::new("保存记忆设置").kind(ButtonKind::Gray).render(),
+                Button::new("正在整理…").disabled().render(),
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn time_and_buttons_do_not_overlap_and_wrap_in_narrow_layout(cx: &mut gpui::TestAppContext) {
+        let (preview, window) = cx.add_window_view(|_, cx| ControlsPreview {
+            time: cx.new(|cx| TextEntry::new(cx, "HH:MM", "23:00")),
+            width: 640.,
+        });
+        let field = window.debug_bounds("memory-time-field").unwrap();
+        let save = window.debug_bounds("memory-save-control").unwrap();
+        let run = window.debug_bounds("memory-run-control").unwrap();
+        assert_eq!(field.size.width, px(180.));
+        assert!(field.right() < save.left());
+        assert!(save.right() < run.left());
+        assert_eq!(field.bottom(), save.bottom());
+        preview.update(window, |preview, cx| {
+            preview.width = 240.;
+            cx.notify();
+        });
+        let field = window.debug_bounds("memory-time-field").unwrap();
+        let save = window.debug_bounds("memory-save-control").unwrap();
+        let run = window.debug_bounds("memory-run-control").unwrap();
+        assert_eq!(field.size.width, px(180.));
+        assert!(field.bottom() < save.top());
+        assert!(save.right() < run.left() || save.bottom() < run.top());
     }
 }
