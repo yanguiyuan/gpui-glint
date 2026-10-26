@@ -4,10 +4,10 @@ use gpui::{
     Render, Styled, Subscription, Window, div, px, rgb,
 };
 use gpui_glint::components::{
-    Button, ButtonKind, Checkbox, Composer, ComposerChip, ComposerContextEntry,
-    ComposerContextSection, ComposerEvent, Date, DatePicker, DatePickerEvent, DateRangePicker,
-    DateTimePicker, DateTimeRangePicker, GroupedDropdown, Icon, InputField, RadioOption,
-    SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectField,
+    Button, ButtonKind, Calendar, CalendarEvent, Checkbox, Composer, ComposerChip,
+    ComposerContextEntry, ComposerContextSection, ComposerEvent, Date, DatePicker, DatePickerEvent,
+    DateRangePicker, DateTimePicker, DateTimeRangePicker, GroupedDropdown, Icon, InputField,
+    RadioOption, SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectField,
     SelectFieldEvent, SelectOption, Slider, Stepper, Switch, TextEntry, ThemeSelector,
     ThemeSelectorEvent, Time, TimePicker, TimeRangePicker, Toast, ToastHost, ToastKind, TokenInput,
 };
@@ -25,6 +25,7 @@ pub struct InputsPage {
     selects: Vec<Entity<Select>>,
     compound: Entity<SelectField>,
     composer: Entity<Composer>,
+    calendar: Entity<Calendar>,
     theme_selector: Entity<ThemeSelector>,
     dates: Vec<Entity<DatePicker>>,
     time: Entity<TimePicker>,
@@ -284,11 +285,22 @@ impl InputsPage {
                 .selected(Time::from_hms_opt(9, 30, 0).unwrap())
                 .theme(theme)
         });
+        let calendar = cx.new(|cx| Calendar::new(cx).theme(theme).day_height(56.));
+        subscriptions.push(
+            cx.subscribe(&calendar, |this, _, event: &CalendarEvent, cx| {
+                if let CalendarEvent::DateSelected(date) = event {
+                    this.toasts.update(cx, |host, cx| {
+                        host.push(Toast::new(format!("已选择 {date}")), cx)
+                    });
+                }
+            }),
+        );
         let datetime = cx.new(|cx| DateTimePicker::new(cx).theme(theme, cx));
         let date_range = cx.new(|cx| DateRangePicker::new(cx).theme(theme));
         let time_range = cx.new(|cx| TimeRangePicker::new(cx).theme(theme));
         let datetime_range = cx.new(|cx| DateTimeRangePicker::new(cx).theme(theme));
         Self {
+            calendar,
             time,
             datetime,
             date_range,
@@ -320,6 +332,8 @@ impl InputsPage {
     }
 
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        self.calendar
+            .update(cx, |calendar, cx| calendar.set_theme(theme, cx));
         self.compound
             .update(cx, |field, cx| field.set_theme(theme, cx));
         self.composer
@@ -715,6 +729,7 @@ impl Render for InputsPage {
                 .child(panel(select_examples, self.theme))
                 .child(panel(composer_example, self.theme))
                 .child(panel(date_examples, self.theme))
+                .child(panel(labeled("Calendar · 月历", self.calendar.clone()), self.theme))
                 .child(panel(temporal_examples, self.theme))
                 .child(panel(toast_examples, self.theme)),
             self.theme,

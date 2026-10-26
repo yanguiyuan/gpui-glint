@@ -408,7 +408,7 @@ fn icon_svg(name: &str) -> Option<String> {
             "none",
         ),
         "settings" => (
-            "<circle cx='12' cy='12' r='3.2'/><path d='M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.4 5.4l1.7 1.7M16.9 16.9l1.7 1.7M18.6 5.4l-1.7 1.7M7.1 16.9l-1.7 1.7'/>",
+            "<path d='M9.81 5.25 L10.58 3.01 L13.42 3.01 L14.19 5.25 L15.22 5.67 L17.35 4.64 L19.36 6.65 L18.33 8.78 L18.75 9.81 L20.99 10.58 L20.99 13.42 L18.75 14.19 L18.33 15.22 L19.36 17.35 L17.35 19.36 L15.22 18.33 L14.19 18.75 L13.42 20.99 L10.58 20.99 L9.81 18.75 L8.78 18.33 L6.65 19.36 L4.64 17.35 L5.67 15.22 L5.25 14.19 L3.01 13.42 L3.01 10.58 L5.25 9.81 L5.67 8.78 L4.64 6.65 L6.65 4.64 L8.78 5.67Z'/><circle cx='12' cy='12' r='3.1'/>",
             "none",
         ),
         "plus" => ("<path d='M12 5v14M5 12h14'/>", "none"),
@@ -620,6 +620,64 @@ fn icon_svg(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_gear_has_a_continuous_outline_at_toolbar_sizes() {
+        let svg = GlintAssets
+            .load("glint-ui/icons/settings.svg")
+            .unwrap()
+            .unwrap();
+        let tree = resvg::usvg::Tree::from_data(&svg, &Default::default()).unwrap();
+        for size in [16, 24, 32] {
+            let mut pixels = resvg::tiny_skia::Pixmap::new(size, size).unwrap();
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(size as f32 / 24., size as f32 / 24.),
+                &mut pixels.as_mut(),
+            );
+            let mut painted: Vec<bool> = pixels
+                .pixels()
+                .iter()
+                .map(|pixel| pixel.alpha() > 32)
+                .collect();
+            let mut components = 0;
+            for start in 0..painted.len() {
+                if !painted[start] {
+                    continue;
+                }
+                components += 1;
+                painted[start] = false;
+                let mut pending = vec![start];
+                while let Some(index) = pending.pop() {
+                    let (x, y) = (index as i32 % size as i32, index as i32 / size as i32);
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let (nx, ny) = (x + dx, y + dy);
+                            if nx < 0 || ny < 0 || nx >= size as i32 || ny >= size as i32 {
+                                continue;
+                            }
+                            let next = (ny * size as i32 + nx) as usize;
+                            if painted[next] {
+                                painted[next] = false;
+                                pending.push(next);
+                            }
+                        }
+                    }
+                }
+            }
+            // The perimeter and bore can touch through antialiasing at 16px,
+            // but the gear must never break into detached sun-like rays.
+            assert!(
+                (1..=2).contains(&components),
+                "settings silhouette at {size}px"
+            );
+            let center = (size / 2 * size + size / 2) as usize;
+            assert!(
+                pixels.pixels()[center].alpha() < 32,
+                "gear bore at {size}px"
+            );
+        }
+    }
+
     #[test]
     fn save_icon_loads_and_renders() {
         let svg = GlintAssets

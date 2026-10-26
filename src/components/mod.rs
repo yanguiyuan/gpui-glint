@@ -1,5 +1,6 @@
 mod badge;
 mod button;
+mod calendar;
 mod closable_tabs;
 mod code_card;
 mod dialog;
@@ -8,6 +9,7 @@ mod icon;
 mod inputs;
 mod json_folding;
 mod layout;
+pub use calendar::{Calendar, CalendarEvent};
 mod mermaid;
 mod popover;
 mod rich_text;

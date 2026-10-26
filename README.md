@@ -152,6 +152,7 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 | --- | --- |
 | `cargo run --example playground` | 全部组件的展示与交互入口 |
 | `cargo run -p glint-api` | API 工作台、请求草稿、真实 HTTP 响应与版本历史 |
+| `cargo run -p glint-agent` | Agent 对话工作台、会话记录、ChatGPT 订阅与 API Provider |
 | `cargo run --example webview --features webview` | HTML 源码高亮与 Wry 原生网页渲染（macOS / Windows 适配） |
 | `cargo run --example mdeditor` | 本地 Markdown 工作区、文档库和保存恢复 |
 | `cargo run --example mermaid` | Mermaid 图表与错误状态 |
@@ -199,6 +200,7 @@ examples/
   ...                独立组件示例
 crates/
   glint-api/         可独立打包发布的 API 工作台
+  glint-agent/       原生 Agent 对话工作台与本地会话记录
 docs/
   components.md      详细组件用法
 tests/               集成测试与性能基准

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Glint Agent">
+  <rect x="72" y="72" width="880" height="880" rx="200" fill="#2563eb"/>
+  <g fill="none" stroke="#ffffff" stroke-width="68" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="276" y="354" width="472" height="354" rx="100"/>
+    <path d="M512 268v86M224 490v82M800 490v82"/>
+    <path d="M448 602h128" stroke-width="44"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="512" cy="264" r="40"/>
+    <circle cx="420" cy="496" r="34"/>
+    <circle cx="604" cy="496" r="34"/>
+  </g>
+</svg>

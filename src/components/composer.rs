@@ -283,6 +283,35 @@ impl Composer {
         self
     }
 
+    /// Adds or replaces a toolbar menu without resetting the prompt or queue.
+    /// An explicit valid default selects that value; otherwise a still-valid
+    /// current selection is retained, falling back to the first option.
+    pub fn set_menu_chip(&mut self, chip: ComposerChip, cx: &mut Context<Self>) {
+        let valid = |value: &SharedString| chip.options.iter().any(|option| &option.value == value);
+        let selected = chip
+            .default_selected
+            .clone()
+            .filter(valid)
+            .or_else(|| self.chip_values.get(&chip.id).cloned().filter(valid))
+            .or_else(|| chip.options.first().map(|option| option.value.clone()));
+        if let Some(value) = selected {
+            self.chip_values.insert(chip.id.clone(), value);
+        } else {
+            self.chip_values.remove(&chip.id);
+        }
+        if let Some(index) = self
+            .menu_chips
+            .iter()
+            .position(|current| current.id == chip.id)
+        {
+            self.menu_chips[index] = chip;
+        } else {
+            self.menu_chips.push(chip);
+        }
+        self.open_chip = None;
+        cx.notify();
+    }
+
     /// Makes the chip with this id open the context panel (the `+` /
     /// at-mention panel) instead of emitting `ChipClicked`.
     pub fn context_panel(
@@ -475,7 +504,7 @@ impl Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         self.editor
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
@@ -506,7 +535,9 @@ impl Render for Composer {
                 .relative()
                 .h(px(26.))
                 .px(px(8.))
-                .flex_shrink_0()
+                .min_w_0()
+                .max_w(px(320.))
+                .flex_shrink_1()
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -558,17 +589,17 @@ impl Render for Composer {
                     cx.stop_propagation();
                 });
             if let Some(icon) = chip.icon {
-                chip_element = chip_element.child(icon.render(14.));
+                chip_element = chip_element.child(icon.render(14.).flex_shrink_0());
             }
             let chip_label = selected_label.or_else(|| chip.label.clone());
             if let Some(label) = chip_label {
-                chip_element = chip_element.child(label);
+                chip_element = chip_element.child(div().min_w_0().text_ellipsis().child(label));
             }
             if chip.chevron {
-                chip_element = chip_element.child(Icon::ChevronDown.render(11.));
+                chip_element = chip_element.child(Icon::ChevronDown.render(11.).flex_shrink_0());
             }
             if is_menu_open {
-                chip_element = chip_element.child(self.chip_menu(chip, selection, cx));
+                chip_element = chip_element.child(self.chip_menu(chip, selection, window, cx));
             }
             chip_element
         };
@@ -591,6 +622,8 @@ impl Render for Composer {
             .child(Icon::ArrowUp.render(16.));
 
         let mut bar = div()
+            .w_full()
+            .min_w_0()
             .flex()
             .items_center()
             .gap(px(1.5))
@@ -774,11 +807,37 @@ impl Composer {
         &self,
         chip: &ComposerChip,
         selection: Option<SharedString>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
         let p = theme.palette();
         let dark = theme.is_dark();
+        let style = window.text_style();
+        let label_width = chip
+            .options
+            .iter()
+            .map(|option| {
+                let run = gpui::TextRun {
+                    len: option.label.len(),
+                    font: style.font(),
+                    color: style.color,
+                    letter_spacing: None,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(option.label.clone(), px(13.), &[run], None)
+                        .width,
+                )
+            })
+            .fold(0_f32, f32::max);
+        let menu_width = (label_width + 64.)
+            .clamp(168., 360.)
+            .min((f32::from(window.viewport_size().width) - 32.).max(120.));
         let rows = chip.options.iter().enumerate().map(|(index, option)| {
             let is_selected = selection.as_ref() == Some(&option.value);
             div()
@@ -787,10 +846,13 @@ impl Composer {
                     chip.id
                 )))
                 .h(px(30.))
+                .flex_shrink_0()
+                .w_full()
+                .min_w_0()
                 .px(px(9.))
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap(px(10.))
                 .rounded(px(6.))
                 .text_size(px(13.))
                 .text_color(rgb(if is_selected { p.accent } else { p.text }))
@@ -809,17 +871,35 @@ impl Composer {
                         cx.notify();
                     })
                 })
-                .child(option.label.clone())
-                .when(is_selected, |row| {
-                    row.child(div().text_size(px(12.)).child("✓"))
-                })
+                .child(
+                    div()
+                        .id(("composer-option-label", index))
+                        .debug_selector(move || format!("composer-option-label-{index}").into())
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .child(option.label.clone()),
+                )
+                .child(
+                    div()
+                        .id(("composer-option-check", index))
+                        .debug_selector(move || format!("composer-option-check-{index}").into())
+                        .w(px(14.))
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .child(if is_selected { "✓" } else { "" }),
+                )
         });
         deferred(
             div()
                 .absolute()
                 .bottom(px(32.))
                 .right_0()
-                .w(px(168.))
+                .id("glass-composer-chip-menu")
+                .debug_selector(|| "composer-chip-menu".into())
+                .w(px(menu_width))
+                .max_h(px(280.))
+                .overflow_y_scroll()
                 .p(px(6.))
                 .flex()
                 .flex_col()
@@ -844,6 +924,7 @@ impl Composer {
                     }
                 }))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .children(rows),
         )
         .with_priority(20)
@@ -1042,4 +1123,57 @@ fn icon_action(
                 .text_color(rgb(p.text))
         })
         .child(icon.render(14.))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn refreshing_model_options_preserves_prompt_queue_and_valid_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let composer = cx.new(|cx| {
+            Composer::new("Message", cx)
+                .menu_chip(ComposerChip::new("model").option("a", "A").option("b", "B"))
+        });
+        composer.update(cx, |composer, cx| {
+            composer.set_value("未发送的内容\n第二行", cx);
+            composer.queue.push("排队中的内容".into());
+            composer.chip_values.insert("model".into(), "b".into());
+            composer.set_menu_chip(
+                ComposerChip::new("model").option("b", "B").option("c", "C"),
+                cx,
+            );
+            assert_eq!(composer.value(cx).as_ref(), "未发送的内容\n第二行");
+            assert_eq!(composer.queue_len(), 1);
+            assert_eq!(composer.chip_values["model"].as_ref(), "b");
+            assert_eq!(composer.menu_chips.len(), 1);
+            composer.set_menu_chip(ComposerChip::new("model").option("c", "C"), cx);
+            assert_eq!(composer.chip_values["model"].as_ref(), "c");
+        });
+    }
+
+    #[gpui::test]
+    fn long_model_labels_stay_inside_the_menu_and_leave_room_for_the_check(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (composer, window) = cx.add_window_view(|_, cx| {
+            Composer::new("Message", cx).menu_chip(ComposerChip::new("model").option(
+                "long",
+                "DeepSeek · a-very-long-model-name-that-must-not-overflow-the-menu",
+            ))
+        });
+        composer.update(window, |composer, cx| {
+            composer.open_chip = Some("model".into());
+            cx.notify();
+        });
+        let menu = window.debug_bounds("composer-chip-menu").unwrap();
+        let label = window.debug_bounds("composer-option-label-0").unwrap();
+        let check = window.debug_bounds("composer-option-check-0").unwrap();
+        assert!(menu.size.width <= px(360.));
+        assert!(label.left() >= menu.left());
+        assert!(label.right() < check.left());
+        assert!(check.right() < menu.right());
+    }
 }

@@ -25,6 +25,7 @@ pub struct CollapsePanel {
     summary: SharedString,
     content: Option<CollapsePanelContent>,
     expanded: bool,
+    compact: bool,
     theme: ThemePreset,
 }
 
@@ -37,8 +38,15 @@ impl CollapsePanel {
             summary: summary.into(),
             content: None,
             expanded: false,
+            compact: false,
             theme: ThemePreset::default(),
         }
+    }
+
+    /// Keep the chevron next to the summary instead of at the far edge.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
@@ -144,7 +152,7 @@ impl Render for CollapsePanel {
                 })
                 .child(
                     div()
-                        .flex_1()
+                        .when(!self.compact, |summary| summary.flex_1())
                         .min_w_0()
                         .truncate()
                         .text_size(px(13.))

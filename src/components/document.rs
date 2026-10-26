@@ -199,6 +199,7 @@ impl RenderBlock {
 /// A native Markdown block editor. Source is owned here; persistence is handled
 /// by subscribers to DocumentEvent::Changed. Register bind_document_editor_keys once.
 pub struct DocumentEditor {
+    embedded_preview: bool,
     render_blocks: HashMap<u64, Rc<RenderBlock>>,
     render_references: String,
     character_count: usize,
@@ -253,6 +254,7 @@ impl DocumentEditor {
             }
         });
         let mut this = Self {
+            embedded_preview: false,
             render_blocks: HashMap::new(),
             render_references: String::new(),
             character_count: 0,
@@ -299,6 +301,17 @@ impl DocumentEditor {
         this.ensure_views(cx);
         this
     }
+    /// Read-only, content-sized Markdown for chat messages and other host scroll views.
+    /// Hides document chrome and leaves scrolling to the parent.
+    pub fn embedded_preview(mut self) -> Self {
+        self.embedded_preview = true;
+        self.preview = true;
+        self.status_bar_visible = false;
+        self.toc_collapsed = true;
+        self.rounded_corners = false;
+        self
+    }
+
     pub fn theme(mut self, theme: ThemePreset) -> Self {
         self.theme = theme;
         self
@@ -2657,22 +2670,35 @@ impl Render for DocumentEditor {
                 });
             })
             .id("document-paper")
-            .flex_1()
-            .w(px(0.))
+            .debug_selector(|| "document-paper".into())
             .min_w_0()
-            .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .pt_8()
-            .pb_8()
+            .when(!self.embedded_preview, |paper| {
+                paper
+                    .flex_1()
+                    .w(px(0.))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .pt_8()
+                    .pb_8()
+            })
+            .when(self.embedded_preview, |paper| {
+                paper.w_full().flex_shrink_0()
+            })
             .text_size(px(14.))
             .line_height(px(24.))
             .text_color(rgb(theme.color(0x303036)))
             .flex()
             .flex_col()
             .gap(px(12.))
-            .backdrop_blur(px(if theme.is_dark() { 36. } else { 0. }))
-            .bg(if theme.is_dark() {
+            .backdrop_blur(px(if theme.is_dark() && !self.embedded_preview {
+                36.
+            } else {
+                0.
+            }))
+            .bg(if self.embedded_preview {
+                rgba(0x00000000)
+            } else if theme.is_dark() {
                 rgba(theme.panel_material())
             } else {
                 rgb(theme.palette().surface)
@@ -2710,7 +2736,9 @@ impl Render for DocumentEditor {
         let viewport = self.scroll.bounds();
         let offset = self.scroll.offset().y;
         let title_offset = usize::from(self.title.is_some());
-        let can_clip = self.layout_measure_passes == 0 && viewport.size.height > px(0.);
+        let can_clip = !self.embedded_preview
+            && self.layout_measure_passes == 0
+            && viewport.size.height > px(0.);
         for (index, block) in blocks.iter().enumerate() {
             let id = block.id;
             let kind = block.kind();
@@ -2878,7 +2906,7 @@ impl Render for DocumentEditor {
                 .max_w(px(820.))
                 .flex_shrink_0()
                 .mx_auto()
-                .px_5()
+                .when(!self.embedded_preview, |row| row.px_5())
                 .flex()
                 .items_start()
                 .gap(px(8.))
@@ -2900,7 +2928,7 @@ impl Render for DocumentEditor {
                     }
                     cx.notify();
                 }))
-                .child(handle)
+                .when(!self.embedded_preview, |row| row.child(handle))
                 .child(content);
             if self.menu == Some(id) {
                 row = row.child(
@@ -2964,28 +2992,38 @@ impl Render for DocumentEditor {
         }
         self.reveal_block = None;
         let last = self.blocks.last().map(|b| b.id).unwrap_or(0);
-        paper = paper.child(
-            div()
-                .id("append-document-block")
-                .max_w(px(740.))
+        paper = paper.when(!self.preview, |paper| {
+            paper.child(
+                div()
+                    .id("append-document-block")
+                    .max_w(px(740.))
+                    .w_full()
+                    .mx_auto()
+                    .py_3()
+                    .text_color(rgb(theme.color(0xaeaeb2)))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .on_drop(cx.listener(|this, drag: &BlockDrag, _, cx| {
+                        if !this.preview && drag.owner == cx.entity_id() {
+                            this.move_block(drag.id, None, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.preview {
+                            this.insert_after(last, "", cx);
+                        }
+                    }))
+                    .child("＋ 添加块"),
+            )
+        });
+        if self.embedded_preview {
+            return div()
+                .id("glass-document-preview")
+                .debug_selector(|| "glass-document-preview".into())
                 .w_full()
-                .mx_auto()
-                .py_3()
-                .text_color(rgb(theme.color(0xaeaeb2)))
-                .text_size(px(12.))
-                .cursor_pointer()
-                .on_drop(cx.listener(|this, drag: &BlockDrag, _, cx| {
-                    if !this.preview && drag.owner == cx.entity_id() {
-                        this.move_block(drag.id, None, cx);
-                    }
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.preview {
-                        this.insert_after(last, "", cx);
-                    }
-                }))
-                .child("＋ 添加块"),
-        );
+                .min_w_0()
+                .child(paper);
+        }
         div()
             .size_full()
             .min_w_0()
@@ -3080,6 +3118,28 @@ impl Render for DocumentEditor {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn embedded_markdown_uses_content_height_and_hides_document_chrome(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let (document, window) = cx.add_window_view(|_, cx| {
+            DocumentEditor::new(cx, "# Heading\n\n**bold** and `code`\n\n- first\n- second")
+                .embedded_preview()
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("glass-document-preview").is_some());
+        assert!(window.debug_bounds("document-expand-toc").is_none());
+        assert!(window.debug_bounds("append-document-block").is_none());
+        let paper = window.debug_bounds("document-paper").unwrap();
+        assert!(paper.size.height > px(50.) && paper.size.height < px(400.));
+        document.update(window, |editor, _| {
+            assert!(editor.is_preview());
+            assert_eq!(editor.rendered_blocks.len(), editor.blocks.len());
+            assert_eq!(editor.scroll.max_offset().y, px(0.));
+        });
+    }
+
     #[gpui::test]
     fn block_popup_scroll_does_not_scroll_the_document(cx: &mut gpui::TestAppContext) {
         use super::*;

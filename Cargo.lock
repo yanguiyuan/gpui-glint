@@ -2960,6 +2960,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "glint-agent"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "chrono",
+ "gpui-ce",
+ "gpui-glint",
+ "gpui_ce_platform",
+ "keyring",
+ "objc2 0.6.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "winresource",
+]
+
+[[package]]
 name = "glint-api"
 version = "0.1.6"
 dependencies = [

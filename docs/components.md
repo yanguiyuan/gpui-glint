@@ -501,6 +501,9 @@ chips 只负责样式与点击事件，弹出菜单由宿主用 `GroupedDropdown
 `set_theme` 与 `set_value` 支持运行时更新。展示程序的“输入与选择”页提供
 完整演示：提交后短暂显示 spinner 并弹出 Toast。
 
+`set_menu_chip(chip, cx)` 可在模型列表或供应商配置变化后更新同 ID 的菜单，保留输入内容和队列。
+显式提供的有效 `default_selected` 会成为新选择；否则保留仍有效的已有选择，再回退到首个选项。
+
 带 `.option(value, label)` 的 chip 表现为 Select：点击在 chip 上方弹出
 选项菜单，选中行标勾，chip 标签显示当前选项，选择通过
 `ComposerEvent::ChipSelected` 上报；菜单自带 `occlude`，滚动与点击都不会
@@ -692,3 +695,15 @@ Dialog::new("create-environment", form)
 ```
 
 容器统一提供居中面板、主题配色、遮罩和内容滚动，拦截背景点击与滚轮传播。Esc 和点击遮罩触发 `on_close`，不会自动提交；`dismissible(false)` 在提交期间禁止这两种关闭方式。`focus_handles` 按顺序循环处理 Tab／Shift-Tab，宿主应传入当前可用表单控件；初次打开时由宿主聚焦首个控件。`priority` 默认 110，可用于安排嵌套弹层的显示顺序。
+
+## Calendar 月历
+
+`Calendar` 提供周一起始的月份网格、月份切换、回到今天、日期选择和每日事件数量标记。组件不包含调度器或存储；示例见 playground 的 Inputs 页面，实际日程集成见 `crates/glint-agent`。
+
+```rust
+let calendar = cx.new(|cx| Calendar::new(cx).theme(theme).day_height(72.));
+calendar.update(cx, |calendar, cx| calendar.set_markers(markers, cx));
+// CalendarEvent::DateSelected(date) / CalendarEvent::MonthChanged(month)
+```
+
+使用 `set_selected(date, cx)` 同步选中日期及当前月份，`value()` 读取选择。事件标记由 `HashMap<NaiveDate, usize>` 提供。
