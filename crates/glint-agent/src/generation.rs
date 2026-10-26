@@ -5,6 +5,11 @@ use serde_json::Value;
 pub struct GenerationStats {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Occupancy of the final request, separate from cumulative turn billing.
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
     pub elapsed_ms: u64,
     pub first_token_ms: Option<u64>,
     pub generation_ms: Option<u64>,
@@ -92,6 +97,8 @@ pub struct Completion {
 pub struct Metrics {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    context_input_tokens: Option<u64>,
+    context_window: Option<u64>,
     first_output: Option<u64>,
     last_output: Option<u64>,
     output_updates: usize,
@@ -111,6 +118,11 @@ impl Metrics {
             .or(value["inputTokens"].as_u64())
         {
             self.input_tokens = Some(input);
+            self.context_input_tokens = Some(
+                input
+                    .saturating_add(value["cache_read_input_tokens"].as_u64().unwrap_or(0))
+                    .saturating_add(value["cache_creation_input_tokens"].as_u64().unwrap_or(0)),
+            );
         }
         if let Some(output) = value["completion_tokens"]
             .as_u64()
@@ -118,6 +130,18 @@ impl Metrics {
             .or(value["outputTokens"].as_u64())
         {
             self.output_tokens = Some(output);
+        }
+    }
+
+    pub fn context_tokens(&self) -> Option<u64> {
+        self.context_input_tokens
+            .zip(self.output_tokens)
+            .map(|(input, output)| input.saturating_add(output))
+    }
+
+    pub fn set_context_window(&mut self, capacity: Option<u64>) {
+        if let Some(capacity) = capacity.filter(|capacity| *capacity > 0) {
+            self.context_window = Some(capacity);
         }
     }
 
@@ -131,6 +155,8 @@ impl Metrics {
         GenerationStats {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            context_tokens: self.context_tokens(),
+            context_window: self.context_window,
             elapsed_ms,
             first_token_ms: self.first_output,
             generation_ms,
@@ -156,6 +182,10 @@ pub struct StreamCompletion {
 }
 
 impl StreamCompletion {
+    pub fn context_tokens(&self) -> Option<u64> {
+        self.metrics.context_tokens()
+    }
+
     pub fn push(&mut self, bytes: &[u8], elapsed_ms: u64) -> Result<(), String> {
         self.pending.extend_from_slice(bytes);
         while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
@@ -362,6 +392,24 @@ impl StreamCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_occupancy_includes_anthropic_cache_and_waits_for_measured_counts() {
+        let mut metrics = Metrics::default();
+        metrics.usage(&serde_json::json!({"input_tokens":100,"cache_read_input_tokens":500,"cache_creation_input_tokens":50,"output_tokens":0}));
+        assert_eq!(metrics.context_tokens(), Some(650));
+        metrics.usage(&serde_json::json!({"output_tokens":40}));
+        metrics.set_context_window(Some(1000));
+        let stats = metrics.finish(10);
+        assert_eq!(stats.context_tokens, Some(690));
+        assert_eq!(stats.context_window, Some(1000));
+        let mut unknown = Metrics::default();
+        unknown.usage(&serde_json::json!({"output_tokens":10}));
+        assert_eq!(unknown.context_tokens(), None);
+        let mut openai = Metrics::default();
+        openai.usage(&serde_json::json!({"prompt_tokens":900,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":800}}));
+        assert_eq!(openai.context_tokens(), Some(950));
+    }
 
     #[test]
     fn anthropic_split_utf8_and_usage_produce_real_token_speed() {

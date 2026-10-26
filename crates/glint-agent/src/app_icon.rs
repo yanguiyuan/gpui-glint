@@ -1,18 +1,5 @@
-use std::sync::{Arc, OnceLock};
-
+#[cfg(target_os = "macos")]
 const ICON_PNG: &[u8] = include_bytes!("../assets/glint-agent-icon.png");
-
-pub fn image() -> Arc<gpui::Image> {
-    static IMAGE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            Arc::new(gpui::Image::from_bytes(
-                gpui::ImageFormat::Png,
-                ICON_PNG.to_vec(),
-            ))
-        })
-        .clone()
-}
 
 /// Embedded so direct `cargo run` launches have the same Dock icon as a bundle.
 #[cfg(target_os = "macos")]

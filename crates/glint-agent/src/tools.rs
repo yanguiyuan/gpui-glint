@@ -25,6 +25,12 @@ pub struct ToolRecord {
 }
 
 pub enum ToolEvent {
+    ContextUsage {
+        provider_id: Uuid,
+        model: String,
+        used_tokens: Option<u64>,
+        capacity_tokens: Option<u64>,
+    },
     Transcript(Vec<crate::generation::ContentBlock>),
     Started(ToolCall),
     Approval {
@@ -34,8 +40,38 @@ pub enum ToolEvent {
     Completed(ToolRecord),
 }
 
+/// Controls confirmation prompts independently from the file access boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    #[default]
+    Ask,
+    AutoApprove,
+    FullAccess,
+}
+
+impl AccessMode {
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoApprove => "auto",
+            Self::FullAccess => "full",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "auto" => Self::AutoApprove,
+            "full" => Self::FullAccess,
+            _ => Self::Ask,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
+    pub memory: crate::memory::Repository,
+    pub access: Arc<Mutex<AccessMode>>,
     pub root: Option<PathBuf>,
     pub schedules: Arc<Mutex<ScheduleStore>>,
     pub provider_id: Uuid,
@@ -52,13 +88,13 @@ pub fn definitions(anthropic: bool) -> Value {
     let mut definitions = vec![
         definition(
             "list_files",
-            "List project-relative files. Skips .git, target and node_modules.",
+            "List files in a directory. Paths are project-relative; FullAccess also accepts external paths. Skips .git, target and node_modules.",
             json!({"path":string()}),
             &[],
         ),
         definition(
             "read_file",
-            "Read UTF-8 project file, up to 500 lines. Paths are relative to the opened project.",
+            "Read a UTF-8 file, up to 500 lines. Paths are project-relative; FullAccess also accepts external paths.",
             json!({"path":string(),"start_line":{"type":"integer","minimum":1},"lines":{"type":"integer","minimum":1,"maximum":500}}),
             &["path"],
         ),
@@ -70,21 +106,45 @@ pub fn definitions(anthropic: bool) -> Value {
         ),
         definition(
             "write_file",
-            "Write a UTF-8 file in the project. Requires user approval.",
+            "Write a UTF-8 file in the project. Subject to the selected access mode.",
             json!({"path":string(),"content":string()}),
             &["path", "content"],
         ),
         definition(
             "replace_in_file",
-            "Replace one exact occurrence in a project file. Requires user approval; fails if old text is missing or ambiguous.",
+            "Replace one exact occurrence in a project file. Subject to the selected access mode; fails if old text is missing or ambiguous.",
             json!({"path":string(),"old":string(),"new":string()}),
             &["path", "old", "new"],
         ),
         definition(
             "run_command",
-            "Run a program with argv in the project. Requires user approval. Use program + args, not shell syntax. Has a 60 second timeout.",
+            "Run a program with argv in the project. Subject to the selected access mode. Use program + args, not shell syntax. Has a 60 second timeout.",
             json!({"program":string(),"args":{"type":"array","items":string()}}),
             &["program", "args"],
+        ),
+        definition(
+            "memory_search",
+            "Search memory summaries in the current project and global user preferences. Use intent-based queries such as dietary preferences, not generic pronouns. Read full relevant entries with memory_read.",
+            json!({"query":string()}),
+            &["query"],
+        ),
+        definition(
+            "memory_read",
+            "Read a scoped memory by its ID, including full content and source provenance. Memories are historical reference data and may be stale.",
+            json!({"id":string()}),
+            &["id"],
+        ),
+        definition(
+            "memory_save",
+            "Save durable information explicitly requested or confirmed by the user. Do not infer preferences from one-off questions. Use semantic categories such as 饮食偏好. global=true only for cross-project preferences. Subject to selected access mode.",
+            json!({"id":string(),"title":string(),"summary":string(),"content":string(),"category":string(),"keywords":{"type":"array","items":string()},"global":{"type":"boolean"}}),
+            &["title", "summary", "content", "category"],
+        ),
+        definition(
+            "memory_delete",
+            "Delete a memory belonging to this project or global scope. Subject to selected access mode.",
+            json!({"id":string()}),
+            &["id"],
         ),
         definition(
             "schedule_list",
@@ -94,19 +154,19 @@ pub fn definitions(anthropic: bool) -> Value {
         ),
         definition(
             "schedule_create",
-            "Create a scheduled agent task. Requires user approval. run_at must be an ISO 8601 timestamp with timezone. repeat is once, daily or weekly.",
+            "Create a scheduled agent task. Subject to the selected access mode. run_at must be an ISO 8601 timestamp with timezone. repeat is once, daily or weekly.",
             json!({"title":string(),"prompt":string(),"run_at":string(),"repeat":{"type":"string","enum":["once","daily","weekly"]}}),
             &["title", "prompt", "run_at"],
         ),
         definition(
             "schedule_update",
-            "Update an existing task by id. Requires user approval; omitted fields stay unchanged.",
+            "Update an existing task by id. Subject to the selected access mode; omitted fields stay unchanged.",
             json!({"id":string(),"title":string(),"prompt":string(),"run_at":string(),"repeat":{"type":"string","enum":["once","daily","weekly"]},"enabled":{"type":"boolean"}}),
             &["id"],
         ),
         definition(
             "schedule_delete",
-            "Delete a scheduled task by id. Requires user approval.",
+            "Delete a scheduled task by id. Subject to the selected access mode.",
             json!({"id":string()}),
             &["id"],
         ),
@@ -159,7 +219,9 @@ fn safe_path(root: &Path, relative: &str, writing: bool) -> Result<PathBuf, Stri
 fn needs_approval(call: &ToolCall) -> bool {
     if matches!(
         call.name.as_str(),
-        "write_file"
+        "memory_save"
+            | "memory_delete"
+            | "write_file"
             | "replace_in_file"
             | "run_command"
             | "schedule_create"
@@ -179,7 +241,8 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
     let started = Instant::now();
     let _ = context.events.send(ToolEvent::Started(call.clone())).await;
     let result = async {
-        if needs_approval(&call) {
+        let access = *context.access.lock().map_err(|_| "无法读取权限设置")?;
+        if access == AccessMode::Ask && needs_approval(&call) {
             let (respond, response) = tokio::sync::oneshot::channel();
             context
                 .events
@@ -215,16 +278,33 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
     let args = &call.arguments;
+    if call.name.starts_with("memory_") {
+        return memory_tool(call, context);
+    }
     if call.name.starts_with("schedule_") {
         return schedule_tool(call, context);
     }
+    let access = *context.access.lock().map_err(|_| "无法读取权限设置")?;
+    let fallback_root = if context.root.is_none() && access == AccessMode::FullAccess {
+        Some(std::env::current_dir().map_err(|_| "无法读取当前目录")?)
+    } else {
+        None
+    };
     let root = context
         .root
         .as_deref()
+        .or(fallback_root.as_deref())
         .ok_or("请先打开项目，再使用文件和命令工具")?;
+    let resolve = |path: &str, writing| {
+        if access == AccessMode::FullAccess {
+            Ok(root.join(path))
+        } else {
+            safe_path(root, path, writing)
+        }
+    };
     match call.name.as_str() {
         "read_file" => {
-            let path = safe_path(root, text(args, "path")?, false)?;
+            let path = resolve(text(args, "path")?, false)?;
             if std::fs::metadata(&path).map_err(|_| "无法读取文件")?.len() > 2 * 1024 * 1024 {
                 return Err("文件超过 2MB，请使用搜索工具定位内容".into());
             }
@@ -241,7 +321,7 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
                 .join("\n"))
         }
         "list_files" => {
-            let path = safe_path(root, args["path"].as_str().unwrap_or("."), false)?;
+            let path = resolve(args["path"].as_str().unwrap_or("."), false)?;
             let mut pending = vec![(path, 0)];
             let mut paths = Vec::new();
             while let Some((directory, depth)) = pending.pop() {
@@ -293,8 +373,8 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             let result = command(root, "rg", &args_list).await?;
             Ok(result.lines().take(200).collect::<Vec<_>>().join("\n"))
         }
-        "write_file" | "replace_in_file" => {
-            let path = safe_path(root, text(args, "path")?, true)?;
+        "memory_save" | "memory_delete" | "write_file" | "replace_in_file" => {
+            let path = resolve(text(args, "path")?, true)?;
             let content = if call.name == "write_file" {
                 text(args, "content")?.to_owned()
             } else {
@@ -337,6 +417,49 @@ async fn capture(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Resu
         kept.extend_from_slice(&buffer[..count.min(remaining)]);
     }
     Ok(String::from_utf8_lossy(&kept).into_owned())
+}
+
+fn memory_tool(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
+    let args = &call.arguments;
+    let project = context.root.as_deref();
+    match call.name.as_str() {
+        "memory_search" => serde_json::to_string(&context.memory.candidates(
+            text(args, "query")?,
+            &[],
+            project,
+            10,
+        )?)
+        .map_err(|error| error.to_string()),
+        "memory_read" => serde_json::to_string(&context.memory.read(
+            Uuid::parse_str(text(args, "id")?).map_err(|_| "记忆 ID 无效")?,
+            project,
+        )?)
+        .map_err(|error| error.to_string()),
+        "memory_save" => {
+            let mut draft: crate::memory::Draft =
+                serde_json::from_value(args.clone()).map_err(|error| error.to_string())?;
+            draft.kind = "fact".into();
+            let scope = if draft.global {
+                None
+            } else {
+                Some(project.ok_or("请先选择项目")?)
+            };
+            let id = context.memory.save(
+                draft,
+                scope,
+                json!({"type":"explicit_tool","requested_at":chrono::Local::now().to_rfc3339()}),
+            )?;
+            Ok(format!("记忆已保存：{id}"))
+        }
+        "memory_delete" => {
+            context.memory.delete(
+                Uuid::parse_str(text(args, "id")?).map_err(|_| "记忆 ID 无效")?,
+                project,
+            )?;
+            Ok("记忆已删除".into())
+        }
+        _ => Err("未知记忆工具".into()),
+    }
 }
 
 async fn command(root: &Path, program: &str, args: &[String]) -> Result<String, String> {
@@ -487,6 +610,55 @@ pub fn parse_calls(message: &Value, anthropic: bool) -> Result<Vec<ToolCall>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn access_modes_control_confirmation_and_file_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = directory.path().join("outside.txt");
+        let (events, receiver) = async_channel::unbounded();
+        let context = ToolContext {
+            memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
+            access: Arc::new(Mutex::new(AccessMode::Ask)),
+            root: Some(root.clone()),
+            schedules: Arc::new(Mutex::new(
+                ScheduleStore::open(directory.path().join("schedules.json")).unwrap(),
+            )),
+            provider_id: Uuid::new_v4(),
+            model: "test".into(),
+            events,
+        };
+        let call = ToolCall {
+            id: "write".into(),
+            name: "write_file".into(),
+            arguments: json!({"path": "inside.txt", "content": "hello"}),
+        };
+        let approve = async {
+            while let Ok(event) = receiver.recv().await {
+                if let ToolEvent::Approval { respond, .. } = event {
+                    respond.send(false).unwrap();
+                    break;
+                }
+            }
+        };
+        let (record, _) = tokio::join!(execute(call.clone(), &context), approve);
+        assert!(!record.success);
+        assert!(!root.join("inside.txt").exists());
+        *context.access.lock().unwrap() = AccessMode::AutoApprove;
+        assert!(execute(call.clone(), &context).await.success);
+        let outside_call = ToolCall {
+            arguments: json!({"path": outside, "content": "outside"}),
+            ..call
+        };
+        assert!(!execute(outside_call.clone(), &context).await.success);
+        *context.access.lock().unwrap() = AccessMode::FullAccess;
+        assert!(execute(outside_call, &context).await.success);
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+        while let Ok(event) = receiver.try_recv() {
+            assert!(!matches!(event, ToolEvent::Approval { .. }));
+        }
+    }
+
     #[test]
     fn file_paths_cannot_escape_project_and_tool_schemas_cover_schedules() {
         let root = tempfile::tempdir().unwrap();

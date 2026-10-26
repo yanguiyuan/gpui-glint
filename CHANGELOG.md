@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in `Composer::stop_on_busy(true)` and `ComposerEvent::StopRequested` to reuse the send button for cancellation.
+- Move Glint Agent state to SQLite with legacy JSON import; add scoped semantic memory recall, memory tools, and configurable nightly conversation consolidation.
+
+- Add clipboard image paste to `PromptEditor`: ⌘/Ctrl-V with an image (or copied image files) emits `PromptEditorEvent::ImagePasted` carrying `PastedImage` bytes instead of inserting text.
+- Add pasted-image attachments to `Composer` with a removable thumbnail strip; submissions now carry text plus images. **Breaking:** `ComposerEvent::Submitted` and `Queued` hold a `ComposerSubmission { text, images }` instead of a bare `SharedString`.
+
 ## 0.1.3 — 2026-10-12
 
 - Add API template methods for random values, UUIDs, names, XSS test text, UTC time, and request Cookie extraction, with per-send evaluation and copyable examples.

@@ -19,6 +19,64 @@ pub enum Protocol {
     Anthropic,
 }
 
+/// Requested reasoning effort for providers that expose a thinking switch
+/// (DeepSeek documents `thinking` plus `output_config.effort`). `Default`
+/// sends nothing and keeps the provider's own behavior.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Thinking {
+    #[default]
+    Default,
+    Off,
+    Low,
+    High,
+    Max,
+}
+
+impl Thinking {
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "off" => Self::Off,
+            "low" => Self::Low,
+            "high" => Self::High,
+            "max" => Self::Max,
+            _ => Self::Default,
+        }
+    }
+
+    /// Injects the protocol-specific thinking fields into a request body.
+    fn apply(self, body: &mut Value, protocol: Protocol) {
+        match protocol {
+            Protocol::Anthropic => match self {
+                Self::Default => {}
+                Self::Off => body["thinking"] = json!({"type": "disabled"}),
+                Self::Low | Self::High | Self::Max => {
+                    body["thinking"] = json!({"type": "enabled"});
+                    // Reasoning consumes the token budget; raise the ceiling.
+                    body["max_tokens"] = json!(32768);
+                    body["output_config"] = json!({"effort": match self {
+                        Self::Low => "low",
+                        Self::High => "high",
+                        _ => "max",
+                    }});
+                }
+            },
+            Protocol::OpenAi => match self {
+                Self::Default => {}
+                Self::Off => {
+                    body["thinking"] = json!({"type": "disabled", "reasoning_effort": "none"})
+                }
+                Self::Low | Self::High | Self::Max => {
+                    body["thinking"] = json!({"type": "enabled", "reasoning_effort": match self {
+                        Self::Low => "low",
+                        Self::High => "high",
+                        _ => "max",
+                    }});
+                }
+            },
+        }
+    }
+}
+
 /// Non-secret provider configuration. API keys live in the OS credential store.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -32,6 +90,10 @@ pub struct Config {
     pub id: Uuid,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_context_windows: std::collections::HashMap<String, u64>,
+    #[serde(default)]
+    pub context_window_overrides: std::collections::HashMap<String, u64>,
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
@@ -53,6 +115,8 @@ impl Default for Config {
             discovery_id: None,
             id: Uuid::new_v4(),
             models: vec![],
+            model_context_windows: Default::default(),
+            context_window_overrides: Default::default(),
             api_key_env: None,
             kind: Kind::Compatible,
             codex_path: default_codex(),
@@ -241,7 +305,18 @@ impl<T: Send + 'static> Job<T> {
     }
 }
 
+#[derive(Default)]
+pub struct ModelCatalog {
+    pub models: Vec<String>,
+    pub context_windows: std::collections::HashMap<String, u64>,
+}
+
+#[cfg(test)]
 pub async fn list_models(config: Config, key: String) -> Result<Vec<String>, String> {
+    Ok(list_model_catalog(config, key).await?.models)
+}
+
+pub async fn list_model_catalog(config: Config, key: String) -> Result<ModelCatalog, String> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
@@ -266,6 +341,19 @@ pub async fn list_models(config: Config, key: String) -> Result<Vec<String>, Str
         .await
         .map_err(|_| "无法获取模型列表，请检查服务地址、认证与网络")?;
     let data = response_json(response).await?;
+    let context_windows = data["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item["id"].as_str()?;
+            let capacity = item["context_window"]
+                .as_u64()
+                .or(item["context_length"].as_u64())
+                .or(item["max_context_tokens"].as_u64())?;
+            (capacity > 0).then(|| (name.to_owned(), capacity))
+        })
+        .collect();
     let mut models: Vec<String> = data["data"]
         .as_array()
         .ok_or("服务未返回模型列表")?
@@ -278,13 +366,63 @@ pub async fn list_models(config: Config, key: String) -> Result<Vec<String>, Str
     if models.is_empty() {
         return Err("服务没有返回可用模型".into());
     }
-    Ok(models)
+    Ok(ModelCatalog {
+        models,
+        context_windows,
+    })
 }
 
-pub fn messages(messages: &[Message]) -> Vec<Value> {
-    messages.iter().filter(|message| message.role != Role::Notice)
-        .map(|message| json!({"role": if message.role == Role::User { "user" } else { "assistant" }, "content": message.text}))
+pub fn messages(messages: &[Message], protocol: Protocol) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| message.role != Role::Notice)
+        .map(|message| {
+            let content = if message.role == Role::User {
+                user_content(&message.text, &message.images, protocol)
+            } else {
+                json!(message.text)
+            };
+            json!({
+                "role": if message.role == Role::User { "user" } else { "assistant" },
+                "content": content
+            })
+        })
         .collect()
+}
+
+/// Builds a user turn's `content` value: a plain string when there are no
+/// images, otherwise a typed part array with the images inlined as base64
+/// (`image_url` data URLs for OpenAI-compatible services, `image` blocks for
+/// Anthropic-compatible ones such as DeepSeek's Anthropic endpoint).
+pub fn user_content(
+    text: &str,
+    images: &[crate::model::MessageImage],
+    protocol: Protocol,
+) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    }
+    for image in images {
+        parts.push(match protocol {
+            Protocol::Anthropic => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.media_type,
+                    "data": image.data,
+                }
+            }),
+            Protocol::OpenAi => json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{};base64,{}", image.media_type, image.data)}
+            }),
+        });
+    }
+    json!(parts)
 }
 
 static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
@@ -312,19 +450,26 @@ impl Drop for Request {
 }
 
 impl Request {
-    pub fn start(config: Config, key: String, messages: Vec<Value>) -> Result<Self, String> {
-        Self::start_with_tools(config, key, messages, None)
+    pub fn start(
+        config: Config,
+        key: String,
+        messages: Vec<Value>,
+        thinking: Thinking,
+    ) -> Result<Self, String> {
+        Self::start_with_tools(config, key, messages, thinking, None)
     }
 
     pub fn start_with_tools(
         config: Config,
         key: String,
         messages: Vec<Value>,
+        thinking: Thinking,
         context: Option<crate::tools::ToolContext>,
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self(runtime()?.spawn(async move {
             if config.kind == Kind::ChatGpt {
+                // Codex CLI manages its own reasoning configuration.
                 tokio::time::timeout(
                     Duration::from_secs(180),
                     crate::chatgpt::complete(&config, messages, context),
@@ -332,7 +477,7 @@ impl Request {
                 .await
                 .map_err(|_| "ChatGPT 请求超时，请稍后重试".to_owned())?
             } else {
-                complete(config, key, messages, context).await
+                complete(config, key, messages, thinking, context).await
             }
         })))
     }
@@ -366,21 +511,33 @@ async fn complete(
     config: Config,
     key: String,
     mut messages: Vec<Value>,
+    thinking: Thinking,
     context: Option<crate::tools::ToolContext>,
 ) -> Result<crate::generation::Completion, String> {
     let started = std::time::Instant::now();
     let mut records = Vec::new();
     let mut blocks = Vec::new();
     let mut total: Option<crate::generation::GenerationStats> = None;
-    for _ in 0..8 {
+    loop {
         let mut reply = single_request(
             config.clone(),
             key.clone(),
             messages.clone(),
+            thinking,
             context.as_ref(),
             &blocks,
         )
         .await?;
+        if let Some(context) = &context {
+            let _ = context
+                .events
+                .try_send(crate::tools::ToolEvent::ContextUsage {
+                    provider_id: config.id,
+                    model: config.model.clone(),
+                    used_tokens: reply.stats.context_tokens,
+                    capacity_tokens: reply.stats.context_window,
+                });
+        }
         blocks.extend(reply.blocks.clone());
         if let Some(context) = &context {
             let _ = context
@@ -388,6 +545,8 @@ async fn complete(
                 .try_send(crate::tools::ToolEvent::Transcript(blocks.clone()));
         }
         if let Some(stats) = &mut total {
+            stats.context_tokens = reply.stats.context_tokens;
+            stats.context_window = reply.stats.context_window.or(stats.context_window);
             stats.input_tokens = stats
                 .input_tokens
                 .zip(reply.stats.input_tokens)
@@ -454,13 +613,13 @@ async fn complete(
             messages.push(json!({"role":"user","content":anthropic_results}));
         }
     }
-    Err("已达到单次任务 8 轮工具调用上限，请拆分任务后继续".into())
 }
 
 async fn single_request(
     config: Config,
     key: String,
     messages: Vec<Value>,
+    thinking: Thinking,
     context: Option<&crate::tools::ToolContext>,
     prefix: &[crate::generation::ContentBlock],
 ) -> Result<crate::generation::Completion, String> {
@@ -495,6 +654,7 @@ async fn single_request(
     if context.is_some() {
         body["tools"] = crate::tools::definitions(config.protocol == Protocol::Anthropic);
     }
+    thinking.apply(&mut body, config.protocol);
     let mut request = client.post(endpoint).json(&body);
     if config.protocol == Protocol::Anthropic {
         request = request.header("anthropic-version", "2023-06-01");
@@ -527,6 +687,7 @@ async fn single_request(
     {
         let mut stream = crate::generation::StreamCompletion::default();
         let mut bytes = 0;
+        let mut last_context = None;
         while let Some(chunk) = response
             .chunk()
             .await
@@ -538,6 +699,18 @@ async fn single_request(
             }
             stream.push(&chunk, started.elapsed().as_millis() as u64)?;
             if let Some(context) = context {
+                let used = stream.context_tokens();
+                if used.is_some() && used != last_context {
+                    last_context = used;
+                    let _ = context
+                        .events
+                        .try_send(crate::tools::ToolEvent::ContextUsage {
+                            provider_id: config.id,
+                            model: config.model.clone(),
+                            used_tokens: used,
+                            capacity_tokens: None,
+                        });
+                }
                 let mut blocks = prefix.to_vec();
                 blocks.extend(stream.snapshot());
                 let _ = context
@@ -654,6 +827,69 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn model_catalog_keeps_real_window_metadata_and_manual_limits_round_trip() {
+        let (url, server) = server_for(
+            "get /v1/models ",
+            "200 OK",
+            r#"{"data":[{"id":"a","context_window":1048576},{"id":"b","context_length":128000},{"id":"unknown"}]}"#,
+        );
+        let mut config = Config {
+            base_url: url,
+            ..Default::default()
+        };
+        let models = runtime()
+            .unwrap()
+            .block_on(list_model_catalog(config.clone(), "test-only-key".into()))
+            .unwrap();
+        assert_eq!(models.context_windows["a"], 1048576);
+        assert_eq!(models.context_windows["b"], 128000);
+        assert!(!models.context_windows.contains_key("unknown"));
+        config.model_context_windows = models.context_windows;
+        config.context_window_overrides.insert("a".into(), 500000);
+        let loaded: Config =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.context_window_overrides["a"], 500000);
+        assert_eq!(loaded.model_context_windows["a"], 1048576);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn thinking_levels_use_the_documented_protocol_fields() {
+        let mut body = json!({"max_tokens": 8192});
+        Thinking::Default.apply(&mut body, Protocol::Anthropic);
+        assert!(body.get("thinking").is_none());
+
+        let mut body = json!({"max_tokens": 8192});
+        Thinking::Off.apply(&mut body, Protocol::Anthropic);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["max_tokens"], 8192);
+
+        let mut body = json!({"max_tokens": 8192});
+        Thinking::High.apply(&mut body, Protocol::Anthropic);
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert_eq!(body["max_tokens"], 32768);
+
+        let mut body = json!({});
+        Thinking::Max.apply(&mut body, Protocol::OpenAi);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "reasoning_effort": "max"})
+        );
+
+        let mut body = json!({});
+        Thinking::Off.apply(&mut body, Protocol::OpenAi);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "disabled", "reasoning_effort": "none"})
+        );
+
+        assert_eq!(Thinking::from_value("off"), Thinking::Off);
+        assert_eq!(Thinking::from_value("max"), Thinking::Max);
+        assert_eq!(Thinking::from_value("unknown"), Thinking::Default);
+    }
 
     #[test]
     fn saved_configuration_wins_over_environment_discovery() {
@@ -787,12 +1023,22 @@ mod tests {
                             assert_eq!(result["tool_call_id"], "call-1");
                         }
                     }
-                    let body = match (anthropic, round) {
-                        (true, 0) => json!({"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"before"},{"type":"tool_use","id":"call-1","name":"schedule_list","input":{}}]}),
-                        (false, 0) => json!({"choices":[{"message":{"reasoning_content":"plan","content":"before","tool_calls":[{"id":"call-1","type":"function","function":{"name":"schedule_list","arguments":"{}"}}]}}]}),
+                    let mut body = match (anthropic, round) {
+                        (true, 0) => {
+                            json!({"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"before"},{"type":"tool_use","id":"call-1","name":"schedule_list","input":{}}]})
+                        }
+                        (false, 0) => {
+                            json!({"choices":[{"message":{"reasoning_content":"plan","content":"before","tool_calls":[{"id":"call-1","type":"function","function":{"name":"schedule_list","arguments":"{}"}}]}}]})
+                        }
                         (true, _) => json!({"content":[{"type":"text","text":"done"}]}),
                         (false, _) => json!({"choices":[{"message":{"content":"done"}}]}),
-                    }.to_string();
+                    };
+                    body["usage"] = if anthropic {
+                        json!({"input_tokens":100 * (round + 1),"output_tokens":10})
+                    } else {
+                        json!({"prompt_tokens":100 * (round + 1),"completion_tokens":10})
+                    };
+                    let body = body.to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
             });
@@ -808,6 +1054,8 @@ mod tests {
             };
             let (events, _receiver) = async_channel::unbounded();
             let context = crate::tools::ToolContext {
+                memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
+                access: std::sync::Arc::new(std::sync::Mutex::new(crate::tools::AccessMode::Ask)),
                 root: None,
                 schedules: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::schedules::ScheduleStore::open(directory.path().join("schedules.json"))
@@ -821,6 +1069,7 @@ mod tests {
                 config,
                 "test-only-key".into(),
                 vec![json!({"role":"user","content":"list schedules"})],
+                Thinking::Default,
                 Some(context),
             )
             .unwrap();
@@ -830,6 +1079,9 @@ mod tests {
             assert!(
                 matches!(&reply.blocks[..], [ContentBlock::Thinking(plan), ContentBlock::Text(before), ContentBlock::ToolCall(call), ContentBlock::ToolResult(result), ContentBlock::Text(after)] if plan == "plan" && before == "before" && call.id == "call-1" && result.success && after == "done")
             );
+            assert_eq!(reply.stats.input_tokens, Some(300));
+            assert_eq!(reply.stats.output_tokens, Some(20));
+            assert_eq!(reply.stats.context_tokens, Some(210));
             assert_eq!(reply.tool_records.len(), 1);
             assert!(reply.tool_records[0].success);
             server.join().unwrap();
@@ -851,6 +1103,7 @@ mod tests {
             config,
             "test-only-key".into(),
             vec![json!({"role":"user","content":"你好"})],
+            Thinking::Default,
         )
         .unwrap();
         assert_eq!(
@@ -887,6 +1140,7 @@ mod tests {
                 json!({"role":"system","content":"Be concise"}),
                 json!({"role":"user","content":"Hello"}),
             ],
+            Thinking::Default,
         )
         .unwrap();
         assert_eq!(
@@ -954,7 +1208,8 @@ mod tests {
             model: "test-model".into(),
             ..Config::default()
         };
-        let request = Request::start(config, "test-only-key".into(), vec![]).unwrap();
+        let request =
+            Request::start(config, "test-only-key".into(), vec![], Thinking::Default).unwrap();
         let error = runtime().unwrap().block_on(request.response()).unwrap_err();
         assert!(error.contains("401"));
         assert!(!error.contains("test-only-key"));
@@ -968,11 +1223,46 @@ mod tests {
         session.push(Role::Agent, "你好，有什么需要帮助？".into());
         session.push(Role::Notice, "已停止回复".into());
         assert_eq!(
-            messages(&session.messages),
+            messages(&session.messages, Protocol::OpenAi),
             vec![
                 json!({"role":"user","content":"你好"}),
                 json!({"role":"assistant","content":"你好，有什么需要帮助？"})
             ]
+        );
+    }
+
+    #[test]
+    fn user_images_use_the_protocol_specific_base64_shape() {
+        use crate::model::MessageImage;
+        let image = MessageImage {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+            file: None,
+        };
+        assert_eq!(
+            user_content("看这张图", &[image.clone()], Protocol::Anthropic),
+            json!([
+                {"type":"text","text":"看这张图"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ])
+        );
+        assert_eq!(
+            user_content("看这张图", &[image.clone()], Protocol::OpenAi),
+            json!([
+                {"type":"text","text":"看这张图"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ])
+        );
+        // An image-only prompt still yields a valid user turn on both protocols.
+        assert_eq!(
+            user_content("", &[image], Protocol::Anthropic),
+            json!([
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ])
+        );
+        assert_eq!(
+            user_content("纯文本", &[], Protocol::OpenAi),
+            json!("纯文本")
         );
     }
 
@@ -1015,6 +1305,7 @@ mod tests {
             config.clone(),
             key,
             vec![json!({"role":"user","content":"Reply with OK only."})],
+            Thinking::Default,
         )
         .unwrap();
         let text = runtime()

@@ -1,12 +1,15 @@
 use crate::theme::ThemePreset;
 use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
-    KeyBinding, LayoutId, LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, SharedString, Style, Styled, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, WrappedLine, actions, div, fill, point, px, relative, rgb, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, ImageFormat,
+    ImageSource, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId,
+    LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, SharedString, Style, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, point, px, relative, rgb, size,
 };
 
 actions!(
@@ -31,6 +34,124 @@ actions!(
         Newline
     ]
 );
+
+/// An image pasted into the editor, holding the clipboard's encoded bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PastedImage(Arc<gpui::Image>);
+
+impl PastedImage {
+    pub fn new(format: ImageFormat, bytes: Vec<u8>) -> Self {
+        Self(Arc::new(gpui::Image::from_bytes(format, bytes)))
+    }
+
+    /// Encoded format of the clipboard bytes, e.g. TIFF for macOS screenshots.
+    pub fn format(&self) -> ImageFormat {
+        self.0.format
+    }
+
+    pub fn media_type(&self) -> &'static str {
+        self.0.format.mime_type()
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0.bytes
+    }
+
+    /// Render source for `img()` previews, sharing the encoded bytes.
+    pub fn source(&self) -> ImageSource {
+        ImageSource::Image(self.0.clone())
+    }
+}
+
+impl From<&gpui::Image> for PastedImage {
+    fn from(image: &gpui::Image) -> Self {
+        Self(Arc::new(image.clone()))
+    }
+}
+
+/// Events emitted by [`PromptEditor`] for paste content it does not edit as text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptEditorEvent {
+    /// One or more images were pasted; the editor text is left untouched.
+    ImagePasted(Vec<PastedImage>),
+    PasteFailed(SharedString),
+}
+
+impl EventEmitter<PromptEditorEvent> for PromptEditor {}
+
+/// Extracts pasteable images from a clipboard item: embedded image entries
+/// first, then image files among the external paths.
+fn clipboard_images(item: &ClipboardItem) -> Result<Vec<PastedImage>, String> {
+    let mut images = Vec::new();
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) => {
+                if image.bytes.len() > 20 * 1024 * 1024 {
+                    return Err("图片原始数据超过 20MB".into());
+                }
+                images.push(PastedImage::from(image));
+            }
+            ClipboardEntry::ExternalPaths(paths) => {
+                for path in paths.paths() {
+                    if images.len() >= 16 {
+                        return Err("一次最多粘贴 16 张图片".into());
+                    }
+                    if let Some(image) = image_file(path)? {
+                        images.push(image);
+                    }
+                }
+            }
+            ClipboardEntry::String(_) => {}
+        }
+    }
+    if images.len() > 16 {
+        return Err("一次最多粘贴 16 张图片".into());
+    }
+    if images
+        .iter()
+        .map(|image| image.bytes().len())
+        .sum::<usize>()
+        > 64 * 1024 * 1024
+    {
+        return Err("图片原始数据总量超过 64MB".into());
+    }
+    Ok(images)
+}
+
+fn image_file(path: &Path) -> Result<Option<PastedImage>, String> {
+    use std::io::Read;
+    let Some(format) = image_format_for(path) else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|_| "无法读取粘贴的图片文件")?;
+    if file.metadata().map_err(|_| "无法读取图片信息")?.len() > 20 * 1024 * 1024 {
+        return Err("图片原始数据超过 20MB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(20 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取图片")?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("图片原始数据超过 20MB".into());
+    }
+    Ok(Some(PastedImage::new(format, bytes)))
+}
+
+fn image_format_for(path: &Path) -> Option<ImageFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "gif" => ImageFormat::Gif,
+        "svg" => ImageFormat::Svg,
+        "bmp" => ImageFormat::Bmp,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "ico" => ImageFormat::Ico,
+        "pbm" | "ppm" | "pgm" => ImageFormat::Pnm,
+        _ => return None,
+    })
+}
 
 /// Registers the editing shortcuts used by [`PromptEditor`]. Scoped to the
 /// `GlassPromptEditor` key context so other inputs stay unaffected.
@@ -73,6 +194,7 @@ pub struct PromptEditor {
     /// Text tokens painted in a custom color (e.g. `@mentions`), matched
     /// against whole `@word` tokens in the content.
     highlights: Vec<(SharedString, u32)>,
+    paste_task: Option<gpui::Task<()>>,
 }
 
 pub(crate) struct EditorLine {
@@ -136,6 +258,7 @@ impl PromptEditor {
     }
 
     pub fn set_value(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.paste_task = None;
         let content = value.into();
         let end = content.len();
         self.content = content;
@@ -160,6 +283,7 @@ impl PromptEditor {
             last_bounds: None,
             lines: Vec::new(),
             highlights: Vec::new(),
+            paste_task: None,
         }
     }
 
@@ -519,9 +643,37 @@ impl PromptEditor {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_selection(&text.replace("\r\n", "\n").replace('\r', "\n"), cx);
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let has_images = item.entries().iter().any(|entry| {
+            matches!(
+                entry,
+                ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_)
+            )
+        });
+        if !has_images {
+            if let Some(text) = item.text() {
+                self.replace_selection(&text.replace("\r\n", "\n").replace('\r', "\n"), cx);
+            }
+            return;
         }
+        let fallback_text = item.text();
+        let read = cx
+            .background_executor()
+            .spawn(async move { clipboard_images(&item) });
+        self.paste_task = Some(cx.spawn(async move |weak, cx| {
+            let result = read.await;
+            let _ = weak.update(cx, |this, cx| match result {
+                Ok(images) if !images.is_empty() => cx.emit(PromptEditorEvent::ImagePasted(images)),
+                Err(error) => cx.emit(PromptEditorEvent::PasteFailed(error.into())),
+                _ => {
+                    if let Some(text) = fallback_text {
+                        this.replace_selection(&text.replace("\r\n", "\n").replace('\r', "\n"), cx);
+                    }
+                }
+            });
+        }));
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1102,6 +1254,36 @@ fn mention_ranges(
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn restoring_text_cancels_an_inflight_image_paste(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (editor, window) = cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message"));
+        let events = Rc::new(Cell::new(0));
+        let received = events.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&editor, move |_, event: &PromptEditorEvent, _| {
+                if matches!(event, PromptEditorEvent::ImagePasted(_)) {
+                    received.set(received.get() + 1);
+                }
+            })
+        });
+        window.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                ImageFormat::Png,
+                vec![1, 2, 3],
+            )));
+            editor.update(cx, |editor, cx| {
+                editor.paste(&Paste, window, cx);
+                editor.set_value("another conversation", cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(events.get(), 0);
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.value(), "another conversation")
+        });
+    }
+
     #[test]
     fn line_splitting_keeps_byte_offsets() {
         let content = "第一行\nsecond\n";
@@ -1130,5 +1312,47 @@ mod tests {
         // The @ inside email@a.com is not preceded by whitespace, so it is
         // not treated as a mention.
         assert_eq!(spans, vec![(7, 16, 0x24864c), (21, 31, 0x007aff)],);
+    }
+
+    #[test]
+    fn clipboard_images_come_from_entries_or_image_files() {
+        let png = PastedImage::new(ImageFormat::Png, vec![1, 2, 3]);
+        let mut item = ClipboardItem::new_string("纯文本".into());
+        assert!(clipboard_images(&item).unwrap().is_empty());
+
+        item = ClipboardItem::new_image(&gpui::Image::from_bytes(ImageFormat::Tiff, vec![9, 9]));
+        let images = clipboard_images(&item).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format(), ImageFormat::Tiff);
+        assert_eq!(images[0].media_type(), "image/tiff");
+        assert_eq!(images[0].bytes(), &[9, 9]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shot.png");
+        std::fs::write(&path, [4, 5, 6]).unwrap();
+        item = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                vec![path].into(),
+            ))],
+        };
+        let images = clipboard_images(&item).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format(), ImageFormat::Png);
+        assert_eq!(images[0].bytes(), &[4, 5, 6]);
+        assert_eq!(png, PastedImage::new(ImageFormat::Png, vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn image_formats_are_detected_from_file_extensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let check = |name: &str, expected: Option<ImageFormat>| {
+            let path = directory.path().join(name);
+            assert_eq!(image_format_for(&path), expected, "{name}");
+        };
+        check("shot.png", Some(ImageFormat::Png));
+        check("photo.JPG", Some(ImageFormat::Jpeg));
+        check("capture.tiff", Some(ImageFormat::Tiff));
+        check("notes.txt", None);
+        check("archive", None);
     }
 }

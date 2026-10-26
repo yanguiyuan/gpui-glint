@@ -6,26 +6,35 @@
 mod app_icon;
 mod app_tools_ui;
 mod chatgpt;
+mod context_usage;
+mod database;
 mod discovery;
 mod generation;
+mod images;
+mod memory;
+mod memory_ui;
 mod model;
+mod outline;
 mod project_ui;
 mod provider;
 mod provider_catalog;
 mod provider_ui;
 mod schedule_ui;
 mod schedules;
+mod storage;
+mod titles;
 mod tools;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, ScrollHandle,
-    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, point,
-    prelude::*, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, Focusable, FontWeight, Image, ImageFormat,
+    KeyBinding, ObjectFit, ScrollHandle, SharedString, Subscription, Task, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, size,
 };
 use gpui_glint::{
     components::{
         AppLayout, Button, ButtonKind, ButtonSize, Calendar, CalendarEvent, Composer, ComposerChip,
-        ComposerEvent, GlintAssets, GroupList, GroupListEvent, Icon, IconButton, SearchInput,
+        ComposerContextEntry, ComposerContextSection, ComposerEvent, ComposerSubmission,
+        GlintAssets, GroupList, GroupListEvent, Icon, IconButton, Popover, SearchInput,
         SegmentOption, SegmentedControl, TextEntry, bind_composer_keys, bind_prompt_editor_keys,
         bind_text_entry_keys, window_drag_region,
     },
@@ -50,13 +59,16 @@ struct AgentWorkspace {
     transcript: Vec<generation::ContentBlock>,
     markdown_views:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
+    image_views: std::cell::RefCell<images::PreviewCache>,
     process_panels:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ProcessPanel>>,
     tool_panels: std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ToolPanel>>,
     approval: Option<app_tools_ui::Approval>,
+    access: std::sync::Arc<std::sync::Mutex<tools::AccessMode>>,
     catalog: provider_catalog::ProviderCatalog,
     history: History,
     provider: provider::Config,
+    thinking: provider::Thinking,
     provider_settings: provider_ui::Settings,
     provider_error: Option<String>,
     show_settings: bool,
@@ -70,7 +82,21 @@ struct AgentWorkspace {
     _subscriptions: Vec<Subscription>,
     scroll: ScrollHandle,
     show_sessions: bool,
+    show_auxiliary_sidebar: bool,
+    project_picker_open: bool,
+    outline: Entity<outline::ConversationOutline>,
     pending: Option<(Uuid, Task<()>)>,
+    titles: Entity<titles::TitleGenerator>,
+    save_sender: Option<async_channel::Sender<storage::SaveRequest>>,
+    save_worker: Option<Task<()>>,
+    save_delay: Option<Task<()>>,
+    save_revision: u64,
+    preparing: Option<(Uuid, Task<()>)>,
+    context_models: Option<Task<()>>,
+    memory: memory::Repository,
+    memory_ui: memory_ui::State,
+    memory_task: Option<Task<()>>,
+    memory_last_probe: Option<std::time::Instant>,
 }
 
 impl AgentWorkspace {
@@ -110,8 +136,10 @@ impl AgentWorkspace {
         let mut provider_settings = provider_ui::Settings::new(editing, discovered, cx);
         provider_settings.message = provider_error.clone();
         let theme = ThemePreset::Moonstone;
+        let memory = memory::Repository::new(path.clone());
+        let memory_ui = memory_ui::State::new(&memory, history.active().project.as_deref(), cx);
         let group_list =
-            cx.new(|_| GroupList::new(project_ui::session_groups(&history, "")).theme(theme));
+            cx.new(|_| GroupList::new(project_ui::session_groups(&history, "", None)).theme(theme));
         let calendar = cx.new(|cx| Calendar::new(cx).theme(theme));
         let schedule_path = path.with_file_name("schedules.json");
         let schedules = std::sync::Arc::new(std::sync::Mutex::new(
@@ -120,21 +148,89 @@ impl AgentWorkspace {
         ));
         let schedule_editor = schedule_ui::ScheduleEditor::new(cx);
         let draft = history.active().draft.clone();
+        let access = std::sync::Arc::new(std::sync::Mutex::new(history.access_mode));
         let composer = cx.new(|cx| {
             Composer::new("描述任务，或继续追问…", cx)
                 .clear_on_submit(false)
+                .stop_on_busy(true)
+                .chip(ComposerChip::new("attach").icon(Icon::Plus))
+                .context_panel(
+                    "attach",
+                    "添加上下文",
+                    [ComposerContextSection::untitled([
+                        ComposerContextEntry::new("file", "文件")
+                            .icon(Icon::Text)
+                            .description("选择文件作为上下文")
+                            .insert_mention(false),
+                        ComposerContextEntry::new("directory", "目录")
+                            .icon(Icon::Folder)
+                            .description("选择目录作为上下文")
+                            .insert_mention(false),
+                    ])],
+                )
+                .context_on_at(true)
+                .context_hints([("@", "添加文件和目录")])
+                .chip(
+                    ComposerChip::new("access")
+                        .icon(Icon::Shield)
+                        .option("ask", "请求批准")
+                        .option("auto", "自动批准")
+                        .option("full", "完全访问权限")
+                        .default_selected(history.access_mode.value())
+                        .chevron(),
+                )
                 .menu_chip(model_chip(&catalog))
+                .menu_chip(thinking_chip())
                 .disabled(!provider.enabled)
                 .theme(theme)
         });
         composer.update(cx, |editor, cx| editor.set_value(draft, cx));
         let search = cx.new(|cx| TextEntry::new(cx, "搜索会话…", "").theme(theme));
+        let outline = cx.new(|_| outline::ConversationOutline::new(theme));
+        let titles = cx.new(|_| titles::TitleGenerator::new());
         let subscriptions = vec![
+            cx.subscribe(&outline, |this, _, event: &outline::Jump, cx| {
+                this.scroll.scroll_to_top_of_item(event.0);
+                cx.notify();
+            }),
+            cx.subscribe(&titles, |this, _, event: &titles::GeneratedTitle, cx| {
+                if let Some(session) =
+                    this.history.sessions.iter_mut().find(|session| {
+                        session.id == event.session && session.title == event.previous
+                    })
+                {
+                    session.title = event.title.clone();
+                    this.save(cx);
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&group_list, |this, _, event: &GroupListEvent, cx| {
                 if let GroupListEvent::ItemSelected { item, .. } = event {
                     if let Ok(id) = Uuid::parse_str(item) {
                         this.switch(id, cx);
                     }
+                }
+                if let GroupListEvent::HeaderAction { group, index: 0 } = event {
+                    if let Some(path) = this
+                        .history
+                        .projects
+                        .iter()
+                        .find(|path| format!("project:{}", path.display()) == group.as_ref())
+                        .cloned()
+                    {
+                        this.capture_draft(cx);
+                        this.history.new_session_for(Some(path));
+                        this.restore_draft(cx);
+                        this.show_settings = false;
+                        this.show_calendar = false;
+                        this.save(cx);
+                        cx.notify();
+                    }
+                }
+                if let GroupListEvent::ItemAction { item, .. } = event
+                    && let Ok(id) = Uuid::parse_str(item)
+                {
+                    this.delete_session(id, cx);
                 }
             }),
             cx.subscribe(&calendar, |this, _, event: &CalendarEvent, cx| {
@@ -150,13 +246,45 @@ impl AgentWorkspace {
                 &composer,
                 |this, _, event: &ComposerEvent, cx| match event {
                     ComposerEvent::Changed(value) => {
-                        this.history.active_mut().draft = value.to_string();
-                        this.save();
+                        if this.history.active().draft != value.as_ref() {
+                            this.history.active_mut().draft = value.to_string();
+                            this.save(cx);
+                            cx.notify();
+                        }
+                    }
+                    ComposerEvent::AttachmentsChanged => {
+                        this.capture_draft(cx);
+                        this.save(cx);
+                    }
+                    ComposerEvent::AttachmentError(error) => {
+                        this.provider_error = Some(error.to_string());
                         cx.notify();
                     }
-                    ComposerEvent::Submitted(text) => this.send(text.to_string(), cx),
+                    ComposerEvent::Submitted(submission) => this.send(submission.clone(), cx),
+                    ComposerEvent::StopRequested => this.stop(cx),
+                    ComposerEvent::ContextSelected { id, .. }
+                        if matches!(id.as_ref(), "file" | "directory") =>
+                    {
+                        this.pick_context(id.as_ref() == "directory", cx);
+                    }
+                    ComposerEvent::ChipSelected { chip, value } if chip.as_ref() == "access" => {
+                        let mode = tools::AccessMode::from_value(value);
+                        this.history.access_mode = mode;
+                        *this.access.lock().unwrap() = mode;
+                        if mode != tools::AccessMode::Ask {
+                            if let Some(approval) = this.approval.take() {
+                                let _ = approval.respond.send(true);
+                            }
+                        }
+                        this.save(cx);
+                        cx.notify();
+                    }
                     ComposerEvent::ChipSelected { chip, value } if chip.as_ref() == "model" => {
                         this.choose_model(value, cx)
+                    }
+                    ComposerEvent::ChipSelected { chip, value } if chip.as_ref() == "thinking" => {
+                        this.thinking = provider::Thinking::from_value(value);
+                        cx.notify();
                     }
                     ComposerEvent::ChipClicked(chip) if chip.as_ref() == "model" => {
                         this.show_settings = true;
@@ -181,12 +309,15 @@ impl AgentWorkspace {
             tool_activity: vec![],
             transcript: vec![],
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
+            image_views: std::cell::RefCell::new(images::PreviewCache::default()),
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             approval: None,
+            access,
             history,
             catalog,
             provider,
+            thinking: provider::Thinking::Default,
             provider_settings,
             provider_error,
             show_settings: false,
@@ -199,71 +330,119 @@ impl AgentWorkspace {
             _subscriptions: subscriptions,
             scroll: ScrollHandle::new(),
             show_sessions: true,
+            show_auxiliary_sidebar: true,
+            project_picker_open: false,
+            outline,
             pending: None,
+            titles,
+            save_sender: None,
+            save_worker: None,
+            save_delay: None,
+            save_revision: 0,
+            preparing: None,
+            context_models: None,
+            memory,
+            memory_ui,
+            memory_task: None,
+            memory_last_probe: None,
         };
+        workspace.start_storage(cx);
+        workspace.restore_draft(cx);
         workspace.refresh_calendar(cx);
         workspace.start_scheduler(cx);
-        if workspace.provider.enabled
-            && workspace.provider.kind == provider::Kind::Compatible
-            && workspace
-                .provider_settings
-                .discovered
-                .iter()
-                .any(|found| found.config.base_url == workspace.provider.base_url)
-        {
-            workspace.refresh_models(cx);
-        }
+        workspace.sync_context_usage(cx);
+        workspace.refresh_context_models(cx);
         workspace
     }
 
-    fn save(&mut self) {
-        if self.storage_readable {
-            self.storage_error = self
-                .history
-                .save(&self.path)
-                .err()
-                .map(|error| format!("会话保存失败：{error}。修改尚未写入磁盘。"));
-        }
+    fn capture_draft(&mut self, cx: &App) {
+        let composer = self.composer.read(cx);
+        let session = self.history.active_mut();
+        session.draft = composer.value(cx).to_string();
+        session.draft_images = composer.attachments().to_vec();
+    }
+
+    fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        self.sync_context_usage(cx);
+        let session = self.history.active();
+        let text = session.draft.clone();
+        let images = session.draft_images.clone();
+        self.composer
+            .update(cx, |composer, cx| composer.set_draft(text, images, cx));
     }
 
     fn switch(&mut self, id: Uuid, cx: &mut Context<Self>) {
         self.show_settings = false;
         self.show_calendar = false;
         self.provider_error = None;
-        self.history.active_mut().draft = self.composer.read(cx).value(cx).to_string();
+        self.capture_draft(cx);
         self.history.active = id;
-        let draft = self.history.active().draft.clone();
-        self.composer
-            .update(cx, |editor, cx| editor.set_value(draft, cx));
+        self.project_picker_open = false;
+        images::release_previews(self.image_views.borrow_mut().clear(), cx);
+        self.restore_draft(cx);
         self.scroll = ScrollHandle::new();
-        self.save();
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Removes a session from the list. Deleting the active session falls
+    /// back to the newest remaining one; the session awaiting a reply is kept.
+    fn delete_session(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self
+            .pending
+            .as_ref()
+            .or(self.preparing.as_ref())
+            .is_some_and(|(pending, _)| *pending == id)
+        {
+            self.provider_error = Some("会话正在等待回复，请先停止再删除。".into());
+            cx.notify();
+            return;
+        }
+        self.capture_draft(cx);
+        self.titles.update(cx, |titles, _| titles.cancel(id));
+        images::release_previews(self.image_views.borrow_mut().remove_session(id), cx);
+        let previous_active = self.history.active;
+        if !self.history.remove(id) {
+            return;
+        }
+        if self.history.active != previous_active {
+            self.restore_draft(cx);
+            self.show_settings = false;
+            self.show_calendar = false;
+            self.scroll = ScrollHandle::new();
+        }
+        self.save(cx);
         cx.notify();
     }
 
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_settings = false;
         self.provider_error = None;
-        self.history.active_mut().draft = self.composer.read(cx).value(cx).to_string();
+        self.capture_draft(cx);
         self.show_calendar = false;
         self.history
             .new_session_for(self.history.active().project.clone());
-        let draft = self.history.active().draft.clone();
-        self.composer
-            .update(cx, |editor, cx| editor.set_value(draft, cx));
+        self.restore_draft(cx);
         self.scroll = ScrollHandle::new();
-        self.save();
+        self.save(cx);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn send(&mut self, text: String, cx: &mut Context<Self>) {
-        self.send_to(self.history.active, text, self.provider.clone(), true, cx);
+    fn send(&mut self, submission: ComposerSubmission, cx: &mut Context<Self>) {
+        self.send_to(
+            self.history.active,
+            submission,
+            self.provider.clone(),
+            true,
+            cx,
+        );
     }
 
     pub fn send_to(
         &mut self,
         id: Uuid,
-        text: String,
+        submission: ComposerSubmission,
         config: provider::Config,
         clear_composer: bool,
         cx: &mut Context<Self>,
@@ -271,8 +450,8 @@ impl AgentWorkspace {
         if self.pending.is_some() {
             return;
         }
-        let text = text.trim().to_owned();
-        if text.is_empty() {
+        let text = submission.text.trim().to_owned();
+        if text.is_empty() && submission.images.is_empty() {
             return;
         }
         if !config.enabled {
@@ -280,6 +459,100 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
+        if config.kind == provider::Kind::ChatGpt && !submission.images.is_empty() {
+            self.provider_error = Some("ChatGPT（Codex CLI）暂不支持图片输入。".into());
+            cx.notify();
+            return;
+        }
+        if self.preparing.is_some() {
+            return;
+        }
+        if self
+            .history
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .and_then(|session| session.project.as_ref())
+            .is_none()
+        {
+            self.provider_error = Some("请先选择项目，再开始会话".into());
+            cx.notify();
+            return;
+        }
+        let raw_images = submission.images;
+        let repository = self.memory.clone();
+        let project = self
+            .history
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .and_then(|session| session.project.clone())
+            .unwrap();
+        let recall_config = config.clone();
+        let query = text.clone();
+        let prepare = cx.background_executor().spawn(async move {
+            let images = images::prepare(&raw_images)?;
+            let recall_job = provider::Job::start(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    repository.recall(recall_config, &project, &query),
+                )
+                .await
+                .map_err(|_| "记忆召回超时".to_owned())?
+            });
+            let recall = match match recall_job {
+                Ok(job) => job.result().await,
+                Err(error) => Err(error),
+            } {
+                Ok(recall) => recall,
+                Err(error) => memory::Recall {
+                    notice: Some(format!("记忆召回暂不可用：{error}")),
+                    ..Default::default()
+                },
+            };
+            Ok::<_, String>((images, recall))
+        });
+        self.preparing = Some((
+            id,
+            cx.spawn(async move |weak, cx| {
+                let result = prepare.await;
+                let _ = weak.update(cx, |this, cx| {
+                    if let Some((_, task)) = this.preparing.take() {
+                        task.detach();
+                    }
+                    match result {
+                        Ok((images, recall)) => {
+                            this.begin_request(id, text, images, recall, config, clear_composer, cx)
+                        }
+                        Err(error) => {
+                            this.provider_error = Some(error);
+                            this.composer.update(cx, |composer, cx| {
+                                composer.set_disabled(!this.provider.enabled, cx);
+                                composer.set_busy(false, cx);
+                            });
+                            cx.notify();
+                        }
+                    }
+                });
+            }),
+        ));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_busy(true, cx);
+            composer.set_disabled(true, cx);
+        });
+        cx.notify();
+    }
+
+    fn begin_request(
+        &mut self,
+        id: Uuid,
+        text: String,
+        images: Vec<model::MessageImage>,
+        recall: memory::Recall,
+        config: provider::Config,
+        clear_composer: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self
             .history
             .sessions
@@ -290,48 +563,90 @@ impl AgentWorkspace {
         };
         let (events, receiver) = async_channel::unbounded();
         let tool_context = tools::ToolContext {
+            memory: self.memory.clone(),
+            access: self.access.clone(),
             root: self.history.sessions[index].project.clone(),
             schedules: self.schedules.clone(),
             provider_id: config.id,
             model: config.model.clone(),
             events,
         };
+        // The session's first turn gets an AI-generated title once the reply
+        // lands; Codex CLI would boot a whole process for it, so skip that.
+        let first_turn = self.history.sessions[index].messages.is_empty();
+        let title_config =
+            (first_turn && config.kind == provider::Kind::Compatible).then(|| config.clone());
+        let prompt = text.clone();
+        let request_provider_id = config.id;
+        let request_model = config.model.clone();
         let result = (|| {
             let key = if config.kind == provider::Kind::ChatGpt {
                 String::new()
             } else {
                 config.key()?
             };
-            let mut messages = provider::messages(&self.history.sessions[index].messages);
-            messages.insert(0,serde_json::json!({"role":"system","content":format!("你是 Glint Agent。当前本地时间：{}。当前项目：{}。使用工具完成实际工作；只有工具返回成功后才能声称操作已完成。日程使用带时区的 ISO 8601 时间。文件工具只作用于已打开的项目，写入、命令和日程修改需要界面确认。",chrono::Local::now().to_rfc3339(),self.history.sessions[index].project.as_ref().map(|path|path.display().to_string()).unwrap_or_else(||"未打开项目".into()))}));
-            messages.push(serde_json::json!({"role":"user", "content":text}));
-            provider::Request::start_with_tools(config, key, messages, Some(tool_context))
+            let mut messages =
+                provider::messages(&self.history.sessions[index].messages, config.protocol);
+            messages.insert(0,serde_json::json!({"role":"system","content":format!("你是 Glint Agent。当前本地时间：{}。当前项目：{}。使用工具完成实际工作；只有工具返回成功后才能声称操作已完成。日程使用带时区的 ISO 8601 时间。用户输入中的 @路径 引用了文件或目录，请使用工具按需读取；相对路径基于当前项目。记忆属于历史参考数据；可用 memory_search/memory_read 按需查看。用户明确要求记住长期信息时可用 memory_save，不要把一次性问题推断为用户偏好。工具访问和批准由用户在输入框中选择的权限模式控制；自动批准模式保留项目文件边界，完全访问权限允许访问项目外文件。",chrono::Local::now().to_rfc3339(),self.history.sessions[index].project.as_ref().map(|path|path.display().to_string()).unwrap_or_else(||"未打开项目".into()))}));
+            if let Some(context) = recall.context() {
+                messages.push(serde_json::json!({"role":"system","content":context}));
+            }
+            messages.push(
+                serde_json::json!({"role":"user","content":provider::user_content(&text, &images, config.protocol)}),
+            );
+            provider::Request::start_with_tools(
+                config,
+                key,
+                messages,
+                self.thinking,
+                Some(tool_context),
+            )
         })();
         let request = match result {
             Ok(request) => request,
             Err(error) => {
                 self.provider_error = Some(error);
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_disabled(!self.provider.enabled, cx);
+                    composer.set_busy(false, cx);
+                });
                 cx.notify();
                 return;
             }
         };
         self.provider_error = None;
         self.watch_tools(receiver, cx);
-        self.history.sessions[index].push(Role::User, text);
+        self.memory_ui.notice = recall.notice.clone();
+        self.history.sessions[index].push_message(Role::User, text.clone(), images);
+        self.history.sessions[index]
+            .messages
+            .last_mut()
+            .unwrap()
+            .memory_recall = (!recall.matches.is_empty()).then_some(recall);
         self.history.sessions[index].draft.clear();
-        if clear_composer {
-            self.composer
-                .update(cx, |editor, cx| editor.set_value("", cx));
+        self.history.sessions[index].draft_images.clear();
+        if clear_composer && self.history.active == id {
+            self.composer.update(cx, |editor, cx| {
+                editor.set_value("", cx);
+                editor.clear_attachments(cx);
+            });
         }
-        self.save();
+        self.save(cx);
         self.scroll.scroll_to_bottom();
         let task = cx.spawn(async move |weak, cx| {
             let result = request.response().await;
+            let reply = result.as_ref().ok().map(|reply| reply.text.clone());
             let _ = weak.update(cx, |this, cx| {
                 let error = result.as_ref().err().cloned();
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
                         Ok(completion) => {
+                            session.context = Some(context_usage::ContextSnapshot {
+                                provider_id: request_provider_id,
+                                model: request_model,
+                                used_tokens: completion.stats.context_tokens,
+                                capacity_tokens: completion.stats.context_window,
+                            });
                             session.push(Role::Agent, completion.text);
                             session.messages.last_mut().unwrap().blocks = completion.blocks;
                             session.messages.last_mut().unwrap().stats = Some(completion.stats);
@@ -341,6 +656,21 @@ impl AgentWorkspace {
                             session.push(Role::Notice, format!("请求失败：{error}"));
                             session.messages.last_mut().unwrap().tools = this.tool_activity.clone();
                             session.messages.last_mut().unwrap().blocks = this.transcript.clone();
+                        }
+                    }
+                }
+                if let (Some(config), Some(reply)) = (title_config, reply) {
+                    if !reply.trim().is_empty() {
+                        if let Some(session) = this
+                            .history
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == id)
+                        {
+                            let previous = session.title.clone();
+                            this.titles.update(cx, |titles, cx| {
+                                titles.generate(id, previous, config, prompt, reply, cx)
+                            });
                         }
                     }
                 }
@@ -360,7 +690,7 @@ impl AgentWorkspace {
                     composer.set_disabled(false, cx);
                     composer.set_busy(false, cx);
                 });
-                this.save();
+                this.save(cx);
                 if this.history.active == id {
                     this.scroll.scroll_to_bottom();
                 }
@@ -376,6 +706,13 @@ impl AgentWorkspace {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        if self.preparing.take().is_some() {
+            self.composer.update(cx, |composer, cx| {
+                composer.set_disabled(!self.provider.enabled, cx);
+                composer.set_busy(false, cx);
+            });
+            cx.notify();
+        }
         if let Some((id, _task)) = self.pending.take() {
             self.tool_listener = None;
             self.approval = None;
@@ -395,14 +732,16 @@ impl AgentWorkspace {
                 session.messages.last_mut().unwrap().tools =
                     std::mem::take(&mut self.tool_activity);
             }
-            self.save();
+            self.save(cx);
             cx.notify();
         }
     }
 
     fn search_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.show_settings {
+            self.show_auxiliary_sidebar = true;
             window.focus(&self.provider_settings.search.focus_handle(cx), cx);
+            cx.notify();
             return;
         }
         self.show_sessions = true;
@@ -413,6 +752,7 @@ impl AgentWorkspace {
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_settings = true;
         self.show_calendar = false;
+        self.show_auxiliary_sidebar = true;
         window.focus(&self.provider_settings.search.focus_handle(cx), cx);
         cx.notify();
     }
@@ -427,8 +767,31 @@ impl AgentWorkspace {
             .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
             .pr_3()
             .text_size(px(12.))
-            .child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Glint Agent"))
+            .when(self.show_settings, |bar| {
+                bar.child(
+                    IconButton::new(Icon::ArrowLeft, "返回会话")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_settings = false;
+                            window.focus(&this.composer.focus_handle(cx), cx);
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                IconButton::new(Icon::Sidebar, "展开或收起侧栏")
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.show_settings || this.show_calendar {
+                            this.show_auxiliary_sidebar = !this.show_auxiliary_sidebar;
+                        } else {
+                            this.show_sessions = !this.show_sessions;
+                        }
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
                     .flex()
@@ -511,17 +874,6 @@ impl AgentWorkspace {
                         "未连接 Provider".into()
                     }),
             )
-            .when(!self.show_settings, |bar| {
-                bar.child(
-                    IconButton::new(Icon::Sidebar, "展开或收起会话记录")
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_sessions = !this.show_sessions;
-                            cx.notify();
-                        })),
-                )
-            })
     }
 
     fn rail(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -602,7 +954,14 @@ impl AgentWorkspace {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        let groups = project_ui::session_groups(&self.history, self.search.read(cx).value());
+        let groups = project_ui::session_groups(
+            &self.history,
+            self.search.read(cx).value(),
+            self.pending
+                .as_ref()
+                .or(self.preparing.as_ref())
+                .map(|(id, _)| *id),
+        );
         self.group_list.update(cx, |list, cx| {
             list.set_groups(groups, cx);
             list.set_selected(Some(self.history.active.to_string().into()), cx);
@@ -662,7 +1021,7 @@ impl AgentWorkspace {
                     .on_change(move |index, _, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.history.group_by_project = index == 0;
-                            this.save();
+                            this.save(cx);
                             cx.notify();
                         });
                     })
@@ -692,19 +1051,60 @@ impl AgentWorkspace {
             )
     }
 
-    fn welcome(&self, cx: &mut Context<Self>) -> gpui::Div {
+    /// One outline entry per user turn: the message index (which matches the
+    /// scroll container's child index), the question preview, and the agent's
+    /// reply preview shown on hover.
+    fn outline_entries(&self) -> Vec<(usize, String, String)> {
+        let session = self.history.active();
+        let mut entries = Vec::new();
+        for (index, message) in session.messages.iter().enumerate() {
+            if message.role != Role::User {
+                continue;
+            }
+            let mut question = preview_line(&message.text, 40);
+            if question.is_empty() {
+                question = "[图片]".to_string();
+            }
+            let reply = session.messages[index + 1..]
+                .iter()
+                .find(|message| message.role == Role::Agent)
+                .map(|message| preview_line(&message.text, 90))
+                .unwrap_or_default();
+            entries.push((index, question, reply));
+        }
+        entries
+    }
+
+    /// Decodes a persisted message image once, then serves the cached bitmap
+    /// for subsequent frames.
+    fn user_image(
+        &self,
+        key: String,
+        image: &model::MessageImage,
+        cx: &mut Context<Self>,
+    ) -> Option<std::sync::Arc<Image>> {
+        if let Some(found) = self.image_views.borrow_mut().get(&key) {
+            return Some(found);
+        }
+        let format = ImageFormat::from_mime_type(&image.media_type)?;
+        let bytes = images::decode(image).ok()?;
+        let decoded = std::sync::Arc::new(Image::from_bytes(format, bytes));
+        images::release_previews(
+            self.image_views.borrow_mut().insert(key, decoded.clone()),
+            cx,
+        );
+        Some(decoded)
+    }
+
+    fn welcome(&self) -> gpui::Div {
         let p = self.theme.palette();
-        let mut welcome = div()
+        div()
             .w_full()
-            .max_w(px(720.))
             .flex()
             .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .text_color(rgb(p.accent))
-                    .child(Icon::Workflow.render(32.)),
-            )
+            .items_center()
+            .gap_2()
+            .text_center()
             .child(
                 div()
                     .text_size(px(28.))
@@ -717,13 +1117,11 @@ impl AgentWorkspace {
                     .text_color(rgb(p.text_muted))
                     .child("从一个问题、一项改动，或一个想法开始。"),
             )
-            .child(
-                div()
-                    .mt_4()
-                    .text_size(px(11.))
-                    .text_color(rgb(p.text_muted))
-                    .child("从这里开始"),
-            );
+    }
+
+    fn starter_suggestions(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let mut welcome = div().w_full().flex().flex_wrap().justify_center().gap_3();
         for (index, (icon, title, prompt)) in [
             (
                 Icon::Compass,
@@ -747,24 +1145,23 @@ impl AgentWorkspace {
             welcome = welcome.child(
                 div()
                     .id(("suggestion", index))
-                    .w_full()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .p_3()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
                     .rounded(px(9.))
                     .border_1()
                     .border_color(rgb(p.border))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(p.surface_subtle)))
                     .child(icon.render(17.).text_color(rgb(p.text_muted)))
-                    .child(div().flex_1().child(title))
-                    .child(Icon::ArrowUp.render(14.).text_color(rgb(p.text_muted)))
+                    .child(title)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.composer
                             .update(cx, |editor, cx| editor.set_value(prompt, cx));
                         this.history.active_mut().draft = prompt.into();
-                        this.save();
+                        this.save(cx);
                         window.focus(&this.composer.focus_handle(cx), cx);
                         cx.notify();
                     })),
@@ -774,11 +1171,24 @@ impl AgentWorkspace {
     }
 
     fn content(&self, cx: &mut Context<Self>) -> gpui::Div {
+        self.sync_context_usage(cx);
         let p = self.theme.palette();
         let session = self.history.active();
+        let outline_entries = self.outline_entries();
+        let show_outline = outline_entries.len() >= 2;
+        self.outline.update(cx, |outline, cx| {
+            outline.set(
+                session.id,
+                outline_entries,
+                self.scroll.top_item(),
+                self.theme,
+                cx,
+            )
+        });
         let running = self
             .pending
             .as_ref()
+            .or(self.preparing.as_ref())
             .is_some_and(|(id, _)| *id == session.id);
         let mut messages = div()
             .id("conversation")
@@ -791,9 +1201,15 @@ impl AgentWorkspace {
             .items_center()
             .px(px(40.))
             .py_6()
-            .gap_6();
+            .gap_6()
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                // Keep the outline's active tick tracking the scroll position.
+                this.outline.update(cx, |outline, cx| {
+                    outline.set_top(this.scroll.top_item(), cx)
+                });
+            }));
         if session.messages.is_empty() {
-            messages = messages.justify_center().child(self.welcome(cx));
+            // The empty state places the composer in the centered stack below.
         } else {
             for (index, message) in session.messages.iter().enumerate() {
                 let user = message.role == Role::User;
@@ -874,6 +1290,44 @@ impl AgentWorkspace {
                                             ))
                                         })
                                 })
+                                .when_some(message.memory_recall.as_ref(), |body, recall| {
+                                    body.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(format!(
+                                                "自动回忆 {} 条：{}",
+                                                recall.matches.len(),
+                                                recall
+                                                    .matches
+                                                    .iter()
+                                                    .map(|memory| memory.title.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join("、")
+                                            )),
+                                    )
+                                })
+                                .when(user && !message.images.is_empty(), |body| {
+                                    body.child(div().flex().flex_wrap().gap_2().children(
+                                        message.images.iter().enumerate().filter_map(
+                                            |(image_index, image)| {
+                                                let key = format!(
+                                                    "{}:{index}:img{image_index}",
+                                                    self.history.active
+                                                );
+                                                self.user_image(key, image, cx).map(|source| {
+                                                    img(source)
+                                                        .w(px(160.))
+                                                        .h(px(120.))
+                                                        .object_fit(ObjectFit::Cover)
+                                                        .rounded(px(8.))
+                                                        .border_1()
+                                                        .border_color(rgb(p.border))
+                                                })
+                                            },
+                                        ),
+                                    ))
+                                })
                                 .when_some(message.stats.as_ref(), |body, stats| {
                                     body.child(
                                         div()
@@ -919,23 +1373,55 @@ impl AgentWorkspace {
                     .child("正在等待模型回复…"),
             );
         }
+        let conversation = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(messages)
+            .when(show_outline, |wrap| wrap.child(self.outline.clone()));
         let composer = div()
             .w_full()
             .max_w(px(800.))
-            .child(self.composer.clone())
-            .when(self.pending.is_some(), |panel| {
-                panel.child(
-                    div().mt_2().flex().justify_end().child(
-                        Button::new("停止回复")
-                            .icon(Icon::Pause)
-                            .kind(ButtonKind::Gray)
-                            .size(ButtonSize::Small)
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                    ),
-                )
-            });
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(self.approval.is_some(), |panel| {
+                panel.child(self.approval_panel(cx))
+            })
+            .child(
+                div()
+                    .rounded(px(12.))
+                    .bg(rgb(p.surface_subtle))
+                    .flex()
+                    .flex_col()
+                    .when(session.messages.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .px_3()
+                                .py_2()
+                                .child(self.project_selector(cx)),
+                        )
+                    })
+                    .child(self.composer.clone()),
+            );
+        if session.messages.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .when_some(self.provider_error.clone(), |root, error| {
+                    root.child(div().px_5().py_2().text_color(rgb(0xd9342b)).child(error))
+                })
+                .child(new_session_layout(
+                    self.welcome(),
+                    composer,
+                    self.starter_suggestions(cx),
+                ));
+        }
         div()
             .size_full()
             .flex()
@@ -972,7 +1458,7 @@ impl AgentWorkspace {
             .when_some(self.storage_error.clone(), |root, error| {
                 root.child(div().px_5().py_2().text_color(rgb(0xd9342b)).child(error))
             })
-            .child(messages)
+            .child(conversation)
             .child(
                 div()
                     .flex_shrink_0()
@@ -989,8 +1475,13 @@ impl AgentWorkspace {
                             .text_size(px(10.))
                             .text_color(rgb(p.text_muted))
                             .child(if self.provider.enabled {
+                                let image_hint = if self.provider.kind == provider::Kind::ChatGpt {
+                                    "仅文本对话"
+                                } else {
+                                    "支持图片输入"
+                                };
                                 format!(
-                                    "{} · {} · 仅文本对话",
+                                    "{} · {} · {image_hint}",
                                     self.provider.name, self.provider.model
                                 )
                             } else {
@@ -1038,22 +1529,54 @@ impl Render for AgentWorkspace {
                 .navigation_rail(self.rail(cx))
                 .navigation_rail_width(46.)
                 .sidebar_width(if self.show_settings { 280. } else { 260. })
-                .sidebar_visible(self.show_settings || self.show_calendar || self.show_sessions)
+                .sidebar_visible(if self.show_settings || self.show_calendar {
+                    self.show_auxiliary_sidebar
+                } else {
+                    self.show_sessions
+                })
                 .theme(self.theme),
             )
-            .when(self.approval.is_some(), |root| {
-                root.child(
-                    div()
-                        .absolute()
-                        .bottom(px(20.))
-                        .left(px(64.))
-                        .right(px(24.))
-                        .flex()
-                        .justify_center()
-                        .child(self.approval_panel(cx)),
-                )
-            })
     }
+}
+
+fn new_session_layout(
+    welcome: gpui::Div,
+    composer: gpui::Div,
+    suggestions: gpui::Div,
+) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_h_0()
+        .size_full()
+        .px(px(40.))
+        .py(px(32.))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .items_center()
+        .child(
+            div()
+                .w_full()
+                .max_w(px(800.))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(24.))
+                .child(welcome)
+                .child(
+                    div()
+                        .id("new-session-composer")
+                        .debug_selector(|| "new-session-composer".into())
+                        .w_full()
+                        .child(composer),
+                )
+                .child(
+                    div()
+                        .id("new-session-suggestions")
+                        .debug_selector(|| "new-session-suggestions".into())
+                        .child(suggestions),
+                ),
+        )
 }
 
 fn model_chip(catalog: &provider_catalog::ProviderCatalog) -> ComposerChip {
@@ -1087,6 +1610,53 @@ fn model_chip(catalog: &provider_catalog::ProviderCatalog) -> ComposerChip {
         chip = chip.default_selected(format!("{id}:{}", catalog.active_model));
     }
     chip
+}
+
+/// Cleans an AI-generated session title: first line only, wrapping quotes and
+/// markdown markers stripped, bounded length.
+fn session_title(raw: &str) -> Option<String> {
+    let line = raw.trim().lines().next().unwrap_or("").trim();
+    let line = line.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\u{201c}' | '\u{201d}' | '\'' | '`' | '*' | '#' | ' '
+        )
+    });
+    (!line.is_empty()).then(|| truncate_chars(line, 24))
+}
+
+/// First non-empty line of a message, truncated to `limit` characters.
+fn preview_line(text: &str, limit: usize) -> String {
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    truncate_chars(line, limit)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() > limit {
+        format!("{}…", text.chars().take(limit).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+/// Reasoning-effort selector: the default leaves the provider's own behavior
+/// untouched, the other levels map to DeepSeek's documented `thinking` /
+/// `output_config.effort` fields.
+fn thinking_chip() -> ComposerChip {
+    ComposerChip::new("thinking")
+        .icon(Icon::Pulse)
+        .label("思考 · 默认")
+        .chevron()
+        .option("default", "思考 · 默认")
+        .option("off", "思考 · 关闭")
+        .option("low", "思考 · 低")
+        .option("high", "思考 · 高")
+        .option("max", "思考 · 最大")
+        .default_selected("default")
 }
 
 fn history_path() -> PathBuf {
@@ -1157,4 +1727,48 @@ fn main() {
             .expect("无法打开 Glint Agent 窗口");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NewSessionLayoutTest;
+    impl Render for NewSessionLayoutTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            new_session_layout(div().h(px(48.)), div().h(px(140.)), div().h(px(32.)))
+        }
+    }
+
+    #[gpui::test]
+    fn new_session_composer_is_centered_with_suggestions_below(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, _| NewSessionLayoutTest);
+        view.update(window, |_, cx| cx.notify());
+        let composer = window.debug_bounds("new-session-composer").unwrap();
+        let suggestions = window.debug_bounds("new-session-suggestions").unwrap();
+        let size = window.update(|window, _| window.viewport_size());
+        assert_eq!(composer.center().x, size.width / 2.);
+        assert!((composer.center().y - size.height / 2.).abs() <= px(24.));
+        assert!(suggestions.top() > composer.bottom());
+        assert!(composer.size.width <= px(800.));
+    }
+
+    #[test]
+    fn session_titles_are_cleaned_and_bounded() {
+        assert_eq!(
+            session_title("\u{201c}把工具调用上限移除\u{201d}"),
+            Some("把工具调用上限移除".into())
+        );
+        assert_eq!(
+            session_title("# **重构 provider 模块**\n说明文字"),
+            Some("重构 provider 模块".into())
+        );
+        assert_eq!(
+            session_title("一".repeat(40).as_str()),
+            Some(format!("{}…", "一".repeat(24)))
+        );
+        assert_eq!(session_title("  \n \"。\" \n更多"), Some("。".into()));
+        assert_eq!(session_title("   "), None);
+        assert_eq!(session_title(""), None);
+    }
 }

@@ -1,14 +1,16 @@
-use super::Icon;
+use super::{Button, ButtonKind, ButtonSize, Icon, Popover};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, EventEmitter, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
+    Animation, AnimationExt as _, Context, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    rgba,
 };
 use std::collections::HashSet;
 
 /// A group header in a [`GroupList`]: an icon + title row whose trailing
-/// actions appear only while hovered.
+/// actions appear only while hovered. `Folder`/`Folders` header icons follow
+/// the group's expand state (closed while collapsed, open once expanded).
 #[derive(Clone, Debug)]
 pub struct GroupListHeader {
     pub id: SharedString,
@@ -50,7 +52,9 @@ pub struct GroupListItem {
     pub prefix: Option<SharedString>,
     pub prefix_color: Option<u32>,
     pub hover_icon: Option<Icon>,
+    pub reserve_icon_space: bool,
     pub action: Option<Icon>,
+    pub action_confirmation: Option<SharedString>,
 }
 
 impl GroupListItem {
@@ -63,12 +67,20 @@ impl GroupListItem {
             prefix: None,
             prefix_color: None,
             hover_icon: None,
+            reserve_icon_space: false,
             action: None,
+            action_confirmation: None,
         }
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Keeps a 14px icon slot even when no leading icon is visible.
+    pub fn reserve_icon_space(mut self, reserve: bool) -> Self {
+        self.reserve_icon_space = reserve;
         self
     }
 
@@ -90,6 +102,12 @@ impl GroupListItem {
     /// e.g. a pin shortcut.
     pub fn hover_icon(mut self, icon: Icon) -> Self {
         self.hover_icon = Some(icon);
+        self
+    }
+
+    /// Requires confirmation in a popover before emitting ItemAction.
+    pub fn confirm_action(mut self, title: impl Into<SharedString>) -> Self {
+        self.action_confirmation = Some(title.into());
         self
     }
 
@@ -148,6 +166,7 @@ pub struct GroupList {
     groups: Vec<GroupListGroup>,
     selected: Option<SharedString>,
     hovered: Option<SharedString>,
+    confirming: Option<SharedString>,
     collapsed: HashSet<SharedString>,
     theme: ThemePreset,
     width: Option<f32>,
@@ -161,6 +180,7 @@ impl GroupList {
             groups: groups.into_iter().collect(),
             selected: None,
             hovered: None,
+            confirming: None,
             collapsed: HashSet::new(),
             theme: ThemePreset::default(),
             width: None,
@@ -241,6 +261,14 @@ impl GroupList {
         cx: &mut Context<Self>,
     ) {
         self.groups = groups.into_iter().collect();
+        if self.confirming.as_ref().is_some_and(|id| {
+            !self
+                .groups
+                .iter()
+                .any(|group| group.items.iter().any(|item| &item.id == id))
+        }) {
+            self.confirming = None;
+        }
         cx.notify();
     }
 
@@ -312,6 +340,15 @@ impl Render for GroupList {
                     }
                 }));
             if let Some(icon) = group.header.icon {
+                // Folder headers follow the expand state like the directory
+                // tree: closed folder while collapsed, open folder once shown.
+                let icon = match icon {
+                    Icon::Folder | Icon::Folders if self.collapsed.contains(&group_id) => {
+                        Icon::Folder
+                    }
+                    Icon::Folder | Icon::Folders => Icon::FolderOpen,
+                    other => other,
+                };
                 header = header.child(icon.render(15.));
             }
             header = header.child(
@@ -411,12 +448,22 @@ impl Render for GroupList {
                     item.icon
                 };
                 if let Some(icon) = leading_icon {
-                    row = row.child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(rgb(p.text_muted))
-                            .child(icon.render(14.)),
-                    );
+                    let leading = div()
+                        .size(px(14.))
+                        .flex_shrink_0()
+                        .text_color(rgb(p.text_muted))
+                        .child(icon.render(14.));
+                    row = if matches!(icon, Icon::Spinner) {
+                        row.child(leading.with_animation(
+                            SharedString::from(format!("group-list-running:{}", item.id)),
+                            Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                            |icon, delta| icon.opacity(0.3 + 0.7 * delta),
+                        ))
+                    } else {
+                        row.child(leading)
+                    };
+                } else if item.reserve_icon_space {
+                    row = row.child(div().size(px(14.)).flex_shrink_0());
                 }
                 if let Some(prefix) = &item.prefix {
                     row = row.child(
@@ -431,50 +478,132 @@ impl Render for GroupList {
                 }
                 row = row.child(
                     div()
+                        .id(SharedString::from(format!("group-list-label:{}", item.id)))
+                        .debug_selector({
+                            let id = item.id.clone();
+                            move || format!("group-list-label:{id}").into()
+                        })
                         .min_w_0()
                         .flex_1()
                         .truncate()
                         .child(item.label.clone()),
                 );
-                let trailing_action = item_hovered.then_some(item.action).flatten();
+                let trailing_action = (item_hovered || self.confirming.as_ref() == Some(&item_id))
+                    .then_some(item.action)
+                    .flatten();
                 if let Some(action) = trailing_action {
-                    row = row.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "glass-group-list-item-action-{}",
-                                item_id
-                            )))
-                            .size(px(22.))
-                            .flex_shrink_0()
+                    let trigger = div()
+                        .id(SharedString::from(format!(
+                            "glass-group-list-item-action-{}",
+                            item_id
+                        )))
+                        .debug_selector({
+                            let id = item_id.clone();
+                            move || format!("group-list-action:{id}").into()
+                        })
+                        .size(px(22.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .text_color(rgb(p.text_muted))
+                        .cursor_pointer()
+                        .hover(move |style| {
+                            style
+                                .bg(if dark {
+                                    rgba(0xffffff1f)
+                                } else {
+                                    rgb(p.border)
+                                })
+                                .text_color(rgb(p.text))
+                        })
+                        .child(action.render(14.));
+                    if let Some(title) = &item.action_confirmation {
+                        let group = group_id.clone();
+                        let id = item_id.clone();
+                        let content = div()
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.))
-                            .text_color(rgb(p.text_muted))
-                            .cursor_pointer()
-                            .hover(move |style| {
-                                style
-                                    .bg(if dark {
-                                        rgba(0xffffff1f)
-                                    } else {
-                                        rgb(p.border)
-                                    })
-                                    .text_color(rgb(p.text))
-                            })
-                            .on_click(cx.listener({
-                                let group_id = group_id.clone();
-                                let item_id = item_id.clone();
-                                move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.emit(GroupListEvent::ItemAction {
-                                        group: group_id.clone(),
-                                        item: item_id.clone(),
-                                    });
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(p.text_muted))
+                                    .child("删除后无法恢复。"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("取消")
+                                            .kind(ButtonKind::Gray)
+                                            .size(ButtonSize::Small)
+                                            .theme(theme)
+                                            .render()
+                                            .debug_selector(|| "group-list-cancel".into())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirming = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("删除")
+                                            .kind(ButtonKind::Danger)
+                                            .size(ButtonSize::Small)
+                                            .theme(theme)
+                                            .render()
+                                            .debug_selector(|| "group-list-confirm".into())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if this.confirming.as_ref() == Some(&id) {
+                                                    this.confirming = None;
+                                                    cx.emit(GroupListEvent::ItemAction {
+                                                        group: group.clone(),
+                                                        item: id.clone(),
+                                                    });
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
+                            );
+                        let weak = cx.entity().downgrade();
+                        let id = item_id.clone();
+                        row = row.child(
+                            Popover::new(
+                                SharedString::from(format!("group-list-confirm:{item_id}")),
+                                trigger,
+                                content,
+                            )
+                            .open(self.confirming.as_ref() == Some(&item_id))
+                            .width(240.)
+                            .trigger_height(22.)
+                            .theme(theme)
+                            .on_open_change(move |open, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.confirming = open.then(|| id.clone());
                                     cx.notify();
-                                }
-                            }))
-                            .child(action.render(14.)),
-                    );
+                                });
+                            }),
+                        );
+                    } else {
+                        row = row.child(trigger.on_click(cx.listener({
+                            let group = group_id.clone();
+                            let item = item_id.clone();
+                            move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(GroupListEvent::ItemAction {
+                                    group: group.clone(),
+                                    item: item.clone(),
+                                });
+                            }
+                        })));
+                    }
                 } else if let Some(meta) = &item.meta {
                     row = row.child(
                         div()
@@ -490,5 +619,76 @@ impl Render for GroupList {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn action_popover_only_emits_after_confirmation(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (list, window) = cx.add_window_view(|_, _| {
+            GroupList::new([
+                GroupListGroup::new(GroupListHeader::new("project", "Project")).item(
+                    GroupListItem::new("session", "Session")
+                        .action(Icon::Trash)
+                        .confirm_action("删除此会话？"),
+                ),
+            ])
+            .width(260.)
+        });
+        let events = Rc::new(Cell::new(0));
+        let received = events.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&list, move |_, event, _| {
+                if matches!(event, GroupListEvent::ItemAction { .. }) {
+                    received.set(received.get() + 1);
+                }
+            })
+        });
+        list.update(window, |list, cx| {
+            list.hovered = Some("i:session".into());
+            cx.notify();
+        });
+        let action = window.debug_bounds("group-list-action:session").unwrap();
+        window.simulate_click(action.center(), gpui::Modifiers::default());
+        assert_eq!(events.get(), 0);
+        assert!(list.read_with(window, |list, _| list.confirming.is_some()));
+        let cancel = window.debug_bounds("group-list-cancel").unwrap();
+        window.simulate_click(cancel.center(), gpui::Modifiers::default());
+        assert_eq!(events.get(), 0);
+        list.update(window, |list, cx| {
+            list.hovered = Some("i:session".into());
+            cx.notify();
+        });
+        let action = window.debug_bounds("group-list-action:session").unwrap();
+        window.simulate_click(action.center(), gpui::Modifiers::default());
+        let confirm = window.debug_bounds("group-list-confirm").unwrap();
+        window.simulate_click(confirm.center(), gpui::Modifiers::default());
+        assert_eq!(events.get(), 1);
+    }
+
+    #[gpui::test]
+    fn reserved_icon_slot_keeps_labels_stable_when_running(cx: &mut gpui::TestAppContext) {
+        let groups = |running| {
+            let mut item = GroupListItem::new("session", "Session").reserve_icon_space(true);
+            if running {
+                item = item.icon(Icon::Spinner);
+            }
+            [GroupListGroup::new(GroupListHeader::new("project", "Project")).item(item)]
+        };
+        let (list, window) = cx.add_window_view(|_, _| GroupList::new(groups(false)));
+        list.update(window, |_, cx| cx.notify());
+        let idle = window.debug_bounds("group-list-label:session").unwrap();
+        list.update(window, |list, cx| list.set_groups(groups(true), cx));
+        let running = window.debug_bounds("group-list-label:session").unwrap();
+        assert_eq!(idle, running);
+        list.update(window, |list, cx| list.set_groups(groups(false), cx));
+        assert_eq!(
+            idle,
+            window.debug_bounds("group-list-label:session").unwrap()
+        );
     }
 }

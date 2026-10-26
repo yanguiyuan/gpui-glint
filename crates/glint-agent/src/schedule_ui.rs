@@ -381,7 +381,7 @@ impl AgentWorkspace {
                     .await;
                 if weak
                     .update(cx, |this, cx| {
-                        if this.pending.is_some() {
+                        if this.pending.is_some() || this.preparing.is_some() {
                             return;
                         }
                         let due = this
@@ -410,7 +410,13 @@ impl AgentWorkspace {
                                     let id = session.id;
                                     this.history.sessions.insert(0, session);
                                     this.running_schedule = Some(task.id);
-                                    this.send_to(id, task.prompt, config, false, cx);
+                                    this.send_to(
+                                        id,
+                                        ComposerSubmission::text(task.prompt.clone()),
+                                        config,
+                                        false,
+                                        cx,
+                                    );
                                     if let Some(session) = this
                                         .history
                                         .sessions
@@ -419,8 +425,8 @@ impl AgentWorkspace {
                                     {
                                         session.title = format!("定时任务 · {}", task.title);
                                     }
-                                    this.save();
-                                    if this.pending.is_none() {
+                                    this.save(cx);
+                                    if this.pending.is_none() && this.preparing.is_none() {
                                         let error = this
                                             .provider_error
                                             .clone()
@@ -437,13 +443,13 @@ impl AgentWorkspace {
                                     });
                                 }
                                 this.refresh_calendar(cx);
-                                this.save();
+                                this.save(cx);
                                 cx.notify();
                             }
                             Err(error) => {
                                 this.schedule_editor.notice = Some(error);
                             }
-                            _ => {}
+                            Ok(None) => this.tick_memory(false, cx),
                         }
                     })
                     .is_err()

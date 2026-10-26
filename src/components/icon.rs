@@ -416,7 +416,10 @@ fn icon_svg(name: &str) -> Option<String> {
             "<path d='M17 3.5a2.6 2.6 0 0 1 3.7 3.7L8 20l-4.5 1L4.5 16.5z'/>",
             "none",
         ),
-        "trash" => ("<path d='M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14'/>", "none"),
+        "trash" => (
+            "<path d='M3 6h18M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6M5 6v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6M9 10v7M15 10v7'/>",
+            "none",
+        ),
         "save" => (
             "<path d='M5 3h12l4 4v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z'/><path d='M7 3v6h9V3M7 21v-8h10v8'/>",
             "none",

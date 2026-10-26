@@ -2,6 +2,71 @@ use super::*;
 use gpui_glint::components::InputField;
 use std::collections::HashMap;
 
+fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let cleaned = value.replace([',', '_'], "");
+    let (number, multiplier) = match cleaned.chars().last() {
+        Some('k' | 'K') => (&cleaned[..cleaned.len() - 1], 1_000_u64),
+        Some('m' | 'M') => (&cleaned[..cleaned.len() - 1], 1_000_000_u64),
+        _ => (cleaned.as_str(), 1_u64),
+    };
+    let parse = || -> Option<u64> {
+        let (whole, fraction) = number.trim().split_once('.').unwrap_or((number.trim(), ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|ch| ch.is_ascii_digit())
+            || !fraction.bytes().all(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        let base = whole.parse::<u64>().ok()?.checked_mul(multiplier)?;
+        let extra = if fraction.is_empty() {
+            0
+        } else {
+            let divisor = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+            let scaled = fraction.parse::<u64>().ok()?.checked_mul(multiplier)?;
+            if scaled % divisor != 0 {
+                return None;
+            }
+            scaled / divisor
+        };
+        base.checked_add(extra).filter(|value| *value > 0)
+    };
+    parse()
+        .map(Some)
+        .ok_or_else(|| "请输入正数 token 数，可用 256K、1M，或留空自动获取".into())
+}
+
+fn available_model_row(
+    model: &str,
+    added: bool,
+    theme: ThemePreset,
+    on_add: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let selector: SharedString = format!("add-model:{model}").into();
+    div()
+        .id(SharedString::from(format!("available-model:{model}")))
+        .px_4()
+        .py_2()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(div().flex_1().child(model.to_owned()))
+        .child(
+            Button::new(if added { "已添加" } else { "添加" })
+                .icon(if added { Icon::CheckCircle } else { Icon::Plus })
+                .kind(ButtonKind::Plain)
+                .size(ButtonSize::Mini)
+                .theme(theme)
+                .when(added, |button| button.disabled())
+                .render()
+                .debug_selector(move || selector.to_string())
+                .when(!added, |button| button.on_click(on_add)),
+        )
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Section {
     #[default]
@@ -9,6 +74,7 @@ pub enum Section {
     Appearance,
     Storage,
     Shortcuts,
+    Memory,
     Provider,
 }
 
@@ -19,6 +85,7 @@ impl Section {
             Self::Appearance => "外观",
             Self::Storage => "存储",
             Self::Shortcuts => "键盘快捷键",
+            Self::Memory => "记忆",
             Self::Provider => "供应商",
         }
     }
@@ -39,6 +106,10 @@ pub struct Settings {
     pub models: Vec<String>,
     default_model: String,
     available_models: Vec<String>,
+    context_windows: HashMap<String, u64>,
+    context_origin: String,
+    window_inputs: HashMap<String, Entity<TextEntry>>,
+    new_model_window: Entity<TextEntry>,
     pub discovering: Option<Task<()>>,
     pub section: Section,
     tab: ProviderTab,
@@ -77,6 +148,21 @@ impl Settings {
             default_model: config.model.clone(),
             drafts: HashMap::new(),
             available_models: vec![],
+            context_windows: config.model_context_windows.clone(),
+            context_origin: config.base_url.clone(),
+            window_inputs: config
+                .models
+                .iter()
+                .map(|model| {
+                    let value = config
+                        .context_window_overrides
+                        .get(model)
+                        .map(u64::to_string)
+                        .unwrap_or_default();
+                    (model.clone(), entry("自动获取", &value))
+                })
+                .collect(),
+            new_model_window: entry("例如 1M，留空自动", ""),
             discovering: None,
             section: Section::General,
             tab: ProviderTab::Connection,
@@ -114,6 +200,24 @@ impl Settings {
         self.kind = config.kind;
         self.protocol = config.protocol;
         self.models = config.models.clone();
+        self.context_windows = config.model_context_windows.clone();
+        self.context_origin = config.base_url.clone();
+        self.window_inputs = config
+            .models
+            .iter()
+            .map(|model| {
+                let value = config
+                    .context_window_overrides
+                    .get(model)
+                    .map(u64::to_string)
+                    .unwrap_or_default();
+                let entry = cx
+                    .new(|cx| TextEntry::new(cx, "自动获取", value).theme(ThemePreset::Moonstone));
+                (model.clone(), entry)
+            })
+            .collect();
+        self.new_model_window
+            .update(cx, |entry, cx| entry.set_value("", cx));
         self.default_model = config.model.clone();
         self.use_env = use_env;
         self.available_models.clear();
@@ -134,11 +238,15 @@ impl Settings {
     }
 
     pub fn set_theme(&self, theme: ThemePreset, cx: &mut Context<AgentWorkspace>) {
+        for entry in self.window_inputs.values() {
+            entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
+        }
         for entry in [
             &self.search,
             &self.name,
             &self.url,
             &self.model,
+            &self.new_model_window,
             &self.key,
             &self.key_env,
             &self.codex_path,
@@ -158,14 +266,62 @@ impl AgentWorkspace {
         let chip = model_chip(&self.catalog);
         self.composer.update(cx, |composer, cx| {
             composer.set_menu_chip(chip, cx);
-            composer.set_disabled(!self.provider.enabled || self.pending.is_some(), cx);
+            composer.set_disabled(
+                !self.provider.enabled || self.pending.is_some() || self.preparing.is_some(),
+                cx,
+            );
         });
+        self.sync_context_usage(cx);
+        self.context_models = None;
+        self.refresh_context_models(cx);
+        cx.notify();
+    }
+
+    pub(super) fn cache_context_windows(
+        &mut self,
+        id: Uuid,
+        origin: &str,
+        models: Vec<String>,
+        windows: HashMap<String, u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .catalog
+            .providers
+            .iter_mut()
+            .find(|profile| profile.id == id && profile.base_url == origin)
+        else {
+            return;
+        };
+        let changed = profile.model_context_windows != windows;
+        profile.model_context_windows = windows.clone();
+        if changed {
+            let _ = self.catalog.save(&self.catalog_path());
+        }
+        if self.provider_settings.selected == Some(id)
+            && self
+                .provider_settings
+                .url
+                .read(cx)
+                .value()
+                .trim()
+                .trim_end_matches('/')
+                == origin
+        {
+            self.provider_settings.available_models = models;
+            self.provider_settings.context_windows = windows;
+            self.provider_settings.context_origin = origin.to_owned();
+        }
+        if self.provider.id == id {
+            self.provider = self.catalog.current();
+            self.sync_context_usage(cx);
+        }
         cx.notify();
     }
 
     pub(super) fn choose_model(&mut self, value: &str, cx: &mut Context<Self>) {
         let result = (|| {
-            if self.pending.is_some() {
+            if self.pending.is_some() || self.preparing.is_some() {
                 return Err("请先停止当前回复，再切换模型".to_owned());
             }
             let (id, model) = value.split_once(':').ok_or("模型选择无效")?;
@@ -196,6 +352,22 @@ impl AgentWorkspace {
         config.name = settings.name.read(cx).value().trim().to_owned();
         config.model = settings.default_model.clone();
         config.models = settings.models.clone();
+        config.model_context_windows = if settings.context_origin == url {
+            settings.context_windows.clone()
+        } else {
+            HashMap::new()
+        };
+        config.context_window_overrides = settings
+            .models
+            .iter()
+            .filter_map(|model| {
+                let input = settings.window_inputs.get(model)?;
+                parse_context_window(input.read(cx).value())
+                    .ok()
+                    .flatten()
+                    .map(|value| (model.clone(), value))
+            })
+            .collect();
         config.codex_path = settings.codex_path.read(cx).value().trim().to_owned();
         config.api_key_env = if settings.use_env {
             Some(settings.key_env.read(cx).value().trim().to_owned())
@@ -271,7 +443,15 @@ impl AgentWorkspace {
     fn save_provider(&mut self, activate: bool, cx: &mut Context<Self>) {
         let config = self.edited_provider(cx);
         let result = (|| {
-            if self.pending.is_some() && (activate || self.catalog.active == Some(config.id)) {
+            for model in &self.provider_settings.models {
+                if let Some(input) = self.provider_settings.window_inputs.get(model) {
+                    parse_context_window(input.read(cx).value())
+                        .map_err(|error| format!("{model}：{error}"))?;
+                }
+            }
+            if (self.pending.is_some() || self.preparing.is_some())
+                && (activate || self.catalog.active == Some(config.id))
+            {
                 return Err("请先停止当前回复，再修改正在使用的供应商".into());
             }
             config.validate()?;
@@ -329,10 +509,15 @@ impl AgentWorkspace {
         }
         if !self.provider_settings.models.contains(&model) {
             self.provider_settings.models.push(model.clone());
+            self.provider_settings.window_inputs.insert(
+                model.clone(),
+                cx.new(|cx| TextEntry::new(cx, "自动获取", "").theme(self.theme)),
+            );
         }
         if self.provider_settings.default_model.is_empty() {
-            self.provider_settings.default_model = model;
+            self.provider_settings.default_model = model.clone();
         }
+        self.provider_settings.message = Some(format!("已添加 {model}，点击保存后即可用于对话。"));
         self.provider_settings
             .model
             .update(cx, |entry, cx| entry.set_value("", cx));
@@ -355,14 +540,21 @@ impl AgentWorkspace {
             .to_owned();
         let result = if config.kind == provider::Kind::ChatGpt {
             let path = config.codex_path.clone();
-            provider::Job::start(async move { chatgpt::models(&path).await })
+            provider::Job::start(async move {
+                Ok(provider::ModelCatalog {
+                    models: chatgpt::models(&path).await?,
+                    ..Default::default()
+                })
+            })
         } else {
             let key = if !self.provider_settings.use_env && !provided.is_empty() {
                 Ok(provided)
             } else {
                 config.key()
             };
-            key.and_then(|key| provider::Job::start(provider::list_models(config.clone(), key)))
+            key.and_then(|key| {
+                provider::Job::start(provider::list_model_catalog(config.clone(), key))
+            })
         };
         match result {
             Err(error) => self.provider_settings.message = Some(error),
@@ -388,7 +580,9 @@ impl AgentWorkspace {
                         }
                         match result {
                             Ok(models) => {
-                                this.provider_settings.available_models = models;
+                                this.provider_settings.available_models = models.models;
+                                this.provider_settings.context_windows = models.context_windows;
+                                this.provider_settings.context_origin = config.base_url.clone();
                                 this.provider_settings.message = None;
                             }
                             Err(error) => this.provider_settings.message = Some(error),
@@ -429,6 +623,7 @@ impl AgentWorkspace {
                 config,
                 key,
                 vec![serde_json::json!({"role":"user","content":"Reply with OK."})],
+                provider::Thinking::Default,
             )
         })();
         match result {
@@ -506,6 +701,9 @@ impl AgentWorkspace {
     }
 
     pub fn settings_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.provider_settings.section == Section::Memory {
+            return self.memory_page(cx);
+        }
         if self.provider_settings.section != Section::Provider {
             return self.settings_overview(cx);
         }
@@ -816,6 +1014,7 @@ impl AgentWorkspace {
                 let remove = model.clone();
                 models = models.child(
                     div()
+                        .id(SharedString::from(format!("configured-model:{model}")))
                         .px_4()
                         .py_3()
                         .flex()
@@ -825,7 +1024,25 @@ impl AgentWorkspace {
                             row.border_t_1().border_color(rgb(p.border))
                         })
                         .child(Icon::Workflow.render(15.).text_color(rgb(p.text_muted)))
-                        .child(div().flex_1().child(model.clone()))
+                        .child(div().flex_1().min_w_0().child(model.clone()).when_some(
+                            settings.context_windows.get(model),
+                            |label, capacity| {
+                                label.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(format!("接口窗口：{capacity} tokens")),
+                                )
+                            },
+                        ))
+                        .when_some(settings.window_inputs.get(model), |row, input| {
+                            row.child(
+                                div()
+                                    .w(px(180.))
+                                    .flex_shrink_0()
+                                    .child(field("上下文窗口（tokens）", input)),
+                            )
+                        })
                         .child(
                             Button::new(if default_model {
                                 "默认模型"
@@ -856,6 +1073,7 @@ impl AgentWorkspace {
                                     this.provider_settings
                                         .models
                                         .retain(|model| model != &remove);
+                                    this.provider_settings.window_inputs.remove(&remove);
                                     if this.provider_settings.default_model == remove {
                                         this.provider_settings.default_model = this
                                             .provider_settings
@@ -870,6 +1088,12 @@ impl AgentWorkspace {
                 );
             }
             page = page
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("上下文窗口支持 1M、256K（十进制）；留空使用接口值，手动填写优先。"),
+                )
                 .child(models)
                 .child(
                     div()
@@ -878,6 +1102,11 @@ impl AgentWorkspace {
                         .gap_3()
                         .child(div().flex_1().child(field("手动添加模型", &settings.model)))
                         .child(
+                            div()
+                                .w(px(180.))
+                                .child(field("上下文窗口（tokens）", &settings.new_model_window)),
+                        )
+                        .child(
                             Button::new("添加")
                                 .kind(ButtonKind::Glass)
                                 .theme(self.theme)
@@ -885,7 +1114,36 @@ impl AgentWorkspace {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let model =
                                         this.provider_settings.model.read(cx).value().to_owned();
-                                    this.add_model(model, cx);
+                                    if model.trim().is_empty() {
+                                        this.provider_settings.message =
+                                            Some("请输入模型 ID".into());
+                                        cx.notify();
+                                        return;
+                                    }
+                                    let window = this
+                                        .provider_settings
+                                        .new_model_window
+                                        .read(cx)
+                                        .value()
+                                        .to_owned();
+                                    match parse_context_window(&window) {
+                                        Ok(_) => {
+                                            let model = model.trim().to_owned();
+                                            this.add_model(model.clone(), cx);
+                                            if let Some(input) =
+                                                this.provider_settings.window_inputs.get(&model)
+                                            {
+                                                input.update(cx, |input, cx| {
+                                                    input.set_value(window, cx)
+                                                });
+                                            }
+                                            this.provider_settings
+                                                .new_model_window
+                                                .update(cx, |input, cx| input.set_value("", cx));
+                                        }
+                                        Err(error) => this.provider_settings.message = Some(error),
+                                    }
+                                    cx.notify();
                                 })),
                         ),
                 )
@@ -914,11 +1172,7 @@ impl AgentWorkspace {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx))),
                         ),
                 );
-            let available: Vec<_> = settings
-                .available_models
-                .iter()
-                .filter(|model| !settings.models.contains(model))
-                .collect();
+            let available: Vec<_> = settings.available_models.iter().collect();
             if !available.is_empty() {
                 page = page.child(
                     div()
@@ -930,24 +1184,12 @@ impl AgentWorkspace {
                         .border_color(rgb(p.border))
                         .children(available.into_iter().map(|model| {
                             let add = model.clone();
-                            div()
-                                .px_4()
-                                .py_2()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(div().flex_1().child(model.clone()))
-                                .child(
-                                    Button::new("添加")
-                                        .icon(Icon::Plus)
-                                        .kind(ButtonKind::Plain)
-                                        .size(ButtonSize::Mini)
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.add_model(add.clone(), cx)
-                                        })),
-                                )
+                            available_model_row(
+                                model,
+                                settings.models.contains(model),
+                                self.theme,
+                                cx.listener(move |this, _, _, cx| this.add_model(add.clone(), cx)),
+                            )
                         })),
                 );
             }
@@ -985,6 +1227,7 @@ impl AgentWorkspace {
             (Section::General, Icon::Settings),
             (Section::Appearance, Icon::HalfCircle),
             (Section::Storage, Icon::Folder),
+            (Section::Memory, Icon::Database),
             (Section::Shortcuts, Icon::Code),
         ] {
             if !query.is_empty() && !section.title().to_lowercase().contains(&query) {
@@ -1010,6 +1253,9 @@ impl AgentWorkspace {
                     .child(section.title())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.provider_settings.section = section;
+                        if section == Section::Memory {
+                            this.reload_memories(cx);
+                        }
                         window.focus(&this.provider_settings.search.focus_handle(cx), cx);
                         cx.notify();
                     })),
@@ -1144,21 +1390,6 @@ impl AgentWorkspace {
                 ),
             )
             .child(navigation)
-            .child(
-                div().p_3().border_t_1().border_color(rgb(p.border)).child(
-                    Button::new("返回会话")
-                        .icon(Icon::ArrowLeft)
-                        .kind(ButtonKind::Plain)
-                        .theme(self.theme)
-                        .render()
-                        .w_full()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_settings = false;
-                            window.focus(&this.composer.focus_handle(cx), cx);
-                            cx.notify();
-                        })),
-                ),
-            )
     }
     fn settings_container(&self, page: gpui::Div) -> gpui::Div {
         div().size_full().child(
@@ -1303,10 +1534,15 @@ impl AgentWorkspace {
                 card = card
                     .child(row(
                         "会话记录",
-                        "包含消息与未发送的草稿。".into(),
+                        "SQLite 保存会话、草稿、项目、供应商、日程与记忆。".into(),
                         format!("{} 个会话", self.history.sessions.len()),
                     ))
                     .child(div().border_t_1().border_color(rgb(p.border)))
+                    .child(row(
+                        "SQLite 数据库",
+                        crate::database::path(&self.path).display().to_string(),
+                        "WAL".into(),
+                    ))
                     .child(row(
                         "数据目录",
                         self.path
@@ -1320,7 +1556,7 @@ impl AgentWorkspace {
                     .child(row(
                         "API Key",
                         "密钥由操作系统凭据库管理。".into(),
-                        "不写入 JSON".into(),
+                        "不写入 SQLite".into(),
                     ));
                 page = page.child(card);
             }
@@ -1350,5 +1586,66 @@ impl AgentWorkspace {
             _ => {}
         }
         self.settings_container(page)
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    struct ModelRows {
+        added: Vec<String>,
+    }
+    impl Render for ModelRows {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(600.))
+                .flex()
+                .flex_col()
+                .children(["gpt-a", "gpt-b"].into_iter().map(|model| {
+                    available_model_row(
+                        model,
+                        self.added.iter().any(|added| added == model),
+                        ThemePreset::Moonstone,
+                        cx.listener(move |this, _, _, cx| {
+                            this.added.push(model.into());
+                            cx.notify();
+                        }),
+                    )
+                }))
+        }
+    }
+    #[gpui::test]
+    fn repeated_add_labels_dispatch_to_the_correct_model_once(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, _| ModelRows { added: Vec::new() });
+        view.update(window, |_, cx| cx.notify());
+        for model in ["add-model:gpt-b", "add-model:gpt-a"] {
+            let button = window.debug_bounds(model).unwrap();
+            window.simulate_click(button.center(), gpui::Modifiers::default());
+        }
+        let button = window.debug_bounds("add-model:gpt-b").unwrap();
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        view.read_with(window, |view, _| assert_eq!(view.added, ["gpt-b", "gpt-a"]));
+    }
+
+    #[test]
+    fn manual_context_windows_validate_and_empty_means_auto() {
+        assert_eq!(parse_context_window(""), Ok(None));
+        assert_eq!(parse_context_window("1,048,576"), Ok(Some(1048576)));
+        assert_eq!(parse_context_window("128_000"), Ok(Some(128000)));
+        assert_eq!(parse_context_window("1M"), Ok(Some(1_000_000)));
+        assert_eq!(parse_context_window("256K"), Ok(Some(256_000)));
+        assert_eq!(parse_context_window("1.5m"), Ok(Some(1_500_000)));
+        assert_eq!(parse_context_window("1.25k"), Ok(Some(1_250)));
+        for invalid in [
+            "0",
+            "-1",
+            "128G",
+            "1.5",
+            "unknown",
+            "18446744073709551615M",
+            "0.0000001M",
+        ] {
+            assert!(parse_context_window(invalid).is_err());
+        }
     }
 }

@@ -20,6 +20,7 @@ pub struct Popover {
     gap: f32,
     padding: f32,
     right_trigger_width: Option<f32>,
+    above_trigger: bool,
     theme: ThemePreset,
     on_open_change: Option<OpenHandler>,
 }
@@ -39,6 +40,7 @@ impl Popover {
             gap: 6.,
             padding: 16.,
             right_trigger_width: None,
+            above_trigger: false,
             theme: ThemePreset::default(),
             on_open_change: None,
         }
@@ -65,6 +67,13 @@ impl Popover {
         self.right_trigger_width = Some(width.max(0.));
         self
     }
+    /// Opens above the trigger, aligned to its left edge.
+    pub fn above_trigger(mut self) -> Self {
+        self.above_trigger = true;
+        self.right_trigger_width = None;
+        self
+    }
+
     /// Content inset in pixels. Defaults to 16; compact menus can use 4.
     pub fn padding(mut self, padding: f32) -> Self {
         self.padding = padding.max(0.);
@@ -108,6 +117,7 @@ impl Popover {
             .child(
                 div()
                     .id("popover-trigger")
+                    .debug_selector(|| "popover-trigger".into())
                     .cursor_pointer()
                     .child(self.trigger)
                     .on_click(move |_, window, cx| {
@@ -126,8 +136,12 @@ impl Popover {
                     el.pl(px(width + self.gap))
                         .w(px(self.width + width + self.gap))
                 })
-                .when(self.right_trigger_width.is_none(), |el| {
-                    el.pt(px(self.trigger_height + self.gap)).w(px(self.width))
+                .when(
+                    self.right_trigger_width.is_none() && !self.above_trigger,
+                    |el| el.pt(px(self.trigger_height + self.gap)).w(px(self.width)),
+                )
+                .when(self.above_trigger, |el| {
+                    el.pb(px(self.trigger_height + self.gap)).w(px(self.width))
                 })
                 .on_mouse_down_out(move |_, window, cx| {
                     if let Some(handler) = &dismiss {
@@ -137,6 +151,8 @@ impl Popover {
                 .child(
                     div()
                         .id("popover-content")
+                        .debug_selector(|| "popover-content".into())
+                        .occlude()
                         .p(px(self.padding))
                         .rounded(px(9.))
                         .border_1()
@@ -153,20 +169,24 @@ impl Popover {
                 deferred(
                     div()
                         .absolute()
-                        .when(self.right_trigger_width.is_some(), |el| {
-                            el.bottom_0().left_0()
-                        })
-                        .when(self.right_trigger_width.is_none(), |el| {
-                            el.top_0().right_0()
-                        })
+                        .when(
+                            self.right_trigger_width.is_some() || self.above_trigger,
+                            |el| el.bottom_0().left_0(),
+                        )
+                        .when(
+                            self.right_trigger_width.is_none() && !self.above_trigger,
+                            |el| el.top_0().right_0(),
+                        )
                         .w(px(self.width))
                         .child(
                             anchored()
-                                .anchor(if self.right_trigger_width.is_some() {
-                                    Anchor::BottomLeft
-                                } else {
-                                    Anchor::TopLeft
-                                })
+                                .anchor(
+                                    if self.right_trigger_width.is_some() || self.above_trigger {
+                                        Anchor::BottomLeft
+                                    } else {
+                                        Anchor::TopLeft
+                                    },
+                                )
                                 .snap_to_window_with_margin(px(8.))
                                 .child(popup),
                         ),
@@ -181,5 +201,43 @@ impl IntoElement for Popover {
     type Element = gpui::Stateful<gpui::Div>;
     fn into_element(self) -> Self::Element {
         self.render()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Context, Render, px};
+    struct AbovePopover;
+    impl Render for AbovePopover {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_start()
+                .pl(px(80.))
+                .pt(px(300.))
+                .child(
+                    Popover::new(
+                        "project",
+                        div().w(px(130.)).h(px(28.)).child("Project"),
+                        div().h(px(80.)).child("Projects"),
+                    )
+                    .open(true)
+                    .above_trigger()
+                    .trigger_height(28.)
+                    .width(280.),
+                )
+        }
+    }
+    #[gpui::test]
+    fn above_menu_aligns_to_trigger_left_and_clears_the_button(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, _| AbovePopover);
+        view.update(window, |_, cx| cx.notify());
+        let trigger = window.debug_bounds("popover-trigger").unwrap();
+        let menu = window.debug_bounds("popover-content").unwrap();
+        assert_eq!(menu.left(), trigger.left());
+        assert!(menu.bottom() <= trigger.top() - px(6.));
     }
 }

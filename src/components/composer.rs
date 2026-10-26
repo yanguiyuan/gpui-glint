@@ -1,11 +1,11 @@
-use super::{Icon, PromptEditor};
+use super::{Icon, PastedImage, PromptEditor, PromptEditorEvent};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, BoxShadow, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    actions, deferred, div, point, px, relative, rgb, rgba,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton, ObjectFit,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Window, actions, deferred, div, img, point, px, relative, rgb, rgba,
 };
 use std::collections::HashMap;
 
@@ -115,6 +115,8 @@ pub struct ComposerContextEntry {
     pub description: Option<SharedString>,
     /// Icon and inserted-mention color; falls back to the accent color.
     pub color: Option<u32>,
+    /// Whether selecting this entry inserts a mention, or only emits an event.
+    pub insert_mention: bool,
 }
 
 impl ComposerContextEntry {
@@ -125,6 +127,7 @@ impl ComposerContextEntry {
             label: label.into(),
             description: None,
             color: None,
+            insert_mention: true,
         }
     }
 
@@ -135,6 +138,12 @@ impl ComposerContextEntry {
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Use false for entries that open a picker before inserting a mention.
+    pub fn insert_mention(mut self, enabled: bool) -> Self {
+        self.insert_mention = enabled;
         self
     }
 
@@ -170,10 +179,115 @@ impl ComposerContextSection {
     }
 }
 
+/// Measured context usage supplied by the host. A zero capacity hides the
+/// indicator; the component never estimates token counts from prompt text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComposerContextUsage {
+    pub used_tokens: u64,
+    pub capacity_tokens: u64,
+}
+
+impl ComposerContextUsage {
+    pub fn new(used_tokens: u64, capacity_tokens: u64) -> Self {
+        Self {
+            used_tokens,
+            capacity_tokens,
+        }
+    }
+
+    pub fn remaining_tokens(self) -> u64 {
+        self.capacity_tokens.saturating_sub(self.used_tokens)
+    }
+
+    pub fn remaining_percent(self) -> u8 {
+        if self.capacity_tokens == 0 {
+            return 0;
+        }
+        (self.remaining_tokens() as f64 / self.capacity_tokens as f64 * 100.).round() as u8
+    }
+
+    fn used_ratio(self) -> f32 {
+        if self.capacity_tokens == 0 {
+            return 0.;
+        }
+        (self.used_tokens as f64 / self.capacity_tokens as f64).clamp(0., 1.) as f32
+    }
+
+    fn label(self) -> String {
+        format!(
+            "上下文剩余 {}% · 已使用 {} / {} tokens",
+            self.remaining_percent(),
+            self.used_tokens,
+            self.capacity_tokens
+        )
+    }
+}
+
+/// A visible indicator even when a server has not supplied both numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerContextState {
+    Initial {
+        capacity_tokens: Option<u64>,
+    },
+    Known(ComposerContextUsage),
+    Unknown {
+        used_tokens: Option<u64>,
+        capacity_tokens: Option<u64>,
+    },
+}
+impl ComposerContextState {
+    fn ratio(self) -> f32 {
+        match self {
+            Self::Known(usage) => usage.used_ratio(),
+            Self::Unknown { .. } | Self::Initial { .. } => 0.,
+        }
+    }
+    fn label(self) -> String {
+        match self {
+            Self::Initial {
+                capacity_tokens: Some(capacity),
+            } => format!("新会话 · 上下文剩余 100% · 窗口 {capacity} tokens（尚未发送请求）"),
+            Self::Initial {
+                capacity_tokens: None,
+            } => "新会话 · 上下文窗口未知，可在模型设置中填写".into(),
+            Self::Known(usage) => format!("{} · 服务端统计，不含未发送草稿", usage.label()),
+            Self::Unknown {
+                used_tokens,
+                capacity_tokens,
+            } => match (used_tokens, capacity_tokens) {
+                (Some(used), _) => {
+                    format!("已使用 {used} tokens · 上下文窗口未知，可在模型设置中填写")
+                }
+                (_, Some(capacity)) => format!("上下文窗口 {capacity} tokens · 等待服务端返回用量"),
+                _ => "上下文窗口与用量未知，可在模型设置中填写窗口上限".into(),
+            },
+        }
+    }
+}
+
+/// A prompt ready to send: the text plus any images pasted via ⌘/Ctrl-V.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComposerSubmission {
+    pub text: SharedString,
+    pub images: Vec<PastedImage>,
+}
+
+impl ComposerSubmission {
+    pub fn text(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ComposerEvent {
     /// The prompt text changed.
     Changed(SharedString),
+    AttachmentsChanged,
+    AttachmentError(SharedString),
+    StopRequested,
     /// An accessory chip without options was clicked; the payload is the chip id.
     ChipClicked(SharedString),
     /// A select-style chip picked a new value.
@@ -182,9 +296,9 @@ pub enum ComposerEvent {
         value: SharedString,
     },
     /// The prompt was submitted via the send button or the Enter shortcut.
-    Submitted(SharedString),
+    Submitted(ComposerSubmission),
     /// The prompt was queued because a submission is already in flight.
-    Queued(SharedString),
+    Queued(ComposerSubmission),
     /// A context panel entry was picked. The matching mention token
     /// (`@label`) has already been inserted into the prompt.
     ContextSelected {
@@ -206,19 +320,25 @@ pub struct Composer {
     menu_chips: Vec<ComposerChip>,
     chip_values: HashMap<SharedString, SharedString>,
     open_chip: Option<SharedString>,
-    queue: Vec<SharedString>,
+    context_usage: Option<ComposerContextState>,
+    queue: Vec<ComposerSubmission>,
+    /// Images pasted with ⌘/Ctrl-V, submitted with the next send.
+    attachments: Vec<PastedImage>,
     context_trigger: Option<SharedString>,
     context_title: SharedString,
     context_sections: Vec<ComposerContextSection>,
     context_hints: Vec<(SharedString, SharedString)>,
     context_open: bool,
+    context_on_at: bool,
+    observed_text: SharedString,
     mention_colors: HashMap<SharedString, u32>,
     busy: bool,
+    stop_on_busy: bool,
     disabled: bool,
     clear_on_submit: bool,
     send_enabled_override: Option<bool>,
     focus: FocusHandle,
-    _subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -233,7 +353,51 @@ impl Composer {
         let editor = cx.new(|cx| PromptEditor::new(cx, placeholder).min_rows(2));
         let subscription = cx.observe(&editor, |this, _, cx| {
             let text: SharedString = this.editor.read(cx).value().to_owned().into();
-            cx.emit(ComposerEvent::Changed(text));
+            if text != this.observed_text {
+                if this.context_on_at
+                    && !this.context_sections.is_empty()
+                    && text.ends_with('@')
+                    && text[..text.len() - 1]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace)
+                {
+                    this.context_open = true;
+                    this.open_chip = None;
+                }
+                this.observed_text = text.clone();
+                cx.emit(ComposerEvent::Changed(text));
+            }
+            cx.notify();
+        });
+        let events = cx.subscribe(&editor, |this, _, event: &PromptEditorEvent, cx| {
+            match event {
+                PromptEditorEvent::ImagePasted(images) => {
+                    if this.attachments.len() + images.len() > 16 {
+                        cx.emit(ComposerEvent::AttachmentError(
+                            "一次最多添加 16 张图片".into(),
+                        ));
+                        return;
+                    }
+                    let bytes: usize = this
+                        .attachments
+                        .iter()
+                        .chain(images)
+                        .map(|image| image.bytes().len())
+                        .sum();
+                    if bytes > 64 * 1024 * 1024 {
+                        cx.emit(ComposerEvent::AttachmentError(
+                            "附件原始数据总量超过 64MB".into(),
+                        ));
+                        return;
+                    }
+                    this.attachments.extend(images.iter().cloned());
+                    cx.emit(ComposerEvent::AttachmentsChanged);
+                }
+                PromptEditorEvent::PasteFailed(error) => {
+                    cx.emit(ComposerEvent::AttachmentError(error.clone()))
+                }
+            }
             cx.notify();
         });
         Self {
@@ -243,19 +407,24 @@ impl Composer {
             menu_chips: Vec::new(),
             chip_values: HashMap::new(),
             open_chip: None,
+            context_usage: None,
             queue: Vec::new(),
+            attachments: Vec::new(),
             context_trigger: None,
             context_title: "添加".into(),
             context_sections: Vec::new(),
             context_hints: Vec::new(),
             context_open: false,
+            context_on_at: false,
+            observed_text: "".into(),
             mention_colors: HashMap::new(),
             busy: false,
+            stop_on_busy: false,
             disabled: false,
             clear_on_submit: true,
             send_enabled_override: None,
             focus: cx.focus_handle(),
-            _subscription: subscription,
+            _subscriptions: [subscription, events],
         }
     }
 
@@ -338,6 +507,44 @@ impl Composer {
         self
     }
 
+    /// Shows a context usage ring before the model/accessory menus.
+    pub fn context_usage(mut self, usage: ComposerContextUsage) -> Self {
+        self.context_usage =
+            (usage.capacity_tokens > 0).then_some(ComposerContextState::Known(usage));
+        self
+    }
+
+    /// Updates measured token usage; None or zero capacity hides the ring.
+    pub fn set_context_usage(
+        &mut self,
+        usage: Option<ComposerContextUsage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_context_state(
+            usage
+                .filter(|usage| usage.capacity_tokens > 0)
+                .map(ComposerContextState::Known),
+            cx,
+        );
+    }
+
+    pub fn set_context_state(
+        &mut self,
+        state: Option<ComposerContextState>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context_usage != state {
+            self.context_usage = state;
+            cx.notify();
+        }
+    }
+
+    /// Opens the configured context panel when typing a standalone @.
+    pub fn context_on_at(mut self, enabled: bool) -> Self {
+        self.context_on_at = enabled;
+        self
+    }
+
     /// Appends a colored `@label` mention token to the prompt and registers
     /// its paint color.
     pub fn add_mention(
@@ -348,6 +555,9 @@ impl Composer {
     ) {
         let label = label.into();
         let mut next = self.editor.read(cx).value().to_owned();
+        if self.context_on_at && next.ends_with('@') {
+            next.pop();
+        }
         if !next.is_empty() && !next.ends_with(' ') && !next.ends_with('\n') {
             next.push(' ');
         }
@@ -394,6 +604,13 @@ impl Composer {
         self
     }
 
+    /// Replaces send with a stop button while busy. Defaults to false so
+    /// existing queue-based composers retain their submission behavior.
+    pub fn stop_on_busy(mut self, enabled: bool) -> Self {
+        self.stop_on_busy = enabled;
+        self
+    }
+
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.busy = busy;
         if !busy {
@@ -435,9 +652,44 @@ impl Composer {
         cx.notify();
     }
 
+    /// Restores one conversation's text and images together. Cancels pending
+    /// file pastes from the previous conversation via PromptEditor::set_value.
+    pub fn set_draft(
+        &mut self,
+        text: impl Into<SharedString>,
+        images: Vec<PastedImage>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.into();
+        self.observed_text = text.clone();
+        for image in std::mem::replace(&mut self.attachments, images) {
+            image.source().remove_asset(cx);
+        }
+        self.context_open = false;
+        self.editor
+            .update(cx, |editor, cx| editor.set_value(text, cx));
+        cx.notify();
+    }
+
     /// Number of prompts waiting in the queue.
     pub fn queue_len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Images pasted via ⌘/Ctrl-V that will be submitted with the next send.
+    pub fn attachments(&self) -> &[PastedImage] {
+        &self.attachments
+    }
+
+    /// Drops all pasted images without notifying submission flows.
+    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) {
+        if !self.attachments.is_empty() {
+            for image in self.attachments.drain(..) {
+                image.source().remove_asset(cx);
+            }
+            cx.emit(ComposerEvent::AttachmentsChanged);
+            cx.notify();
+        }
     }
 
     fn sendable(&self, cx: &App) -> bool {
@@ -446,8 +698,22 @@ impl Composer {
         }
         match self.send_enabled_override {
             Some(enabled) => enabled,
-            None => !self.editor.read(cx).is_empty(),
+            None => !self.editor.read(cx).is_empty() || !self.attachments.is_empty(),
         }
+    }
+
+    fn submission(&mut self, text: SharedString, cx: &mut Context<Self>) -> ComposerSubmission {
+        let images = if self.clear_on_submit {
+            std::mem::take(&mut self.attachments)
+        } else {
+            self.attachments.clone()
+        };
+        if self.clear_on_submit {
+            for image in &images {
+                image.source().remove_asset(cx);
+            }
+        }
+        ComposerSubmission { text, images }
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -459,11 +725,12 @@ impl Composer {
             self.editor
                 .update(cx, |editor, cx| editor.set_value("", cx));
         }
+        let submission = self.submission(text.clone(), cx);
         if self.busy {
-            self.queue.push(text.clone());
-            cx.emit(ComposerEvent::Queued(text));
+            self.queue.push(submission.clone());
+            cx.emit(ComposerEvent::Queued(submission));
         } else {
-            cx.emit(ComposerEvent::Submitted(text));
+            cx.emit(ComposerEvent::Submitted(submission));
         }
         cx.notify();
     }
@@ -480,8 +747,8 @@ impl Composer {
         if index >= self.queue.len() {
             return;
         }
-        let text = self.queue.remove(index);
-        cx.emit(ComposerEvent::Submitted(text));
+        let submission = self.queue.remove(index);
+        cx.emit(ComposerEvent::Submitted(submission));
         cx.notify();
     }
 
@@ -489,9 +756,13 @@ impl Composer {
         if index >= self.queue.len() {
             return;
         }
-        let text = self.queue.remove(index);
+        let submission = self.queue.remove(index);
+        for image in std::mem::replace(&mut self.attachments, submission.images) {
+            image.source().remove_asset(cx);
+        }
+        cx.emit(ComposerEvent::AttachmentsChanged);
         self.editor
-            .update(cx, |editor, cx| editor.set_value(text, cx));
+            .update(cx, |editor, cx| editor.set_value(submission.text, cx));
         cx.notify();
     }
 
@@ -604,6 +875,7 @@ impl Render for Composer {
             chip_element
         };
 
+        let stopping = self.busy && self.stop_on_busy;
         let send_button = div()
             .id("glass-composer-send")
             .size(px(28.))
@@ -611,15 +883,36 @@ impl Render for Composer {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(8.))
+            .rounded(px(if stopping { 14. } else { 8. }))
             .cursor_pointer()
-            .bg(rgb(if sendable { p.accent } else { p.surface_subtle }))
+            .bg(rgb(if stopping {
+                p.text
+            } else if sendable {
+                p.accent
+            } else {
+                p.surface_subtle
+            }))
             .text_color(rgb(if sendable { 0xffffff } else { p.text_muted }))
             .when(sendable, |button| {
                 button.hover(move |style| style.opacity(0.88))
             })
-            .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
-            .child(Icon::ArrowUp.render(16.));
+            .debug_selector(|| "composer-send-or-stop".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.busy && this.stop_on_busy {
+                    cx.emit(ComposerEvent::StopRequested);
+                } else {
+                    this.submit(cx);
+                }
+            }))
+            .child(if stopping {
+                div()
+                    .size(px(9.))
+                    .rounded(px(1.))
+                    .bg(rgb(p.surface))
+                    .into_any_element()
+            } else {
+                Icon::ArrowUp.render(16.).into_any_element()
+            });
 
         let mut bar = div()
             .w_full()
@@ -648,6 +941,56 @@ impl Render for Composer {
                         Animation::new(std::time::Duration::from_millis(900)).repeat(),
                         |spinner, delta| spinner.opacity(0.3 + 0.7 * delta),
                     ),
+            );
+        }
+        if let Some(usage) = self.context_usage {
+            let ring = div()
+                .id("composer-context-usage")
+                .debug_selector(|| "composer-context-usage".into())
+                .size(px(28.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let center = bounds.center();
+                            let radius = f32::from(bounds.size.width) / 2. - 1.5;
+                            for (fraction, color) in [(1., p.border), (usage.ratio(), p.text_muted)]
+                            {
+                                if fraction <= 0. {
+                                    continue;
+                                }
+                                let steps = (64. * fraction).ceil().max(1.) as usize;
+                                let mut path = gpui::PathBuilder::stroke(px(2.5));
+                                for step in 0..=steps {
+                                    let angle = -std::f32::consts::FRAC_PI_2
+                                        + std::f32::consts::TAU * fraction * step as f32
+                                            / steps as f32;
+                                    let point = point(
+                                        center.x + px(radius * angle.cos()),
+                                        center.y + px(radius * angle.sin()),
+                                    );
+                                    if step == 0 {
+                                        path.move_to(point);
+                                    } else {
+                                        path.line_to(point);
+                                    }
+                                }
+                                if let Ok(path) = path.build() {
+                                    window.paint_path(path, rgb(color));
+                                }
+                            }
+                        },
+                    )
+                    .size(px(16.)),
+                );
+            bar = bar.child(
+                super::Tooltip::new(ring, usage.label())
+                    .theme(theme)
+                    .render(cx),
             );
         }
         bar = bar
@@ -694,7 +1037,12 @@ impl Render for Composer {
         if self.context_open {
             card = card.child(self.context_panel_element(cx));
         }
-        let card = card.child(editor_scroll).child(bar);
+        let card = card
+            .when(!self.attachments.is_empty(), |card| {
+                card.child(self.attachments_element(cx))
+            })
+            .child(editor_scroll)
+            .child(bar);
 
         let mut root = div()
             .id("glass-composer")
@@ -719,7 +1067,7 @@ impl Render for Composer {
                 }
             }));
 
-        for (index, text) in self.queue.iter().enumerate() {
+        for (index, submission) in self.queue.iter().enumerate() {
             let row = div()
                 .w_full()
                 .flex()
@@ -742,7 +1090,7 @@ impl Render for Composer {
                         .truncate()
                         .text_size(px(13.))
                         .text_color(rgb(p.text))
-                        .child(text.clone()),
+                        .child(submission.text.clone()),
                 )
                 .child(
                     div()
@@ -931,6 +1279,73 @@ impl Composer {
         .into_any_element()
     }
 
+    /// Thumbnail strip of pasted images above the input; each thumb can be
+    /// removed before submitting.
+    fn attachments_element(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let p = theme.palette();
+        let dark = theme.is_dark();
+        let thumbs = self.attachments.iter().enumerate().map(|(index, image)| {
+            div()
+                .id(SharedString::from(format!(
+                    "glass-composer-attachment-{index}"
+                )))
+                .relative()
+                .size(px(48.))
+                .flex_shrink_0()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(if dark {
+                    rgba(theme.glass_line())
+                } else {
+                    rgb(p.border)
+                })
+                .overflow_hidden()
+                .child(
+                    img(image.source())
+                        .size(px(48.))
+                        .object_fit(ObjectFit::Cover),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "glass-composer-attachment-remove-{index}"
+                        )))
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(2.))
+                        .size(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .bg(rgba(0x000000aa))
+                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(rgb(p.accent)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index < this.attachments.len() {
+                                this.attachments.remove(index).source().remove_asset(cx);
+                                cx.emit(ComposerEvent::AttachmentsChanged);
+                                cx.notify();
+                            }
+                        }))
+                        .child(Icon::Close.render(10.)),
+                )
+        });
+        div()
+            .id("glass-composer-attachments")
+            .w_full()
+            .min_w_0()
+            .px(px(13.))
+            .pt(px(10.))
+            .flex()
+            .gap(px(8.))
+            .overflow_x_scroll()
+            .children(thumbs)
+            .into_any_element()
+    }
+
     /// Builds the context panel (添加 / at-mention panel) anchored above the card.
     fn context_panel_element(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
@@ -1016,9 +1431,12 @@ impl Composer {
                             let id = entry.id.clone();
                             let label = entry.label.clone();
                             let color = entry.color.unwrap_or(p.accent);
+                            let insert_mention = entry.insert_mention;
                             cx.listener(move |this, _, _, cx| {
                                 this.close_context_panel(cx);
-                                this.add_mention(label.clone(), color, cx);
+                                if insert_mention {
+                                    this.add_mention(label.clone(), color, cx);
+                                }
                                 cx.emit(ComposerEvent::ContextSelected {
                                     id: id.clone(),
                                     label: label.clone(),
@@ -1130,6 +1548,165 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn busy_stop_button_works_with_disabled_editor_and_preserves_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+        let (composer, window) =
+            cx.add_window_view(|_, cx| Composer::new("Message", cx).stop_on_busy(true));
+        let stops = Rc::new(Cell::new(0));
+        let submits = Rc::new(Cell::new(0));
+        let stop_count = stops.clone();
+        let submit_count = submits.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event, _| match event {
+                ComposerEvent::StopRequested => stop_count.set(stop_count.get() + 1),
+                ComposerEvent::Submitted(_) => submit_count.set(submit_count.get() + 1),
+                _ => {}
+            })
+        });
+        composer.update(window, |this, cx| {
+            this.set_value("keep draft", cx);
+            this.set_disabled(true, cx);
+            this.set_busy(true, cx);
+        });
+        let button = window.debug_bounds("composer-send-or-stop").unwrap();
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(stops.get(), 1);
+        assert_eq!(submits.get(), 0);
+        composer.read_with(window, |this, cx| {
+            assert_eq!(this.value(cx).as_ref(), "keep draft")
+        });
+        composer.update(window, |this, cx| {
+            this.set_busy(false, cx);
+            this.set_disabled(false, cx);
+        });
+        let button = window.debug_bounds("composer-send-or-stop").unwrap();
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(stops.get(), 1);
+        assert_eq!(submits.get(), 1);
+    }
+
+    #[test]
+    fn context_usage_clamps_remaining_and_handles_unknown_capacity() {
+        let usage = ComposerContextUsage::new(32000, 128000);
+        assert_eq!(usage.remaining_tokens(), 96000);
+        assert_eq!(usage.remaining_percent(), 75);
+        assert_eq!(usage.used_ratio(), 0.25);
+        let full = ComposerContextUsage::new(200000, 128000);
+        assert_eq!(full.remaining_tokens(), 0);
+        assert_eq!(full.used_ratio(), 1.);
+        assert_eq!(ComposerContextUsage::new(0, 0).remaining_percent(), 0);
+        assert_eq!(
+            ComposerContextUsage::new(u64::MAX, u64::MAX).remaining_tokens(),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn context_usage_is_optional_and_updates_without_changing_the_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (composer, window) = cx.add_window_view(|_, cx| Composer::new("Message", cx));
+        composer.update(window, |composer, cx| composer.set_value("keep draft", cx));
+        assert!(window.debug_bounds("composer-context-usage").is_none());
+        composer.update(window, |composer, cx| {
+            composer.set_context_state(
+                Some(ComposerContextState::Unknown {
+                    used_tokens: None,
+                    capacity_tokens: Some(128000),
+                }),
+                cx,
+            )
+        });
+        assert!(window.debug_bounds("composer-context-usage").is_some());
+        composer.update(window, |composer, cx| {
+            composer.set_context_usage(Some(ComposerContextUsage::new(32000, 128000)), cx)
+        });
+        assert!(window.debug_bounds("composer-context-usage").is_some());
+        composer.read_with(window, |composer, cx| {
+            assert_eq!(composer.value(cx).as_ref(), "keep draft")
+        });
+        composer.update(window, |composer, cx| composer.set_context_usage(None, cx));
+        assert!(window.debug_bounds("composer-context-usage").is_none());
+    }
+
+    #[gpui::test]
+    fn restoring_drafts_isolates_images_and_nontext_notifications_do_not_emit_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+        let composer = cx.new(|cx| Composer::new("Message", cx));
+        let changes = Rc::new(Cell::new(0));
+        let received = changes.clone();
+        let _observer = cx.new(|cx: &mut Context<()>| {
+            cx.subscribe(&composer, move |_, _, event: &ComposerEvent, _| {
+                if matches!(event, ComposerEvent::Changed(_)) {
+                    received.set(received.get() + 1);
+                }
+            })
+            .detach();
+        });
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        composer.update(cx, |composer, cx| {
+            composer.set_draft("A", vec![image.clone()], cx)
+        });
+        cx.run_until_parked();
+        let editor = composer.read_with(cx, |composer, _| composer.editor.clone());
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 0);
+        composer.update(cx, |composer, cx| composer.set_draft("B", Vec::new(), cx));
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, cx| {
+            assert!(composer.attachments().is_empty());
+            assert_eq!(composer.value(cx).as_ref(), "B");
+        });
+        composer.update(cx, |composer, cx| composer.set_draft("A", vec![image], cx));
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, _| {
+            assert_eq!(composer.attachments()[0].bytes(), &[1, 2, 3])
+        });
+        editor.update(cx, |editor, cx| editor.set_value("edited", cx));
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 1);
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 1);
+    }
+
+    #[gpui::test]
+    fn at_trigger_opens_context_and_selected_path_replaces_the_trigger(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let composer = cx.new(|cx| {
+            Composer::new("Message", cx)
+                .context_panel(
+                    "attach",
+                    "添加",
+                    [ComposerContextSection::untitled([
+                        ComposerContextEntry::new("file", "文件").insert_mention(false),
+                    ])],
+                )
+                .context_on_at(true)
+        });
+        composer.update(cx, |composer, cx| composer.set_value("查看 @", cx));
+        cx.run_until_parked();
+        composer.update(cx, |composer, cx| {
+            assert!(composer.context_panel_open());
+            composer.close_context_panel(cx);
+            composer.add_mention("src/main.rs", 0x007aff, cx);
+            assert_eq!(composer.value(cx).as_ref(), "查看 @src/main.rs ");
+        });
+        cx.run_until_parked();
+        composer.update(cx, |composer, cx| {
+            composer.set_value("user@example.com", cx)
+        });
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, _| assert!(!composer.context_panel_open()));
+    }
+
+    #[gpui::test]
     fn refreshing_model_options_preserves_prompt_queue_and_valid_selection(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1139,7 +1716,9 @@ mod tests {
         });
         composer.update(cx, |composer, cx| {
             composer.set_value("未发送的内容\n第二行", cx);
-            composer.queue.push("排队中的内容".into());
+            composer
+                .queue
+                .push(ComposerSubmission::text("排队中的内容"));
             composer.chip_values.insert("model".into(), "b".into());
             composer.set_menu_chip(
                 ComposerChip::new("model").option("b", "B").option("c", "C"),
@@ -1175,5 +1754,35 @@ mod tests {
         assert!(label.left() >= menu.left());
         assert!(label.right() < check.left());
         assert!(check.right() < menu.right());
+    }
+
+    #[gpui::test]
+    fn pasted_images_attach_submit_with_the_prompt_and_clear(cx: &mut gpui::TestAppContext) {
+        let composer = cx.new(|cx| Composer::new("Message", cx));
+        let editor = composer.read_with(cx, |composer, _| composer.editor.clone());
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+
+        // The editor emits ImagePasted when the clipboard holds an image.
+        editor.update(cx, |_, cx| {
+            cx.emit(PromptEditorEvent::ImagePasted(vec![image]));
+        });
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, cx| {
+            assert_eq!(composer.attachments().len(), 1);
+            assert!(composer.sendable(cx));
+        });
+
+        composer.update(cx, |composer, cx| {
+            composer.busy = true;
+            composer.submit(cx);
+        });
+        composer.read_with(cx, |composer, _| {
+            assert!(composer.attachments().is_empty());
+            assert_eq!(composer.queue_len(), 1);
+            let queued = &composer.queue[0];
+            assert_eq!(queued.text.as_ref(), "");
+            assert_eq!(queued.images.len(), 1);
+            assert_eq!(queued.images[0].bytes(), &[1, 2, 3]);
+        });
     }
 }

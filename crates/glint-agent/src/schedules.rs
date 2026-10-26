@@ -39,12 +39,17 @@ pub struct ScheduleStore {
 
 impl ScheduleStore {
     pub fn open(path: PathBuf) -> Result<Self, String> {
-        let tasks: Vec<Schedule> = match std::fs::read(&path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|_| "日程文件损坏，请检查 schedules.json")?
+        let stored = crate::database::load_schedules(&path)?;
+        let importing = stored.is_none();
+        let tasks: Vec<Schedule> = if let Some(tasks) = stored {
+            tasks
+        } else {
+            match std::fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|_| "日程文件损坏，请检查 schedules.json")?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+                Err(_) => return Err("无法读取日程文件".into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(_) => return Err("无法读取日程文件".into()),
         };
         let mut store = Self {
             tasks,
@@ -52,11 +57,16 @@ impl ScheduleStore {
             readable: true,
         };
         // An interrupted app must not leave tasks permanently marked as running.
+        let mut recovered = false;
         for task in &mut store.tasks {
             if task.running {
                 task.running = false;
+                recovered = true;
                 task.last_error = Some("上次执行被应用退出中断".into());
             }
+        }
+        if importing || recovered {
+            store.save()?;
         }
         Ok(store)
     }
@@ -71,61 +81,51 @@ impl ScheduleStore {
         if !self.readable {
             return Err("日程存储不可用，原始文件已保留".into());
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| "无法创建日程目录")?;
-        }
-        let temp = self.path.with_extension("json.tmp");
-        std::fs::write(
-            &temp,
-            serde_json::to_vec_pretty(&self.tasks).map_err(|_| "无法编码日程")?,
-        )
-        .map_err(|_| "无法写入日程")?;
-        std::fs::rename(temp, &self.path).map_err(|_| "无法保存日程".into())
+        crate::database::save_schedules(&self.path, &self.tasks)
     }
     pub fn upsert(&mut self, task: Schedule) -> Result<(), String> {
         if task.title.trim().is_empty() || task.prompt.trim().is_empty() {
             return Err("任务标题和提示词不能为空".into());
         }
-        let old = self.tasks.clone();
-        if let Some(existing) = self.tasks.iter_mut().find(|item| item.id == task.id) {
-            *existing = task;
-        } else {
-            self.tasks.push(task);
+        if !self.readable {
+            return Err("日程存储不可用，原始数据已保留".into());
         }
-        if let Err(error) = self.save() {
-            self.tasks = old;
-            return Err(error);
-        }
+        let connection = crate::database::open(&self.path)?;
+        crate::database::put_schedule(&connection, &task)?;
+        self.tasks = crate::database::load_schedules(&self.path)?.unwrap_or_default();
         Ok(())
     }
     pub fn remove(&mut self, id: Uuid) -> Result<(), String> {
-        if self.tasks.iter().any(|task| task.id == id && task.running) {
-            return Err("请等待任务执行完成后再删除".into());
+        if !self.readable {
+            return Err("日程存储不可用".into());
         }
-        let old = self.tasks.clone();
-        self.tasks.retain(|task| task.id != id);
-        if self.tasks.len() == old.len() {
-            return Err("日程不存在".into());
+        let connection = crate::database::open(&self.path)?;
+        let removed = connection
+            .execute(
+                "DELETE FROM schedules WHERE id=?1 AND running=0",
+                [id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        if removed == 0 {
+            return Err("日程不存在或仍在执行中".into());
         }
-        if let Err(error) = self.save() {
-            self.tasks = old;
-            return Err(error);
-        }
+        self.tasks = crate::database::load_schedules(&self.path)?.unwrap_or_default();
         Ok(())
     }
     pub fn claim_due(&mut self, now: DateTime<Local>) -> Result<Option<Schedule>, String> {
-        let Some(index) = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| task.enabled && !task.running && task.run_at <= now)
-            .min_by_key(|(_, task)| task.run_at)
-            .map(|(index, _)| index)
-        else {
+        use rusqlite::OptionalExtension;
+        if !self.readable {
+            return Err("日程存储不可用".into());
+        }
+        let mut connection = crate::database::open(&self.path)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let value: Option<String> = transaction.query_row("SELECT payload FROM schedules WHERE enabled=1 AND running=0 AND run_at<=?1 ORDER BY run_at,id LIMIT 1", [now.timestamp()], |row|row.get(0)).optional().map_err(|error|error.to_string())?;
+        let Some(value) = value else {
             return Ok(None);
         };
-        let old = self.tasks[index].clone();
-        let task = &mut self.tasks[index];
+        let mut task: Schedule = serde_json::from_str(&value).map_err(|error| error.to_string())?;
         task.running = true;
         task.last_run = Some(now);
         task.last_error = None;
@@ -138,18 +138,38 @@ impl ScheduleStore {
                 }
             }
         }
-        if let Err(error) = self.save() {
-            self.tasks[index] = old;
-            return Err(error);
-        }
-        Ok(Some(self.tasks[index].clone()))
+        crate::database::put_schedule(&transaction, &task)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.tasks = crate::database::load_schedules(&self.path)?.unwrap_or_default();
+        Ok(Some(task))
     }
     pub fn finish(&mut self, id: Uuid, error: Option<String>) -> Result<(), String> {
-        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+        use rusqlite::OptionalExtension;
+        if !self.readable {
+            return Err("日程存储不可用".into());
+        }
+        let mut connection = crate::database::open(&self.path)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let value: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM schedules WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(value) = value {
+            let mut task: Schedule =
+                serde_json::from_str(&value).map_err(|error| error.to_string())?;
             task.running = false;
             task.last_error = error;
+            crate::database::put_schedule(&transaction, &task)?;
         }
-        self.save()
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.tasks = crate::database::load_schedules(&self.path)?.unwrap_or_default();
+        Ok(())
     }
 }
 

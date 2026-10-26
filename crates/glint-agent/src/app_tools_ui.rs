@@ -24,6 +24,189 @@ pub struct Approval {
     pub respond: tokio::sync::oneshot::Sender<bool>,
 }
 
+struct ToolPresentation {
+    icon: Icon,
+    summary: String,
+    body: String,
+}
+
+fn tool_signature(record: &tools::ToolRecord) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    record.call.name.hash(&mut hash);
+    record.call.arguments.to_string().hash(&mut hash);
+    record.result.hash(&mut hash);
+    record.success.hash(&mut hash);
+    record.elapsed_ms.hash(&mut hash);
+    hash.finish().to_string()
+}
+
+fn command_summary(call: &tools::ToolCall) -> String {
+    fn quote(value: &str) -> String {
+        let value = value.replace(['\r', '\n'], " ");
+        if !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || "_./:@%+=,-".contains(ch))
+        {
+            value
+        } else {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        }
+    }
+    let mut command = vec![quote(
+        call.arguments["program"].as_str().unwrap_or("run_command"),
+    )];
+    if let Some(args) = call.arguments["args"].as_array() {
+        command.extend(args.iter().filter_map(|arg| arg.as_str()).map(quote));
+    }
+    command.join(" ")
+}
+
+fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
+    let running = record.result == "执行中…";
+    let command_failed = record.call.name == "run_command"
+        && record
+            .result
+            .strip_prefix("exit: ")
+            .and_then(|result| result.lines().next())
+            .is_some_and(|status| status.trim() != "0");
+    let success = record.success && !command_failed;
+    let args = &record.call.arguments;
+    let path = args["path"].as_str().unwrap_or(".");
+    let (icon, action, target) = match record.call.name.as_str() {
+        "run_command" => (
+            Icon::Shell,
+            if running {
+                "正在运行"
+            } else if success {
+                "已运行"
+            } else {
+                "命令失败"
+            },
+            command_summary(&record.call),
+        ),
+        "read_file" => (
+            Icon::Text,
+            if running {
+                "正在读取"
+            } else if success {
+                "已读取"
+            } else {
+                "读取失败"
+            },
+            path.into(),
+        ),
+        "list_files" => (
+            Icon::Folder,
+            if running {
+                "正在列出目录"
+            } else if success {
+                "已列出目录"
+            } else {
+                "列出目录失败"
+            },
+            path.into(),
+        ),
+        "search_files" => (
+            Icon::Search,
+            if running {
+                "正在搜索"
+            } else if success {
+                "已搜索"
+            } else {
+                "搜索失败"
+            },
+            args["pattern"].as_str().unwrap_or("").into(),
+        ),
+        "write_file" => (
+            Icon::Pencil,
+            if running {
+                "正在写入"
+            } else if success {
+                "已写入"
+            } else {
+                "写入失败"
+            },
+            path.into(),
+        ),
+        "replace_in_file" => (
+            Icon::Pencil,
+            if running {
+                "正在更新"
+            } else if success {
+                "已更新"
+            } else {
+                "更新失败"
+            },
+            path.into(),
+        ),
+        name if name.starts_with("memory_") => (
+            Icon::Text,
+            if running {
+                "正在处理记忆"
+            } else if !success {
+                "记忆处理失败"
+            } else {
+                match name {
+                    "memory_search" => "已搜索记忆",
+                    "memory_read" => "已读取记忆",
+                    "memory_save" => "已保存记忆",
+                    _ => "已删除记忆",
+                }
+            },
+            args["title"]
+                .as_str()
+                .or(args["query"].as_str())
+                .or(args["id"].as_str())
+                .unwrap_or("")
+                .into(),
+        ),
+        name if name.starts_with("schedule_") => (
+            Icon::Calendar,
+            if running {
+                "正在处理日程"
+            } else if success {
+                "日程已处理"
+            } else {
+                "日程处理失败"
+            },
+            args["title"]
+                .as_str()
+                .or(args["id"].as_str())
+                .unwrap_or("")
+                .into(),
+        ),
+        _ => (
+            Icon::Workflow,
+            if running {
+                "正在调用"
+            } else if success {
+                "已完成"
+            } else {
+                "调用失败"
+            },
+            record.call.name.clone(),
+        ),
+    };
+    let mut summary = format!("{action} {target}");
+    if record.call.name == "run_command" && !running {
+        summary.push_str(&format!(" · {:.1}s", record.elapsed_ms as f64 / 1000.));
+    }
+    let body = if running {
+        "等待工具返回结果…".into()
+    } else if record.call.name == "run_command" && record.result.trim().is_empty() {
+        "命令已结束，无输出。".into()
+    } else {
+        record.result.clone()
+    };
+    ToolPresentation {
+        icon,
+        summary,
+        body,
+    }
+}
+
 impl AgentWorkspace {
     pub fn watch_tools(
         &mut self,
@@ -37,6 +220,29 @@ impl AgentWorkspace {
                 if weak
                     .update(cx, |this, cx| {
                         match event {
+                            tools::ToolEvent::ContextUsage {
+                                provider_id,
+                                model,
+                                used_tokens,
+                                capacity_tokens,
+                            } => {
+                                if let Some((id, _)) = &this.pending {
+                                    if let Some(session) = this
+                                        .history
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|session| session.id == *id)
+                                    {
+                                        session.context = Some(context_usage::ContextSnapshot {
+                                            provider_id,
+                                            model,
+                                            used_tokens,
+                                            capacity_tokens,
+                                        });
+                                    }
+                                }
+                                this.sync_context_usage(cx);
+                            }
                             tools::ToolEvent::Transcript(blocks) => this.transcript = blocks,
                             tools::ToolEvent::Started(call) => {
                                 this.tool_activity.push(tools::ToolRecord {
@@ -47,7 +253,11 @@ impl AgentWorkspace {
                                 })
                             }
                             tools::ToolEvent::Approval { call, respond } => {
-                                this.approval = Some(Approval { call, respond })
+                                if *this.access.lock().unwrap() != tools::AccessMode::Ask {
+                                    let _ = respond.send(true);
+                                } else {
+                                    this.approval = Some(Approval { call, respond });
+                                }
                             }
                             tools::ToolEvent::Completed(record) => {
                                 if let Some(existing) = this
@@ -79,44 +289,37 @@ impl AgentWorkspace {
         let mut cache = self.tool_panels.borrow_mut();
         let mut list = div().w_full().min_w_0().flex().flex_col().gap_1();
         for record in records {
-            let signature = serde_json::to_string(record).unwrap_or_default();
+            let signature = tool_signature(record);
             let entry = cache
                 .entry(record.call.id.clone())
                 .or_insert_with(|| ToolPanel {
                     signature: String::new(),
                     theme,
-                    panel: cx.new(|_| CollapsePanel::new("").icon(Icon::Workflow).theme(theme)),
+                    panel: cx.new(|_| {
+                        CollapsePanel::new("")
+                            .icon(tool_presentation(record).icon)
+                            .theme(theme)
+                    }),
                 });
             if entry.signature != signature || entry.theme != theme {
-                let status = if record.result == "执行中…" {
-                    "执行中".into()
-                } else {
-                    format!(
-                        "{} · {:.2}s",
-                        if record.success {
-                            "完成"
-                        } else {
-                            "未完成"
-                        },
-                        record.elapsed_ms as f64 / 1000.
-                    )
-                };
-                let summary = format!("{} · {}", record.call.name, status);
-                let arguments =
-                    serde_json::to_string_pretty(&record.call.arguments).unwrap_or_default();
-                let result: String = record.result.chars().take(8000).collect();
+                let presentation = tool_presentation(record);
+                let result: SharedString = presentation.body.into();
                 entry.panel.update(cx, |panel, cx| {
                     panel.set_theme(theme, cx);
-                    panel.set_summary(summary, cx);
+                    panel.set_summary(presentation.summary, cx);
                     panel.set_content(
                         move |_, _| {
                             div()
-                                .min_w_0()
+                                .id("tool-output")
                                 .w_full()
+                                .min_w_0()
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
                                 .text_size(px(12.))
                                 .line_height(px(20.))
+                                .font_family("monospace")
                                 .text_color(rgb(p.text_muted))
-                                .child(format!("参数\n{arguments}\n\n结果\n{result}"))
+                                .child(result.clone())
                                 .into_any_element()
                         },
                         cx,
@@ -169,8 +372,14 @@ impl AgentWorkspace {
         use generation::ContentBlock;
         use gpui_glint::components::CollapsePanel;
         let theme = self.theme;
-        let p = theme.palette();
         let mut body = div().w_full().min_w_0().flex().flex_col().gap_2();
+        let completed: std::collections::HashSet<_> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult(record) => Some(record.call.id.as_str()),
+                _ => None,
+            })
+            .collect();
         for (index, block) in blocks.iter().enumerate() {
             match block {
                 ContentBlock::Text(text) => {
@@ -207,40 +416,17 @@ impl AgentWorkspace {
                     body = body.child(entry.panel.clone());
                 }
                 ContentBlock::ToolCall(call) => {
-                    let mut cache = self.tool_panels.borrow_mut();
-                    let signature = serde_json::to_string(call).unwrap_or_default();
-                    let entry =
-                        cache
-                            .entry(format!("call:{}", call.id))
-                            .or_insert_with(|| ToolPanel {
-                                signature: String::new(),
-                                theme,
-                                panel: cx.new(|_| {
-                                    CollapsePanel::new("").icon(Icon::Workflow).theme(theme)
-                                }),
-                            });
-                    if entry.signature != signature || entry.theme != theme {
-                        let arguments =
-                            serde_json::to_string_pretty(&call.arguments).unwrap_or_default();
-                        entry.panel.update(cx, |panel, cx| {
-                            panel.set_theme(theme, cx);
-                            panel.set_summary(format!("调用 {}", call.name), cx);
-                            panel.set_content(
-                                move |_, _| {
-                                    div()
-                                        .text_size(px(12.))
-                                        .line_height(px(20.))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(arguments.clone())
-                                        .into_any_element()
-                                },
-                                cx,
-                            );
-                        });
-                        entry.signature = signature;
-                        entry.theme = theme;
+                    // Completed calls use their result row and the same panel
+                    // identity, so streaming never leaves a duplicate call row.
+                    if !completed.contains(call.id.as_str()) {
+                        let running = tools::ToolRecord {
+                            call: call.clone(),
+                            result: "执行中…".into(),
+                            success: false,
+                            elapsed_ms: 0,
+                        };
+                        body = body.child(self.tool_records(std::slice::from_ref(&running), cx));
                     }
-                    body = body.child(entry.panel.clone());
                 }
                 ContentBlock::ToolResult(record) => {
                     body = body.child(self.tool_records(std::slice::from_ref(record), cx))
@@ -368,6 +554,49 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+    #[test]
+    fn builtin_summaries_describe_commands_and_files_and_bodies_are_only_results() {
+        let mut record = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "one".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({"program":"git","args":["diff","--cached","--name-status"]}),
+            },
+            result: "exit: 0\nM src/main.rs".into(),
+            success: true,
+            elapsed_ms: 1200,
+        };
+        let view = tool_presentation(&record);
+        assert_eq!(
+            view.summary,
+            "已运行 git diff --cached --name-status · 1.2s"
+        );
+        assert_eq!(view.body, record.result);
+        record.result = "执行中…".into();
+        assert!(
+            tool_presentation(&record)
+                .summary
+                .starts_with("正在运行 git diff")
+        );
+        record.result = "exit: 2\nerror".into();
+        assert!(tool_presentation(&record).summary.starts_with("命令失败"));
+        record.call.name = "read_file".into();
+        record.call.arguments = serde_json::json!({"path":"src/main.rs","start_line":1});
+        record.result = "1: fn main() {}".into();
+        assert_eq!(tool_presentation(&record).summary, "已读取 src/main.rs");
+        assert_eq!(tool_presentation(&record).body, "1: fn main() {}");
+        record.success = false;
+        assert_eq!(tool_presentation(&record).summary, "读取失败 src/main.rs");
+        record.call.arguments =
+            serde_json::json!({"program":"sh","args":["-c","printf '%s' hello"]});
+        assert_eq!(
+            command_summary(&record.call),
+            "sh -c 'printf '\\''%s'\\'' hello'"
+        );
+        record.result = "x".repeat(12000);
+        assert_eq!(tool_presentation(&record).body.len(), 12000);
+    }
+
     #[test]
     fn folding_preserves_intermediate_text_and_only_exposes_the_final_answer() {
         let blocks = vec![

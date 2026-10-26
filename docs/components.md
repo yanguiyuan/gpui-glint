@@ -484,8 +484,8 @@ let composer = cx.new(|cx| {
 });
 let subscription = cx.subscribe(&composer, |this, _, event: &ComposerEvent, cx| {
     match event {
-        ComposerEvent::Submitted(text) => { /* 发送提示词 */ }
-        ComposerEvent::Queued(text) => { /* 提示词进入队列 */ }
+        ComposerEvent::Submitted(submission) => { /* 发送提示词，submission.text / submission.images */ }
+        ComposerEvent::Queued(submission) => { /* 提示词进入队列 */ }
         ComposerEvent::ChipSelected { chip, value } => { /* 切换模型或档位 */ }
         ComposerEvent::ChipClicked(id) => { /* 打开附件等无选项 chip */ }
         ComposerEvent::Changed(text) => { /* 同步草稿 */ }
@@ -509,11 +509,27 @@ chips 只负责样式与点击事件，弹出菜单由宿主用 `GroupedDropdown
 `ComposerEvent::ChipSelected` 上报；菜单自带 `occlude`，滚动与点击都不会
 穿透到页面。
 
+停止按钮：`.stop_on_busy(true)` 将 busy 状态下的发送按钮替换为圆形停止按钮，点击发出 `ComposerEvent::StopRequested`，由宿主取消请求；不会提交或清空当前草稿。默认关闭，保留队列行为。
+
 队列：busy 期间提交的提示词自动进入队列（`ComposerEvent::Queued`），以行
 形式排在输入框上方，每行提供 立即（越序提交，`Submitted`）、编辑（回填到
 输入框）与删除三个操作；宿主调用 `set_busy(false)` 结束当前请求时，最旧的
 排队提示词会自动作为 `Submitted` 发出，直至队列清空。`queue_len()` 返回
 当前排队数量。
+
+图片粘贴：编辑器聚焦时按 ⌘/Ctrl-V，剪贴板中的图片（含 Finder 复制的图片
+文件）不会插入文本，而是作为附件显示在输入框上方的缩略图条中，每张可单独
+移除；提交时随 `ComposerEvent::Submitted` / `Queued` 的
+`ComposerSubmission { text, images }` 一并发出（`images` 为
+`PastedImage`，携带原始编码字节与格式，`source()` 可直接用于 `img()` 预览）。
+只有图片没有文字时发送按钮同样可用；`clear_attachments(cx)` 可手动清空。
+
+上下文余量：`.context_usage(ComposerContextUsage::new(used_tokens, capacity_tokens))`
+在模型菜单前显示静态环形进度；深色弧表示已使用比例，hover 提示剩余百分比和
+实际 token 用量。宿主可用 `set_context_usage(Some(usage), cx)` 更新，传入 `None`
+或容量为 0 时隐藏。`set_context_state` 还支持 `Initial` 和 `Unknown` 状态，
+让新会话或尚未收到完整统计时保留圆环并说明缺失数据。组件不从文字长度估算 token，也不预设模型上下文上限；
+playground 的示例数值仅用于展示。
 
 上下文面板（@ 面板）：用 `.context_panel(trigger, title, sections)` 声明
 后，点击对应 id 的 chip 会在卡片上方弹出面板——分组条目带图标与灰色描述，
@@ -522,7 +538,10 @@ chips 只负责样式与点击事件，弹出菜单由宿主用 `GroupedDropdown
 `@label` 提及插入提示词（`PromptEditor` 对内容中的 `@word` 记号按注册的
 颜色着色，编辑后自动重算，未注册的 `@` 记号用强调色），并发出
 `ComposerEvent::ContextSelected { id, label }`；`add_mention(label, color)`
-可供宿主在面板之外追加提及。
+可供宿主在面板之外追加提及。`.context_on_at(true)` 支持输入独立的 `@`
+打开面板，追加提及时替换该触发字符。选择器入口可用
+`ComposerContextEntry::insert_mention(false)` 仅发出事件，由宿主打开文件选择器，
+再通过 `add_mention` 插入选中的真实路径。
 
 ## 分组列表
 
@@ -530,6 +549,12 @@ chips 只负责样式与点击事件，弹出菜单由宿主用 `GroupedDropdown
 （图标 + 文本 + 尾部元信息）。悬停分组头浮现尾部操作按钮，悬停条目时
 前导图标可切换为快捷操作（如收藏）、尾部元信息切换为操作图标（如删除），
 选中项以胶囊高亮。条目 id 需跨分组唯一。
+`GroupListItem::reserve_icon_space(true)` 在无图标时保留 14px 图标位置，
+适合仅在运行中显示 `Icon::Spinner` 的条目，避免状态切换时文字位移。
+`confirm_action("删除此会话？")` 使尾部操作在确认 popover 中点击“删除”后
+才发出 `ItemAction`；取消、Esc 或点击外部均不触发操作。分组头使用文件夹图标
+（`Icon::Folder` / `Icon::Folders`）时会跟随展开状态自动切换：收缩显示
+闭合文件夹，展开显示打开的文件夹，与目录树一致。
 
 `GroupListItem::prefix("GET").prefix_color(color)` 可在条目名称前显示带颜色的短标签，适用于 API 方法。
 
@@ -707,3 +732,5 @@ calendar.update(cx, |calendar, cx| calendar.set_markers(markers, cx));
 ```
 
 使用 `set_selected(date, cx)` 同步选中日期及当前月份，`value()` 读取选择。事件标记由 `HashMap<NaiveDate, usize>` 提供。
+
+`Popover::above_trigger()` 支持在触发按钮上方弹出，并与其左侧对齐；默认方向保持不变。

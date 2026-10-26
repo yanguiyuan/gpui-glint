@@ -96,11 +96,11 @@ pub use select_field::{SelectField, SelectFieldEvent, SelectFieldValue};
 
 mod composer;
 pub use composer::{
-    Composer, ComposerChip, ComposerContextEntry, ComposerContextSection, ComposerEvent,
-    bind_composer_keys,
+    Composer, ComposerChip, ComposerContextEntry, ComposerContextSection, ComposerContextState,
+    ComposerContextUsage, ComposerEvent, ComposerSubmission, bind_composer_keys,
 };
 mod prompt_editor;
-pub use prompt_editor::{PromptEditor, bind_prompt_editor_keys};
+pub use prompt_editor::{PastedImage, PromptEditor, PromptEditorEvent, bind_prompt_editor_keys};
 
 mod group_list;
 pub use group_list::{GroupList, GroupListEvent, GroupListGroup, GroupListHeader, GroupListItem};

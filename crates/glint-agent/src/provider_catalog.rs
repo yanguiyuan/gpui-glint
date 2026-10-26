@@ -21,7 +21,11 @@ fn discovered_config(found: &DiscoveredProvider) -> Config {
 
 impl ProviderCatalog {
     pub fn load(path: &Path, discovered: &[DiscoveredProvider]) -> Result<Self, String> {
-        let mut catalog = if path.exists() {
+        let stored = crate::database::load_catalog(path)?;
+        let importing = stored.is_none();
+        let mut catalog = if let Some(value) = stored {
+            serde_json::from_value(value).map_err(|error| format!("供应商数据库损坏：{error}"))?
+        } else if path.exists() {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).map_err(|_| "无法读取供应商列表")?)
                     .map_err(|_| "供应商列表损坏，请检查 providers.json")?;
@@ -79,20 +83,14 @@ impl ProviderCatalog {
                 catalog.active_model = provider.model.clone();
             }
         }
+        if importing {
+            catalog.save(path)?;
+        }
         Ok(catalog)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| "无法创建供应商配置目录")?;
-        }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(self).map_err(|_| "无法编码供应商列表")?,
-        )
-        .map_err(|_| "无法写入供应商列表")?;
-        std::fs::rename(temporary, path).map_err(|_| "无法保存供应商列表".into())
+        crate::database::save_catalog(path, self)
     }
 
     pub fn current(&self) -> Config {

@@ -5,11 +5,12 @@ use gpui::{
 };
 use gpui_glint::components::{
     Button, ButtonKind, Calendar, CalendarEvent, Checkbox, Composer, ComposerChip,
-    ComposerContextEntry, ComposerContextSection, ComposerEvent, Date, DatePicker, DatePickerEvent,
-    DateRangePicker, DateTimePicker, DateTimeRangePicker, GroupedDropdown, Icon, InputField,
-    RadioOption, SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectField,
-    SelectFieldEvent, SelectOption, Slider, Stepper, Switch, TextEntry, ThemeSelector,
-    ThemeSelectorEvent, Time, TimePicker, TimeRangePicker, Toast, ToastHost, ToastKind, TokenInput,
+    ComposerContextEntry, ComposerContextSection, ComposerContextUsage, ComposerEvent, Date,
+    DatePicker, DatePickerEvent, DateRangePicker, DateTimePicker, DateTimeRangePicker,
+    GroupedDropdown, Icon, InputField, RadioOption, SearchInput, SegmentOption, SegmentedControl,
+    Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption, Slider, Stepper, Switch,
+    TextEntry, ThemeSelector, ThemeSelectorEvent, Time, TimePicker, TimeRangePicker, Toast,
+    ToastHost, ToastKind, TokenInput,
 };
 use gpui_glint::theme::ThemePreset;
 
@@ -116,6 +117,8 @@ impl InputsPage {
         let composer = cx.new(|cx| {
             Composer::new("提出后续修改要求…", cx)
                 .theme(theme)
+                // Example values; production hosts supply measured usage.
+                .context_usage(ComposerContextUsage::new(32000, 128000))
                 .chip(ComposerChip::new("attach").icon(Icon::Plus))
                 .chip(
                     ComposerChip::new("access")
@@ -186,14 +189,23 @@ impl InputsPage {
         subscriptions.push(cx.subscribe(
             &composer,
             |this, _, event: &ComposerEvent, cx| match event {
-                ComposerEvent::Submitted(text) => {
+                ComposerEvent::Submitted(submission) => {
                     this.composer
                         .update(cx, |composer, cx| composer.set_busy(true, cx));
                     this.toasts.update(cx, |host, cx| {
+                        let description = if submission.images.is_empty() {
+                            submission.text.to_string()
+                        } else {
+                            format!(
+                                "{}（含 {} 张图片）",
+                                submission.text,
+                                submission.images.len()
+                            )
+                        };
                         host.push(
                             Toast::new("已提交提示词")
                                 .kind(ToastKind::Success)
-                                .description(text.to_string()),
+                                .description(description),
                             cx,
                         );
                     });
@@ -209,12 +221,12 @@ impl InputsPage {
                     })
                     .detach();
                 }
-                ComposerEvent::Queued(text) => {
+                ComposerEvent::Queued(submission) => {
                     this.toasts.update(cx, |host, cx| {
                         host.push(
                             Toast::new("已加入队列")
                                 .kind(ToastKind::Info)
-                                .description(text.to_string()),
+                                .description(submission.text.to_string()),
                             cx,
                         );
                     });
@@ -245,7 +257,18 @@ impl InputsPage {
                         );
                     });
                 }
-                ComposerEvent::Changed(_) => {}
+                ComposerEvent::AttachmentError(error) => {
+                    this.toasts.update(cx, |host, cx| {
+                        host.push(
+                            Toast::new("无法添加图片")
+                                .kind(ToastKind::Error)
+                                .description(error.to_string()),
+                            cx,
+                        );
+                    });
+                }
+                ComposerEvent::StopRequested => { this.composer.update(cx, |composer, cx| composer.set_busy(false, cx)); }
+                ComposerEvent::Changed(_) | ComposerEvent::AttachmentsChanged => {}
             },
         ));
         let theme_selector = cx.new(|cx| ThemeSelector::new(cx).selected(theme).theme(theme));

@@ -319,7 +319,7 @@ pub async fn complete(
     if connection.tools.is_some() {
         params["dynamicTools"] = Value::Array(crate::tools::definitions(true).as_array().unwrap().iter()
             .map(|tool|json!({"type":"function","name":tool["name"],"description":tool["description"],"inputSchema":tool["input_schema"]})).collect());
-        params["baseInstructions"] = "You are Glint Agent. Use the registered tools to complete the user's task. File tools are scoped to the user's opened project; write and command tools require host approval.".into();
+        params["baseInstructions"] = "You are Glint Agent. Use the registered tools to complete the user's task. The host enforces the user's selected access mode for all tools: Ask requires confirmation for mutations, AutoApprove skips confirmation within the project file boundary, FullAccess also permits paths outside the project. @path mentions refer to files or directories; use tools to inspect them as needed.".into();
     }
     let thread = connection.rpc("thread/start", params).await?;
     let thread_id = thread["thread"]["id"]
@@ -372,7 +372,20 @@ pub async fn complete(
                 }
             }
             Some("thread/tokenUsage/updated") => {
-                metrics.usage(&event["params"]["tokenUsage"]["last"])
+                let usage = &event["params"]["tokenUsage"];
+                metrics.usage(&usage["last"]);
+                let capacity = usage["modelContextWindow"].as_u64();
+                metrics.set_context_window(capacity);
+                if let Some(context) = &connection.tools {
+                    let _ = context
+                        .events
+                        .try_send(crate::tools::ToolEvent::ContextUsage {
+                            provider_id: context.provider_id,
+                            model: context.model.clone(),
+                            used_tokens: metrics.context_tokens(),
+                            capacity_tokens: capacity,
+                        });
+                }
             }
             Some("turn/completed") => {
                 return completed_reply(&event, replies).map(|text| {
