@@ -141,6 +141,17 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
             },
             path.into(),
         ),
+        "session_read" => (
+            Icon::Text,
+            if running {
+                "正在读取会话"
+            } else if success {
+                "已读取会话"
+            } else {
+                "读取会话失败"
+            },
+            args["session_id"].as_str().unwrap_or("").into(),
+        ),
         name if name.starts_with("memory_") => (
             Icon::Text,
             if running {

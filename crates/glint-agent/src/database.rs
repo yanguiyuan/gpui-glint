@@ -20,8 +20,32 @@ pub fn open(anchor: &Path) -> Result<Connection, String> {
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
     connection
-        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")
+        .execute_batch("PRAGMA foreign_keys=ON;")
         .map_err(|e| e.to_string())?;
+    let journal: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        // Simultaneous first opens may race while switching journal modes.
+        // SQLite can report BUSY here without invoking the busy handler.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match connection.execute_batch("PRAGMA journal_mode=WAL;") {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.sqlite_error_code(),
+                        Some(
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(format!("无法启用 SQLite WAL：{error}")),
+            }
+        }
+    }
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| e.to_string())?;
@@ -152,7 +176,9 @@ pub fn load_history(anchor: &Path) -> Result<Option<Value>, String> {
 }
 pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<(), String> {
     let mut connection = open(anchor)?;
-    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
     transaction.execute_batch("CREATE TEMP TABLE keep_sessions(id TEXT PRIMARY KEY); CREATE TEMP TABLE keep_projects(path TEXT PRIMARY KEY);").map_err(|e|e.to_string())?;
     for (ordinal, project) in history.projects.iter().enumerate() {
         let path = project.to_string_lossy();
@@ -337,43 +363,45 @@ mod tests {
     }
     #[test]
     fn concurrent_first_open_and_independent_domain_writes_preserve_each_other() {
-        let dir = tempfile::tempdir().unwrap();
-        let anchor = dir.path().join("sessions.json");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let workers: Vec<_> = (0..3)
-            .map(|i| {
-                let anchor = anchor.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    match i {
-                        0 => save_history(&anchor, &History::default()),
-                        1 => save_catalog(
-                            &anchor,
-                            &ProviderCatalog {
-                                providers: vec![Config::default()],
-                                active: None,
-                                active_model: String::new(),
-                            },
-                        ),
-                        _ => save_schedules(&anchor, &[]),
-                    }
-                    .unwrap();
+        for _ in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let anchor = dir.path().join("sessions.json");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let workers: Vec<_> = (0..3)
+                .map(|i| {
+                    let anchor = anchor.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        match i {
+                            0 => save_history(&anchor, &History::default()),
+                            1 => save_catalog(
+                                &anchor,
+                                &ProviderCatalog {
+                                    providers: vec![Config::default()],
+                                    active: None,
+                                    active_model: String::new(),
+                                },
+                            ),
+                            _ => save_schedules(&anchor, &[]),
+                        }
+                        .unwrap();
+                    })
                 })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert!(load_history(&anchor).unwrap().is_some());
+            assert_eq!(
+                load_catalog(&anchor).unwrap().unwrap()["providers"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(load_schedules(&anchor).unwrap().is_some());
         }
-        assert!(load_history(&anchor).unwrap().is_some());
-        assert_eq!(
-            load_catalog(&anchor).unwrap().unwrap()["providers"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(load_schedules(&anchor).unwrap().is_some());
     }
     #[test]
     fn newer_database_is_rejected_without_rewriting_version() {
