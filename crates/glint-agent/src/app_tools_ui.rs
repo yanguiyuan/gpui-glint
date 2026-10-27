@@ -245,6 +245,17 @@ impl AgentWorkspace {
             while let Ok(event) = receiver.recv().await {
                 if weak
                     .update(cx, |this, cx| {
+                        // Request the bottom on the next layout, when the new
+                        // text/tool rows have their updated heights. Background
+                        // sessions and token-usage updates must not move this view.
+                        if !matches!(&event, tools::ToolEvent::ContextUsage { .. })
+                            && this
+                                .pending
+                                .as_ref()
+                                .is_some_and(|(id, _)| *id == this.history.active)
+                        {
+                            this.scroll.scroll_to_bottom();
+                        }
                         match event {
                             tools::ToolEvent::ContextUsage {
                                 provider_id,
