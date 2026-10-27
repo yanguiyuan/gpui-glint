@@ -1047,8 +1047,10 @@ impl Workbench {
                 field.set_completions(completions.clone(), cx)
             });
         }
-        self.body
-            .update(cx, |body, cx| body.set_completions(completions.clone(), cx));
+        self.body.update(cx, |body, cx| {
+            body.set_reference_resolver(Some(resolver.clone()), cx);
+            body.set_completions(completions.clone(), cx);
+        });
         if let Some(editor) = &self.directory_settings {
             let collection = self
                 .collections

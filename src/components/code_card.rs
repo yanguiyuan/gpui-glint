@@ -1,5 +1,6 @@
 use super::rich_text::{Format, RichText};
 use super::text_completion::{CompletionKey, CompletionState, TextCompletion, completion_menu};
+use super::text_reference::{TextReference, TextReferenceResolver, reference_colors, references};
 use crate::theme::ThemePreset;
 use gpui::AppContext;
 use gpui::prelude::FluentBuilder;
@@ -151,6 +152,44 @@ struct LineCache {
     width: Pixels,
 }
 
+/// Overlay reference colors without losing syntax runs, IME underlines, or UTF-8 offsets.
+fn reference_runs(
+    runs: Vec<TextRun>,
+    start: usize,
+    refs: &[TextReference],
+    theme: ThemePreset,
+) -> Vec<TextRun> {
+    if refs.is_empty() {
+        return runs;
+    }
+    let mut result = Vec::new();
+    let mut offset = start;
+    for run in runs {
+        let end = offset + run.len;
+        let mut boundaries = vec![offset, end];
+        for reference in refs {
+            if reference.range.start < end && reference.range.end > offset {
+                boundaries.push(reference.range.start.max(offset));
+                boundaries.push(reference.range.end.min(end));
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for pair in boundaries.windows(2) {
+            let mut part = run.clone();
+            part.len = pair[1] - pair[0];
+            if let Some(reference) = refs.iter().find(|r| r.range.contains(&pair[0])) {
+                let (foreground, background) = reference_colors(theme, reference.value.is_err());
+                part.color = gpui::rgb_to_hsla(rgb(foreground));
+                part.background_color = Some(gpui::rgb_to_hsla(rgb(background)));
+            }
+            result.push(part);
+        }
+        offset = end;
+    }
+    result
+}
+
 #[derive(Clone, Copy)]
 enum ScrollAxis {
     Horizontal,
@@ -194,6 +233,8 @@ pub struct CodeCard {
     language: SharedString,
     read_only: bool,
     completions: CompletionState,
+    reference_resolver: Option<TextReferenceResolver>,
+    reference_cache: Option<(SharedString, Rc<Vec<TextReference>>)>,
     show_header: bool,
     prose: bool,
     rich: Option<RichText>,
@@ -271,6 +312,86 @@ impl CodeCard {
         if self.completions.set_items(items) {
             cx.notify();
         }
+    }
+    /// Highlight template expressions and show their resolved values (or errors) on hover.
+    /// Display references never replace the source, selection, or clipboard contents.
+    pub fn set_reference_resolver(
+        &mut self,
+        resolver: Option<TextReferenceResolver>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reference_resolver = resolver;
+        self.reference_cache = None;
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn resolved_references(&mut self) -> Rc<Vec<TextReference>> {
+        if self.prose || self.reference_resolver.is_none() {
+            return Rc::default();
+        }
+        if let Some((content, references)) = &self.reference_cache
+            && content == &self.content
+        {
+            return references.clone();
+        }
+        let references = Rc::new(references(
+            &self.content,
+            self.reference_resolver.as_ref().unwrap(),
+        ));
+        self.reference_cache = Some((self.content.clone(), references.clone()));
+        references
+    }
+
+    fn reference_theme(&self) -> ThemePreset {
+        if self.dark {
+            ThemePreset::DarkObsidian
+        } else {
+            ThemePreset::Moonstone
+        }
+    }
+
+    fn reference_tooltips(
+        content: &str,
+        theme: ThemePreset,
+        refs: &[TextReference],
+        source_line: (usize, &EditorLine),
+        inset: Pixels,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let (start, line) = source_line;
+        let end = start + line.len();
+        refs.iter()
+            .filter_map(|reference| {
+                let from = reference.range.start.max(start);
+                let to = reference.range.end.min(end);
+                if from >= to {
+                    return None;
+                }
+                let expression = &content[reference.range.clone()];
+                let label = match &reference.value {
+                    Ok(value) => format!("{expression} → {value}"),
+                    Err(error) => format!("{expression} · {error}"),
+                };
+                let left = line.x_for_index(from - start);
+                let width = line.x_for_index(to - start) - left;
+                let offset = reference.range.start;
+                Some(
+                    super::Tooltip::new(div().size_full(), label)
+                        .theme(theme)
+                        .render(cx)
+                        .id(("code-reference", offset))
+                        .debug_selector(move || format!("code-reference-{offset}").into())
+                        .absolute()
+                        .left(inset + left)
+                        .top_0()
+                        .w(width)
+                        .h(height)
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
     fn handle_completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         if self.read_only {
@@ -433,6 +554,8 @@ impl CodeCard {
             language: language.into(),
             read_only: false,
             completions: CompletionState::default(),
+            reference_resolver: None,
+            reference_cache: None,
             show_header: true,
             prose: false,
             rich: None,
@@ -2307,6 +2430,8 @@ impl CodeCard {
         cx: &mut Context<Self>,
         colors: CodeColors,
     ) -> gpui::Div {
+        let refs = self.resolved_references();
+        let reference_theme = self.reference_theme();
         let mut font = window.text_style().font();
         font.family = "Menlo".into();
         let font_size = px(13.);
@@ -2461,6 +2586,7 @@ impl CodeCard {
                                         strikethrough: None,
                                     })
                                     .collect::<Vec<_>>();
+                                let runs = reference_runs(runs, start, &refs, reference_theme);
                                 EditorLine::shape(
                                     window,
                                     false,
@@ -2475,6 +2601,15 @@ impl CodeCard {
                             line.width + if summary.is_some() { px(200.) } else { px(0.) };
                         cache.width = cache.width.max(row_width);
                         let end = start + line.len();
+                        let reference_tooltips = Self::reference_tooltips(
+                            &content,
+                            reference_theme,
+                            &refs,
+                            (start, &line),
+                            px(0.),
+                            px(LINE_HEIGHT),
+                            cx,
+                        );
                         div()
                             .w_full()
                             .h(px(LINE_HEIGHT))
@@ -2532,6 +2667,7 @@ impl CodeCard {
                             .child(
                                 div().flex_1().min_w_0().h_full().overflow_hidden().child(
                                     div()
+                                        .relative()
                                         .ml(px(8.) + offset)
                                         .w(row_width + px(18.))
                                         .h_full()
@@ -2557,7 +2693,8 @@ impl CodeCard {
                                                 .whitespace_nowrap()
                                                 .text_color(rgb(colors.comment))
                                                 .child(summary)
-                                        })),
+                                        }))
+                                        .children(reference_tooltips),
                                 ),
                             )
                     })
@@ -2610,6 +2747,7 @@ impl Render for CodeCard {
         if self.viewport && self.read_only && !self.prose {
             return self.render_viewport(window, cx, colors);
         }
+        let refs = self.resolved_references();
         let focused = self.focus_handle.is_focused(window);
         let rich_mode = self.rich.is_some();
         let font_size = if rich_mode {
@@ -2813,7 +2951,7 @@ impl Render for CodeCard {
                 let runs = if let Some(rich) = &self.rich {
                     rich.runs(start..end, &font, window.text_style().color)
                 } else {
-                    runs
+                    reference_runs(runs, start, &refs, self.reference_theme())
                 };
                 let line = EditorLine::shape(
                     window,
@@ -2915,6 +3053,7 @@ impl Render for CodeCard {
                     .child((index + 1).to_string()),
             );
             let mut row = div()
+                .relative()
                 .min_w_full()
                 .h(line_height)
                 .pl(px(if rich_mode { 0. } else { 8. }))
@@ -2922,8 +3061,17 @@ impl Render for CodeCard {
             if !rich_mode {
                 row = row.bg(background);
             }
+            let reference_tooltips = Self::reference_tooltips(
+                &self.content,
+                self.reference_theme(),
+                &refs,
+                (start, &line),
+                px(if rich_mode { 0. } else { 8. }),
+                line_height,
+                cx,
+            );
             lines = lines.child(
-                row.child(CodeLine {
+                row.children(reference_tooltips).child(CodeLine {
                     search_matches: search_matches
                         .iter()
                         .filter_map(|hit| {
@@ -3196,6 +3344,125 @@ impl Focusable for CodeCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_reference_colors_preserve_syntax_utf8_and_ime_underlines() {
+        let source = "\"中文{{chat_id}}{{missing}}后缀\"";
+        let resolver: TextReferenceResolver = Rc::new(|expression| {
+            if expression == "{{chat_id}}" {
+                Ok("chat-123".into())
+            } else {
+                Err("未定义变量".into())
+            }
+        });
+        let refs = references(source, &resolver);
+        for theme in [ThemePreset::Moonstone, ThemePreset::DarkObsidian] {
+            let original = TextRun {
+                len: source.len(),
+                color: gpui::rgb_to_hsla(rgb(0xaabbcc)),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let runs = reference_runs(vec![original.clone()], 0, &refs, theme);
+            assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), source.len());
+            assert_eq!(runs.len(), 4);
+            assert_eq!(runs[0].len, "\"中文".len());
+            assert_eq!(runs[0].color, original.color);
+            assert_eq!(runs[3].color, original.color);
+            for (run, warning) in [(&runs[1], false), (&runs[2], true)] {
+                let (foreground, background) = reference_colors(theme, warning);
+                assert_eq!(run.color, gpui::rgb_to_hsla(rgb(foreground)));
+                assert_eq!(
+                    run.background_color,
+                    Some(gpui::rgb_to_hsla(rgb(background)))
+                );
+                assert!(run.underline.is_some());
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn template_references_resolve_refresh_and_preserve_editing_and_copy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_code_card_keys);
+        struct Viewer(Entity<CodeCard>);
+        impl Render for Viewer {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(500.)).h(px(180.)).child(self.0.clone())
+            }
+        }
+        let source = "{\n  \"中文\": \"{{chat_id}}\",\n  \"other\": \"{{missing}}\"\n}";
+        let selector: &'static str = Box::leak(
+            format!("code-reference-{}", source.find("{{chat_id}}").unwrap()).into_boxed_str(),
+        );
+        for viewport in [false, true] {
+            let editor = cx.new(|cx| {
+                let mut editor = CodeCard::new(cx, "json", source).show_header(false);
+                if viewport {
+                    editor = editor.read_only(true).viewport();
+                }
+                editor.set_reference_resolver(
+                    Some(Rc::new(|expression| match expression {
+                        "{{chat_id}}" => Ok("chat-123".into()),
+                        _ => Err("未定义变量".into()),
+                    })),
+                    cx,
+                );
+                editor
+            });
+            let (_, window) = cx.add_window_view(|_, _| Viewer(editor.clone()));
+            let reference = window.debug_bounds(selector).unwrap();
+            editor.update(window, |editor, _| {
+                let refs = editor.resolved_references();
+                assert_eq!(refs[0].value, Ok("chat-123".into()));
+                assert!(refs[1].value.is_err());
+                let (start, line, bounds) = editor
+                    .last_lines
+                    .iter()
+                    .find(|(start, line, _)| {
+                        refs[0].range.start >= *start && refs[0].range.end <= *start + line.len()
+                    })
+                    .unwrap();
+                assert!(
+                    (reference.left()
+                        - (bounds.left() + line.x_for_index(refs[0].range.start - start)))
+                    .abs()
+                        < px(1.),
+                    "reference hover bounds follow the source glyphs"
+                );
+            });
+            window.simulate_click(reference.center(), gpui::Modifiers::default());
+            window.simulate_keystrokes("ctrl-a ctrl-c");
+            assert_eq!(
+                window.read_from_clipboard().unwrap().text().unwrap(),
+                source
+            );
+            if !viewport {
+                window.simulate_input("改");
+                editor.read_with(window, |editor, _| assert_eq!(editor.content(), "改"));
+                window.simulate_keystrokes("ctrl-z");
+            }
+            editor.update(window, |editor, cx| {
+                editor.set_reference_resolver(Some(Rc::new(|_| Ok("chat-456".into()))), cx);
+            });
+            window.run_until_parked();
+            editor.update(window, |editor, cx| {
+                assert_eq!(editor.content(), source);
+                assert_eq!(editor.resolved_references()[0].value, Ok("chat-456".into()));
+                editor.set_content("前缀 {{unfinished", cx);
+            });
+            window.run_until_parked();
+            editor.update(window, |editor, cx| {
+                assert!(editor.resolved_references()[0].value.is_err());
+                editor.set_reference_resolver(None, cx);
+                assert!(editor.resolved_references().is_empty());
+            });
+        }
+    }
 
     #[gpui::test]
     fn shared_prose_editor_keeps_geometry_for_each_window(cx: &mut gpui::TestAppContext) {

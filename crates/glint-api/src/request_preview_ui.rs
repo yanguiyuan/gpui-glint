@@ -199,8 +199,12 @@ impl RequestPreview {
         } else {
             "text"
         };
+        let request_body = card(body_language, body, cx);
+        request_body.update(cx, |body, cx| {
+            body.set_reference_resolver(Some(snapshot.resolver.clone()), cx);
+        });
         let request_cards = vec![
-            card(body_language, body, cx),
+            request_body,
             card(
                 "http",
                 snapshot
