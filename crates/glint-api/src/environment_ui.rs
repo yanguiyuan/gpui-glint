@@ -949,6 +949,276 @@ impl Workbench {
     }
 }
 
+impl Workbench {
+    pub(super) fn environment_name(&self, index: usize) -> &str {
+        self.environment_names
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or("不使用环境")
+    }
+
+    pub(super) fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
+        self.request_reference_resolver(
+            &self.snapshot(cx),
+            self.requests
+                .get(self.active)
+                .map(|request| request.collection.as_str()),
+            cx,
+        )
+    }
+
+    pub(super) fn request_reference_resolver(
+        &self,
+        draft: &Draft,
+        collection: Option<&str>,
+        cx: &App,
+    ) -> TextReferenceResolver {
+        let values = self.environment_values(self.selected_environment(cx), collection);
+        let resolver = template::TemplateResolver::for_request(&values, draft);
+        std::rc::Rc::new(move |expression| match &resolver {
+            Ok(resolver) => resolver.resolve(expression),
+            Err(error) => Err(error.clone()),
+        })
+    }
+
+    pub(super) fn sync_reference_inputs(&mut self, cx: &mut Context<Self>) {
+        let resolver = self.reference_resolver(cx);
+        let mut completions = self.environment_completions(cx);
+        let oauth_completions = completions.clone();
+        completions.extend(
+            [
+                ("uuid()", "生成 UUID"),
+                ("random_id()", "生成随机 ID"),
+                ("random_int(0, 100)", "生成随机整数"),
+                ("random_string(16)", "生成随机字符串"),
+                ("random_name()", "生成随机姓名"),
+                ("now()", "当前时间"),
+                ("now('%Y-%m-%d')", "格式化日期"),
+                ("timestamp()", "Unix 秒级时间戳"),
+                ("timestamp_ms()", "Unix 毫秒级时间戳"),
+            ]
+            .map(|(expression, description)| TextCompletion::new(expression, description)),
+        );
+        let draft = self.snapshot(cx);
+        for cookie in draft
+            .cookies
+            .iter()
+            .filter(|pair| pair.enabled && !pair.key.trim().is_empty())
+        {
+            completions.push(TextCompletion::new(
+                format!(
+                    "cookie('{}')",
+                    cookie.key.replace('\\', "\\\\").replace('\'', "\\'")
+                ),
+                "读取请求 Cookie",
+            ));
+        }
+        for row in self
+            .params
+            .iter()
+            .chain(self.headers.iter())
+            .chain(self.cookies.iter())
+            .chain(self.form.iter())
+        {
+            for entry in [&row.key, &row.value] {
+                entry.update(cx, |entry, cx| {
+                    entry.set_reference_resolver(Some(resolver.clone()), cx);
+                    entry.set_completions(completions.clone(), cx)
+                });
+            }
+        }
+        let oauth_resolver = template::TemplateResolver::new(&self.active_environment_values(cx));
+        let oauth_resolver: TextReferenceResolver =
+            std::rc::Rc::new(move |expression| oauth_resolver.resolve(expression));
+        for entry in self
+            .oauth
+            .fields
+            .iter()
+            .chain(std::iter::once(&self.oauth.secret))
+        {
+            entry.update(cx, |entry, cx| {
+                entry.set_reference_resolver(Some(oauth_resolver.clone()), cx);
+                entry.set_completions(oauth_completions.clone(), cx)
+            });
+        }
+        for field in [&self.endpoint, &self.authentication] {
+            field.update(cx, |field, cx| {
+                field.set_reference_resolver(Some(resolver.clone()), cx);
+                field.set_completions(completions.clone(), cx)
+            });
+        }
+        self.body
+            .update(cx, |body, cx| body.set_completions(completions.clone(), cx));
+        if let Some(editor) = &self.directory_settings {
+            let collection = self
+                .collections
+                .get(editor.read(cx).collection)
+                .map(|c| c.collection.as_str());
+            let completions = self.environment_completions_for(cx, collection);
+            editor.update(cx, |editor, cx| {
+                editor.set_context(self.theme, completions, cx)
+            });
+        }
+    }
+
+    pub(super) fn selected_environment(&self, cx: &App) -> usize {
+        self.environment
+            .read(cx)
+            .value()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn environment_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let applied = self.selected_environment(cx);
+        let mut list = div().flex().flex_col().gap_2().px_2().py_3();
+        for (index, name) in self.environment_names.iter().enumerate().skip(1) {
+            let selected = self.editing_environment == index;
+            let scoped = self.editor_environment(index);
+            let base = scoped
+                .variables
+                .iter()
+                .find(|variable| variable.name == "base_url")
+                .map(|variable| variable.value.as_str())
+                .unwrap_or("");
+            let host = reqwest::Url::parse(base)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "未配置服务地址".into());
+            let caption = format!("{} 个变量", scoped.variables.len());
+            list = list.child(
+                div()
+                    .id(("environment-profile", index))
+                    .px_3()
+                    .py_3()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(if selected { p.accent } else { p.panel }))
+                    .bg(rgb(if selected { p.accent_tint } else { p.panel }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(p.accent_tint)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(if index == 2 {
+                                Icon::Code.render(15.)
+                            } else {
+                                Icon::Globe.render(15.)
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(name.clone()),
+                            )
+                            .when(index == applied, |row| {
+                                row.child(
+                                    div()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(p.accent))
+                                        .child("使用中"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .font_family("Menlo")
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .truncate()
+                            .child(host),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(caption),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.editing_environment = index;
+                        this.revealed_variables.clear();
+                        this.variable_delete = None;
+                        this.variable_error = None;
+                        this.variable_search
+                            .update(cx, |entry, cx| entry.set_value("", cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.panel))
+            .child(
+                div()
+                    .h(px(44.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("请求环境"))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("{} 个环境", self.environment_names.len() - 1)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .id("environment-list-scroll")
+                    .overflow_y_scroll()
+                    .child(list)
+                    .when(
+                        self.environment_names.len() > 1 || !self.collections.is_empty(),
+                        |list| {
+                            list.child(
+                                Button::new("创建环境")
+                                    .icon(Icon::Plus)
+                                    .kind(ButtonKind::Gray)
+                                    .size(ButtonSize::Mini)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "sidebar-create-environment".into())
+                                    .mx_2()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.begin_create_environment(window, cx);
+                                    })),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child("全局当前环境")
+                    .child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_color(rgb(p.text))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.accent)))
+                            .child(self.environment_name(applied).to_owned()),
+                    ),
+            )
+    }
+}
+
 #[cfg(test)]
 mod scope_tests {
     use super::*;
