@@ -38,6 +38,27 @@ fn memory_controls(
         )
 }
 
+fn memory_scope(card: &memory::Card) -> &'static str {
+    if card.project.is_some() {
+        "项目"
+    } else {
+        "全局"
+    }
+}
+
+fn matches_memory(card: &memory::Card, query: &str, scope: usize) -> bool {
+    let in_scope = match scope {
+        1 => card.project.is_some(),
+        2 => card.project.is_none(),
+        _ => true,
+    };
+    in_scope
+        && (query.is_empty()
+            || [&card.title, &card.summary, &card.category]
+                .iter()
+                .any(|text| text.to_lowercase().contains(query)))
+}
+
 pub struct State {
     pub settings: memory::Settings,
     pub cards: Vec<memory::Card>,
@@ -46,6 +67,10 @@ pub struct State {
     pub last_archive: String,
     pub time: Entity<TextEntry>,
     pub confirming: Option<Uuid>,
+    search: Entity<TextEntry>,
+    scope: usize,
+    show_settings: bool,
+    detail_scroll: ScrollHandle,
 }
 impl State {
     pub fn new(
@@ -56,7 +81,13 @@ impl State {
         let result = repository.settings();
         let notice = result.as_ref().err().cloned();
         let settings = result.unwrap_or_default();
+        let search = cx.new(|cx| TextEntry::new(cx, "搜索记忆名称、摘要或分类…", ""));
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
+            search,
+            scope: 0,
+            show_settings: false,
+            detail_scroll: ScrollHandle::new(),
             time: cx.new(|cx| {
                 TextEntry::new(
                     cx,
@@ -88,7 +119,21 @@ impl AgentWorkspace {
             .memory
             .list(self.history.active().project.as_deref(), 100)
         {
-            Ok(cards) => self.memory_ui.cards = cards,
+            Ok(cards) => {
+                self.memory_ui.cards = cards;
+                if let Some(id) = self
+                    .memory_ui
+                    .selected
+                    .as_ref()
+                    .map(|record| record.card.id)
+                {
+                    self.memory_ui.selected = self
+                        .memory
+                        .read(id, self.history.active().project.as_deref())
+                        .ok();
+                    self.memory_ui.confirming = None;
+                }
+            }
             Err(error) => self.memory_ui.notice = Some(error),
         }
         self.memory_ui.last_archive = self.memory.last_archive().unwrap_or_default();
@@ -172,44 +217,338 @@ impl AgentWorkspace {
         });
         self.reload_memories(cx);
     }
-    pub fn memory_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn select_memory(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        match self
+            .memory
+            .read(id, self.history.active().project.as_deref())
+        {
+            Ok(record) => {
+                self.memory_ui.selected = Some(record);
+                self.memory_ui.confirming = None;
+                self.memory_ui.detail_scroll = ScrollHandle::new();
+            }
+            Err(error) => self.memory_ui.notice = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn memory_preferences(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
         let state = &self.memory_ui;
         let recall_weak = cx.entity().downgrade();
         let nightly_weak = cx.entity().downgrade();
-        let mut page=div().w_full().max_w(px(820.)).mx_auto().flex().flex_col().gap_4()
-            .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("记忆"))
-            .child(div().text_color(rgb(p.text_muted)).child("根据当前意图回忆相关信息；原始对话保留在本机。"))
-            .child(div().p_4().rounded(px(12.)).border_1().border_color(rgb(p.border)).flex().flex_col().gap_4()
-                .child(div().flex().items_center().justify_between().child(Switch::new("自动语义回忆").checked(state.settings.automatic_recall).theme(self.theme).on_change(move |checked,_,cx|{let _=recall_weak.update(cx,|this,cx|{this.memory_ui.settings.automatic_recall=checked;this.save_memory_settings(cx);});}).render()))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("先理解问题意图，再筛选记忆摘要；模型按需读取全文。使用当前模型进行语义判断。"))
-                .child(div().flex().items_center().justify_between().child(Switch::new("每天整理对话").checked(state.settings.nightly_enabled).theme(self.theme).on_change(move |checked,_,cx|{let _=nightly_weak.update(cx,|this,cx|{this.memory_ui.settings.nightly_enabled=checked;this.save_memory_settings(cx);});}).render()))
-                .child(memory_controls(
-                    state.time.clone(),
-                    self.theme,
-                    Button::new("保存记忆设置").kind(ButtonKind::Gray).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|this.save_memory_settings(cx))),
-                    Button::new(if self.memory_task.is_some(){"正在整理…"}else{"立即整理"}).theme(self.theme).when(self.memory_task.is_some(),|button|button.disabled()).render().on_click(cx.listener(|this,_,_,cx|this.tick_memory(true,cx))),
-                ))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child(format!("下次：{} · 应用运行且对话空闲时执行；退出后在下次启动补处理。",state.settings.next_run.format("%m-%d %H:%M"))))
-                .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(state.last_archive.clone())))
-            .when_some(state.notice.clone(),|page,notice|page.child(div().p_3().rounded(px(8.)).bg(rgb(p.surface_subtle)).child(notice)))
-            .child(div().font_weight(FontWeight::MEDIUM).child(format!("当前项目与全局记忆 · {} 条（最近 100 条）",state.cards.len())));
-        if state.cards.is_empty() {
-            page = page.child(
+        div()
+            .id("memory-preferences")
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .p_4()
+            .bg(rgb(p.surface_subtle))
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                Switch::new("自动语义回忆")
+                    .checked(state.settings.automatic_recall)
+                    .theme(self.theme)
+                    .on_change(move |checked, _, cx| {
+                        let _ = recall_weak.update(cx, |this, cx| {
+                            this.memory_ui.settings.automatic_recall = checked;
+                            this.save_memory_settings(cx);
+                        });
+                    })
+                    .render(),
+            )
+            .child(
                 div()
-                    .p_5()
+                    .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child("尚无记忆。可以在对话中说“记住我的偏好”，或立即整理已有对话。"),
+                    .child("根据问题意图筛选相关记忆，使用当前模型进行判断，按需读取全文。"),
+            )
+            .child(
+                Switch::new("每天整理对话")
+                    .checked(state.settings.nightly_enabled)
+                    .theme(self.theme)
+                    .on_change(move |checked, _, cx| {
+                        let _ = nightly_weak.update(cx, |this, cx| {
+                            this.memory_ui.settings.nightly_enabled = checked;
+                            this.save_memory_settings(cx);
+                        });
+                    })
+                    .render(),
+            )
+            .child(memory_controls(
+                state.time.clone(),
+                self.theme,
+                Button::new("保存记忆设置")
+                    .kind(ButtonKind::Gray)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| this.save_memory_settings(cx))),
+                Button::new(if self.memory_task.is_some() {
+                    "正在整理…"
+                } else {
+                    "立即整理"
+                })
+                .theme(self.theme)
+                .when(self.memory_task.is_some(), |button| button.disabled())
+                .render()
+                .on_click(cx.listener(|this, _, _, cx| this.tick_memory(true, cx))),
+            ))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child(if state.settings.nightly_enabled {
+                        format!(
+                            "下次整理：{} · 应用运行且对话空闲时执行；退出后在下次启动补处理。",
+                            state.settings.next_run.format("%m-%d %H:%M")
+                        )
+                    } else {
+                        "自动整理已关闭，仍可随时手动整理。".into()
+                    }),
+            )
+            .when(!state.last_archive.is_empty(), |body| {
+                body.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted))
+                        .child(state.last_archive.clone()),
+                )
+            })
+    }
+
+    pub fn memory_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let state = &self.memory_ui;
+        // Both entries also follow the active theme when this settings page is opened.
+        state
+            .time
+            .update(cx, |entry, cx| entry.set_theme(self.theme, cx));
+        state
+            .search
+            .update(cx, |entry, cx| entry.set_theme(self.theme, cx));
+        let query = state.search.read(cx).value().trim().to_lowercase();
+        let filtered: Vec<_> = state
+            .cards
+            .iter()
+            .filter(|card| matches_memory(card, &query, state.scope))
+            .collect();
+        let status = format!(
+            "自动回忆{} · {}",
+            if state.settings.automatic_recall {
+                "已开启"
+            } else {
+                "已关闭"
+            },
+            if state.settings.nightly_enabled {
+                format!(
+                    "每天 {:02}:{:02} 整理",
+                    state.settings.hour, state.settings.minute
+                )
+            } else {
+                "自动整理已关闭".into()
+            }
+        );
+        let header = div()
+            .p_6()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(24.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("记忆"),
+                    )
+                    .child(
+                        Button::new("刷新记忆")
+                            .kind(ButtonKind::Gray)
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.memory_ui.notice = None;
+                                this.reload_memories(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(if state.show_settings {
+                            "收起设置"
+                        } else {
+                            "记忆设置"
+                        })
+                        .kind(ButtonKind::Gray)
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.memory_ui.show_settings = !this.memory_ui.show_settings;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(div().text_color(rgb(p.text_muted)).child(status))
+            .when_some(state.notice.clone(), |header, notice| {
+                header.child(
+                    div()
+                        .p_3()
+                        .rounded(px(8.))
+                        .bg(rgb(p.surface_subtle))
+                        .child(notice),
+                )
+            });
+        let weak = cx.entity().downgrade();
+        let mut list = div()
+            .id("memory-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child(format!(
+                        "显示 {} / {} 条 · 最近 100 条",
+                        filtered.len(),
+                        state.cards.len()
+                    )),
             );
+        if filtered.is_empty() {
+            list = list.child(div().p_3().text_color(rgb(p.text_muted)).child(
+                if state.cards.is_empty() {
+                    "尚无记忆。在对话中说“记住我的偏好”，或在记忆设置中整理已有对话。"
+                } else {
+                    "没有匹配的记忆，试试其他关键词或切换范围。"
+                },
+            ));
         }
-        for card in &state.cards {
+        for card in filtered {
             let id = card.id;
             let selected = state
                 .selected
                 .as_ref()
-                .filter(|record| record.card.id == id);
-            let read = id;
-            let weak = cx.entity().downgrade();
+                .is_some_and(|record| record.card.id == id);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("memory:{id}")))
+                    .p_3()
+                    .flex_shrink_0()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(if selected { p.accent } else { p.border }))
+                    .bg(rgb(if selected { p.accent_tint } else { p.panel }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(p.surface_subtle)))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(card.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(memory_scope(card)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(preview_line(&card.summary, 85)),
+                    )
+                    .when(!card.category.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(card.category.clone()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_memory(id, cx))),
+            );
+        }
+        let sidebar = div()
+            .w(gpui::relative(0.36))
+            .min_w(px(240.))
+            .max_w(px(380.))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .border_r_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .p_3()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        SearchInput::new("搜索记忆")
+                            .control(state.search.clone())
+                            .theme(self.theme)
+                            .render()
+                            .w_full(),
+                    )
+                    .child(
+                        SegmentedControl::new([
+                            SegmentOption::new("全部"),
+                            SegmentOption::new("项目"),
+                            SegmentOption::new("全局"),
+                        ])
+                        .id("memory-scope")
+                        .selected(state.scope)
+                        .theme(self.theme)
+                        .on_change(move |index, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.memory_ui.scope = index;
+                                cx.notify();
+                            });
+                        })
+                        .render()
+                        .w_full(),
+                    ),
+            )
+            .child(list);
+        let mut detail = div()
+            .id("memory-detail")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.panel));
+        if let Some(record) = &state.selected {
+            let id = record.card.id;
             let confirm = div()
                 .flex()
                 .flex_col()
@@ -225,28 +564,23 @@ impl AgentWorkspace {
                                 .memory
                                 .delete(id, this.history.active().project.as_deref());
                             this.memory_ui.confirming = None;
-                            this.memory_ui.notice = result.err();
-                            if this
-                                .memory_ui
-                                .selected
-                                .as_ref()
-                                .is_some_and(|record| record.card.id == id)
-                            {
-                                this.memory_ui.selected = None;
+                            match result {
+                                Ok(()) => {
+                                    this.memory_ui.selected = None;
+                                    this.memory_ui.notice =
+                                        Some("记忆已删除，原始会话已保留。".into());
+                                }
+                                Err(error) => this.memory_ui.notice = Some(error),
                             }
                             this.reload_memories(cx);
                         })),
                 );
-            let trigger = IconButton::new(Icon::Trash, format!("删除记忆 {}", card.title))
-                .plain()
-                .theme(self.theme)
-                .render();
-            page = page.child(
+            let weak = cx.entity().downgrade();
+            detail = detail.child(
                 div()
-                    .id(SharedString::from(format!("memory:{id}")))
                     .p_4()
-                    .rounded(px(10.))
-                    .border_1()
+                    .flex_shrink_0()
+                    .border_b_1()
                     .border_color(rgb(p.border))
                     .flex()
                     .flex_col()
@@ -259,23 +593,19 @@ impl AgentWorkspace {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(18.))
+                                    .text_ellipsis()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(card.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(if card.project.is_some() {
-                                        "项目"
-                                    } else {
-                                        "全局记忆"
-                                    }),
+                                    .child(record.card.title.clone()),
                             )
                             .child(
                                 Popover::new(
                                     SharedString::from(format!("delete-memory:{id}")),
-                                    trigger,
+                                    IconButton::new(Icon::Trash, "删除记忆")
+                                        .plain()
+                                        .theme(self.theme)
+                                        .render(),
                                     confirm,
                                 )
                                 .open(state.confirming == Some(id))
@@ -288,80 +618,155 @@ impl AgentWorkspace {
                                         });
                                     },
                                 ),
+                            )
+                            .child(
+                                IconButton::new(Icon::Close, "关闭记忆详情")
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.memory_ui.selected = None;
+                                        this.memory_ui.confirming = None;
+                                        cx.notify();
+                                    })),
                             ),
                     )
                     .child(
                         div()
+                            .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child(card.summary.clone()),
+                            .child(format!(
+                                "{} · {}",
+                                memory_scope(&record.card),
+                                record.card.category
+                            )),
+                    ),
+            );
+            detail = detail.child(
+                div()
+                    .id("memory-detail-scroll")
+                    .track_scroll(&state.detail_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .child(
+                        div()
+                            .mb_3()
+                            .text_color(rgb(p.text_muted))
+                            .child(record.card.summary.clone()),
                     )
                     .child(
-                        Button::new(if selected.is_some() {
-                            "收起记忆和来源"
-                        } else {
-                            "查看记忆和来源"
-                        })
-                        .kind(ButtonKind::Plain)
-                        .size(ButtonSize::Small)
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this
-                                .memory_ui
-                                .selected
-                                .as_ref()
-                                .is_some_and(|record| record.card.id == read)
-                            {
-                                this.memory_ui.selected = None;
-                            } else {
-                                match this
-                                    .memory
-                                    .read(read, this.history.active().project.as_deref())
-                                {
-                                    Ok(record) => this.memory_ui.selected = Some(record),
-                                    Err(error) => this.memory_ui.notice = Some(error),
-                                }
-                            }
-                            cx.notify();
-                        })),
+                        div()
+                            .mb_4()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("更新于 {}", record.card.updated_at)),
                     )
-                    .when_some(selected, |card, record| {
-                        card.child(
+                    .child(self.markdown_text(
+                        "memory-settings-preview".into(),
+                        &record.content,
+                        cx,
+                    ))
+                    .when(!record.keywords.is_empty(), |body| {
+                        body.child(
                             div()
-                                .w_full()
-                                .min_w_0()
-                                .mt_2()
-                                .p_3()
-                                .rounded(px(8.))
-                                .bg(rgb(p.surface_subtle))
-                                .flex()
-                                .flex_col()
-                                .gap_3()
-                                .child(record.content.clone())
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(format!("来源：{}", record.source)),
-                                ),
+                                .mt_4()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(format!("关键词：{}", record.keywords.join("、"))),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .mt_6()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(rgb(p.border))
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(div().font_weight(FontWeight::MEDIUM).child("来源记录"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(
+                                        "记忆来源于历史对话，可能随时间变化；原始对话保留在本机。",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded(px(8.))
+                                    .bg(rgb(p.surface_subtle))
+                                    .text_size(px(11.))
+                                    .font_family("monospace")
+                                    .child(
+                                        serde_json::to_string_pretty(&record.source)
+                                            .unwrap_or_default(),
+                                    ),
+                            ),
+                    ),
             );
-        }
-        div().size_full().child(
-            div()
-                .id("memory-settings")
-                .size_full()
-                .overflow_y_scroll()
+        } else {
+            detail = detail
+                .items_center()
+                .justify_center()
+                .gap_3()
                 .p_6()
-                .child(page),
-        )
+                .child(Icon::Database.render(28.).text_color(rgb(p.text_muted)))
+                .child(div().font_weight(FontWeight::MEDIUM).child("选择一条记忆"))
+                .child(
+                    div()
+                        .text_color(rgb(p.text_muted))
+                        .child("在左侧选择记忆，在这里查看正文和来源。"),
+                );
+        }
+        div()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .when(state.show_settings, |page| {
+                page.child(self.memory_preferences(cx).flex_shrink_0())
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .child(sidebar)
+                    .child(detail),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_filters_combine_scope_with_title_summary_and_category() {
+        let mut card = memory::Card {
+            id: Uuid::new_v4(),
+            title: "GPUI layout".into(),
+            summary: "自动滚动".into(),
+            category: "交互".into(),
+            project: None,
+            updated_at: String::new(),
+            reason: String::new(),
+        };
+        assert!(matches_memory(&card, "gpui", 0));
+        assert!(matches_memory(&card, "滚动", 2));
+        assert!(matches_memory(&card, "交互", 0));
+        assert!(!matches_memory(&card, "", 1));
+        assert!(!matches_memory(&card, "missing", 0));
+        card.project = Some(PathBuf::from("/project"));
+        assert!(matches_memory(&card, "gpui", 1));
+        assert!(!matches_memory(&card, "gpui", 2));
+    }
 
     struct ControlsPreview {
         time: Entity<TextEntry>,
