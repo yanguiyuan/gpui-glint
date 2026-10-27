@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Glint Vault",
+  "version": "0.1.0",
+  "description": "从本机 Glint 密码箱选择账号，经确认后填充当前网站。",
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "background": {"service_worker": "background.mjs", "type": "module"},
+  "action": {"default_title": "Glint Vault", "default_popup": "popup.html"},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

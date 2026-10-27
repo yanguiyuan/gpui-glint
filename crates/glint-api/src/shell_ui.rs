@@ -18,7 +18,9 @@ impl Workbench {
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
-                    .child(if self.show_proxies {
+                    .child(if self.show_vault {
+                        "›  密码箱".into()
+                    } else if self.show_proxies {
                         "›  代理管理".into()
                     } else if self.show_mcp {
                         "›  MCP".into()
@@ -84,7 +86,7 @@ impl Workbench {
             )
             .child(self.background_tasks_menu(cx))
             .when(
-                !self.show_environments && !self.show_plugins && !self.show_mcp,
+                !self.show_vault && !self.show_environments && !self.show_plugins && !self.show_mcp,
                 |bar| {
                     bar.child(
                         IconButton::new(Icon::Sidebar, "展开或收起记录")
@@ -119,6 +121,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_vault = false;
                         this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_environments = false;
@@ -132,6 +135,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_vault = false;
                         this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_plugins = false;
@@ -155,6 +159,7 @@ impl Workbench {
                     })
                     .debug_selector(|| "open-proxy-manager".into())
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_vault = false;
                         this.show_proxies = true;
                         this.show_environments = false;
                         this.show_plugins = false;
@@ -175,6 +180,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_vault = false;
                         this.show_proxies = false;
                         this.show_mcp = false;
                         this.show_plugins = false;
@@ -193,6 +199,23 @@ impl Workbench {
                     })
                     .debug_selector(|| "open-mcp-history".into())
                     .on_click(cx.listener(|this, _, _, cx| this.open_mcp_history(cx))),
+            )
+            .child(
+                IconButton::new(Icon::Key, "密码箱")
+                    .theme(self.theme)
+                    .render()
+                    .when(self.show_vault, |button| {
+                        button.bg(rgb(self.theme.palette().accent_tint))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_vault = true;
+                        this.show_proxies = false;
+                        this.show_mcp = false;
+                        this.show_plugins = false;
+                        this.show_environments = false;
+                        this.directory_settings = None;
+                        cx.notify();
+                    })),
             )
             .child(div().flex_1())
             .child(self.update_button(cx))
@@ -565,6 +588,12 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.show_proxies || self.show_mcp || self.show_plugins || self.show_environments {
+            self.show_vault = false;
+        }
+        self.vault.update(cx, |vault, cx| {
+            vault.set_host_state(self.show_vault, self.theme, cx)
+        });
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         {
             self.activate_html_window(window, cx);
@@ -626,7 +655,9 @@ impl Render for Workbench {
             .min_h_0()
             .min_w_0()
             .flex()
-            .child(if self.show_proxies {
+            .child(if self.show_vault {
+                div().size_full().child(self.vault.clone())
+            } else if self.show_proxies {
                 self.proxy_workspace(cx)
             } else if self.show_mcp {
                 self.mcp_history_workspace(cx)
@@ -641,6 +672,7 @@ impl Render for Workbench {
             })
             .when(
                 self.show_activity
+                    && !self.show_vault
                     && self.shared_request_editor(self.active).is_none()
                     && !self.show_proxies
                     && !self.show_environments
@@ -694,6 +726,7 @@ impl Render for Workbench {
             AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
                 .navigation_rail(self.rail(cx))
                 .navigation_rail_width(46.)
+                .sidebar_visible(!self.show_vault)
                 .sidebar_width(self.sidebar_width)
                 .sidebar_resize_handle(resize_handle)
                 .theme(self.theme)
@@ -756,6 +789,10 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
+                if this.show_vault {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.request_binding.is_some() {
                     cx.stop_propagation();
                 }
@@ -779,6 +816,10 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
+                if this.show_vault {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.request_binding.is_some() {
                     cx.stop_propagation();
                 }
@@ -800,6 +841,10 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
+                if this.show_vault {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.request_binding.is_some() {
                     cx.stop_propagation();
                 }

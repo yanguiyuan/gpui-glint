@@ -207,3 +207,7 @@ tests/               集成测试与性能基准
 ```
 
 可选插件体系：启用 `plugins` feature 后，可使用通用 JS 插件契约与原生 `PluginPage` 页面组件。默认 UI 库不加载 JS 引擎。详见 [插件集成](docs/plugins.md)。
+
+### Glint Vault
+
+`crates/glint-vault` 提供本地加密密码箱、可嵌入的原生页面和 Chrome / Edge 扩展。独立运行：`cargo run -p glint-vault`；Glint API / Agent 可从侧栏钥匙图标打开同一个密码箱。集成与共享存储说明见 [Glint Vault](crates/glint-vault/README.md)。

@@ -2,6 +2,7 @@ use super::*;
 
 impl Workbench {
     pub(super) fn open_mcp_history(&mut self, cx: &mut Context<Self>) {
+        self.show_vault = false;
         self.show_proxies = false;
         self.show_mcp = true;
         self.show_plugins = false;

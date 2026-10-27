@@ -65,6 +65,7 @@ pub struct TextEntry {
     active_window: Option<gpui::WindowId>,
     window_layouts: std::collections::HashMap<gpui::WindowId, WindowLayout>,
     read_only: bool,
+    masked: bool,
     completions: CompletionState,
     fit_content: bool,
     reference_resolver: Option<TextReferenceResolver>,
@@ -114,7 +115,7 @@ impl TextEntry {
         }
     }
     fn choose_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only || self.marked_range.is_some() {
+        if self.masked || self.read_only || self.marked_range.is_some() {
             return;
         }
         if let Some(active) = self
@@ -134,7 +135,8 @@ impl TextEntry {
         cx: &mut Context<Self>,
     ) {
         let modifiers = &event.keystroke.modifiers;
-        if self.read_only
+        if self.masked
+            || self.read_only
             || modifiers.platform
             || modifiers.control
             || modifiers.alt
@@ -163,6 +165,41 @@ impl TextEntry {
         self.read_only = value;
         self
     }
+    /// Mask secret input and disable selection copy/cut and template suggestions.
+    /// This hides rendering and native text queries, not all copies in process memory.
+    pub fn masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
+        self
+    }
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked != masked {
+            self.masked = masked;
+            self.last_layout = None;
+            self.window_layouts.clear();
+            cx.notify();
+        }
+    }
+    fn display_offset(&self, offset: usize) -> usize {
+        if self.masked {
+            self.content[..offset.min(self.content.len())]
+                .chars()
+                .count()
+                * '•'.len_utf8()
+        } else {
+            offset
+        }
+    }
+    fn content_offset(&self, offset: usize) -> usize {
+        if self.masked {
+            self.content
+                .char_indices()
+                .nth(offset / '•'.len_utf8())
+                .map_or(self.content.len(), |(index, _)| index)
+        } else {
+            offset
+        }
+    }
+
     /// Keep the full text width, for example inside a horizontally scrolling cell.
     pub fn fit_content(mut self) -> Self {
         self.fit_content = true;
@@ -241,6 +278,7 @@ impl TextEntry {
             active_window: None,
             window_layouts: Default::default(),
             read_only: false,
+            masked: false,
             completions: CompletionState::default(),
             fit_content: false,
             reference_resolver: None,
@@ -422,6 +460,9 @@ impl TextEntry {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masked {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -430,7 +471,7 @@ impl TextEntry {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+        if self.masked || self.read_only {
             return;
         }
         if !self.selected_range.is_empty() {
@@ -488,7 +529,7 @@ impl TextEntry {
         let (Some(bounds), Some(line)) = (&self.last_bounds, &self.last_layout) else {
             return 0;
         };
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        self.content_offset(line.closest_index_for_x(position.x - bounds.left() + self.scroll_x))
     }
 }
 
@@ -502,7 +543,11 @@ impl EntityInputHandler for TextEntry {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        Some(if self.masked {
+            "*".repeat(self.content[range].encode_utf16().count())
+        } else {
+            self.content[range].to_string()
+        })
     }
 
     fn selected_text_range(
@@ -608,11 +653,11 @@ impl EntityInputHandler for TextEntry {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + line.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + line.x_for_index(self.display_offset(range.start)) - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + line.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + line.x_for_index(self.display_offset(range.end)) - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -627,9 +672,9 @@ impl EntityInputHandler for TextEntry {
         self.activate_window(window, _cx);
         let bounds = self.last_bounds?;
         let line = self.last_layout.as_ref()?;
-        Some(
-            self.offset_to_utf16(line.closest_index_for_x(point.x - bounds.left() + self.scroll_x)),
-        )
+        Some(self.offset_to_utf16(
+            self.content_offset(line.closest_index_for_x(point.x - bounds.left() + self.scroll_x)),
+        ))
     }
 }
 
@@ -691,6 +736,8 @@ impl Element for TextEntryElement {
         let placeholder = input.content.is_empty();
         let display_text = if placeholder {
             input.placeholder.clone()
+        } else if input.masked {
+            "•".repeat(input.content.chars().count()).into()
         } else {
             input.content.clone()
         };
@@ -714,6 +761,7 @@ impl Element for TextEntryElement {
         let refs = input
             .reference_resolver
             .as_ref()
+            .filter(|_| !input.masked)
             .map(|resolver| references(&input.content, resolver))
             .unwrap_or_default();
         let mut boundaries = vec![0, display_text.len()];
@@ -721,9 +769,15 @@ impl Element for TextEntryElement {
             boundaries.extend([reference.range.start, reference.range.end]);
         }
         if !placeholder {
-            boundaries.extend([input.selected_range.start, input.selected_range.end]);
+            boundaries.extend([
+                input.display_offset(input.selected_range.start),
+                input.display_offset(input.selected_range.end),
+            ]);
             if let Some(marked) = &input.marked_range {
-                boundaries.extend([marked.start, marked.end]);
+                boundaries.extend([
+                    input.display_offset(marked.start),
+                    input.display_offset(marked.end),
+                ]);
             }
         }
         let boundaries = text_run_boundaries(&display_text, boundaries);
@@ -733,8 +787,8 @@ impl Element for TextEntryElement {
                 let start = range[0];
                 let selected = !placeholder
                     && focused
-                    && start >= input.selected_range.start
-                    && start < input.selected_range.end;
+                    && start >= input.display_offset(input.selected_range.start)
+                    && start < input.display_offset(input.selected_range.end);
                 let color = if selected {
                     gpui::rgb_to_hsla(rgb(0xffffff))
                 } else if let Some(reference) = refs
@@ -746,10 +800,10 @@ impl Element for TextEntryElement {
                     run.color
                 };
                 let composing = !placeholder
-                    && input
-                        .marked_range
-                        .as_ref()
-                        .is_some_and(|marked| start >= marked.start && start < marked.end);
+                    && input.marked_range.as_ref().is_some_and(|marked| {
+                        start >= input.display_offset(marked.start)
+                            && start < input.display_offset(marked.end)
+                    });
                 TextRun {
                     letter_spacing: None,
                     len: range[1] - start,
@@ -774,7 +828,8 @@ impl Element for TextEntryElement {
             None,
         );
         let scroll_x = if focused && !input.fit_content {
-            let caret = line.x_for_index(input.cursor_offset().min(line.len()));
+            let caret =
+                line.x_for_index(input.display_offset(input.cursor_offset()).min(line.len()));
             let available = (bounds.size.width - px(2.)).max(px(1.));
             let maximum = (line.width - available).max(px(0.));
             let mut offset = input.scroll_x.min(maximum);
@@ -797,7 +852,8 @@ impl Element for TextEntryElement {
                 fill(
                     Bounds::new(
                         point(
-                            bounds.left() + line.x_for_index(input.cursor_offset()),
+                            bounds.left()
+                                + line.x_for_index(input.display_offset(input.cursor_offset())),
                             bounds.top(),
                         ),
                         size(px(1.5), bounds.bottom() - bounds.top()),
@@ -811,11 +867,14 @@ impl Element for TextEntryElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(input.selected_range.start),
+                            bounds.left()
+                                + line
+                                    .x_for_index(input.display_offset(input.selected_range.start)),
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(input.selected_range.end),
+                            bounds.left()
+                                + line.x_for_index(input.display_offset(input.selected_range.end)),
                             bounds.bottom(),
                         ),
                     ),
@@ -850,7 +909,7 @@ impl Element for TextEntryElement {
                     background
                 })
                 .collect(),
-            search_highlights: if placeholder {
+            search_highlights: if placeholder || input.masked {
                 Vec::new()
             } else {
                 super::search_highlight::match_ranges(&input.content, &input.search_query)
@@ -943,6 +1002,7 @@ impl Render for TextEntry {
         let refs = self
             .reference_resolver
             .as_ref()
+            .filter(|_| !self.masked)
             .map(|resolver| references(&self.content, resolver))
             .unwrap_or_default();
         let preview = !self.focus_handle.is_focused(window) && !refs.is_empty();
@@ -986,7 +1046,7 @@ impl Render for TextEntry {
             .line_height(px(self.font_size * 1.5))
             .text_size(px(self.font_size))
             .text_color(rgb(theme.color(0x292d32)));
-        if self.fit_content {
+        if self.fit_content && !self.masked {
             let style = window.text_style();
             let line = window.text_system().shape_line(
                 self.content.clone(),
@@ -1078,6 +1138,7 @@ impl Render for TextEntry {
             root = root.child(TextEntryElement { input: cx.entity() });
         }
         if self.focus_handle.is_focused(window)
+            && !self.masked
             && !self.read_only
             && let Some(active) = self.completions.active(
                 &self.content,
@@ -1151,6 +1212,37 @@ fn text_run_boundaries(text: &str, offsets: impl IntoIterator<Item = usize>) -> 
 mod selection_tests {
     use super::*;
     use gpui::AppContext;
+
+    #[gpui::test]
+    fn masked_input_hides_unicode_layout_native_text_and_clipboard(cx: &mut gpui::TestAppContext) {
+        let (entry, window) =
+            cx.add_window_view(|_, cx| TextEntry::new(cx, "Password", "秘密😀a").masked(true));
+        window.update(|window, cx| {
+            entry.update(cx, |entry, cx| {
+                assert_eq!(entry.display_offset("秘密😀".len()), 9);
+                assert_eq!(entry.content_offset(9), "秘密😀".len());
+                assert_eq!(entry.last_layout.as_ref().unwrap().text.as_ref(), "••••");
+                let mut range = None;
+                assert_eq!(
+                    entry.text_for_range(0..6, &mut range, window, cx).unwrap(),
+                    "*****"
+                );
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep clipboard".to_owned()));
+                entry.selected_range = 0..entry.content.len();
+                entry.copy(&Copy, window, cx);
+                entry.cut(&Cut, window, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().unwrap(),
+                    "keep clipboard"
+                );
+                assert_eq!(entry.value(), "秘密😀a");
+                entry.set_masked(false, cx);
+            })
+        });
+        entry.read_with(window, |entry, _| {
+            assert_eq!(entry.last_layout.as_ref().unwrap().text.as_ref(), "秘密😀a")
+        });
+    }
 
     #[gpui::test]
     fn shared_text_entry_uses_the_clicked_windows_geometry(cx: &mut gpui::TestAppContext) {

@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="popup.css"><title>Glint Vault</title></head>
+<body>
+  <header><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 8 8m-4-4 3-3m-6 0 3-3"/></svg><strong>Glint Vault</strong><button id="refresh" title="重新连接" aria-label="重新连接">↻</button></header>
+  <main><p id="site">正在连接本机密码箱…</p><p id="status" role="status" aria-live="polite"></p><div id="entries"></div></main>
+  <footer>先在 Glint Vault / API / Agent 中解锁密码箱。选择账号后，在本机确认本次填充。</footer>
+  <script type="module" src="popup.mjs"></script>
+</body></html>

@@ -687,6 +687,7 @@ mod remote_tests {
 
 impl Workbench {
     pub(super) fn open_plugin_manager(&mut self, cx: &mut Context<Self>) {
+        self.show_vault = false;
         self.show_proxies = false;
         self.show_mcp = false;
         self.show_plugins = true;

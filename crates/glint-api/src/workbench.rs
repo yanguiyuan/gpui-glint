@@ -61,6 +61,8 @@ pub(super) struct Workbench {
     pub(super) storage_dirty: bool,
     pub(super) focus: FocusHandle,
     pub(super) theme: ThemePreset,
+    pub(super) show_vault: bool,
+    pub(super) vault: Entity<glint_vault::VaultPage>,
     pub(super) requests: Vec<Request>,
     pub(super) collections: Vec<RequestGroups>,
     pub(super) current_collection: usize,
@@ -707,6 +709,10 @@ impl Workbench {
             responses: data.responses,
             focus: cx.focus_handle(),
             theme: ThemePreset::Moonstone,
+            show_vault: false,
+            vault: cx.new(|cx| {
+                glint_vault::VaultPage::new(glint_vault::default_path(), ThemePreset::Moonstone, cx)
+            }),
             requests,
             collections,
             current_collection: 0,
@@ -919,6 +925,17 @@ impl Workbench {
         let subscription = cx.observe_self(|this, cx| this.persist(cx));
         this.subscriptions.push(subscription);
         this.set_theme(ThemePreset::Moonstone, cx);
+        this.subscriptions.push(cx.subscribe(
+            &this.vault,
+            |this, _, _: &glint_vault::VaultEvent, cx| {
+                this.show_vault = true;
+                this.show_proxies = false;
+                this.show_environments = false;
+                this.show_plugins = false;
+                this.show_mcp = false;
+                cx.notify();
+            },
+        ));
         this
     }
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/glint-api", "crates/glint-agent", "crates/glint-plugin", "crates/glint-plugin-registry", "crates/glint-plugin-server", "crates/glint-plugin-cli"]
+members = [".", "crates/glint-api", "crates/glint-agent", "crates/glint-vault", "crates/glint-plugin", "crates/glint-plugin-registry", "crates/glint-plugin-server", "crates/glint-plugin-cli"]
 default-members = ["."]
 resolver = "3"
 

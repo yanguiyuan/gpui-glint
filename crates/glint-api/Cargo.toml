@@ -12,6 +12,7 @@ default = ["webview"]
 webview = ["gpui-glint/webview"]
 
 [dependencies]
+glint-vault = { path = "../glint-vault" }
 gpui-glint = { path = "../..", features = ["plugins"] }
 glint-plugin-registry = { path = "../glint-plugin-registry" }
 gpui = { package = "gpui-ce", version = "=0.2.2" }
