@@ -2,6 +2,24 @@ use super::*;
 use gpui_glint::components::Switch;
 use std::sync::Arc;
 
+// Metadata is shown above the instructions. Keep YAML descriptions from
+// becoming accidental Markdown headings in the reading pane.
+fn skill_instructions(source: &str) -> &str {
+    let source = source.trim_start_matches('\u{feff}');
+    let mut lines = source.split_inclusive('\n');
+    let Some(first) = lines.next().filter(|line| line.trim() == "---") else {
+        return source;
+    };
+    let mut offset = first.len();
+    for line in lines {
+        offset += line.len();
+        if line.trim() == "---" {
+            return &source[offset..];
+        }
+    }
+    source
+}
+
 fn context_sections(catalog: Option<&skills::Catalog>) -> Vec<ComposerContextSection> {
     let mut entries: Vec<_> = catalog
         .into_iter()
@@ -40,7 +58,8 @@ pub struct State {
     task: Option<Task<()>>,
     search: Entity<TextEntry>,
     notice: Option<String>,
-    selected: Option<(String, String)>,
+    selected: Option<(String, Result<String, String>)>,
+    detail_scroll: ScrollHandle,
 }
 impl State {
     pub fn set_theme(&self, theme: ThemePreset, cx: &mut Context<AgentWorkspace>) {
@@ -56,6 +75,7 @@ impl State {
             search,
             notice: None,
             selected: None,
+            detail_scroll: ScrollHandle::new(),
         }
     }
 }
@@ -82,6 +102,7 @@ impl AgentWorkspace {
     }
     pub fn reset_skill_context(&mut self, cx: &mut Context<Self>) {
         self.skills_ui.catalog = None;
+        self.skills_ui.selected = None;
         self.sync_skill_context(cx);
         self.reload_skills(cx);
     }
@@ -121,9 +142,14 @@ impl AgentWorkspace {
                 }
                 match result {
                     Ok(catalog) => {
+                        this.skills_ui.selected = this
+                            .skills_ui
+                            .selected
+                            .as_ref()
+                            .filter(|(id, _)| catalog.skills.iter().any(|skill| skill.id == *id))
+                            .map(|(id, _)| (id.clone(), catalog.preview(id)));
                         this.skills_ui.catalog = Some(Arc::new(catalog));
                         this.skills_ui.notice = None;
-                        this.skills_ui.selected = None;
                         this.sync_skill_context(cx);
                     }
                     Err(error) => this.skills_ui.notice = Some(error),
@@ -159,171 +185,199 @@ impl AgentWorkspace {
         })
         .detach();
     }
+    fn open_skill_preview(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(catalog) = &self.skills_ui.catalog {
+            let content = catalog.preview(&id);
+            self.skills_ui.selected = Some((id, content));
+            self.skills_ui.detail_scroll = ScrollHandle::new();
+            cx.notify();
+        }
+    }
+
     pub fn skills_page(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let state = &self.skills_ui;
-        let query = state.search.read(cx).value().to_lowercase();
-        let mut page=div().w_full().max_w(px(820.)).mx_auto().flex().flex_col().gap_4()
-            .child(div().text_size(px(28.)).font_weight(FontWeight::SEMIBOLD).child("技能"))
-            .child(div().text_color(rgb(p.text_muted)).child("先提供技能描述，按需读取 SKILL.md。可在提问中用 $技能名 指定，脚本仍遵循当前审批设置。"))
-            .child(div().flex().flex_wrap().items_center().gap_3()
-                .child(Button::new(if state.task.is_some(){"正在扫描…"}else{"刷新技能"}).kind(ButtonKind::Gray).theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|this.reload_skills(cx))))
-                .child(Button::new("添加技能目录").theme(self.theme).render().on_click(cx.listener(|this,_,_,cx|this.choose_skills_root(cx)))))
-            .child(SearchInput::new("搜索技能").control(state.search.clone()).width(400.).theme(self.theme).render())
-            .when_some(state.notice.clone(),|page,notice|page.child(div().p_3().rounded(px(8.)).bg(rgb(p.surface_subtle)).child(notice)));
+        let query = state.search.read(cx).value().trim().to_lowercase();
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_6()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(24.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("技能"),
+                    )
+                    .child(
+                        Button::new(if state.task.is_some() {
+                            "正在扫描…"
+                        } else {
+                            "刷新技能"
+                        })
+                        .kind(ButtonKind::Gray)
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(|this, _, _, cx| this.reload_skills(cx))),
+                    )
+                    .child(
+                        Button::new("添加技能目录")
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_skills_root(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(rgb(p.text_muted))
+                    .child("点击技能查看指令，在提问中用 $技能名 指定使用。"),
+            )
+            .when_some(state.notice.clone(), |page, notice| {
+                page.child(
+                    div()
+                        .p_3()
+                        .rounded(px(8.))
+                        .bg(rgb(p.surface_subtle))
+                        .child(notice),
+                )
+            });
+
+        let mut list = div()
+            .id("skills-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2();
         if let Some(catalog) = &state.catalog {
-            page = page.child(div().font_weight(FontWeight::MEDIUM).child(format!(
-                "当前项目与用户技能 · {} 项 · 已启用 {} 项",
-                catalog.skills.len(),
-                catalog.skills.iter().filter(|skill| skill.enabled).count()
-            )));
-            if catalog.skills.is_empty() {
-                page = page.child(div().p_4().text_color(rgb(p.text_muted)).child(
-                    "尚未发现技能。添加包含 SKILL.md 的技能目录，或把技能放进下方默认目录后刷新。",
+            let filtered: Vec<_> = catalog
+                .skills
+                .iter()
+                .filter(|skill| {
+                    query.is_empty()
+                        || skill.name.to_lowercase().contains(&query)
+                        || skill.description.to_lowercase().contains(&query)
+                })
+                .collect();
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child(format!(
+                        "{} 项技能 · 已启用 {} 项",
+                        catalog.skills.len(),
+                        catalog.skills.iter().filter(|skill| skill.enabled).count()
+                    )),
+            );
+            if filtered.is_empty() {
+                list = list.child(div().p_3().text_color(rgb(p.text_muted)).child(
+                    if catalog.skills.is_empty() {
+                        "尚未发现技能，请添加包含 SKILL.md 的目录。"
+                    } else {
+                        "没有匹配的技能，试试其他关键词。"
+                    },
                 ));
             }
-            for skill in catalog.skills.iter().filter(|skill| {
-                query.is_empty()
-                    || skill.name.contains(&query)
-                    || skill.description.to_lowercase().contains(&query)
-            }) {
+            for skill in filtered {
                 let id = skill.id.clone();
-                let name = skill.name.clone();
-                let read_name = name.clone();
-                let weak = cx.entity().downgrade();
-                page = page.child(
+                let selected = state
+                    .selected
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &skill.id);
+                list = list.child(
                     div()
                         .id(SharedString::from(format!("skill:{}", skill.id)))
-                        .p_4()
+                        .debug_selector(move || format!("skill:{id}"))
+                        .p_3()
+                        .flex_shrink_0()
+                        .rounded(px(8.))
                         .border_1()
-                        .border_color(rgb(p.border))
-                        .rounded(px(10.))
+                        .border_color(rgb(if selected { p.accent } else { p.border }))
+                        .bg(rgb(if selected { p.accent_tint } else { p.panel }))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(p.surface_subtle)))
                         .flex()
                         .flex_col()
-                        .gap_3()
+                        .gap_2()
                         .child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_3()
-                                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(name))
+                                .gap_2()
                                 .child(
                                     div()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(skill.source.clone()),
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_ellipsis()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(skill.name.clone()),
                                 )
                                 .child(
-                                    Switch::new("启用")
-                                        .checked(skill.enabled)
-                                        .theme(self.theme)
-                                        .on_change(move |enabled, _, cx| {
-                                            let _ = weak.update(cx, |this, cx| {
-                                                match skills::Manager::new(this.path.clone())
-                                                    .set_enabled(&id, enabled)
-                                                {
-                                                    Ok(()) => this.reload_skills(cx),
-                                                    Err(error) => {
-                                                        this.skills_ui.notice = Some(error);
-                                                        cx.notify();
-                                                    }
-                                                }
-                                            });
-                                        })
-                                        .render(),
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(if skill.enabled {
+                                            skill.source.clone()
+                                        } else {
+                                            format!("{} · 已停用", skill.source)
+                                        }),
                                 ),
                         )
-                        .child(skill.description.clone())
-                        .when_some(skill.compatibility.clone(), |card, text| {
-                            card.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(format!("兼容性：{text}")),
-                            )
-                        })
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(px(11.))
                                 .text_color(rgb(p.text_muted))
-                                .child(skill.root.display().to_string()),
+                                .child(preview_line(&skill.description, 85)),
                         )
-                        .when(skill.enabled, |card| {
-                            card.child(
-                                Button::new("查看技能指令")
-                                    .kind(ButtonKind::Plain)
-                                    .size(ButtonSize::Small)
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if this
-                                            .skills_ui
-                                            .selected
-                                            .as_ref()
-                                            .is_some_and(|(name, _)| name == &read_name)
-                                        {
-                                            this.skills_ui.selected = None;
-                                        } else if let Some(catalog) = &this.skills_ui.catalog {
-                                            match catalog.read(&read_name, "SKILL.md", 1, 500) {
-                                                Ok(value) => {
-                                                    this.skills_ui.selected = Some((
-                                                        read_name.clone(),
-                                                        value["content"]
-                                                            .as_str()
-                                                            .unwrap_or("")
-                                                            .to_owned(),
-                                                    ))
-                                                }
-                                                Err(error) => this.skills_ui.notice = Some(error),
-                                            }
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .when_some(
-                            state
-                                .selected
-                                .as_ref()
-                                .filter(|(name, _)| name == &skill.name),
-                            |card, (_, text)| {
-                                card.child(
-                                    div()
-                                        .p_3()
-                                        .rounded(px(8.))
-                                        .bg(rgb(p.surface_subtle))
-                                        .child(text.clone()),
-                                )
-                            },
-                        ),
+                        .on_click({
+                            let id = skill.id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_skill_preview(id.clone(), cx);
+                            })
+                        }),
                 );
             }
-            for warning in &catalog.warnings {
-                page = page.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.text_muted))
-                        .child(warning.clone()),
-                );
-            }
-            page = page.child(
+            list = list.child(
                 div()
                     .mt_4()
+                    .px_2()
+                    .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child("扫描目录 · 同名技能优先使用项目版本"),
+                    .child("扫描目录"),
+            );
+            list = list.child(
+                div()
+                    .px_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child("同名技能优先使用项目版本"),
             );
             for (path, source) in &catalog.roots {
                 let remove = path.clone();
-                page = page.child(
+                list = list.child(
                     div()
                         .id(SharedString::from(format!("skill-root:{}", path.display())))
+                        .p_2()
+                        .flex_shrink_0()
                         .flex()
-                        .items_center()
-                        .gap_3()
+                        .flex_col()
+                        .gap_1()
                         .child(
                             div()
-                                .flex_1()
-                                .text_size(px(11.))
+                                .text_size(px(10.))
                                 .text_color(rgb(p.text_muted))
                                 .child(format!("{source} · {}", path.display())),
                         )
@@ -349,21 +403,216 @@ impl AgentWorkspace {
                         }),
                 );
             }
+            for warning in &catalog.warnings {
+                list = list.child(
+                    div()
+                        .p_2()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child(warning.clone()),
+                );
+            }
+        } else {
+            list = list.child(div().p_3().text_color(rgb(p.text_muted)).child(
+                if state.task.is_some() {
+                    "正在扫描技能…"
+                } else {
+                    "点击刷新技能加载列表。"
+                },
+            ));
         }
-        div().size_full().child(
-            div()
-                .id("skills-settings")
-                .size_full()
+        let sidebar = div()
+            .w(gpui::relative(0.36))
+            .min_w(px(240.))
+            .max_w(px(380.))
+            .h_full()
+            .flex_shrink_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(rgb(p.border))
+            .child(
+                div().p_3().flex_shrink_0().child(
+                    SearchInput::new("搜索技能")
+                        .control(state.search.clone())
+                        .theme(self.theme)
+                        .render()
+                        .w_full(),
+                ),
+            )
+            .child(list);
+        let mut detail = div()
+            .id("skill-detail")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.panel));
+        if let Some(((id, content), skill)) = state.selected.as_ref().and_then(|selection| {
+            state
+                .catalog
+                .as_ref()?
+                .skills
+                .iter()
+                .find(|skill| skill.id == selection.0)
+                .map(|skill| (selection, skill))
+        }) {
+            let weak = cx.entity().downgrade();
+            let toggle_id = id.clone();
+            detail = detail.child(
+                div()
+                    .p_4()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(18.))
+                                    .text_ellipsis()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(skill.name.clone()),
+                            )
+                            .child(
+                                Switch::new("启用")
+                                    .checked(skill.enabled)
+                                    .theme(self.theme)
+                                    .on_change(move |enabled, _, cx| {
+                                        let _ =
+                                            weak.update(cx, |this, cx| match skills::Manager::new(
+                                                this.path.clone(),
+                                            )
+                                            .set_enabled(&toggle_id, enabled)
+                                            {
+                                                Ok(()) => this.reload_skills(cx),
+                                                Err(error) => {
+                                                    this.skills_ui.notice = Some(error);
+                                                    cx.notify();
+                                                }
+                                            });
+                                    })
+                                    .render(),
+                            )
+                            .child(
+                                IconButton::new(Icon::Close, "关闭技能详情")
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills_ui.selected = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("{} · SKILL.md", skill.source)),
+                    ),
+            );
+            let mut body = div()
+                .id("skill-detail-scroll")
+                .debug_selector(|| "skill-detail-scroll".into())
+                .track_scroll(&state.detail_scroll)
+                .flex_1()
+                .min_h_0()
                 .overflow_y_scroll()
                 .p_6()
-                .child(page),
-        )
+                .child(
+                    div()
+                        .mb_4()
+                        .text_color(rgb(p.text_muted))
+                        .child(skill.description.clone()),
+                )
+                .when_some(skill.compatibility.clone(), |body, text| {
+                    body.child(
+                        div()
+                            .mb_3()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("兼容性：{text}")),
+                    )
+                })
+                .child(
+                    div()
+                        .mb_4()
+                        .text_size(px(10.))
+                        .text_color(rgb(p.text_muted))
+                        .child(skill.root.join("SKILL.md").display().to_string()),
+                );
+            body = match content {
+                Ok(text) => body.child(self.markdown_text(
+                    "skill-settings-preview".into(),
+                    skill_instructions(text),
+                    cx,
+                )),
+                Err(error) => body.child(
+                    div()
+                        .p_3()
+                        .rounded(px(8.))
+                        .bg(rgb(p.surface_subtle))
+                        .child(error.clone()),
+                ),
+            };
+            detail = detail.child(body);
+        } else {
+            detail = detail
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_6()
+                .child(Icon::Workflow.render(28.).text_color(rgb(p.text_muted)))
+                .child(div().font_weight(FontWeight::MEDIUM).child("选择一个技能"))
+                .child(
+                    div()
+                        .text_color(rgb(p.text_muted))
+                        .child("在左侧选择技能，在这里查看完整指令和启用状态。"),
+                );
+        }
+        div()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .child(sidebar)
+                    .child(detail),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_separates_metadata_without_changing_markdown_instructions() {
+        assert_eq!(
+            skill_instructions("\u{feff}---\r\nname: review\r\n---\r\n# Review\r\n\r\n---\r\nBody"),
+            "# Review\r\n\r\n---\r\nBody"
+        );
+        assert_eq!(skill_instructions("# Plain"), "# Plain");
+        assert_eq!(
+            skill_instructions("---\nname: incomplete"),
+            "---\nname: incomplete"
+        );
+    }
     struct Preview {
         composer: Entity<Composer>,
         _subscription: Subscription,

@@ -72,6 +72,21 @@ fn bounded_read(path: &Path, limit: usize) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|_| "技能文件必须为 UTF-8 文本".into())
 }
+fn read_manifest(skill: &Skill) -> Result<String, String> {
+    let path = skill
+        .root
+        .join("SKILL.md")
+        .canonicalize()
+        .map_err(|_| "技能文件已不可用")?;
+    if !path.starts_with(&skill.root) {
+        return Err("技能文件已指向包外，请刷新".into());
+    }
+    let manifest = bounded_read(&path, MAX_SKILL)?;
+    if format!("{:x}", Sha256::digest(manifest.as_bytes())) != skill.digest {
+        return Err("技能内容已改变，请刷新以加载新版本".into());
+    }
+    Ok(manifest)
+}
 fn metadata(text: &str, directory: &Path) -> Result<Metadata, String> {
     let text = text.trim_start_matches('\u{feff}');
     let mut lines = text.lines();
@@ -304,6 +319,16 @@ impl Manager {
     }
 }
 impl Catalog {
+    /// Read the complete manifest for the settings preview, including disabled
+    /// skills. This does not grant the agent access to disabled skills.
+    pub fn preview(&self, id: &str) -> Result<String, String> {
+        let skill = self
+            .skills
+            .iter()
+            .find(|skill| skill.id == id)
+            .ok_or("技能已不可用，请刷新列表")?;
+        read_manifest(skill)
+    }
     pub fn empty(anchor: PathBuf) -> Self {
         Self {
             skills: vec![],
@@ -378,18 +403,7 @@ impl Catalog {
         if !resolved.starts_with(&skill.root) {
             return Err("技能资源符号链接指向包外".into());
         }
-        let manifest_path = skill
-            .root
-            .join("SKILL.md")
-            .canonicalize()
-            .map_err(|_| "技能文件已不可用")?;
-        if !manifest_path.starts_with(&skill.root) {
-            return Err("技能文件已指向包外，请刷新".into());
-        }
-        let manifest = bounded_read(&manifest_path, MAX_SKILL)?;
-        if format!("{:x}", Sha256::digest(manifest.as_bytes())) != skill.digest {
-            return Err("技能内容在请求期间已改变，请重新发送请求以加载新版本".into());
-        }
+        let manifest = read_manifest(skill)?;
         let text = if path == "SKILL.md" {
             manifest
         } else {
@@ -421,6 +435,29 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_preview_reads_complete_disabled_skills_without_enabling_tool_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = manager(directory.path());
+        let root = package(
+            &manager.user_root(),
+            "review",
+            "Review code",
+            &"line\n".repeat(600),
+        );
+        let catalog = manager.catalog_with_home(None, None).unwrap();
+        let id = catalog.skills[0].id.clone();
+        let expected = std::fs::read_to_string(root.join("SKILL.md")).unwrap();
+        assert_eq!(catalog.preview(&id).unwrap(), expected);
+        manager.set_enabled(&id, false).unwrap();
+        let disabled = manager.catalog_with_home(None, None).unwrap();
+        assert_eq!(disabled.preview(&id).unwrap(), expected);
+        assert!(disabled.read("review", "SKILL.md", 1, 500).is_err());
+        std::fs::write(root.join("SKILL.md"), "changed").unwrap();
+        assert!(disabled.preview(&id).is_err());
+        assert!(disabled.preview("missing").is_err());
+    }
+
     fn package(root: &Path, name: &str, description: &str, body: &str) -> PathBuf {
         let path = root.join(name);
         std::fs::create_dir_all(&path).unwrap();
