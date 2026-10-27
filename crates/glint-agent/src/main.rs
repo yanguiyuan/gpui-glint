@@ -39,8 +39,8 @@ use gpui_glint::{
         AppLayout, Button, ButtonKind, ButtonSize, Calendar, CalendarEvent, Composer, ComposerChip,
         ComposerContextEntry, ComposerContextSection, ComposerEvent, ComposerSubmission,
         GlintAssets, GroupList, GroupListEvent, Icon, IconButton, Popover, SearchInput,
-        SegmentOption, SegmentedControl, TextEntry, bind_composer_keys, bind_prompt_editor_keys,
-        bind_text_entry_keys, window_drag_region,
+        SegmentOption, SegmentedControl, ShimmerText, TextEntry, bind_composer_keys,
+        bind_prompt_editor_keys, bind_text_entry_keys, window_drag_region,
     },
     theme::ThemePreset,
 };
@@ -1466,8 +1466,10 @@ impl AgentWorkspace {
                     .items_center()
                     .gap_2()
                     .text_color(rgb(p.text_muted))
-                    .child(Icon::Spinner.render(15.))
-                    .child("正在等待模型回复…"),
+                    .child(
+                        ShimmerText::new("agent-waiting-reply", "正在等待模型回复…")
+                            .theme(self.theme),
+                    ),
             );
         }
         let conversation = div()

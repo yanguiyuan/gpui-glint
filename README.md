@@ -104,6 +104,8 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 
 这些片段中的 `cx` 来自宿主的 GPUI 上下文。事件订阅返回的 `Subscription` 也需要保存在宿主中，否则订阅会失效。组件是否自行提交状态取决于具体组件，例如 `Select` 使用受控选择，日期选择器会提交用户选择；详见组件指南。
 
+等待状态可使用 `ShimmerText::new("reply-pending", "正在等待模型回复…").theme(theme)`。组件继承父容器的字号，高光从左向右扫过文字；每个实例使用稳定且唯一的 ID。可通过 `.duration(Duration::from_millis(2200))` 调整周期、`.animated(false)` 关闭动效，也会自动遵循系统减少动态效果的设置。
+
 按使用的编辑器注册快捷键：
 
 | 使用场景 | 启动时调用 |
