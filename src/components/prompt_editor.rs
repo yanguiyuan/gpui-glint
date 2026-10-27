@@ -192,7 +192,7 @@ pub struct PromptEditor {
     last_bounds: Option<Bounds<Pixels>>,
     lines: Vec<EditorLine>,
     /// Text tokens painted in a custom color (e.g. `@mentions`), matched
-    /// against whole `@word` tokens in the content.
+    /// against whole @mentions and registered $skill tokens in the content.
     highlights: Vec<(SharedString, u32)>,
     paste_task: Option<gpui::Task<()>>,
 }
@@ -230,7 +230,8 @@ impl PromptEditor {
     }
 
     /// Paints occurrences of the given tokens (e.g. `"@Workflow"`) in the
-    /// given color. Unlisted `@word` tokens fall back to the accent color.
+    /// given color. Registered `$skill` tokens also use these colors; unlisted
+    /// `@word` tokens fall back to the accent color. Unknown `$variables` do not.
     pub fn set_highlights(&mut self, highlights: Vec<(SharedString, u32)>, cx: &mut Context<Self>) {
         if self.highlights != highlights {
             self.highlights = highlights;
@@ -246,6 +247,30 @@ impl PromptEditor {
 
     pub fn value(&self) -> &str {
         &self.content
+    }
+
+    /// Current UTF-8 selection range, for caret-aware host completions.
+    pub fn selection_range(&self) -> Range<usize> {
+        self.selected_range.clone()
+    }
+
+    /// Replace a valid UTF-8 range and leave the caret immediately after it.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if range.start > range.end
+            || range.end > self.content.len()
+            || !self.content.is_char_boundary(range.start)
+            || !self.content.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.selected_range = range;
+        self.replace_selection(text, cx);
+        true
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1205,20 +1230,19 @@ impl Focusable for PromptEditor {
     }
 }
 
-/// Ranges of `@word` mention tokens in the content, with their paint colors.
-/// A token starts at `@` preceded by the content start or whitespace and runs
-/// to the next whitespace. Unregistered tokens fall back to `default`.
+/// Paint @mentions and explicitly registered $skill tokens at word boundaries.
+/// Unknown $variables remain ordinary text; files retain the default accent.
 fn mention_ranges(
     content: &str,
     highlights: &[(SharedString, u32)],
     default: u32,
 ) -> Vec<(Range<usize>, u32)> {
-    let color_for = |token: &str| -> u32 {
+    let color_for = |token: &str| -> Option<u32> {
         highlights
             .iter()
             .find(|(text, _)| text.as_ref() == token)
             .map(|(_, color)| *color)
-            .unwrap_or(default)
+            .or_else(|| token.starts_with('@').then_some(default))
     };
     let mut ranges = Vec::new();
     let mut current: Option<Range<usize>> = None;
@@ -1228,15 +1252,16 @@ fn mention_ranges(
         if let Some(range) = current.as_mut() {
             if ch.is_whitespace() {
                 let finished = range.clone();
-                if finished.len() > 1 {
-                    let color = color_for(&content[finished.clone()]);
+                if finished.len() > 1
+                    && let Some(color) = color_for(&content[finished.clone()])
+                {
                     ranges.push((finished, color));
                 }
                 current = None;
             } else {
                 range.end = next;
             }
-        } else if ch == '@' && previous_whitespace {
+        } else if matches!(ch, '@' | '$') && previous_whitespace {
             current = Some(index..next);
         }
         previous_whitespace = ch.is_whitespace();
@@ -1245,7 +1270,9 @@ fn mention_ranges(
         && range.len() > 1
     {
         let token = &content[range.clone()];
-        ranges.push((range, color_for(token)));
+        if let Some(color) = color_for(token) {
+            ranges.push((range, color));
+        }
     }
     ranges
 }
@@ -1312,6 +1339,20 @@ mod tests {
         // The @ inside email@a.com is not preceded by whitespace, so it is
         // not treated as a mention.
         assert_eq!(spans, vec![(7, 16, 0x24864c), (21, 31, 0x007aff)],);
+    }
+
+    #[test]
+    fn registered_skill_tokens_are_highlighted_without_coloring_shell_variables() {
+        let text = "$wps365-skills $HOME $unknown inline$wps365-skills @README";
+        let ranges = mention_ranges(text, &[("$wps365-skills".into(), 0x007aff)], 0x112233);
+        let spans: Vec<_> = ranges
+            .iter()
+            .map(|(range, color)| (&text[range.clone()], *color))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![("$wps365-skills", 0x007aff), ("@README", 0x112233)]
+        );
     }
 
     #[test]

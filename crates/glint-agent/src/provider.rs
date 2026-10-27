@@ -1054,6 +1054,9 @@ mod tests {
             };
             let (events, _receiver) = async_channel::unbounded();
             let context = crate::tools::ToolContext {
+                skills: std::sync::Arc::new(crate::skills::Catalog::empty(
+                    directory.path().join("sessions.json"),
+                )),
                 memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
                 access: std::sync::Arc::new(std::sync::Mutex::new(crate::tools::AccessMode::Ask)),
                 root: None,

@@ -489,6 +489,9 @@ let subscription = cx.subscribe(&composer, |this, _, event: &ComposerEvent, cx| 
         ComposerEvent::ChipSelected { chip, value } => { /* 切换模型或档位 */ }
         ComposerEvent::ChipClicked(id) => { /* 打开附件等无选项 chip */ }
         ComposerEvent::Changed(text) => { /* 同步草稿 */ }
+        ComposerEvent::ContextOpened => { /* 可在后台刷新上下文候选 */ }
+        ComposerEvent::ContextQueryChanged(query) => { /* 过滤宿主缓存的项目文件 */ }
+        _ => {}
     }
 });
 ```
@@ -734,3 +737,11 @@ calendar.update(cx, |calendar, cx| calendar.set_markers(markers, cx));
 使用 `set_selected(date, cx)` 同步选中日期及当前月份，`value()` 读取选择。事件标记由 `HashMap<NaiveDate, usize>` 提供。
 
 `Popover::above_trigger()` 支持在触发按钮上方弹出，并与其左侧对齐；默认方向保持不变。
+
+`TextEntry::masked(true)` 与 `set_masked(true, cx)` 用于密码输入：遮罩字符、原生文本查询和模板建议，禁止普通复制/剪切。显式复制密码应由宿主管理剪贴板生命周期；通用输入框不保证清除所有进程内存副本。
+
+动态上下文：订阅 `ComposerEvent::ContextOpened` 后，宿主可异步加载候选并调用 `set_context_sections(sections, cx)`，更新已展开的面板而不关闭它。对于文件选择器或技能等宿主处理的条目，设置 `.insert_mention(false)` 并处理 `ContextSelected`。`add_context_token("$code-review", color, cx)` 插入字面上下文标记，替换光标处整段 `@关键词`，保留草稿前后文字、光标位置和图片；文件仍可用原有 `add_mention` 插入 `@路径`。
+
+开启 `context_on_at(true)` 后，面板会随光标处 `@关键词` 按候选名称和描述实时过滤，忽略大小写；未匹配时显示空状态。`register_context_tokens([(token, color)], cx)` 可为恢复的草稿注册 `$技能名` 高亮，不插入或改变文字。只有注册的 `$` 标记会高亮，普通 shell 变量保持原样。`PromptEditor::selection_range()` 和 `replace_range(range, text, cx)` 提供 UTF-8 边界校验的光标补全接口。
+
+`ComposerEvent::ContextQueryChanged(query)` 在面板打开与光标处查询变化时上报（`context_filter(cx)` 可读取当前值）。宿主可用它从缓存挑选有限的候选，再更新分组；不要在输入回调或 hover 中同步遍历文件系统。Glint Agent 的项目文件索引在后台建立，输入时仅过滤缓存。

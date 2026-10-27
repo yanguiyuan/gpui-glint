@@ -7,7 +7,28 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage,
     Subscription, Window, actions, deferred, div, img, point, px, relative, rgb, rgba,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
+
+/// A standalone @ token around the caret, excluding email addresses.
+fn context_query_range(text: &str, caret: usize) -> Option<Range<usize>> {
+    if !text.is_char_boundary(caret) {
+        return None;
+    }
+    let prefix = &text[..caret];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    if !prefix[start..].starts_with('@') {
+        return None;
+    }
+    let end = text[caret..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(text.len(), |(index, _)| caret + index);
+    Some(start..end)
+}
 
 actions!(glass_composer, [Submit]);
 
@@ -299,8 +320,12 @@ pub enum ComposerEvent {
     Submitted(ComposerSubmission),
     /// The prompt was queued because a submission is already in flight.
     Queued(ComposerSubmission),
-    /// A context panel entry was picked. The matching mention token
-    /// (`@label`) has already been inserted into the prompt.
+    /// The context panel opened; hosts can refresh its entries asynchronously.
+    ContextOpened,
+    /// Current @query changed while the panel is open (also emitted on opening).
+    ContextQueryChanged(SharedString),
+    /// A context panel entry was picked. With automatic mention insertion enabled,
+    /// the matching token has already been inserted by the time this is emitted.
     ContextSelected {
         id: SharedString,
         label: SharedString,
@@ -329,6 +354,7 @@ pub struct Composer {
     context_sections: Vec<ComposerContextSection>,
     context_hints: Vec<(SharedString, SharedString)>,
     context_open: bool,
+    observed_context_query: SharedString,
     context_on_at: bool,
     observed_text: SharedString,
     mention_colors: HashMap<SharedString, u32>,
@@ -356,17 +382,15 @@ impl Composer {
             if text != this.observed_text {
                 if this.context_on_at
                     && !this.context_sections.is_empty()
-                    && text.ends_with('@')
-                    && text[..text.len() - 1]
-                        .chars()
-                        .next_back()
-                        .is_none_or(char::is_whitespace)
+                    && this.context_query(cx).is_some()
                 {
-                    this.context_open = true;
-                    this.open_chip = None;
+                    this.open_context_panel(cx);
                 }
                 this.observed_text = text.clone();
                 cx.emit(ComposerEvent::Changed(text));
+            }
+            if this.context_open {
+                this.emit_context_query(false, cx);
             }
             cx.notify();
         });
@@ -415,6 +439,7 @@ impl Composer {
             context_sections: Vec::new(),
             context_hints: Vec::new(),
             context_open: false,
+            observed_context_query: "".into(),
             context_on_at: false,
             observed_text: "".into(),
             mention_colors: HashMap::new(),
@@ -553,28 +578,92 @@ impl Composer {
         color: u32,
         cx: &mut Context<Self>,
     ) {
-        let label = label.into();
-        let mut next = self.editor.read(cx).value().to_owned();
-        if self.context_on_at && next.ends_with('@') {
-            next.pop();
+        self.add_context_token(format!("@{}", label.into()), color, cx);
+    }
+
+    fn context_query(&self, cx: &App) -> Option<(Range<usize>, String)> {
+        let editor = self.editor.read(cx);
+        let selection = editor.selection_range();
+        if !self.context_on_at || !selection.is_empty() {
+            return None;
         }
-        if !next.is_empty() && !next.ends_with(' ') && !next.ends_with('\n') {
-            next.push(' ');
+        let range = context_query_range(editor.value(), selection.end)?;
+        let query = editor.value()[range.start + 1..selection.end].to_lowercase();
+        Some((range, query))
+    }
+    /// Query after @ at the caret, or an empty string when no mention is active.
+    pub fn context_filter(&self, cx: &App) -> String {
+        self.context_query(cx)
+            .map(|(_, query)| query)
+            .unwrap_or_default()
+    }
+    fn emit_context_query(&mut self, force: bool, cx: &mut Context<Self>) {
+        let query: SharedString = self.context_filter(cx).into();
+        if force || query != self.observed_context_query {
+            self.observed_context_query = query.clone();
+            cx.emit(ComposerEvent::ContextQueryChanged(query));
         }
-        next.push('@');
-        next.push_str(&label);
-        next.push(' ');
-        self.mention_colors
-            .insert(SharedString::from(format!("@{label}")), color);
-        let highlights: Vec<(SharedString, u32)> = self
+    }
+
+    /// Register known context tokens for highlighting restored drafts as well as
+    /// newly selected tokens. No prompt text or attachments are changed.
+    pub fn register_context_tokens(
+        &mut self,
+        tokens: impl IntoIterator<Item = (SharedString, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mention_colors.extend(tokens);
+        let highlights = self
             .mention_colors
             .iter()
             .map(|(token, color)| (token.clone(), *color))
             .collect();
-        self.editor.update(cx, |editor, cx| {
-            editor.set_value(next, cx);
-            editor.set_highlights(highlights, cx);
-        });
+        self.editor
+            .update(cx, |editor, cx| editor.set_highlights(highlights, cx));
+    }
+
+    /// Append a literal context token such as `$review`, replacing a trailing
+    /// standalone @ trigger. Existing text and pasted images are preserved.
+    pub fn add_context_token(
+        &mut self,
+        token: impl Into<SharedString>,
+        color: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let token = token.into();
+        let query = self.context_query(cx).map(|(range, _)| range);
+        if let Some(mut range) = query {
+            if self.editor.read(cx).value()[range.end..].starts_with(' ') {
+                range.end += 1;
+            }
+            let replacement = format!("{token} ");
+            self.editor.update(cx, |editor, cx| {
+                editor.replace_range(range, &replacement, cx);
+            });
+        } else {
+            let mut next = self.editor.read(cx).value().to_owned();
+            if !next.is_empty() && !next.ends_with(' ') && !next.ends_with('\n') {
+                next.push(' ');
+            }
+            next.push_str(&token);
+            next.push(' ');
+            self.editor
+                .update(cx, |editor, cx| editor.set_value(next, cx));
+        }
+        self.register_context_tokens([(token, color)], cx);
+        cx.notify();
+    }
+
+    /// Replace dynamic context entries without closing an already open panel.
+    pub fn set_context_sections(
+        &mut self,
+        sections: impl IntoIterator<Item = ComposerContextSection>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_sections = sections.into_iter().collect();
+        if self.context_sections.is_empty() {
+            self.context_open = false;
+        }
         cx.notify();
     }
 
@@ -584,8 +673,13 @@ impl Composer {
 
     pub fn open_context_panel(&mut self, cx: &mut Context<Self>) {
         if !self.context_sections.is_empty() {
+            let opening = !self.context_open;
             self.context_open = true;
             self.open_chip = None;
+            if opening {
+                cx.emit(ComposerEvent::ContextOpened);
+                self.emit_context_query(true, cx);
+            }
             cx.notify();
         }
     }
@@ -838,8 +932,7 @@ impl Render for Composer {
                             if this.context_open {
                                 this.context_open = false;
                             } else {
-                                this.context_open = true;
-                                this.open_chip = None;
+                                this.open_context_panel(cx);
                             }
                         } else if has_options {
                             if this.open_chip.as_ref() == Some(&id) {
@@ -1399,7 +1492,34 @@ impl Composer {
                     .child(self.context_title.clone()),
             );
 
+        let query = self
+            .context_query(cx)
+            .map(|(_, query)| query)
+            .unwrap_or_default();
+        let match_query = query.replace('\\', "/");
+        let mut matches = 0;
         for section in &self.context_sections {
+            let entries: Vec<_> = section
+                .entries
+                .iter()
+                .filter(|entry| {
+                    query.is_empty()
+                        || entry
+                            .label
+                            .to_lowercase()
+                            .replace('\\', "/")
+                            .contains(&match_query)
+                        || entry.description.as_ref().is_some_and(|text| {
+                            text.to_lowercase()
+                                .replace('\\', "/")
+                                .contains(&match_query)
+                        })
+                })
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            matches += entries.len();
             if let Some(title) = &section.title {
                 panel = panel.child(
                     div()
@@ -1411,7 +1531,7 @@ impl Composer {
                         .child(title.clone()),
                 );
             }
-            for entry in &section.entries {
+            for entry in entries {
                 let entry_color = theme.color(entry.color.unwrap_or(p.accent));
                 panel = panel.child(
                     div()
@@ -1419,6 +1539,10 @@ impl Composer {
                             "glass-composer-context-{}",
                             entry.id
                         )))
+                        .debug_selector({
+                            let id = entry.id.clone();
+                            move || format!("composer-context:{id}")
+                        })
                         .h(px(40.))
                         .px(px(10.))
                         .flex()
@@ -1432,8 +1556,9 @@ impl Composer {
                             let label = entry.label.clone();
                             let color = entry.color.unwrap_or(p.accent);
                             let insert_mention = entry.insert_mention;
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, window, cx| {
                                 this.close_context_panel(cx);
+                                window.focus(&this.editor.focus_handle(cx), cx);
                                 if insert_mention {
                                     this.add_mention(label.clone(), color, cx);
                                 }
@@ -1475,6 +1600,15 @@ impl Composer {
             }
         }
 
+        if matches == 0 {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .text_color(rgb(p.text_muted))
+                    .debug_selector(|| "composer-context-empty".into())
+                    .child(format!("没有匹配“{query}”的上下文")),
+            );
+        }
         if !self.context_hints.is_empty() {
             panel = panel.child(
                 div()
@@ -1547,6 +1681,75 @@ fn icon_action(
 mod tests {
     use super::*;
 
+    #[test]
+    fn context_queries_are_caret_scoped_and_do_not_match_email_addresses() {
+        assert_eq!(
+            context_query_range("检查 @wps 后续", "检查 @wp".len()),
+            Some("检查 ".len().."检查 @wps".len())
+        );
+        assert_eq!(
+            context_query_range("@文件", "@文件".len()),
+            Some(0.."@文件".len())
+        );
+        assert_eq!(context_query_range("email@wps", 9), None);
+        assert_eq!(context_query_range("@wps ", 5), None);
+        assert_eq!(context_query_range("检查", 1), None);
+    }
+
+    #[gpui::test]
+    fn context_filter_matches_labels_and_descriptions_and_replaces_middle_query(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Preview(Entity<Composer>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(650.)).pt(px(300.)).child(self.0.clone())
+            }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                Composer::new("Message", cx)
+                    .context_on_at(true)
+                    .context_panel(
+                        "attach",
+                        "Context",
+                        [ComposerContextSection::new(
+                            "Skills",
+                            [
+                                ComposerContextEntry::new("wps", "wps365-skills")
+                                    .description("Manage documents")
+                                    .insert_mention(false),
+                                ComposerContextEntry::new("review", "code-review")
+                                    .description("Review code")
+                                    .insert_mention(false),
+                            ],
+                        )],
+                    )
+            }))
+        });
+        let composer = preview.read_with(window, |preview, _| preview.0.clone());
+        composer.update(window, |composer, cx| composer.set_value("@WPS", cx));
+        assert!(window.debug_bounds("composer-context:wps").is_some());
+        assert!(window.debug_bounds("composer-context:review").is_none());
+        composer.update(window, |composer, cx| composer.set_value("@documents", cx));
+        assert!(window.debug_bounds("composer-context:wps").is_some());
+        composer.update(window, |composer, cx| composer.set_value("@unmatched", cx));
+        assert!(window.debug_bounds("composer-context-empty").is_some());
+        composer.update(window, |composer, cx| {
+            composer.set_value("检查 @wp 后续", cx);
+            composer.editor.update(cx, |editor, cx| {
+                let caret = "检查 @wp".len();
+                editor.replace_range(caret..caret, "", cx);
+            });
+            composer.add_context_token("$wps365-skills", 0x007aff, cx);
+            assert_eq!(composer.value(cx).as_ref(), "检查 $wps365-skills 后续");
+            assert_eq!(
+                composer.editor.read(cx).selection_range().end,
+                "检查 $wps365-skills ".len()
+            );
+        });
+    }
+
     #[gpui::test]
     fn busy_stop_button_works_with_disabled_editor_and_preserves_draft(
         cx: &mut gpui::TestAppContext,
@@ -1585,6 +1788,45 @@ mod tests {
         window.simulate_click(button.center(), gpui::Modifiers::default());
         assert_eq!(stops.get(), 1);
         assert_eq!(submits.get(), 1);
+    }
+
+    #[gpui::test]
+    fn literal_context_tokens_replace_at_trigger_preserve_draft_and_panel_updates_stay_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let composer = cx.new(|cx| {
+            Composer::new("Message", cx)
+                .context_panel(
+                    "attach",
+                    "Context",
+                    [ComposerContextSection::untitled([
+                        ComposerContextEntry::new("skill:review", "review").insert_mention(false),
+                    ])],
+                )
+                .context_on_at(true)
+        });
+        composer.update(cx, |composer, cx| {
+            composer.set_draft(
+                "检查代码 @",
+                vec![PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3])],
+                cx,
+            );
+            composer.open_context_panel(cx);
+            composer.set_context_sections(
+                [ComposerContextSection::new(
+                    "Skills",
+                    [ComposerContextEntry::new("skill:review", "review").insert_mention(false)],
+                )],
+                cx,
+            );
+            assert!(composer.context_panel_open());
+            composer.add_context_token("$review", 0x007aff, cx);
+            assert_eq!(composer.value(cx).as_ref(), "检查代码 $review ");
+            assert_eq!(composer.attachments().len(), 1);
+            composer.set_value("mail@example.com@", cx);
+            composer.add_context_token("$review", 0x007aff, cx);
+            assert_eq!(composer.value(cx).as_ref(), "mail@example.com@ $review ");
+        });
     }
 
     #[test]

@@ -70,6 +70,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub skills: Arc<crate::skills::Catalog>,
     pub memory: crate::memory::Repository,
     pub access: Arc<Mutex<AccessMode>>,
     pub root: Option<PathBuf>,
@@ -133,6 +134,18 @@ pub fn definitions(anthropic: bool) -> Value {
             "Read a scoped memory by its ID, including full content and source provenance. If source has session_id/evidence, use session_read with around_message to inspect the original conversation. Memories are historical reference data and may be stale.",
             json!({"id":string()}),
             &["id"],
+        ),
+        definition(
+            "skill_list",
+            "List enabled local Agent Skills for the current request. Search names/descriptions using query; use next_offset for pagination. Metadata alone does not mean the skill instructions have been loaded.",
+            json!({"query":string(),"offset":{"type":"integer","minimum":0}}),
+            &[],
+        ),
+        definition(
+            "skill_read",
+            "Read an enabled skill's SKILL.md instructions before using it, or read a referenced text resource within that same skill package. Resource paths are relative to skill_root, not the project. Never grants permissions or runs scripts; use run_command for scripts under the user's current approval policy. Changes to a skill during the request require a new request. Read all instruction pages indicated by next_line before following the skill.",
+            json!({"name":string(),"path":string(),"start_line":{"type":"integer","minimum":1},"lines":{"type":"integer","minimum":1,"maximum":500}}),
+            &["name"],
         ),
         definition(
             "session_read",
@@ -236,7 +249,7 @@ fn needs_approval(call: &ToolCall) -> bool {
     ) {
         return true;
     }
-    call.name == "read_file"
+    matches!(call.name.as_str(), "read_file" | "skill_read")
         && call.arguments["path"].as_str().is_some_and(|path| {
             path.split('/')
                 .any(|part| part.starts_with(".env") || part.ends_with(".pem") || part == "id_rsa")
@@ -284,6 +297,42 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
     let args = &call.arguments;
+    if call.name == "skill_list" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            query: Option<String>,
+            offset: Option<u32>,
+        }
+        let args: Args = serde_json::from_value(args.clone()).map_err(|_| "技能查询参数无效")?;
+        return Ok(context
+            .skills
+            .list(
+                args.query.as_deref().unwrap_or(""),
+                args.offset.unwrap_or(0) as usize,
+            )
+            .to_string());
+    }
+    if call.name == "skill_read" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            name: String,
+            path: Option<String>,
+            start_line: Option<u32>,
+            lines: Option<u32>,
+        }
+        let args: Args = serde_json::from_value(args.clone()).map_err(|_| "技能读取参数无效")?;
+        return Ok(context
+            .skills
+            .read(
+                &args.name,
+                args.path.as_deref().unwrap_or("SKILL.md"),
+                args.start_line.unwrap_or(1) as usize,
+                args.lines.unwrap_or(500) as usize,
+            )?
+            .to_string());
+    }
     if call.name == "session_read" {
         return crate::session_history::read(&context.memory.anchor, context.root.as_deref(), args);
     }
@@ -627,6 +676,9 @@ mod tests {
         let outside = directory.path().join("outside.txt");
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
+            skills: Arc::new(crate::skills::Catalog::empty(
+                directory.path().join("sessions.json"),
+            )),
             memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
             access: Arc::new(Mutex::new(AccessMode::Ask)),
             root: Some(root.clone()),
@@ -685,6 +737,7 @@ mod tests {
         crate::database::save_history(&anchor, &history).unwrap();
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
+            skills: Arc::new(crate::skills::Catalog::empty(anchor.clone())),
             memory: crate::memory::Repository::new(anchor),
             access: Arc::new(Mutex::new(AccessMode::Ask)),
             root: Some("/project/a".into()),
@@ -729,6 +782,75 @@ mod tests {
                         tool["name"] == "session_read"
                     } else {
                         tool["function"]["name"] == "session_read"
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_tools_read_registered_packages_without_executing_scripts_or_granting_permissions()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("sessions.json");
+        let manager = crate::skills::Manager::new(anchor.clone());
+        let package = manager.user_root().join("review");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("SKILL.md"),"---\nname: review\ndescription: Review changes\nallowed-tools: Bash(*)\n---\nRead the diff.\n").unwrap();
+        let (events, _) = async_channel::unbounded();
+        let context = ToolContext {
+            skills: Arc::new(manager.catalog_with_home(None, None).unwrap()),
+            memory: crate::memory::Repository::new(anchor),
+            access: Arc::new(Mutex::new(AccessMode::Ask)),
+            root: None,
+            schedules: Arc::new(Mutex::new(
+                ScheduleStore::open(directory.path().join("schedules.json")).unwrap(),
+            )),
+            provider_id: Uuid::new_v4(),
+            model: "test".into(),
+            events,
+        };
+        let read = ToolCall {
+            id: "skill".into(),
+            name: "skill_read".into(),
+            arguments: json!({"name":"review"}),
+        };
+        let record = execute(read.clone(), &context).await;
+        assert!(record.success, "{}", record.result);
+        assert!(record.result.contains("Read the diff"));
+        assert!(needs_approval(&ToolCall {
+            name: "run_command".into(),
+            arguments: json!({"program":"git","args":["diff"]}),
+            ..read.clone()
+        }));
+        assert!(needs_approval(&ToolCall {
+            arguments: json!({"name":"review","path":".env"}),
+            ..read.clone()
+        }));
+        assert!(
+            !execute(
+                ToolCall {
+                    arguments: json!({"name":"review","path":"../secret"}),
+                    ..read.clone()
+                },
+                &context
+            )
+            .await
+            .success
+        );
+        manager
+            .set_enabled(&context.skills.skills[0].id, false)
+            .unwrap();
+        assert!(!execute(read, &context).await.success);
+        for anthropic in [false, true] {
+            assert!(
+                definitions(anthropic)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|definition| if anthropic {
+                        definition["name"] == "skill_read"
+                    } else {
+                        definition["function"]["name"] == "skill_read"
                     })
             );
         }

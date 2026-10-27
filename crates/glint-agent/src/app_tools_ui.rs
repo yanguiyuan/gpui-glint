@@ -141,6 +141,21 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
             },
             path.into(),
         ),
+        "skill_list" | "skill_read" => (
+            Icon::Workflow,
+            if running {
+                "正在读取技能"
+            } else if success {
+                "已读取技能"
+            } else {
+                "技能读取失败"
+            },
+            args["name"]
+                .as_str()
+                .or(args["query"].as_str())
+                .unwrap_or("技能目录")
+                .into(),
+        ),
         "session_read" => (
             Icon::Text,
             if running {

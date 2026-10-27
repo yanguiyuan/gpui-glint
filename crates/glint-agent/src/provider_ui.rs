@@ -75,6 +75,7 @@ pub enum Section {
     Storage,
     Shortcuts,
     Memory,
+    Skills,
     Provider,
 }
 
@@ -86,6 +87,7 @@ impl Section {
             Self::Storage => "存储",
             Self::Shortcuts => "键盘快捷键",
             Self::Memory => "记忆",
+            Self::Skills => "技能",
             Self::Provider => "供应商",
         }
     }
@@ -701,6 +703,9 @@ impl AgentWorkspace {
     }
 
     pub fn settings_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.provider_settings.section == Section::Skills {
+            return self.skills_page(cx);
+        }
         if self.provider_settings.section == Section::Memory {
             return self.memory_page(cx);
         }
@@ -1228,6 +1233,7 @@ impl AgentWorkspace {
             (Section::Appearance, Icon::HalfCircle),
             (Section::Storage, Icon::Folder),
             (Section::Memory, Icon::Database),
+            (Section::Skills, Icon::Workflow),
             (Section::Shortcuts, Icon::Code),
         ] {
             if !query.is_empty() && !section.title().to_lowercase().contains(&query) {
@@ -1253,6 +1259,9 @@ impl AgentWorkspace {
                     .child(section.title())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.provider_settings.section = section;
+                        if section == Section::Skills {
+                            this.reload_skills(cx);
+                        }
                         if section == Section::Memory {
                             this.reload_memories(cx);
                         }
@@ -1517,6 +1526,8 @@ impl AgentWorkspace {
                                         this.search
                                             .update(cx, |entry, cx| entry.set_theme(theme, cx));
                                         this.provider_settings.set_theme(theme, cx);
+                                        this.skills_ui.set_theme(theme, cx);
+                                        this.sync_skill_context(cx);
                                         cx.notify();
                                     }))
                             }),

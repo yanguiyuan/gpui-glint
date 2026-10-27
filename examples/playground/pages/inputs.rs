@@ -267,8 +267,14 @@ impl InputsPage {
                         );
                     });
                 }
-                ComposerEvent::StopRequested => { this.composer.update(cx, |composer, cx| composer.set_busy(false, cx)); }
-                ComposerEvent::Changed(_) | ComposerEvent::AttachmentsChanged => {}
+                ComposerEvent::StopRequested => {
+                    this.composer
+                        .update(cx, |composer, cx| composer.set_busy(false, cx));
+                }
+                ComposerEvent::Changed(_)
+                | ComposerEvent::AttachmentsChanged
+                | ComposerEvent::ContextOpened
+                | ComposerEvent::ContextQueryChanged(_) => {}
             },
         ));
         let theme_selector = cx.new(|cx| ThemeSelector::new(cx).selected(theme).theme(theme));

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add cached, gitignore-aware project filename/directory suggestions to the Agent @panel, with scoped selection and bounded result ranking.
+- Add Glint Agent local Skills discovery, settings, progressive `skill_list` / `skill_read` tools, and skill selection from the composer's context panel.
+- Add `ComposerEvent::ContextOpened`, dynamic `set_context_sections`, and literal `add_context_token` support while preserving file mentions and image drafts. Filter context rows by caret-scoped @queries and highlight registered $skill tokens, including restored drafts.
+
 - Add opt-in `Composer::stop_on_busy(true)` and `ComposerEvent::StopRequested` to reuse the send button for cancellation.
 - Move Glint Agent state to SQLite with legacy JSON import; add scoped semantic memory recall, memory tools, and configurable nightly conversation consolidation.
 
