@@ -7,6 +7,7 @@ use std::{cell::RefCell, collections::BTreeMap};
 pub struct TemplateResolver {
     values: EnvironmentValues,
     cookies: BTreeMap<String, String>,
+    cookie_error: Option<String>,
     cache: RefCell<BTreeMap<String, String>>,
     now: DateTime<Utc>,
 }
@@ -15,9 +16,20 @@ impl TemplateResolver {
         Self {
             values: values.clone(),
             cookies: BTreeMap::new(),
+            cookie_error: None,
             cache: RefCell::default(),
             now: Utc::now(),
         }
+    }
+    /// Preview independent expressions even when request Cookie extraction fails.
+    /// Keep the extraction error for expressions that actually read a Cookie,
+    /// including indirect references through variables.
+    pub fn for_preview(values: &EnvironmentValues, draft: &Draft) -> Self {
+        Self::for_request(values, draft).unwrap_or_else(|error| {
+            let mut resolver = Self::new(values);
+            resolver.cookie_error = Some(error);
+            resolver
+        })
     }
     pub fn for_request(values: &EnvironmentValues, draft: &Draft) -> Result<Self, String> {
         let mut resolver = Self::new(values);
@@ -186,6 +198,9 @@ impl TemplateResolver {
             },
             "cookie" => match args.as_slice() {
                 [name] if !name.is_empty() => {
+                    if let Some(error) = &self.cookie_error {
+                        return Err(error.clone());
+                    }
                     let value = self
                         .cookies
                         .get(name)
@@ -349,6 +364,46 @@ mod tests {
         ] {
             assert!(resolver.resolve(expression).is_err(), "{expression}");
         }
+    }
+    #[test]
+    fn preview_isolates_cookie_errors_and_preserves_indirect_dependencies() {
+        let env = EnvironmentValues(BTreeMap::from([
+            ("baseurl".into(), "https://example.test".into()),
+            ("csrf".into(), "{{cookie('csrftoken')}}".into()),
+            ("endpoint".into(), "{{baseurl}}/api".into()),
+        ]));
+        let draft = Draft {
+            headers: vec![Pair::new("Cookie", "{{cookie}}", "")],
+            ..Draft::default()
+        };
+        let error = TemplateResolver::for_request(&env, &draft).err().unwrap();
+        let resolver = TemplateResolver::for_preview(&env, &draft);
+        assert_eq!(
+            resolver.resolve("{{baseurl}}").unwrap(),
+            "https://example.test"
+        );
+        assert_eq!(
+            resolver.resolve("{{endpoint}}").unwrap(),
+            "https://example.test/api"
+        );
+        assert_eq!(resolver.resolve("{{cookie}}").unwrap_err(), error);
+        assert_eq!(
+            resolver.resolve("{{cookie('csrftoken')}}").unwrap_err(),
+            error
+        );
+        assert_eq!(resolver.resolve("{{csrf}}").unwrap_err(), error);
+        assert!(
+            resolver
+                .resolve("{{missing}}")
+                .unwrap_err()
+                .contains("missing")
+        );
+
+        let mut values = env;
+        values.0.insert("cookie".into(), "csrftoken=token".into());
+        let resolver = TemplateResolver::for_preview(&values, &draft);
+        assert_eq!(resolver.resolve("{{csrf}}").unwrap(), "token");
+        assert!(TemplateResolver::for_request(&values, &draft).is_ok());
     }
     #[test]
     fn cookie_extraction_merges_headers_overrides_and_detects_cycles() {

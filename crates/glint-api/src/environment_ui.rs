@@ -974,11 +974,8 @@ impl Workbench {
         cx: &App,
     ) -> TextReferenceResolver {
         let values = self.environment_values(self.selected_environment(cx), collection);
-        let resolver = template::TemplateResolver::for_request(&values, draft);
-        std::rc::Rc::new(move |expression| match &resolver {
-            Ok(resolver) => resolver.resolve(expression),
-            Err(error) => Err(error.clone()),
-        })
+        let resolver = template::TemplateResolver::for_preview(&values, draft);
+        std::rc::Rc::new(move |expression| resolver.resolve(expression))
     }
 
     pub(super) fn sync_reference_inputs(&mut self, cx: &mut Context<Self>) {
