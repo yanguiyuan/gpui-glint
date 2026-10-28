@@ -60,6 +60,7 @@ pub(super) struct Workbench {
     pub(super) responses: Vec<Option<HttpResponse>>,
     pub(super) storage_error: Option<String>,
     pub(super) storage_dirty: bool,
+    pub(super) autosave_task: Option<Task<()>>,
     pub(super) focus: FocusHandle,
     pub(super) theme: ThemePreset,
     pub(super) show_vault: bool,
@@ -730,6 +731,7 @@ impl Workbench {
             storage,
             storage_error: None,
             storage_dirty: true,
+            autosave_task: None,
             environment_names,
             responses: data.responses,
             focus: cx.focus_handle(),
@@ -950,8 +952,16 @@ impl Workbench {
         this.reset_variable_rows(cx);
         this.load(&initial, cx);
         this.restore_response(cx);
-        let subscription = cx.observe_self(|this, cx| this.persist(cx));
+        let subscription = cx.observe_self(|this, cx| {
+            // Keep the local draft current for rendering; defer workspace-wide work.
+            this.capture_draft(cx);
+            this.schedule_persist(cx);
+        });
         this.subscriptions.push(subscription);
+        this.subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.persist(cx);
+            std::future::ready(())
+        }));
         this.set_theme(ThemePreset::Moonstone, cx);
         this.subscriptions.push(cx.subscribe(
             &this.vault,

@@ -516,8 +516,12 @@ impl TextEntry {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.activate_window(window, cx);
         if self.is_selecting {
+            self.activate_window(window, cx);
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.is_selecting = false;
+                return;
+            }
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
     }
@@ -529,6 +533,12 @@ impl TextEntry {
         let (Some(bounds), Some(line)) = (&self.last_bounds, &self.last_layout) else {
             return 0;
         };
+        if position.x < bounds.left() {
+            return 0;
+        }
+        if position.x > bounds.right() {
+            return self.content.len();
+        }
         self.content_offset(line.closest_index_for_x(position.x - bounds.left() + self.scroll_x))
     }
 }
@@ -944,6 +954,27 @@ impl Element for TextEntryElement {
         self.input
             .update(cx, |input, cx| input.activate_window(window, cx));
         let focus_handle = self.input.read(cx).focus_handle.clone();
+        // Keep the drag owned by the input even when the pointer crosses its hitbox.
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == gpui::DispatchPhase::Capture
+                && input.read(cx).is_selecting
+                && input.read(cx).focus_handle.is_focused(window)
+            {
+                input.update(cx, |input, cx| input.on_mouse_move(event, window, cx));
+                cx.stop_propagation();
+            }
+        });
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == gpui::DispatchPhase::Capture
+                && event.button == MouseButton::Left
+                && input.read(cx).is_selecting
+                && input.read(cx).focus_handle.is_focused(window)
+            {
+                input.update(cx, |input, cx| input.on_mouse_up(event, window, cx));
+            }
+        });
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
@@ -1042,7 +1073,6 @@ impl Render for TextEntry {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .line_height(px(self.font_size * 1.5))
             .text_size(px(self.font_size))
             .text_color(rgb(theme.color(0x292d32)));
@@ -1064,6 +1094,7 @@ impl Render for TextEntry {
         if preview {
             let mut content = div()
                 .id("reference-preview")
+                .debug_selector(|| "reference-preview".into())
                 .flex_1()
                 .min_w_0()
                 .overflow_x_scroll()
@@ -1073,7 +1104,9 @@ impl Render for TextEntry {
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
+                        this.activate_window(window, cx);
                         window.focus(&this.focus_handle, cx);
+                        this.is_selecting = true;
                         this.move_to(this.content.len(), cx);
                     }),
                 );
@@ -1113,7 +1146,7 @@ impl Render for TextEntry {
                             window.focus(&this.focus_handle, cx);
                             this.selected_range = reference.range.clone();
                             this.selection_reversed = false;
-                            this.is_selecting = false;
+                            this.is_selecting = true;
                             cx.notify();
                         }),
                     );
@@ -1394,6 +1427,154 @@ mod selection_tests {
     }
 
     #[gpui::test]
+    fn reference_preview_starts_selection_on_first_press(cx: &mut gpui::TestAppContext) {
+        struct Input(Entity<TextEntry>);
+        impl Render for Input {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().p_4().w(px(300.)).h(px(64.)).child(self.0.clone())
+            }
+        }
+        let input = cx.new(|cx| {
+            let mut input = TextEntry::new(cx, "", "{{baseurl}}/v7/chats");
+            input.set_reference_resolver(
+                Some(std::rc::Rc::new(|_| Ok("https://example.test".into()))),
+                cx,
+            );
+            input
+        });
+        let (_, window) = cx.add_window_view(|_, _| Input(input.clone()));
+        let preview = window.debug_bounds("reference-preview").unwrap();
+        window.simulate_event(MouseDownEvent {
+            position: point(preview.right() - px(2.), preview.center().y),
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| assert!(input.is_selecting));
+        let outside = point(preview.left() - px(50.), preview.center().y);
+        window.simulate_event(MouseMoveEvent {
+            position: outside,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| {
+            assert_eq!(input.selected_range, 0..input.content.len())
+        });
+        window.simulate_event(MouseUpEvent {
+            position: outside,
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| assert!(!input.is_selecting));
+    }
+
+    #[gpui::test]
+    fn fast_selection_drag_past_left_edge_selects_hidden_prefix_and_releases(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Input(Entity<TextEntry>);
+        impl Render for Input {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().p_4().w(px(220.)).h(px(64.)).child(self.0.clone())
+            }
+        }
+        let text = "https://example.test/中文/very-long-path/".repeat(8);
+        let input = cx.new(|cx| TextEntry::new(cx, "", text.clone()));
+        let (_, window) = cx.add_window_view(|_, _| Input(input.clone()));
+        window.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        window.simulate_keystrokes("end");
+        let bounds = input.read_with(window, |input, _| {
+            assert!(input.scroll_x > px(0.));
+            input.last_bounds.unwrap()
+        });
+        window.simulate_event(MouseDownEvent {
+            position: point(bounds.right() - px(1.), bounds.center().y),
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| {
+            assert!(input.is_selecting, "mouse down must begin selection")
+        });
+        let outside = point(bounds.left() - px(100.), bounds.bottom() + px(30.));
+        window.simulate_event(MouseMoveEvent {
+            position: outside,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| {
+            assert_eq!(input.selected_range, 0..text.len());
+            assert_eq!(input.scroll_x, px(0.));
+        });
+        window.simulate_event(MouseUpEvent {
+            position: outside,
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        });
+        window.simulate_event(MouseMoveEvent {
+            position: bounds.center(),
+            ..Default::default()
+        });
+        input.read_with(window, |input, _| {
+            assert!(!input.is_selecting);
+            assert_eq!(input.selected_range, 0..text.len());
+        });
+    }
+
+    #[gpui::test]
+    fn template_completion_scrolls_with_wheel_and_keeps_offset_on_render(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Input(Entity<TextEntry>);
+        impl Render for Input {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().p_4().w(px(400.)).h(px(32.)).child(self.0.clone())
+            }
+        }
+        let input = cx.new(|cx| {
+            let mut input = TextEntry::new(cx, "", "{{");
+            input.set_completions(
+                (0..10_000)
+                    .map(|i| TextCompletion::new(format!("item_{i}"), "提示"))
+                    .collect(),
+                cx,
+            );
+            input
+        });
+        let (_, window) = cx.add_window_view(|_, _| Input(input.clone()));
+        window.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        let bounds = window.debug_bounds("template-completion-menu").unwrap();
+        let first = window.debug_bounds("template-completion-0").unwrap();
+        let tracked = window.debug_bounds("template-completion-4").unwrap();
+        assert!(window.debug_bounds("template-completion-9999").is_none());
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: first.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-160.))),
+            ..Default::default()
+        });
+        let scrolled = window.debug_bounds("template-completion-4").unwrap();
+        assert!(scrolled.top() < tracked.top());
+        input.update(window, |_, cx| cx.notify());
+        assert_eq!(
+            window.debug_bounds("template-completion-4").unwrap(),
+            scrolled
+        );
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: point(bounds.center().x, bounds.top() + px(20.)),
+            delta: gpui::ScrollDelta::Lines(point(0., 3.)),
+            ..Default::default()
+        });
+        let back = window.debug_bounds("template-completion-4").unwrap();
+        assert!(back.top() > scrolled.top());
+        window.simulate_keystrokes("up");
+        assert!(window.debug_bounds("template-completion-9999").is_some());
+        window.simulate_keystrokes("down down enter");
+        input.update(window, |input, _| assert_eq!(input.value(), "{{item_1}}"));
+    }
+
+    #[gpui::test]
     fn template_completion_keyboard_mouse_and_ime(cx: &mut gpui::TestAppContext) {
         struct Input(Entity<TextEntry>);
         impl Render for Input {
@@ -1430,7 +1611,13 @@ mod selection_tests {
             });
         });
         let row = window.debug_bounds("template-completion-0").unwrap();
-        window.simulate_click(row.center(), gpui::Modifiers::default());
+        let menu = window.debug_bounds("template-completion-menu").unwrap();
+        assert!(row.size.width >= menu.size.width - px(12.));
+        // The empty area to the right of the label is part of the same clickable row.
+        window.simulate_click(
+            point(row.right() - px(4.), row.center().y),
+            gpui::Modifiers::default(),
+        );
         input.update(window, |input, _| {
             assert_eq!(input.value(), "前缀/{{base_url}}/后缀")
         });

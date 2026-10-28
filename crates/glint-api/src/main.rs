@@ -223,6 +223,11 @@ fn main() {
                 },
                 |window, cx| {
                     let app = cx.new(Workbench::new);
+                    let closing = app.downgrade();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        let _ = closing.update(cx, |app, cx| app.persist(cx));
+                        true
+                    });
                     let focus = app.read(cx).focus.clone();
                     window.focus(&focus, cx);
                     app

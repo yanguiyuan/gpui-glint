@@ -68,6 +68,78 @@ mod tests {
     }
 
     #[gpui::test]
+    fn rapid_endpoint_edits_paint_before_autosave_and_flush_latest_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_text_entry_keys);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rapid-input.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| setup(&path, cx));
+        host.update(window, |host, cx| {
+            host.endpoint
+                .update(cx, |entry, cx| entry.set_text("https://example.test/", cx));
+            host.persist(cx);
+        });
+        let writes = host.read_with(window, |host, _| host.storage.serializations);
+        let endpoint = window.debug_bounds("request-endpoint").unwrap();
+        window.simulate_click(endpoint.center(), gpui::Modifiers::default());
+        window.simulate_keystrokes("end");
+        let mut expected = "https://example.test/".to_owned();
+        for ch in "abcdefgh{{{{ssss1234567890".chars() {
+            window.simulate_input(&ch.to_string());
+            expected.push(ch);
+            host.read_with(window, |host, cx| {
+                assert_eq!(
+                    host.endpoint.read(cx).value().text.as_ref(),
+                    expected.as_str()
+                );
+                assert_eq!(
+                    host.storage.serializations, writes,
+                    "typing must not write SQLite"
+                );
+            });
+        }
+        for _ in 0..10 {
+            window.simulate_keystrokes("backspace");
+            expected.pop();
+            host.read_with(window, |host, cx| {
+                assert_eq!(
+                    host.endpoint.read(cx).value().text.as_ref(),
+                    expected.as_str()
+                );
+                assert_eq!(
+                    host.storage.serializations, writes,
+                    "backspace must not write SQLite"
+                );
+            });
+        }
+        window.executor().advance_clock(Duration::from_millis(200));
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert_eq!(host.storage.serializations, writes + 1)
+        });
+        let saved = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(saved.requests[0].draft.url, expected);
+        // Explicit persistence flushes a pending edit without waiting for the idle timer.
+        host.update(window, |host, cx| {
+            host.endpoint.update(cx, |entry, cx| {
+                entry.set_text("https://example.test/final", cx)
+            });
+            host.persist(cx);
+        });
+        assert_eq!(
+            storage::Store::open(&path)
+                .unwrap()
+                .load()
+                .unwrap()
+                .requests[0]
+                .draft
+                .url,
+            "https://example.test/final"
+        );
+    }
+
+    #[gpui::test]
     fn detached_request_triggers_refresh_and_persists_expiration(cx: &mut gpui::TestAppContext) {
         cx.background_executor.allow_parking();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -672,10 +744,22 @@ impl Workbench {
                 editor
             });
             let observed_id = id.clone();
-            let subscription = cx.observe(&editor, move |owner, _, cx| {
-                if owner.sync_request_editor(&observed_id, cx) {
+            let subscription = cx.observe(&editor, move |owner, editor, cx| {
+                // Publish execution transitions immediately. Ordinary keystrokes must
+                // not clone response bodies/history or serialize the workspace.
+                let current = editor.read(cx);
+                let running =
+                    current.sending.is_some() || current.ws_active || current.ws_connected;
+                let transition = owner
+                    .request_editors
+                    .get(&observed_id)
+                    .is_some_and(|shared| {
+                        shared.running != running || shared.connected != current.ws_connected
+                    });
+                if transition && owner.sync_request_editor(&observed_id, cx) {
                     cx.notify();
                 }
+                owner.schedule_persist(cx);
             });
             self.request_editors.insert(
                 id.clone(),
@@ -826,6 +910,9 @@ impl Workbench {
     }
 
     pub(super) fn refresh_request_editors(&mut self, cx: &mut Context<Self>) {
+        if self.request_editors.is_empty() {
+            return;
+        }
         let selected = self.selected_environment(cx);
         let context = serde_json::to_string(&(
             self.requests
@@ -875,7 +962,9 @@ impl Workbench {
                 if environment_changed {
                     editor.mcp_environment_options(selected, cx);
                 }
-                editor.set_theme(self.theme, cx);
+                if editor.theme != self.theme {
+                    editor.set_theme(self.theme, cx);
+                }
                 editor.sync_reference_inputs(cx);
                 cx.notify();
             });

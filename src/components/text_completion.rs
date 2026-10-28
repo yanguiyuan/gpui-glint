@@ -1,10 +1,13 @@
 use crate::theme::ThemePreset;
 use gpui::{
     AnyElement, App, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point,
-    prelude::FluentBuilder, px, rgb,
+    Styled, UniformListScrollHandle, Window, anchored, deferred, div, prelude::FluentBuilder, px,
+    rgb,
 };
-use std::ops::Range;
+use std::{
+    ops::{Index, Range},
+    rc::Rc,
+};
 
 /// A template expression offered after `{{`. Contains no resolved value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,14 +26,39 @@ impl TextCompletion {
 
 #[derive(Default)]
 pub(super) struct CompletionState {
-    pub items: Vec<TextCompletion>,
+    pub items: Rc<[TextCompletion]>,
+    lowercase: Vec<String>,
+    query: Option<String>,
+    matches: Rc<[usize]>,
     pub selected: usize,
+    scroll: UniformListScrollHandle,
     context: Option<(String, usize)>,
     dismissed: bool,
 }
 pub(super) struct CompletionMatch {
     pub range: Range<usize>,
-    pub items: Vec<TextCompletion>,
+    scroll: UniformListScrollHandle,
+    pub items: CompletionItems,
+}
+/// Shared candidates and matching indices: no expression/description copies per frame.
+#[derive(Clone)]
+pub(super) struct CompletionItems {
+    source: Rc<[TextCompletion]>,
+    indices: Rc<[usize]>,
+}
+impl CompletionItems {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    pub fn get(&self, index: usize) -> Option<&TextCompletion> {
+        self.indices.get(index).map(|i| &self.source[*i])
+    }
+}
+impl Index<usize> for CompletionItems {
+    type Output = TextCompletion;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.source[self.indices[index]]
+    }
 }
 pub(super) enum CompletionKey {
     Handled,
@@ -38,11 +66,19 @@ pub(super) enum CompletionKey {
 }
 impl CompletionState {
     pub fn set_items(&mut self, items: Vec<TextCompletion>) -> bool {
-        if self.items == items {
+        if self.items.as_ref() == items.as_slice() {
             return false;
         }
-        self.items = items;
+        self.lowercase = items
+            .iter()
+            .map(|item| item.expression.to_lowercase())
+            .collect();
+        self.items = items.into();
+        self.query = None;
+        self.matches = Rc::default();
         self.selected = 0;
+        self.scroll
+            .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
         true
     }
     pub fn dismiss(&mut self) {
@@ -57,10 +93,15 @@ impl CompletionState {
         if self.items.is_empty() {
             return None;
         }
-        let context = (text.to_owned(), selection.end);
-        if self.context.as_ref() != Some(&context) {
-            self.context = Some(context);
+        if self
+            .context
+            .as_ref()
+            .is_none_or(|(previous, cursor)| previous != text || *cursor != selection.end)
+        {
+            self.context = Some((text.to_owned(), selection.end));
             self.selected = 0;
+            self.scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
             self.dismissed = false;
         }
         if composing || self.dismissed || !selection.is_empty() {
@@ -74,15 +115,24 @@ impl CompletionState {
             return None;
         }
         let query = query.trim().to_lowercase();
-        let items: Vec<_> = self
-            .items
-            .iter()
-            .filter(|item| item.expression.to_lowercase().contains(&query))
-            .cloned()
-            .collect();
-        if items.is_empty() {
+        if self.query.as_deref() != Some(query.as_str()) {
+            self.matches = self
+                .lowercase
+                .iter()
+                .enumerate()
+                .filter(|(_, expression)| expression.contains(&query))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+                .into();
+            self.query = Some(query);
+        }
+        if self.matches.is_empty() {
             return None;
         }
+        let items = CompletionItems {
+            source: self.items.clone(),
+            indices: self.matches.clone(),
+        };
         self.selected = self.selected.min(items.len() - 1);
         let rest = &text[cursor..];
         let end = match rest.find("}}") {
@@ -98,6 +148,7 @@ impl CompletionState {
         };
         Some(CompletionMatch {
             range: start..end,
+            scroll: self.scroll.clone(),
             items,
         })
     }
@@ -121,6 +172,10 @@ impl CompletionState {
             }
             _ => return None,
         }
+        if matches!(key, "up" | "down") {
+            self.scroll
+                .scroll_to_item(self.selected, gpui::ScrollStrategy::Nearest);
+        }
         Some(CompletionKey::Handled)
     }
 }
@@ -135,8 +190,7 @@ pub(super) fn completion_menu(
 ) -> AnyElement {
     let choose = std::rc::Rc::new(choose);
     let p = theme.palette();
-    let scroll = ScrollHandle::new();
-    scroll.set_offset(point(px(0.), -px(selected.saturating_sub(4) as f32 * 40.)));
+    let scroll = active.scroll;
     let mut menu = div()
         .id("template-completion-menu")
         .debug_selector(|| "template-completion-menu".into())
@@ -155,51 +209,59 @@ pub(super) fn completion_menu(
         })
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .on_mouse_down_out(move |_, window, cx| dismiss(window, cx));
-    let mut rows = div()
-        .id("template-completion-scroll")
-        .max_h(px(240.))
-        .overflow_y_scroll()
-        .track_scroll(&scroll);
-    for (index, item) in active.items.into_iter().enumerate() {
-        let choose = choose.clone();
-        rows = rows.child(
-            div()
-                .id(("template-completion", index))
-                .debug_selector(move || format!("template-completion-{index}").into())
-                .h(px(40.))
-                .px_2()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(index == selected, |el| el.bg(rgb(p.accent_tint)))
-                .hover(|el| el.bg(rgb(p.accent_tint)))
-                .child(
+    let height = px(active.items.len().min(6) as f32 * 40.);
+    let items = active.items;
+    let rows = gpui::uniform_list(
+        "template-completion-scroll",
+        items.len(),
+        move |range, _, _| {
+            range
+                .map(|index| {
+                    let item = &items[index];
+                    let choose = choose.clone();
                     div()
-                        .text_size(px(12.))
-                        .child(format!("{{{{{}}}}}", item.expression)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(p.text_muted))
-                        .child(item.description),
-                )
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    choose(index, window, cx);
-                }),
-        );
-    }
+                        .id(("template-completion", index))
+                        .debug_selector(move || format!("template-completion-{index}").into())
+                        .w_full()
+                        .h(px(40.))
+                        .px_2()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(index == selected, |el| el.bg(rgb(p.accent_tint)))
+                        .hover(|el| el.bg(rgb(p.accent_tint)))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .child(format!("{{{{{}}}}}", item.expression)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(item.description.clone()),
+                        )
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            choose(index, window, cx);
+                        })
+                })
+                .collect::<Vec<_>>()
+        },
+    )
+    .h(height)
+    .w_full()
+    .track_scroll(&scroll);
     menu = menu.child(rows).child(
         div()
             .px_2()
             .pt_1()
             .text_size(px(10.))
             .text_color(rgb(p.text_muted))
-            .child("↑ ↓ 选择 · Tab / Enter 插入 · Esc 收起"),
+            .child("滚轮滑动 · ↑ ↓ 选择 · Tab / Enter 插入 · Esc 收起"),
     );
     deferred(
         anchored()
@@ -214,6 +276,30 @@ pub(super) fn completion_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completion_query_cache_shares_data_and_invalidates_on_candidate_changes() {
+        let mut state = CompletionState::default();
+        state.set_items(
+            (0..10_000)
+                .map(|i| TextCompletion::new(format!("item_{i}"), "候选项"))
+                .collect(),
+        );
+        let first = state.active("{{ITEM_99", &(9..9), false).unwrap();
+        assert_eq!(first.items.len(), 111);
+        for _ in 0..1_000 {
+            let cached = state.active("{{ITEM_99", &(9..9), false).unwrap();
+            assert!(Rc::ptr_eq(&first.items.source, &cached.items.source));
+            assert!(Rc::ptr_eq(&first.items.indices, &cached.items.indices));
+        }
+        state.set_items(vec![TextCompletion::new("item_99999", "新增候选")]);
+        let updated = state.active("{{ITEM_99", &(9..9), false).unwrap();
+        assert_eq!(updated.items.len(), 1);
+        assert_eq!(updated.items[0].expression, "item_99999");
+        assert!(!Rc::ptr_eq(&first.items.source, &updated.items.source));
+        assert!(state.active("{{missing", &(9..9), false).is_none());
+        assert!(state.active("{{missing", &(9..9), false).is_none());
+    }
+
     #[test]
     fn functions_remain_reachable_after_many_environment_variables() {
         let mut state = CompletionState::default();

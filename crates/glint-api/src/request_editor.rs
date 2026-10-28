@@ -2,6 +2,33 @@
 
 use super::*;
 
+#[cfg(test)]
+mod title_hit_tests {
+    use super::*;
+    #[gpui::test]
+    fn blank_header_space_does_not_edit_title(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&dir.path().join("title.sqlite3")).unwrap(),
+                cx,
+            );
+            host.collections
+                .push(RequestGroups::create_collection("API", &[]).unwrap());
+            host.add_request(cx);
+            host
+        });
+        let title = window.debug_bounds("edit-request-name").unwrap();
+        window.simulate_click(
+            point(title.right() + px(50.), title.center().y),
+            gpui::Modifiers::default(),
+        );
+        host.read_with(window, |host, _| assert!(!host.editing_request_name));
+        window.simulate_click(title.center(), gpui::Modifiers::default());
+        host.read_with(window, |host, _| assert!(host.editing_request_name));
+    }
+}
+
 impl Workbench {
     pub(super) fn edit_request_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(request) = self.requests.get(self.active) else {
@@ -116,31 +143,40 @@ impl Workbench {
                 .into_any_element();
         }
         div()
-            .id("edit-request-name")
-            .group("request-name")
             .flex_1()
             .min_w_0()
             .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .hover(|style| style.text_color(rgb(p.accent)))
             .child(
                 div()
+                    .id("edit-request-name")
+                    .debug_selector(|| "edit-request-name".into())
+                    .group("request-name")
                     .min_w_0()
-                    .truncate()
-                    .text_size(px(17.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.requests[self.active].name.clone()),
+                    .max_w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgb(p.accent)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.requests[self.active].name.clone()),
+                    )
+                    .child(
+                        Icon::Pencil
+                            .render(14.)
+                            .flex_shrink_0()
+                            .opacity(0.)
+                            .group_hover("request-name", |style| style.opacity(1.)),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.edit_request_name(window, cx)),
+                    ),
             )
-            .child(
-                Icon::Pencil
-                    .render(14.)
-                    .flex_shrink_0()
-                    .opacity(0.)
-                    .group_hover("request-name", |style| style.opacity(1.)),
-            )
-            .on_click(cx.listener(|this, _, window, cx| this.edit_request_name(window, cx)))
             .into_any_element()
     }
 
@@ -154,7 +190,23 @@ impl Workbench {
         }
     }
 
+    /// Input controls paint immediately; coalesce expensive snapshots and disk writes.
+    pub(super) fn schedule_persist(&mut self, cx: &mut Context<Self>) {
+        if self.request_binding.is_some() {
+            return;
+        }
+        self.autosave_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.persist(cx);
+            });
+        }));
+    }
+
     pub(super) fn persist(&mut self, cx: &mut Context<Self>) {
+        self.autosave_task = None;
         if self.request_binding.is_some() {
             self.capture_draft(cx);
             return;
@@ -575,6 +627,7 @@ impl Workbench {
         self.sync_request_preview(cx);
         self.sync_groups(cx);
         self.notice = format!("已删除请求 {name}");
+        self.persist(cx);
         cx.notify();
     }
 }

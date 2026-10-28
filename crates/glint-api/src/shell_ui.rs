@@ -354,7 +354,13 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().flex_1().min_w_0().child(self.endpoint.clone()))
+                    .child(
+                        div()
+                            .debug_selector(|| "request-endpoint".into())
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.endpoint.clone()),
+                    )
                     .child(
                         Button::new(if self.ws_commands.is_some() {
                             "断开"

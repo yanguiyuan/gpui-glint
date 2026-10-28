@@ -1073,7 +1073,8 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
         bounds: bounds.clone(),
     });
     let click_title = |window: &mut gpui::VisualTestContext| {
-        window.simulate_click(bounds.get().center(), gpui::Modifiers::default());
+        let title = window.debug_bounds("edit-request-name").unwrap();
+        window.simulate_click(title.center(), gpui::Modifiers::default());
     };
     click_title(window);
     host.update(window, |host, cx| {

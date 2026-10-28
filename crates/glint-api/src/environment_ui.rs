@@ -423,6 +423,7 @@ impl Workbench {
                     "已保存{}的环境设置",
                     self.environment_name(index).to_owned()
                 );
+                self.persist(cx);
             }
             Err(error) => self.variable_error = Some(error),
         }
