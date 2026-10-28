@@ -21,6 +21,7 @@ pub(super) struct DirectorySettings {
     form: Vec<PairInput>,
     pair_delete: Option<(Section, bool, gpui::EntityId)>,
     actions: Vec<(String, model::BeforeAction)>,
+    triggers: Vec<model::Trigger>,
     tls: bool,
     completions: Vec<TextCompletion>,
 }
@@ -44,6 +45,7 @@ impl DirectorySettings {
             key: entry(&pair.key, "键"),
             value: entry(&pair.value, "值 / {{变量名}}"),
             note: entry(&pair.note, "说明"),
+            expires_in: entry(&pair.expires_in, "有效期 JSONPath（秒）"),
         }
     }
     fn new(
@@ -234,6 +236,7 @@ impl DirectorySettings {
             form,
             pair_delete: None,
             actions,
+            triggers: draft.triggers.clone(),
             tls: draft.skip_tls_verification,
             completions,
         }
@@ -254,7 +257,7 @@ impl DirectorySettings {
         }
         for (section, rows) in &self.rows {
             for row in rows {
-                for entry in [&row.key, &row.value, &row.note] {
+                for entry in [&row.key, &row.value, &row.note, &row.expires_in] {
                     entry.update(cx, |e, cx| {
                         e.set_theme(theme, cx);
                         if *section != Section::Extractors && entry != &row.note {
@@ -265,7 +268,7 @@ impl DirectorySettings {
             }
         }
         for row in &self.form {
-            for entry in [&row.key, &row.value, &row.note] {
+            for entry in [&row.key, &row.value, &row.note, &row.expires_in] {
                 entry.update(cx, |e, cx| {
                     e.set_theme(theme, cx);
                     if entry != &row.note {
@@ -288,6 +291,7 @@ impl DirectorySettings {
                     key: r.key.read(cx).value().into(),
                     value: r.value.read(cx).value().into(),
                     note: r.note.read(cx).value().into(),
+                    expires_in: r.expires_in.read(cx).value().into(),
                 })
                 .collect()
         };
@@ -315,6 +319,7 @@ impl DirectorySettings {
             body_format: self.body_format,
             form: pairs(&self.form),
             plugins: self.actions.iter().map(|(_, a)| a.clone()).collect(),
+            triggers: self.triggers.clone(),
             skip_tls_verification: self.tls,
             ..Draft::default()
         };
@@ -342,7 +347,7 @@ impl DirectorySettings {
             &self.rows[&section]
         };
         let labels = if section == Section::Extractors {
-            ["环境变量名", "JSONPath", "说明"]
+            ["环境变量名", "JSONPath", "有效期 JSONPath（秒）"]
         } else {
             ["键", "值", "说明"]
         };
@@ -386,7 +391,16 @@ impl DirectorySettings {
                     )
                     .child(div().flex_1().min_w_0().child(row.key.clone()))
                     .child(div().flex_1().min_w_0().child(row.value.clone()))
-                    .child(div().flex_1().min_w_0().child(row.note.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(if section == Section::Extractors {
+                                row.expires_in.clone()
+                            } else {
+                                row.note.clone()
+                            }),
+                    )
                     .child({
                         let row_id = row.key.entity_id();
                         let target = (section, form, row_id);
@@ -1019,6 +1033,68 @@ mod tests {
 #[cfg(test)]
 mod row_delete_tests {
     use super::*;
+    #[gpui::test]
+    fn directory_completions_include_builtin_functions_and_scoped_variables(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&dir.path().join("completions.sqlite3")).unwrap(),
+                cx,
+            );
+            host.collections
+                .push(RequestGroups::create_collection("API", &[]).unwrap());
+            host.add_request(cx);
+            host.scoped_environment_mut(0, Some("API"))
+                .unwrap()
+                .save(None, "baseurl", "https://example.test", false)
+                .unwrap();
+            host.open_directory_settings(0, String::new(), cx);
+            host
+        });
+        host.update(window, |host, cx| {
+            for items in [
+                host.environment_completions(cx),
+                host.environment_completions_for(cx, Some("API")),
+            ] {
+                for (expression, _) in template::METHOD_EXAMPLES {
+                    let expression = expression.trim_start_matches("{{").trim_end_matches("}}");
+                    assert!(
+                        items.iter().any(|item| item.expression == expression
+                            && item.description.starts_with("内置函数")),
+                        "missing {expression}"
+                    );
+                }
+            }
+            let editor = host.directory_settings.as_ref().unwrap();
+            assert!(
+                editor
+                    .read(cx)
+                    .completions
+                    .iter()
+                    .any(|item| item.expression == "uuid()")
+            );
+            assert!(
+                editor
+                    .read(cx)
+                    .completions
+                    .iter()
+                    .any(|item| item.expression == "baseurl")
+            );
+            host.sync_reference_inputs(cx);
+            assert!(
+                host.directory_settings
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .completions
+                    .iter()
+                    .any(|item| item.expression == "timestamp_ms()")
+            );
+        });
+    }
+
     #[gpui::test]
     fn directory_row_delete_confirms_and_cancels_without_losing_other_fields(
         cx: &mut gpui::TestAppContext,

@@ -165,7 +165,7 @@ impl Workbench {
             5=>self.plugin_configuration(cx),
             6=>div().flex().flex_col().gap_3()
                 .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("提取环境变量"))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入所属集合在发送时环境下的变量，不修改全局变量；集合内同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。"))
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入所属集合在发送时环境下的变量，不修改全局变量；集合内同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。有效期填响应中的 JSONPath（如 $.expires_in），单位秒，留空表示不过期。"))
                 .child(self.extractors_table.clone()),
             3=>self.body_configuration(cx),
             _=>div().w_full().flex().flex_col()

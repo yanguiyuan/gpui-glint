@@ -209,6 +209,7 @@ impl Workbench {
                     key: r.key.read(cx).value().into(),
                     value: r.value.read(cx).value().into(),
                     note: r.note.read(cx).value().into(),
+                    expires_in: r.expires_in.read(cx).value().into(),
                 })
                 .collect()
         };
@@ -240,6 +241,19 @@ impl Workbench {
             headers: pairs(&self.headers),
             cookies: pairs(&self.cookies),
             extractors: pairs(&self.extractors),
+            triggers: self
+                .trigger_rows
+                .iter()
+                .map(|row| model::Trigger {
+                    enabled: row.enabled,
+                    condition: model::TriggerCondition::VariableExpired {
+                        variable: row.key.read(cx).value().to_owned(),
+                    },
+                    action: model::TriggerAction::RunRequest {
+                        request_id: row.value.read(cx).value().to_owned(),
+                    },
+                })
+                .collect(),
             oauth: (self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"))
                 .then(|| self.oauth.snapshot(cx)),
             token: self.authentication.read(cx).value().text.to_string(),
@@ -302,6 +316,17 @@ impl Workbench {
         self.cookies = draft.cookies.iter().map(|p| self.pair(p, cx)).collect();
         self.body_format = draft.body_format;
         self.form = draft.form.iter().map(|pair| self.pair(pair, cx)).collect();
+        self.trigger_rows = draft
+            .triggers
+            .iter()
+            .map(|trigger| {
+                let model::TriggerCondition::VariableExpired { variable } = &trigger.condition;
+                let model::TriggerAction::RunRequest { request_id } = &trigger.action;
+                let mut pair = Pair::new(variable, request_id, "");
+                pair.enabled = trigger.enabled;
+                self.pair(&pair, cx)
+            })
+            .collect();
         self.extractors = draft
             .extractors
             .iter()

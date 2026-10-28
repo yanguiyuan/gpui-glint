@@ -79,7 +79,8 @@ impl Workbench {
         let key = Self::entry(&pair.key, "键", cx);
         let value = Self::entry(&pair.value, "值", cx);
         let note = Self::entry(&pair.note, "说明", cx);
-        for entry in [&key, &value, &note] {
+        let expires_in = Self::entry(&pair.expires_in, "留空表示不过期，例如 $.expires_in", cx);
+        for entry in [&key, &value, &note, &expires_in] {
             entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
             let mut previous = entry.read(cx).value().to_string();
             self.row_subscriptions
@@ -103,6 +104,7 @@ impl Workbench {
             key,
             value,
             note,
+            expires_in,
         }
     }
 
@@ -112,6 +114,7 @@ impl Workbench {
             2 => &mut self.cookies,
             3 => &mut self.extractors,
             4 => &mut self.form,
+            5 => &mut self.trigger_rows,
             _ => &mut self.params,
         }
     }
@@ -126,12 +129,13 @@ impl Workbench {
                 self.pair_delete = None;
             }
         }
-        for kind in [0, 1, 2, 3, 4] {
+        for kind in [0, 1, 2, 3, 4, 5] {
             let rows = match kind {
                 1 => &self.headers,
                 2 => &self.cookies,
                 3 => &self.extractors,
                 4 => &self.form,
+                5 => &self.trigger_rows,
                 _ => &self.params,
             };
             let theme = self.theme;
@@ -154,6 +158,7 @@ impl Workbench {
                                         2 => &mut this.cookies,
                                         3 => &mut this.extractors,
                                         4 => &mut this.form,
+                                        5 => &mut this.trigger_rows,
                                         _ => &mut this.params,
                                     };
                                     rows[i].enabled = checked;
@@ -165,7 +170,50 @@ impl Workbench {
                     });
                     let key = row.key.clone();
                     let value = row.value.clone();
-                    let note = row.note.clone();
+                    let note = if kind == 3 {
+                        row.expires_in.clone()
+                    } else {
+                        row.note.clone()
+                    };
+                    let target_select = if kind == 5 {
+                        let collection = self
+                            .requests
+                            .get(self.active)
+                            .map(|r| r.collection.as_str());
+                        let active_id = self.requests.get(self.active).map(|r| &r.id);
+                        let options: Vec<_> = self
+                            .trigger_requests
+                            .as_deref()
+                            .unwrap_or(&self.requests)
+                            .iter()
+                            .filter(|r| {
+                                Some(&r.id) != active_id
+                                    && Some(r.collection.as_str()) == collection
+                                    && r.draft.method != "WS"
+                            })
+                            .map(|r| {
+                                SelectOption::new(r.id.clone(), format!("{} / {}", r.group, r.name))
+                            })
+                            .collect();
+                        let selected = row.value.read(cx).value().to_owned();
+                        let select =
+                            cx.new(|cx| Select::new(options, cx).selected(selected).theme(theme));
+                        let target = row.value.clone();
+                        self.row_subscriptions.push(cx.subscribe(
+                            &select,
+                            move |_: &mut Self, select, event: &SelectEvent, cx| {
+                                let SelectEvent::Changed(value) = event;
+                                select.update(cx, |select, cx| {
+                                    select.set_selected(Some(value.clone()), cx)
+                                });
+                                target
+                                    .update(cx, |entry, cx| entry.set_value(value.to_string(), cx));
+                            },
+                        ));
+                        Some(select)
+                    } else {
+                        None
+                    };
                     let workbench = cx.entity().downgrade();
                     let extractor_cell = (kind == 3)
                         .then(|| cx.new(|cx| json_picker::ExtractorCell::new(workbench, i, cx)));
@@ -210,44 +258,50 @@ impl Workbench {
                             },
                         )
                     });
-                    TableRow::new(
-                        i.to_string(),
-                        [
-                            check,
-                            TableCell::custom(move || {
-                                div()
-                                    .w_full()
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .font_family("Menlo")
-                                    .child(key.clone())
-                            }),
-                            TableCell::custom(move || {
-                                if let Some(cell) = &extractor_cell {
-                                    return cell.clone().into_any_element();
-                                }
-                                div()
-                                    .w_full()
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .font_family("Menlo")
-                                    .child(value.clone())
-                                    .into_any_element()
-                            }),
-                            TableCell::custom(move || {
-                                div()
-                                    .w_full()
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .child(note.clone())
-                            }),
-                            delete,
-                        ],
-                    )
-                    .focus_handle(row.key.read(cx).focus_handle(cx))
+                    let mut cells = vec![
+                        check,
+                        TableCell::custom(move || {
+                            div()
+                                .w_full()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .font_family("Menlo")
+                                .child(key.clone())
+                        }),
+                        TableCell::custom(move || {
+                            if let Some(select) = &target_select {
+                                return select.clone().into_any_element();
+                            }
+                            if let Some(cell) = &extractor_cell {
+                                return cell.clone().into_any_element();
+                            }
+                            div()
+                                .w_full()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .font_family("Menlo")
+                                .child(value.clone())
+                                .into_any_element()
+                        }),
+                        TableCell::custom(move || {
+                            div()
+                                .w_full()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .child(note.clone())
+                        }),
+                        delete,
+                    ];
+                    if kind == 5 {
+                        cells.remove(3);
+                        cells.insert(1, TableCell::text("变量缺失或过期"));
+                        cells.insert(3, TableCell::text("执行集合请求"));
+                    }
+                    TableRow::new(i.to_string(), cells)
+                        .focus_handle(row.key.read(cx).focus_handle(cx))
                 })
                 .collect();
             let table = match kind {
@@ -255,6 +309,7 @@ impl Workbench {
                 2 => &self.cookies_table,
                 3 => &self.extractors_table,
                 4 => &self.form_table,
+                5 => &self.triggers_table,
                 _ => &self.params_table,
             };
             table.update(cx, |table, cx| {

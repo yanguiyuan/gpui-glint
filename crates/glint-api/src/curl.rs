@@ -42,6 +42,57 @@ fn is_request_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://") || value.starts_with("{{")
 }
 
+/// Filter previously cached exports as well as newly generated response commands.
+pub fn filter_response_resolves(command: &str) -> String {
+    if !command.contains("--resolve") {
+        return command.into();
+    }
+    let Ok(normalized) = normalize(command) else {
+        return command.into();
+    };
+    let Some(tokens) = shlex::split(&normalized) else {
+        return command.into();
+    };
+    let Ok(draft) = parse(command) else {
+        return command.into();
+    };
+    let Ok(url) = reqwest::Url::parse(&draft.url) else {
+        return command.into();
+    };
+    let Some(host) = url.host_str() else {
+        return command.into();
+    };
+    let prefix = format!("{}:{}:", host, url.port_or_known_default().unwrap_or(80));
+    let mut parts = vec![];
+    let mut removed = false;
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        if option_takes_value(&token) {
+            let Some(value) = tokens.next() else {
+                return command.into();
+            };
+            if token == "--resolve" && !value.starts_with(&prefix) {
+                removed = true;
+                continue;
+            }
+            let Ok(value) = quote(&value) else {
+                return command.into();
+            };
+            parts.push(format!("{token} {value}"));
+        } else {
+            let Ok(token) = quote(&token) else {
+                return command.into();
+            };
+            parts.push(token);
+        }
+    }
+    if removed {
+        parts.join(" \\\n  ")
+    } else {
+        command.into()
+    }
+}
+
 pub fn quote(value: &str) -> Result<String, String> {
     if value.contains('\0') {
         return Err("cURL 命令不能包含 NUL 字符".into());
@@ -397,6 +448,60 @@ pub fn parse(source: &str) -> Result<Draft, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_export_filters_cached_mappings_without_changing_request_data() {
+        let command = "curl --globoff --compressed --url 'https://api.test/path?q=1' --request 'POST' --resolve 'other.test:443:192.0.2.1' --resolve 'api.test:80:192.0.2.2' --resolve 'api.test:443:192.0.2.3' --header 'X-Example: --resolve other.test:443:192.0.2.1' --data-raw '{\"value\":\"--resolve other.test\"}'";
+        let filtered = filter_response_resolves(command);
+        assert_eq!(parse(&filtered).unwrap(), parse(command).unwrap());
+        let tokens = shlex::split(&filtered).unwrap();
+        let mappings: Vec<_> = tokens
+            .windows(2)
+            .filter(|pair| pair[0] == "--resolve")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(mappings, ["api.test:443:192.0.2.3"]);
+        assert_eq!(filter_response_resolves(&filtered), filtered);
+        assert_eq!(
+            filter_response_resolves("curl https://api.test"),
+            "curl https://api.test"
+        );
+    }
+
+    #[test]
+    fn response_export_normalizes_lf_and_crlf_continuations_without_empty_arguments() {
+        let body = "first\\\nsecond";
+        let parts = [
+            "curl --globoff --compressed".to_owned(),
+            "--url 'https://api.test/path'".into(),
+            "--request 'POST'".into(),
+            "--noproxy ''".into(),
+            "--resolve 'other.test:443:192.0.2.1'".into(),
+            "--resolve 'api.test:80:192.0.2.2'".into(),
+            "--resolve 'api.test:443:192.0.2.3'".into(),
+            format!("--data-raw {}", quote(body).unwrap()),
+        ];
+        for newline in ["\n", "\r\n"] {
+            let command = parts.join(&format!(" \\{newline}  "));
+            let filtered = filter_response_resolves(&command);
+            assert_eq!(parse(&filtered).unwrap(), parse(&command).unwrap());
+            let tokens = shlex::split(&normalize(&filtered).unwrap()).unwrap();
+            assert_eq!(tokens.iter().filter(|token| token.is_empty()).count(), 1);
+            assert!(tokens.windows(2).any(|pair| pair == ["--noproxy", ""]));
+            assert!(tokens.windows(2).any(|pair| pair == ["--data-raw", body]));
+            assert_eq!(
+                tokens
+                    .iter()
+                    .filter(|token| token.as_str() == "--resolve")
+                    .count(),
+                1
+            );
+            assert!(!filtered.contains("other.test"));
+            assert!(!filtered.contains("api.test:80:"));
+            assert_eq!(filter_response_resolves(&filtered), filtered);
+        }
+    }
+
     use crate::{environment::EnvironmentVariables, http::PreparedRequest};
     #[test]
     fn imports_headers_bearer_cookie_json_and_continuations() {

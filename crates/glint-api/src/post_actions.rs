@@ -30,7 +30,32 @@ pub fn extract(
         let existing = staged.variables.iter().find(|v| v.name == name);
         let id = existing.map(|v| v.id);
         let secret = existing.is_some_and(|v| v.secret);
-        staged.save(id, name, &value, secret)?;
+        let expires_at = if rule.expires_in.trim().is_empty() {
+            None
+        } else {
+            let path = JsonPath::parse(rule.expires_in.trim())
+                .map_err(|_| format!("变量 {name} 的有效期 JSONPath 无效"))?;
+            let nodes = path.query(json).all();
+            let seconds = match nodes.as_slice() {
+                [Value::Number(n)] => n.as_u64(),
+                [Value::String(s)] => s.parse::<u64>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| format!("变量 {name} 的有效期须匹配一个非负整数（秒）"))?;
+            Some(
+                i64::try_from(seconds)
+                    .ok()
+                    .and_then(|s| chrono::Utc::now().timestamp().checked_add(s))
+                    .ok_or_else(|| format!("变量 {name} 的有效期超出范围"))?,
+            )
+        };
+        let id = staged.save(id, name, &value, secret)?;
+        staged
+            .variables
+            .iter_mut()
+            .find(|v| v.id == id)
+            .unwrap()
+            .expires_at = expires_at;
         names.push(name.to_owned());
     }
     Ok((staged, names))
@@ -121,6 +146,76 @@ impl super::Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn expiry_is_extracted_atomically_and_old_data_remains_compatible() {
+        let mut rule = Pair::new("access_token", "$.access_token", "");
+        rule.expires_in = "$.expires_in".into();
+        let mut env = EnvironmentVariables::default();
+        env.save(None, "access_token", "old", true).unwrap();
+        let before = chrono::Utc::now().timestamp();
+        let (updated, _) = extract(
+            &[rule.clone()],
+            Some(&json!({"access_token":"new","expires_in":7199})),
+            Some(&env),
+        )
+        .unwrap();
+        let token = &updated.variables[0];
+        assert!(token.secret);
+        assert!(
+            (before + 7199..=chrono::Utc::now().timestamp() + 7199)
+                .contains(&token.expires_at.unwrap())
+        );
+        let restored: EnvironmentVariables =
+            serde_json::from_value(serde_json::to_value(&updated).unwrap()).unwrap();
+        assert_eq!(restored.variables, updated.variables);
+        let mut edited = restored.clone();
+        edited
+            .replace(&[("access_token".into(), "new".into(), true)])
+            .unwrap();
+        assert_eq!(edited.variables[0].expires_at, token.expires_at);
+        edited
+            .replace(&[("access_token".into(), "manual".into(), true)])
+            .unwrap();
+        assert_eq!(edited.variables[0].expires_at, None);
+        for invalid in [
+            json!(-1),
+            json!(1.5),
+            json!(null),
+            json!([]),
+            json!("bad"),
+            json!(u64::MAX),
+        ] {
+            assert!(
+                extract(
+                    &[rule.clone()],
+                    Some(&json!({"access_token":"new", "expires_in":invalid})),
+                    Some(&env)
+                )
+                .is_err()
+            );
+            assert_eq!(env.variables[0].value, "old");
+        }
+        let (updated, _) = extract(
+            &[rule.clone()],
+            Some(&json!({"access_token":"new","expires_in":"0"})),
+            Some(&env),
+        )
+        .unwrap();
+        assert!(updated.variables[0].expires_at.unwrap() <= chrono::Utc::now().timestamp());
+        rule.expires_in.clear();
+        let (updated, _) = extract(
+            &[rule],
+            Some(&json!({"access_token":"new"})),
+            Some(&updated),
+        )
+        .unwrap();
+        assert_eq!(updated.variables[0].expires_at, None);
+        let old: super::super::environment::Variable =
+            serde_json::from_value(json!({"id":0,"name":"token","value":"old","secret":true}))
+                .unwrap();
+        assert_eq!(old.expires_at, None);
+    }
 
     #[gpui::test]
     fn post_actions_tab_edits_extracts_and_persists(cx: &mut gpui::TestAppContext) {

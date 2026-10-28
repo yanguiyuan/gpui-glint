@@ -68,6 +68,107 @@ mod tests {
     }
 
     #[gpui::test]
+    fn detached_request_triggers_refresh_and_persists_expiration(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for body in [
+                r#"{"access_token":"fresh","expires_in":7199}"#,
+                r#"{"ok":true}"#,
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = vec![];
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let count = socket.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("triggers.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = setup(&path, cx);
+            host.requests[0].id = "f29d4365-00db-4a66-b159-f8ae2d5eae64".into();
+            let mut extractor = Pair::new("access_token", "$.access_token", "");
+            extractor.expires_in = "$.expires_in".into();
+            host.load(
+                &Draft {
+                    url: format!("{url}/login"),
+                    extractors: vec![extractor],
+                    ..Default::default()
+                },
+                cx,
+            );
+            host.capture_draft(cx);
+            host.add_request(cx);
+            host.load(
+                &Draft {
+                    url: format!("{url}/main"),
+                    auth: true,
+                    token: "{{access_token}}".into(),
+                    triggers: vec![model::Trigger {
+                        enabled: true,
+                        condition: model::TriggerCondition::VariableExpired {
+                            variable: "access_token".into(),
+                        },
+                        action: model::TriggerAction::RunRequest {
+                            request_id: "f29d4365-00db-4a66-b159-f8ae2d5eae64".into(),
+                        },
+                    }],
+                    ..Default::default()
+                },
+                cx,
+            );
+            host.capture_draft(cx);
+            host
+        });
+        let editor = open(&host, 1, window);
+        editor.update(window, |editor, cx| {
+            assert_eq!(editor.snapshot(cx).triggers.len(), 1);
+            assert_eq!(editor.trigger_requests.as_ref().unwrap().len(), 2);
+            editor.send(cx);
+        });
+        wait_for(window, |window| {
+            editor.read_with(window, |editor, _| editor.sending.is_none())
+        });
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.status, Some(200), "{:?}", editor.error)
+        });
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /login "));
+        assert!(requests[1].starts_with("GET /main "));
+        assert!(
+            requests[1]
+                .to_lowercase()
+                .contains("authorization: bearer fresh")
+        );
+        host.update(window, |host, cx| host.persist(cx));
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.read_with(window, |host, _| {
+            assert_eq!(host.requests[1].draft.triggers.len(), 1);
+            let token = host.collections[0]
+                .environments
+                .values()
+                .flat_map(|e| e.variables.iter())
+                .find(|v| v.name == "access_token")
+                .unwrap();
+            assert_eq!(token.value, "fresh");
+            assert!(token.expires_at.unwrap() > chrono::Utc::now().timestamp());
+        });
+    }
+
+    #[gpui::test]
     fn request_windows_share_editors_inputs_versions_and_mcp_updates(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -529,6 +630,8 @@ impl Workbench {
             let storage_error = self.storage_error.clone();
             let editor = cx.new(|cx| {
                 let mut editor = Self::with_workspace(storage, data, cx);
+                editor.trigger_requests = Some(self.requests.clone());
+                editor.sync_pair_tables(cx);
                 editor.request_binding = Some(Binding {
                     namespace: namespace.clone(),
                     detached: false,
@@ -682,6 +785,13 @@ impl Workbench {
                                 &variable.value,
                                 variable.secret,
                             );
+                            if let Some(saved) = target
+                                .variables
+                                .iter_mut()
+                                .find(|v| v.name == variable.name)
+                            {
+                                saved.expires_at = variable.expires_at;
+                            }
                         }
                     }
                 }
@@ -718,6 +828,10 @@ impl Workbench {
     pub(super) fn refresh_request_editors(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_environment(cx);
         let context = serde_json::to_string(&(
+            self.requests
+                .iter()
+                .map(|r| (&r.id, &r.name, &r.collection, &r.group, &r.draft))
+                .collect::<Vec<_>>(),
             &self.collections,
             &self.environment_names,
             &self.environment_inputs,
@@ -750,6 +864,8 @@ impl Workbench {
                 editor.requests[0].tree_order = request.tree_order;
                 let environment_changed = editor.environment_names != self.environment_names
                     || editor.selected_environment(cx) != selected;
+                editor.trigger_requests = Some(self.requests.clone());
+                editor.sync_pair_tables(cx);
                 editor.collections = self.collections.clone();
                 editor.environment_names = self.environment_names.clone();
                 editor.environment_inputs = self.environment_inputs.clone();

@@ -188,6 +188,8 @@ pub struct Variable {
     pub name: String,
     pub value: String,
     pub secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EnvironmentVariables {
@@ -227,7 +229,18 @@ impl EnvironmentVariables {
             next_id: 0,
         };
         for (name, value, secret) in rows {
-            replacement.save(None, name, value, *secret)?;
+            let id = replacement.save(None, name, value, *secret)?;
+            // Keep expiration when an unrelated editor save leaves this value unchanged.
+            replacement
+                .variables
+                .iter_mut()
+                .find(|v| v.id == id)
+                .unwrap()
+                .expires_at = self
+                .variables
+                .iter()
+                .find(|v| v.name == name.trim() && v.value == *value)
+                .and_then(|v| v.expires_at);
         }
         *self = replacement;
         Ok(())
@@ -279,6 +292,9 @@ impl EnvironmentVariables {
                 .find(|variable| variable.id == id)
                 .ok_or("变量不存在")?;
             variable.name = name.into();
+            if variable.value != value {
+                variable.expires_at = None;
+            }
             variable.value = value.into();
             variable.secret = secret;
             return Ok(id);
@@ -290,6 +306,7 @@ impl EnvironmentVariables {
             name: name.into(),
             value: value.into(),
             secret,
+            expires_at: None,
         });
         Ok(id)
     }

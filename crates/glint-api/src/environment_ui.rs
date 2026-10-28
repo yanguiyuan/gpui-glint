@@ -75,7 +75,18 @@ impl Workbench {
                 }
             }
         }
-        entries.into_values().collect()
+        let mut completions: Vec<_> = entries.into_values().collect();
+        completions.extend(
+            template::METHOD_EXAMPLES
+                .iter()
+                .map(|(expression, description)| {
+                    TextCompletion::new(
+                        expression.trim_start_matches("{{").trim_end_matches("}}"),
+                        format!("内置函数 · {description}"),
+                    )
+                }),
+        );
+        completions
     }
     pub(super) fn editor_environment(&self, index: usize) -> EnvironmentVariables {
         if let Some(name) = &self.editing_variable_collection {
@@ -428,6 +439,29 @@ impl Workbench {
             .map(|row| {
                 let id = row.id;
                 let name = row.name.clone();
+                let expires_at = self
+                    .editor_environment(environment)
+                    .variables
+                    .iter()
+                    .find(|v| v.name == name.read(cx).value())
+                    .and_then(|v| v.expires_at);
+                let expiry_label = expires_at
+                    .map(|expires| {
+                        let time = chrono::DateTime::from_timestamp(expires, 0)
+                            .map(|t| {
+                                t.with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| expires.to_string());
+                        if expires <= chrono::Utc::now().timestamp() {
+                            format!("已过期 · {time}")
+                        } else {
+                            time
+                        }
+                    })
+                    .unwrap_or_else(|| "不过期".into());
+                let expiry_cell = TableCell::text(expiry_label);
                 let name_cell = TableCell::custom(move || {
                     div()
                         .w_full()
@@ -613,7 +647,7 @@ impl Workbench {
                 });
                 TableRow::new(
                     format!("environment-{environment}-{id}"),
-                    [name_cell, value_cell, type_cell, actions],
+                    [name_cell, value_cell, type_cell, expiry_cell, actions],
                 )
                 .focus_handle(row.name.read(cx).focus_handle(cx))
             })
@@ -982,20 +1016,6 @@ impl Workbench {
         let resolver = self.reference_resolver(cx);
         let mut completions = self.environment_completions(cx);
         let oauth_completions = completions.clone();
-        completions.extend(
-            [
-                ("uuid()", "生成 UUID"),
-                ("random_id()", "生成随机 ID"),
-                ("random_int(0, 100)", "生成随机整数"),
-                ("random_string(16)", "生成随机字符串"),
-                ("random_name()", "生成随机姓名"),
-                ("now()", "当前时间"),
-                ("now('%Y-%m-%d')", "格式化日期"),
-                ("timestamp()", "Unix 秒级时间戳"),
-                ("timestamp_ms()", "Unix 毫秒级时间戳"),
-            ]
-            .map(|(expression, description)| TextCompletion::new(expression, description)),
-        );
         let draft = self.snapshot(cx);
         for cookie in draft
             .cookies

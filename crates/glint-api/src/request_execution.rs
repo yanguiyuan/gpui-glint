@@ -60,31 +60,75 @@ impl Workbench {
         self.error = None;
         let proxy = self.effective_proxy(environment_index);
         let variables = self.active_environment_values(cx);
-        let request = match PreparedRequest::new(&draft, &variables)
-            .and_then(|request| self.oauth_attach(request, &draft, cx))
-            .and_then(|request| request.with_proxy(&proxy))
-            .and_then(|request| {
-                plugins::validate_variables(
-                    &self.enabled_before_actions(&draft.plugins),
-                    &self.plugin_catalog,
-                    &variables,
-                )?;
-                Ok(request)
-            }) {
-            Ok(request) => request,
-            Err(error) => {
-                self.push_trace(format!("校验失败：{error}"), cx);
-                self.trace_started = None;
-                self.request_error_toast("无法发送请求", &environment_name, &error, cx);
-                self.error = Some(error);
-                self.notice = "请求配置有误".into();
-                cx.notify();
-                return;
-            }
+        let refresh = if draft.triggers.iter().any(|r| r.enabled) {
+            let collection = self.requests[self.active].collection.clone();
+            let local = self
+                .collections
+                .iter()
+                .find(|c| c.collection == collection)
+                .and_then(|c| c.environments.get(&environment_name))
+                .cloned()
+                .unwrap_or_default();
+            let requests = self
+                .trigger_requests
+                .as_deref()
+                .unwrap_or(&self.requests)
+                .iter()
+                .cloned()
+                .map(|mut request| {
+                    request.draft.plugins = self.enabled_before_actions(&request.draft.plugins);
+                    request
+                })
+                .collect();
+            Some(triggers::TriggerContext {
+                requests,
+                collection,
+                local,
+                global: self.environment_inputs[environment_index].clone(),
+                proxy: proxy.clone(),
+                catalog: self.plugin_catalog.clone(),
+                completed: vec![],
+            })
+        } else {
+            None
         };
-        self.sent_requests[self.active] = Some(request.preview.clone());
-        self.sync_request_preview(cx);
-        self.push_trace("URL、环境变量与请求头校验通过", cx);
+        let request = if refresh.is_some() {
+            None
+        } else {
+            let request = match PreparedRequest::new(&draft, &variables)
+                .and_then(|request| self.oauth_attach(request, &draft, cx))
+                .and_then(|request| request.with_proxy(&proxy))
+                .and_then(|request| {
+                    plugins::validate_variables(
+                        &self.enabled_before_actions(&draft.plugins),
+                        &self.plugin_catalog,
+                        &variables,
+                    )?;
+                    Ok(request)
+                }) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.push_trace(format!("校验失败：{error}"), cx);
+                    self.trace_started = None;
+                    self.request_error_toast("无法发送请求", &environment_name, &error, cx);
+                    self.error = Some(error);
+                    self.notice = "请求配置有误".into();
+                    cx.notify();
+                    return;
+                }
+            };
+            self.sent_requests[self.active] = Some(request.preview.clone());
+            self.sync_request_preview(cx);
+            Some(request)
+        };
+        self.push_trace(
+            if refresh.is_some() {
+                "检查变量过期刷新规则"
+            } else {
+                "URL、环境变量与请求头校验通过"
+            },
+            cx,
+        );
         if draft
             .cookies
             .iter()
@@ -108,13 +152,100 @@ impl Workbench {
         let plugin_ids = self.enabled_before_actions(&draft.plugins);
         let plugin_catalog = self.plugin_catalog.clone();
         let plugin_variables = variables.clone();
+        let refresh_draft = draft.clone();
+        let refresh_request_id = request_id.clone();
+        let refresh_collection_id = extraction_collection.clone();
         self.sending = Some(cx.spawn(async move |this, cx| {
-            let prepared = cx
-                .background_executor()
-                .spawn(async move {
-                    plugins::apply(request, &plugin_ids, &plugin_catalog, &plugin_variables)
-                })
-                .await;
+            let refreshed = if let Some(mut refresh) = refresh {
+                let root = refresh_request_id.clone();
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let result = refresh.run(&refresh_draft, vec![root]).await;
+                        result.map(|_| refresh.completed)
+                    })
+                    .await;
+                match outcome {
+                    Ok(completed) => this
+                        .update(cx, |this, cx| {
+                            this.with_request_executor(&refresh_request_id, cx, |this, cx| {
+                                let collection_name = this
+                                    .collections
+                                    .iter()
+                                    .find(|c| c.id == refresh_collection_id)
+                                    .map(|c| c.collection.clone())
+                                    .ok_or("刷新请求所属集合已不存在")?;
+                                for (name, environment, names) in completed {
+                                    let local = this.scoped_environment_mut(
+                                        environment_index,
+                                        Some(&collection_name),
+                                    )?;
+                                    for name in &names {
+                                        let value = environment
+                                            .variables
+                                            .iter()
+                                            .find(|v| &v.name == name)
+                                            .ok_or("刷新变量不存在")?;
+                                        let id = local
+                                            .variables
+                                            .iter()
+                                            .find(|v| v.name == value.name)
+                                            .map(|v| v.id);
+                                        let id = local.save(
+                                            id,
+                                            &value.name,
+                                            &value.value,
+                                            value.secret,
+                                        )?;
+                                        local
+                                            .variables
+                                            .iter_mut()
+                                            .find(|v| v.id == id)
+                                            .unwrap()
+                                            .expires_at = value.expires_at;
+                                    }
+                                    this.merge_extracted_variables(
+                                        environment_index,
+                                        &collection_name,
+                                        &names,
+                                        cx,
+                                    );
+                                    this.sync_reference_inputs(cx);
+                                    this.push_trace(format!("前置刷新完成 · {name}"), cx);
+                                }
+                                let variables = this.environment_values(
+                                    environment_index,
+                                    Some(&this.requests[this.active].collection),
+                                );
+                                let prepared = PreparedRequest::new(&draft, &variables)
+                                    .and_then(|r| this.oauth_attach(r, &draft, cx))
+                                    .and_then(|r| r.with_proxy(&proxy))?;
+                                plugins::validate_variables(
+                                    &plugin_ids,
+                                    &plugin_catalog,
+                                    &variables,
+                                )?;
+                                Ok((prepared, variables))
+                            })
+                            .ok_or_else(|| "当前请求已不存在".to_owned())?
+                        })
+                        .map_err(|_| "当前窗口已关闭".to_owned())
+                        .and_then(|r| r),
+                    Err(error) => Err(format!("前置刷新失败：{error}")),
+                }
+            } else {
+                Ok((request.unwrap(), plugin_variables))
+            };
+            let prepared = match refreshed {
+                Ok((request, variables)) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            plugins::apply(request, &plugin_ids, &plugin_catalog, &variables)
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             let failure_title = if prepared.is_ok() {
                 "请求失败"
             } else {

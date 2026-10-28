@@ -22,6 +22,7 @@ fn resolve_pairs(
                 key: environment.resolve(&pair.key)?,
                 value: environment.resolve(&pair.value)?,
                 note: pair.note.clone(),
+                expires_in: pair.expires_in.clone(),
             })
         })
         .collect()
@@ -75,15 +76,14 @@ impl PreparedRequest {
                         .trim()
                         .trim_end_matches('.')
                         .to_ascii_lowercase();
-                    let mut ports = vec![80, 443, self.url.port_or_known_default().unwrap_or(80)];
-                    ports.sort_unstable();
-                    ports.dedup();
-                    for port in ports {
-                        args.push(format!(
-                            "--resolve {}",
-                            super::curl::quote(&format!("{domain}:{port}:{ip}"))?
-                        ));
+                    if self.url.host_str() != Some(domain.as_str()) {
+                        continue;
                     }
+                    let port = self.url.port_or_known_default().unwrap_or(80);
+                    args.push(format!(
+                        "--resolve {}",
+                        super::curl::quote(&format!("{domain}:{port}:{ip}"))?
+                    ));
                 }
             } else {
                 args.push(format!("--proxy {}", super::curl::quote(proxy.url.trim())?));
@@ -259,6 +259,7 @@ impl PreparedRequest {
                         key: environment.resolve(&pair.key)?,
                         value: environment.resolve(&pair.value)?,
                         note: pair.note.clone(),
+                        expires_in: pair.expires_in.clone(),
                     })
                 } else {
                     Ok(pair.clone())
@@ -702,10 +703,16 @@ mod tests {
                 enabled: true,
                 built_in: true,
                 skip_tls_verification: tls,
-                mappings: vec![super::super::environment::HostMapping {
-                    domain: "mapped.invalid".into(),
-                    ip: "127.0.0.1".into(),
-                }],
+                mappings: vec![
+                    super::super::environment::HostMapping {
+                        domain: "unrelated.invalid".into(),
+                        ip: "192.0.2.1".into(),
+                    },
+                    super::super::environment::HostMapping {
+                        domain: "MAPPED.invalid.".into(),
+                        ip: "127.0.0.1".into(),
+                    },
+                ],
                 ..Default::default()
             };
             let draft = Draft {
@@ -724,6 +731,8 @@ mod tests {
                 curl.contains("--resolve")
                     && curl.contains(&format!("mapped.invalid:{port}:127.0.0.1"))
             );
+            assert_eq!(curl.matches("--resolve").count(), 1);
+            assert!(!curl.contains("unrelated.invalid"));
             let result = runtime().block_on(execute(request)).unwrap();
             assert_eq!(result.status, 200);
             server.join().unwrap();
@@ -1122,6 +1131,7 @@ mod tests {
             key: "X-Disabled".into(),
             value: "{{unknown}}".into(),
             note: String::new(),
+            expires_in: String::new(),
         });
         assert!(PreparedRequest::new(&draft, &env).is_ok());
         draft.url = "file:///tmp/test".into();

@@ -55,7 +55,9 @@ impl Workbench {
     }
     pub(super) fn copy_response_curl(&mut self, cx: &mut Context<Self>) {
         if let Some(command) = self.sent_curls.get(self.active).and_then(|c| c.clone()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(command));
+            cx.write_to_clipboard(ClipboardItem::new_string(curl::filter_response_resolves(
+                &command,
+            )));
             self.toasts.update(cx, |host, cx| {
                 host.push(Toast::new("已复制 cURL 命令").kind(ToastKind::Success), cx)
             });

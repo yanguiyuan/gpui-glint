@@ -213,6 +213,9 @@ impl Workbench {
             .flex()
             .flex_col()
             .gap_3()
+            .child(div().text_size(px(12.)).child("规则触发器"))
+            .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("条件与动作独立配置，按行顺序执行。变量缺失、为空或过期时触发；动作失败停止发送。目标支持普通 HTTP 请求。"))
+            .child(self.triggers_table.clone())
             .child(
                 div()
                     .text_size(px(12.))

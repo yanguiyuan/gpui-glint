@@ -233,6 +233,7 @@ fn field_label(key: &str) -> String {
         "form" => "表单参数",
         "plugins" => "前置动作",
         "extractors" => "后置提取",
+        "triggers" => "规则触发器",
         "event_decoder" => "事件解码器",
         "skip_tls_verification" => "跳过 TLS 校验",
         "websocket_follow_latest" => "WebSocket 跟随最新消息",

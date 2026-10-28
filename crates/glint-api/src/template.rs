@@ -267,6 +267,7 @@ fn arguments(input: &str) -> Result<Vec<String>, String> {
 pub const METHOD_EXAMPLES: &[(&str, &str)] = &[
     ("{{random_int(1, 100)}}", "随机数字"),
     ("{{uuid()}}", "UUID"),
+    ("{{random_id()}}", "随机 ID"),
     ("{{random_string(16)}}", "随机字符串"),
     ("{{random_name()}}", "随机名字"),
     ("{{xss()}}", "XSS · script"),

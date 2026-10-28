@@ -8,6 +8,8 @@ pub struct Pair {
     pub value: String,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires_in: String,
 }
 impl Pair {
     pub fn new(key: &str, value: &str, note: &str) -> Self {
@@ -16,6 +18,7 @@ impl Pair {
             key: key.into(),
             value: value.into(),
             note: note.into(),
+            expires_in: String::new(),
         }
     }
 }
@@ -23,6 +26,24 @@ impl Default for Pair {
     fn default() -> Self {
         Self::new("", "", "")
     }
+}
+/// Conditions and actions are independent, tagged components of a trigger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trigger {
+    #[serde(default = "action_enabled")]
+    pub enabled: bool,
+    pub condition: TriggerCondition,
+    pub action: TriggerAction,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerCondition {
+    VariableExpired { variable: String },
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerAction {
+    RunRequest { request_id: String },
 }
 /// Request-local action binding; flattened approval preserves older workspace data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,6 +88,8 @@ pub enum BodyFormat {
 pub struct Draft {
     #[serde(default)]
     pub plugins: Vec<BeforeAction>,
+    #[serde(default)]
+    pub triggers: Vec<Trigger>,
     #[serde(default)]
     pub event_decoder: Option<BeforeAction>,
     #[serde(default = "action_enabled")]
@@ -223,7 +246,10 @@ impl DefaultSection {
                 to.body_format = from.body_format;
                 to.form = from.form.clone();
             }
-            Self::Plugins => to.plugins = from.plugins.clone(),
+            Self::Plugins => {
+                to.plugins = from.plugins.clone();
+                to.triggers = from.triggers.clone();
+            }
             Self::Extractors => to.extractors = from.extractors.clone(),
             Self::Settings => to.skip_tls_verification = from.skip_tls_verification,
         }
@@ -780,6 +806,7 @@ impl Default for Draft {
     fn default() -> Self {
         Self {
             plugins: vec![],
+            triggers: vec![],
             event_decoder: None,
             websocket_follow_latest: true,
             websocket_raw: false,

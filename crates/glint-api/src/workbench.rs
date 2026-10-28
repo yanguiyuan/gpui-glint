@@ -28,6 +28,7 @@ pub(super) struct PairInput {
     pub(super) key: Entity<TextEntry>,
     pub(super) value: Entity<TextEntry>,
     pub(super) note: Entity<TextEntry>,
+    pub(super) expires_in: Entity<TextEntry>,
 }
 pub(super) struct Workbench {
     pub(super) request_editors: HashMap<String, request_window::SharedRequest>,
@@ -167,6 +168,9 @@ pub(super) struct Workbench {
     pub(super) cookies: Vec<PairInput>,
     pub(super) extractors: Vec<PairInput>,
     pub(super) extractors_table: Entity<DataTable>,
+    pub(super) trigger_rows: Vec<PairInput>,
+    pub(super) trigger_requests: Option<Vec<model::Request>>,
+    pub(super) triggers_table: Entity<DataTable>,
     pub(super) params_table: Entity<DataTable>,
     pub(super) headers_table: Entity<DataTable>,
     pub(super) response_headers_table: Entity<DataTable>,
@@ -510,6 +514,24 @@ impl Workbench {
                 .empty_row("暂无表单字段。")
                 .add_row("添加表单字段")
         });
+        let triggers_table = cx.new(|cx| {
+            DataTable::new(
+                cx,
+                [
+                    TableColumn::new("启用", 48.),
+                    TableColumn::new("条件", 130.),
+                    TableColumn::new("变量名", 140.).flexible(),
+                    TableColumn::new("动作", 110.),
+                    TableColumn::new("目标请求（同集合）", 220.).flexible(),
+                    TableColumn::new("", 36.),
+                ],
+                [],
+            )
+            .document()
+            .compact()
+            .empty_row("暂无规则触发器。")
+            .add_row("添加规则触发器")
+        });
         let extractors_table = cx.new(|cx| {
             DataTable::new(
                 cx,
@@ -517,7 +539,7 @@ impl Workbench {
                     TableColumn::new("", 48.),
                     TableColumn::new("环境变量名", 160.).flexible(),
                     TableColumn::new("JSONPath", 240.).flexible(),
-                    TableColumn::new("说明", 140.),
+                    TableColumn::new("有效期 JSONPath（秒）", 180.),
                     TableColumn::new("", 36.),
                 ],
                 [],
@@ -546,6 +568,7 @@ impl Workbench {
             (2, &cookies_table),
             (3, &extractors_table),
             (4, &form_table),
+            (5, &triggers_table),
         ] {
             subscriptions.push(cx.subscribe(
                 table,
@@ -561,6 +584,7 @@ impl Workbench {
                             2 => this.cookies.push(row),
                             3 => this.extractors.push(row),
                             4 => this.form.push(row),
+                            5 => this.trigger_rows.push(row),
                             _ => this.params.push(row),
                         }
                         this.sync_pair_tables(cx);
@@ -577,6 +601,7 @@ impl Workbench {
                     TableColumn::new("变量值", 240.).flexible(),
                     // Compact cells reserve 8px on each side, plus a gap to row actions.
                     TableColumn::new("类型", 106.),
+                    TableColumn::new("过期时间", 170.),
                     TableColumn::new("", 76.),
                 ],
                 [],
@@ -816,6 +841,9 @@ impl Workbench {
             cookies: vec![],
             extractors: vec![],
             extractors_table,
+            trigger_rows: vec![],
+            trigger_requests: None,
+            triggers_table,
             params_table,
             headers_table,
             response_headers_table,

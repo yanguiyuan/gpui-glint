@@ -47,6 +47,7 @@ mod storage;
 mod template;
 mod theme_ui;
 mod tree_delete_ui;
+mod triggers;
 mod ui_helpers;
 mod update_ui;
 mod updater;

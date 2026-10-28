@@ -78,7 +78,6 @@ impl CompletionState {
             .items
             .iter()
             .filter(|item| item.expression.to_lowercase().contains(&query))
-            .take(12)
             .cloned()
             .collect();
         if items.is_empty() {
@@ -215,6 +214,30 @@ pub(super) fn completion_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn functions_remain_reachable_after_many_environment_variables() {
+        let mut state = CompletionState::default();
+        let mut items: Vec<_> = (0..20)
+            .map(|i| TextCompletion::new(format!("variable_{i}"), "环境变量"))
+            .collect();
+        items.push(TextCompletion::new("uuid()", "内置函数 · UUID"));
+        state.set_items(items);
+        let active = state.active("{{", &(2..2), false).unwrap();
+        assert_eq!(active.items.len(), 21);
+        for _ in 0..20 {
+            state.key("{{", &(2..2), false, "down");
+        }
+        let Some(CompletionKey::Insert(_, expression)) = state.key("{{", &(2..2), false, "enter")
+        else {
+            panic!("expected function insertion")
+        };
+        assert_eq!(expression, "{{uuid()}}");
+        assert_eq!(
+            state.active("{{uuid", &(6..6), false).unwrap().items[0].expression,
+            "uuid()"
+        );
+    }
+
     #[test]
     fn ranges_preserve_unicode_suffix_and_existing_closing_braces() {
         let mut state = CompletionState::default();

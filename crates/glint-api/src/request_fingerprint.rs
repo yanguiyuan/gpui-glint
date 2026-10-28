@@ -27,6 +27,7 @@ impl Fingerprint {
             rows.retain(|row| row.enabled && !row.key.trim().is_empty());
         }
         draft.plugins.retain(|action| action.enabled);
+        draft.triggers.retain(|trigger| trigger.enabled);
         if draft.event_decoder.as_ref().is_some_and(|a| !a.enabled) {
             draft.event_decoder = None;
         }
