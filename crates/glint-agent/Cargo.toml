@@ -28,6 +28,7 @@ jieba-rs = "0.11.0"
 strsim = "0.11"
 serde_yaml_ng = "0.10"
 ignore = "0.4"
+rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }

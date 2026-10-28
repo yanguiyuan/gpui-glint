@@ -316,8 +316,8 @@ pub async fn complete(
     if !config.model.trim().is_empty() {
         params["model"] = config.model.clone().into();
     }
-    if connection.tools.is_some() {
-        params["dynamicTools"] = Value::Array(crate::tools::definitions(true).as_array().unwrap().iter()
+    if let Some(context) = &connection.tools {
+        params["dynamicTools"] = Value::Array(context.mcp.definitions(true).as_array().unwrap().iter()
             .map(|tool|json!({"type":"function","name":tool["name"],"description":tool["description"],"inputSchema":tool["input_schema"]})).collect());
         params["baseInstructions"] = "You are Glint Agent. Use the registered tools to complete the user's task. The host enforces the user's selected access mode for all tools: Ask requires confirmation for mutations, AutoApprove skips confirmation within the project file boundary, FullAccess also permits paths outside the project. @path mentions refer to files or directories; use tools to inspect them as needed.".into();
     }

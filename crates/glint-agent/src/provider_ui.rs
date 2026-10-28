@@ -76,6 +76,7 @@ pub enum Section {
     Shortcuts,
     Memory,
     Skills,
+    Mcp,
     Provider,
 }
 
@@ -88,6 +89,7 @@ impl Section {
             Self::Shortcuts => "键盘快捷键",
             Self::Memory => "记忆",
             Self::Skills => "技能",
+            Self::Mcp => "MCP",
             Self::Provider => "供应商",
         }
     }
@@ -703,6 +705,9 @@ impl AgentWorkspace {
     }
 
     pub fn settings_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.provider_settings.section == Section::Mcp {
+            return self.mcp_page(cx);
+        }
         if self.provider_settings.section == Section::Skills {
             return self.skills_page(cx);
         }
@@ -1234,6 +1239,7 @@ impl AgentWorkspace {
             (Section::Storage, Icon::Folder),
             (Section::Memory, Icon::Database),
             (Section::Skills, Icon::Workflow),
+            (Section::Mcp, Icon::Workflow),
             (Section::Shortcuts, Icon::Code),
         ] {
             if !query.is_empty() && !section.title().to_lowercase().contains(&query) {
@@ -1259,6 +1265,9 @@ impl AgentWorkspace {
                     .child(section.title())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.provider_settings.section = section;
+                        if section == Section::Mcp {
+                            this.reload_mcp(cx);
+                        }
                         if section == Section::Skills {
                             this.reload_skills(cx);
                         }
@@ -1400,7 +1409,7 @@ impl AgentWorkspace {
             )
             .child(navigation)
     }
-    fn settings_container(&self, page: gpui::Div) -> gpui::Div {
+    pub(crate) fn settings_container(&self, page: gpui::Div) -> gpui::Div {
         div().size_full().child(
             div()
                 .id("settings-content")
@@ -1527,6 +1536,7 @@ impl AgentWorkspace {
                                             .update(cx, |entry, cx| entry.set_theme(theme, cx));
                                         this.provider_settings.set_theme(theme, cx);
                                         this.skills_ui.set_theme(theme, cx);
+                                        this.mcp_ui.set_theme(theme, cx);
                                         this.sync_skill_context(cx);
                                         cx.notify();
                                     }))

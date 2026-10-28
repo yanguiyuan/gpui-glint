@@ -109,3 +109,34 @@ cargo test -p glint-agent installed_codex_reports_chatgpt_account -- --ignored
 cargo test -p glint-agent installed_codex_completes_one_text_turn -- --ignored
 cargo test -p glint-agent deepseek_environment_key_completes_real_chat -- --ignored --nocapture
 ```
+
+## MCP
+
+支持 MCP stdio 子进程和 Streamable HTTP，使用官方 Rust SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk)。在 Agent 数据目录（与 `sessions.json` 同级）创建 `mcp.json`；macOS 默认是 `~/Library/Application Support/Glint Agent/mcp.json`，也可用 `GLINT_AGENT_DATA_DIR` 指定目录。
+
+```json
+{
+  "mcpServers": {
+    "local": {
+      "command": "/absolute/path/to/mcp-server",
+      "args": ["--example"],
+      "env": { "EXAMPLE_SETTING": "value" },
+      "enabled": true
+    },
+    "remote": {
+      "url": "http://localhost:8000/mcp",
+      "enabled": false
+    }
+  }
+}
+```
+
+每个服务器只能配置 `command` 或 `url`。配置在下次发送消息时读取，无需重启；stdio 的工作目录为当前项目，Finder 启动时建议使用可执行文件绝对路径。每次请求独立连接并发现工具，支持工具列表分页；兼容 OpenAI、Anthropic 和 ChatGPT。工具名称在模型侧映射为 `mcp_数字_数字`，描述保留服务器和原始工具名，避免名称冲突。
+
+MCP 调用复用工具卡片、记录和权限选择器；“请求批准”对所有 MCP 工具逐次确认，“自动批准”和“完全访问权限”直接调用。服务器进程启动及工具发现发生在调用批准前，配置中只应启用信任的服务器。MCP 服务器自身的文件、网络访问权限由服务器控制，项目文件边界不约束外部服务器。连接/发现超时 30 秒，工具调用超时 60 秒；服务器连接失败时，本次请求继续使用内置工具，模型会收到错误信息并可修复配置。
+
+Agent 系统上下文包含实际配置路径和格式，可直接要求它配置 MCP。内置 `mcp_config_read` / `mcp_config_write` 仅访问该配置文件，写入在默认模式请求批准，无需开启完全访问权限；写入时校验结构并原子替换。修改在下次用户请求生效，保存成功不代表连接已验证。
+
+“设置 → MCP”可添加、编辑、启停或删除服务器；支持本地程序、JSON 参数与环境变量、远程 URL。点击“检查连接”可检查未保存的配置并查看服务器工具列表，检查不会保存或启用服务器。环境变量以明文配置保存。
+
+目前接入工具能力；暂未提供 OAuth 登录、资源和提示模板浏览器或旧版 HTTP SSE transport。远程示例适用于无需认证的服务，配置文件中的 `env` 为明文，勿提交含密钥的配置。

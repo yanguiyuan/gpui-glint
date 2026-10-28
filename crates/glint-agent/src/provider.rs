@@ -462,12 +462,18 @@ impl Request {
     pub fn start_with_tools(
         config: Config,
         key: String,
-        messages: Vec<Value>,
+        mut messages: Vec<Value>,
         thinking: Thinking,
         context: Option<crate::tools::ToolContext>,
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self(runtime()?.spawn(async move {
+            if let Some(context) = &context {
+                messages.insert(0, json!({"role":"system","content":context.mcp.instructions()}));
+                if let Err(error) = context.mcp.prepare(context.root.as_deref()).await {
+                    messages.insert(0, json!({"role":"system","content":format!("本次 MCP 连接失败，MCP 工具不可用，可通过配置工具修复：{error}")}));
+                }
+            }
             if config.kind == Kind::ChatGpt {
                 // Codex CLI manages its own reasoning configuration.
                 tokio::time::timeout(
@@ -651,8 +657,10 @@ async fn single_request(
     } else {
         json!({"model":config.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}})
     };
-    if context.is_some() {
-        body["tools"] = crate::tools::definitions(config.protocol == Protocol::Anthropic);
+    if let Some(context) = context {
+        body["tools"] = context
+            .mcp
+            .definitions(config.protocol == Protocol::Anthropic);
     }
     thinking.apply(&mut body, config.protocol);
     let mut request = client.post(endpoint).json(&body);
@@ -1054,6 +1062,7 @@ mod tests {
             };
             let (events, _receiver) = async_channel::unbounded();
             let context = crate::tools::ToolContext {
+                mcp: Default::default(),
                 skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                     directory.path().join("sessions.json"),
                 )),

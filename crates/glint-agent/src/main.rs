@@ -11,6 +11,8 @@ mod database;
 mod discovery;
 mod generation;
 mod images;
+mod mcp;
+mod mcp_ui;
 mod memory;
 mod memory_ui;
 mod model;
@@ -102,6 +104,7 @@ struct AgentWorkspace {
     memory: memory::Repository,
     memory_ui: memory_ui::State,
     skills_ui: skills_ui::State,
+    mcp_ui: mcp_ui::State,
     project_context: project_context::State,
     memory_task: Option<Task<()>>,
     memory_last_probe: Option<std::time::Instant>,
@@ -379,6 +382,7 @@ impl AgentWorkspace {
             memory,
             memory_ui,
             skills_ui: skills_ui::State::new(theme, cx),
+            mcp_ui: mcp_ui::State::new(theme, cx),
             project_context: Default::default(),
             memory_task: None,
             memory_last_probe: None,
@@ -632,6 +636,7 @@ impl AgentWorkspace {
         };
         let (events, receiver) = async_channel::unbounded();
         let tool_context = tools::ToolContext {
+            mcp: mcp::Client::new(self.path.with_file_name("mcp.json")),
             skills: skills.clone(),
             memory: self.memory.clone(),
             access: self.access.clone(),
@@ -1043,6 +1048,7 @@ impl AgentWorkspace {
                             .update(cx, |editor, cx| editor.set_theme(this.theme, cx));
                         this.provider_settings.set_theme(this.theme, cx);
                         this.skills_ui.set_theme(this.theme, cx);
+                        this.mcp_ui.set_theme(this.theme, cx);
                         this.sync_skill_context(cx);
                         cx.notify();
                     })),
