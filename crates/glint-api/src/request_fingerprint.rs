@@ -126,6 +126,7 @@ mod tests {
         draft.params.push(disabled);
         draft.headers.push(Pair::new("", "", ""));
         let disabled_action = crate::model::BeforeAction {
+            environment_bindings: Default::default(),
             enabled: false,
             action_id: "inactive".into(),
             ..Default::default()
@@ -229,6 +230,7 @@ mod tests {
             (
                 "plugins",
                 serde_json::json!([crate::model::BeforeAction {
+                    environment_bindings: Default::default(),
                     action_id: "run".into(),
                     ..Default::default()
                 }]),
@@ -236,6 +238,7 @@ mod tests {
             (
                 "event_decoder",
                 serde_json::json!(crate::model::BeforeAction {
+                    environment_bindings: Default::default(),
                     action_id: "decode".into(),
                     ..Default::default()
                 }),

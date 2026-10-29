@@ -718,6 +718,7 @@ fn send_validation_shows_specific_error_toasts_without_starting_network(
             .find(|plugin| plugin.manifest.id == "com.wps.kso1")
             .unwrap();
         host.requests[0].draft.plugins = vec![model::BeforeAction {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval::for_plugin(plugin),
             action_id: "sign-request".into(),
             enabled: true,

@@ -48,6 +48,8 @@ pub enum TriggerAction {
 /// Request-local action binding; flattened approval preserves older workspace data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BeforeAction {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment_bindings: std::collections::BTreeMap<String, String>,
     #[serde(flatten)]
     pub approval: gpui_glint::plugins::Approval,
     #[serde(default)]
@@ -58,6 +60,7 @@ pub struct BeforeAction {
 impl Default for BeforeAction {
     fn default() -> Self {
         Self {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval {
                 id: String::new(),
                 capabilities: Default::default(),

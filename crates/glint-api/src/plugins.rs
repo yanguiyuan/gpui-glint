@@ -517,6 +517,42 @@ fn parse_worker_response(status: std::process::ExitStatus, text: &str) -> Result
         .ok_or_else(|| "插件执行器返回的结果缺少 ok / error 字段".into())
 }
 /// Validate declared environment inputs without running plugin code or exposing values.
+fn resolve_variable<'a>(
+    binding: &'a super::model::BeforeAction,
+    name: &'a str,
+    variables: &'a super::environment::EnvironmentValues,
+) -> (&'a str, Option<&'a String>) {
+    if let Some(custom) = binding
+        .environment_bindings
+        .get(name)
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        if let Some(value) = variables.0.get(custom) {
+            return (custom, Some(value));
+        }
+    }
+    (name, variables.0.get(name))
+}
+
+fn environment_inputs(
+    binding: &super::model::BeforeAction,
+    plugin: &Plugin,
+    variables: &super::environment::EnvironmentValues,
+) -> BTreeMap<String, String> {
+    plugin
+        .manifest
+        .capabilities
+        .iter()
+        .filter_map(|capability| {
+            let name = capability.strip_prefix("environment.read.")?;
+            resolve_variable(binding, name, variables)
+                .1
+                .map(|value| (name.to_owned(), value.clone()))
+        })
+        .collect()
+}
+
 pub fn validate_variables(
     ids: &[super::model::BeforeAction],
     catalog: &[Plugin],
@@ -543,9 +579,10 @@ pub fn validate_variables(
             .iter()
             .filter_map(|permission| permission.strip_prefix("environment.read."))
         {
-            match variables.0.get(name) {
-                None => missing.push(name),
-                Some(value) if value.trim().is_empty() => empty.push(name),
+            let (resolved_name, value) = resolve_variable(approval, name, variables);
+            match value {
+                None => missing.push(resolved_name),
+                Some(value) if value.trim().is_empty() => empty.push(resolved_name),
                 _ => {}
             }
         }
@@ -594,15 +631,7 @@ pub fn apply(
         if !approval.matches(plugin) {
             return Err("插件内容或权限已变化，请在插件页重新授权后发送".into());
         }
-        let variables = plugin
-            .manifest
-            .capabilities
-            .iter()
-            .filter_map(|capability| {
-                let key = capability.strip_prefix("environment.read.")?;
-                variables.0.get(key).map(|v| (key.to_owned(), v.clone()))
-            })
-            .collect();
+        let variables = environment_inputs(approval, plugin, variables);
         let job = Job {
             plugin: plugin.clone(),
             action_id: approval.action_id.clone(),
@@ -672,11 +701,10 @@ pub fn decode_event_presentation(
         .iter()
         .filter_map(|c| c.strip_prefix("environment.read."))
     {
-        let value = variables
-            .0
-            .get(key)
+        let (resolved_name, value) = resolve_variable(binding, key, variables);
+        let value = value
             .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| format!("请在当前环境配置 {key}"))?;
+            .ok_or_else(|| format!("请在当前环境配置 {resolved_name}"))?;
         inputs.insert(key.to_owned(), value.clone());
     }
     let request = serde_json::from_str(text).map_err(|_| "接收消息不是有效 JSON，无法解密")?;
@@ -720,6 +748,56 @@ fn event_presentation(output: Value) -> Result<DecodedEvent, String> {
 mod tests {
     use super::*;
     #[test]
+    fn custom_environment_names_override_fallback_and_keep_worker_permissions_scoped() {
+        let plugin = catalog().0.remove(0);
+        let binding = super::super::model::BeforeAction {
+            approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
+            action_id: "sign-request".into(),
+            environment_bindings: BTreeMap::from([
+                ("wps_app_id".into(), "wps_app_id1".into()),
+                ("wps_app_key".into(), "wps_app_key1".into()),
+                ("ungranted_secret".into(), "other_secret".into()),
+            ]),
+            ..Default::default()
+        };
+        let mut variables = super::super::environment::EnvironmentValues(BTreeMap::from([
+            ("wps_app_id".into(), "DEFAULT".into()),
+            ("wps_app_key".into(), "default-key".into()),
+            ("wps_app_id1".into(), "CUSTOM".into()),
+            ("wps_app_key1".into(), "custom-key".into()),
+            ("other_secret".into(), "must-not-leak".into()),
+        ]));
+        validate_variables(&[binding.clone()], &[plugin.clone()], &variables).unwrap();
+        let inputs = environment_inputs(&binding, &plugin, &variables);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs["wps_app_id"], "CUSTOM");
+        assert_eq!(inputs["wps_app_key"], "custom-key");
+        let output = run_job(Job {
+            plugin: plugin.clone(),
+            action_id: "sign-request".into(),
+            request: json!({"method":"GET","uri":"/v7/test","body":"","headers":{}}),
+            variables: inputs,
+        })
+        .unwrap();
+        assert!(
+            output["setHeaders"]["X-Kso-Authorization"]
+                .as_str()
+                .unwrap()
+                .starts_with("KSO-1 CUSTOM:")
+        );
+        variables.0.remove("wps_app_id1");
+        variables.0.remove("wps_app_key1");
+        assert_eq!(
+            environment_inputs(&binding, &plugin, &variables)["wps_app_id"],
+            "DEFAULT"
+        );
+        validate_variables(&[binding.clone()], &[plugin.clone()], &variables).unwrap();
+        variables.0.insert("wps_app_key1".into(), "  ".into());
+        let error = validate_variables(&[binding], &[plugin], &variables).unwrap_err();
+        assert!(error.contains("未填写：wps_app_key1"));
+        assert!(!error.contains("default-key"));
+    }
+    #[test]
     fn missing_and_empty_action_variables_are_named_without_exposing_values() {
         let plugin = catalog()
             .0
@@ -727,6 +805,7 @@ mod tests {
             .find(|plugin| plugin.manifest.id == "com.wps.kso1")
             .unwrap();
         let mut action = super::super::model::BeforeAction {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
             action_id: "sign-request".into(),
             enabled: true,
@@ -1156,6 +1235,7 @@ mod oauth_preset_tests {
         .unwrap_err();
         assert_eq!(error, "前置动作不可用");
         let binding = super::super::model::BeforeAction {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
             action_id: "user-authorization".into(),
             enabled: true,
@@ -1319,6 +1399,7 @@ mod event_decode_tests {
     fn decoder_requires_approval_and_named_variables_without_affecting_request_hooks() {
         let plugin = job(fixture()["event"].clone()).plugin;
         let mut binding = super::super::model::BeforeAction {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval::for_plugin(&plugin),
             action_id: "decrypt-event".into(),
             enabled: true,

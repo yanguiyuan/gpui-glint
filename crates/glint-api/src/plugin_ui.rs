@@ -1,6 +1,16 @@
 use super::*;
 use gpui_glint::components::{CountBadge, CountBadgeKind, TagBadge, TagBadgeKind};
 
+pub(super) type EnvironmentSettingsCache =
+    std::cell::RefCell<HashMap<(String, String, String), EnvironmentSettings>>;
+
+pub(super) struct EnvironmentSettings {
+    panel: Entity<gpui_glint::components::CollapsePanel>,
+    fields: Vec<(String, Entity<TextEntry>)>,
+    saved: std::collections::BTreeMap<String, String>,
+    _subscriptions: Vec<Subscription>,
+}
+
 fn metadata_badge(label: impl Into<gpui::SharedString>, theme: ThemePreset) -> gpui::Div {
     CountBadge::new(label)
         .kind(CountBadgeKind::Muted)
@@ -51,6 +61,149 @@ impl gpui::Render for ActionDrag {
 }
 
 impl Workbench {
+    fn action_environment_settings(
+        &self,
+        plugin: &gpui_glint::plugins::Plugin,
+        binding: &model::BeforeAction,
+        first_action: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::CollapsePanel> {
+        let request_id = self.requests[self.active].id.clone();
+        let key = (
+            request_id.clone(),
+            plugin.identity(),
+            binding.action_id.clone(),
+        );
+        let mut cache = self.plugin_environment_settings.borrow_mut();
+        // Remove panels for deleted requests while keeping independent state per request/action.
+        cache.retain(|(request, _, _), _| self.requests.iter().any(|r| &r.id == request));
+        let settings = cache.entry(key).or_insert_with(|| {
+            let mut subscriptions = Vec::new();
+            let fields: Vec<_> = plugin
+                .manifest
+                .capabilities
+                .iter()
+                .filter_map(|capability| capability.strip_prefix("environment.read."))
+                .map(|name| {
+                    let entry = Self::entry(
+                        binding
+                            .environment_bindings
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                        name,
+                        cx,
+                    );
+                    let request_id = request_id.clone();
+                    let id = plugin.identity();
+                    let approval = gpui_glint::plugins::Approval::for_plugin(plugin);
+                    let action_id = binding.action_id.clone();
+                    let name_owned = name.to_owned();
+                    subscriptions.push(cx.observe(&entry, move |this, entry, cx| {
+                        let value = entry.read(cx).value().trim().to_owned();
+                        let Some(request) = this.requests.iter_mut().find(|r| r.id == request_id)
+                        else {
+                            return;
+                        };
+                        let position = request.draft.plugins.iter().position(|a| {
+                            a.id == id
+                                && (a.action_id == action_id
+                                    || (first_action && a.action_id.is_empty()))
+                        });
+                        let action = if let Some(position) = position {
+                            &mut request.draft.plugins[position]
+                        } else {
+                            if value.is_empty() {
+                                return;
+                            }
+                            request.draft.plugins.push(model::BeforeAction {
+                                approval: approval.clone(),
+                                action_id: action_id.clone(),
+                                enabled: false,
+                                ..Default::default()
+                            });
+                            request.draft.plugins.last_mut().unwrap()
+                        };
+                        if action
+                            .environment_bindings
+                            .get(&name_owned)
+                            .map(String::as_str)
+                            .unwrap_or("")
+                            == value
+                        {
+                            return;
+                        }
+                        if value.is_empty() {
+                            action.environment_bindings.remove(&name_owned);
+                        } else {
+                            action
+                                .environment_bindings
+                                .insert(name_owned.clone(), value);
+                        }
+                        this.storage_dirty = true;
+                        cx.notify();
+                    }));
+                    (name.to_owned(), entry)
+                })
+                .collect();
+            let content_fields = fields.clone();
+            EnvironmentSettings {
+                panel: cx.new(|_| {
+                    gpui_glint::components::CollapsePanel::new("更多设置")
+                        .compact()
+                        .theme(self.theme)
+                        .content(move |_, _| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(div().text_size(px(11.)).child(
+                                    "填写优先读取的环境变量名；留空或名称不存在时回退到默认变量。",
+                                ))
+                                .children(content_fields.iter().map(|(name, entry)| {
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .child(format!("{name} · 优先读取")),
+                                        )
+                                        .child(entry.clone())
+                                }))
+                                .into_any_element()
+                        })
+                }),
+                fields,
+                saved: binding.environment_bindings.clone(),
+                _subscriptions: subscriptions,
+            }
+        });
+        // Restore versions/drafts into existing editors without rebuilding focus or collapse state.
+        let changed = settings.saved != binding.environment_bindings;
+        for (name, entry) in &settings.fields {
+            entry.update(cx, |entry, cx| {
+                entry.set_theme(self.theme, cx);
+                let value = binding
+                    .environment_bindings
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if changed && entry.value().trim() != value {
+                    entry.set_value(value, cx);
+                }
+            });
+        }
+        settings.saved = binding.environment_bindings.clone();
+        settings
+            .panel
+            .update(cx, |panel, cx| panel.set_theme(self.theme, cx));
+        settings.panel.clone()
+    }
+
     pub(super) fn plugin_enabled(&self, plugin: &gpui_glint::plugins::Plugin) -> bool {
         !self.disabled_plugins.contains(&plugin.family_identity())
     }
@@ -153,6 +306,7 @@ impl Workbench {
                     binding.action_id = action_id;
                 } else {
                     actions.push(model::BeforeAction {
+                        environment_bindings: Default::default(),
                         approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                         action_id,
                         enabled: false,
@@ -299,6 +453,23 @@ impl Workbench {
                     .filter_map(|c| c.strip_prefix("environment.read."))
                     .collect::<Vec<_>>()
                     .join("、");
+                let environment_settings = if environment_names.is_empty() {
+                    None
+                } else {
+                    let mut settings_binding =
+                        binding.cloned().unwrap_or_else(|| model::BeforeAction {
+                            approval: approval.clone(),
+                            enabled: false,
+                            ..Default::default()
+                        });
+                    settings_binding.action_id = action_id.clone();
+                    Some(self.action_environment_settings(
+                        plugin,
+                        &settings_binding,
+                        action_index == 0,
+                        cx,
+                    ))
+                };
                 let selector = if action_index == 0 {
                     format!("plugin-toggle-{}", plugin.identity())
                 } else {
@@ -326,6 +497,7 @@ impl Workbench {
                                     }
                                 } else if checked {
                                     request.draft.plugins.push(model::BeforeAction {
+                                        environment_bindings: Default::default(),
                                         approval: approval.clone(),
                                         action_id: action_id.clone(),
                                         enabled: true,
@@ -418,6 +590,9 @@ impl Workbench {
                             .child(format!("所需环境变量：{environment_names}")),
                     );
                 }
+                if let Some(settings) = environment_settings {
+                    card = card.child(settings);
+                }
                 let order = selected
                     .iter()
                     .position(|a| {
@@ -469,6 +644,69 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn environment_settings_start_collapsed_and_persist_with_the_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.config = 5;
+            host.plugin_catalog.truncate(1);
+            host
+        });
+        let (panel, field) = host.read_with(window, |host, cx| {
+            let settings = host.plugin_environment_settings.borrow();
+            let settings = settings.values().next().unwrap();
+            assert!(!settings.panel.read(cx).is_expanded());
+            (
+                settings.panel.clone(),
+                settings
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name == "wps_app_id")
+                    .unwrap()
+                    .1
+                    .clone(),
+            )
+        });
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        field.update(window, |field, cx| field.set_value("wps_app_id1", cx));
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            let action = &host.requests[host.active].draft.plugins[0];
+            assert_eq!(action.environment_bindings["wps_app_id"], "wps_app_id1");
+            assert!(!action.enabled);
+        });
+        let bounds = window.debug_bounds("plugin-toggle-com.wps.kso1").unwrap();
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            assert_eq!(
+                host.snapshot(cx).plugins[0].environment_bindings["wps_app_id"],
+                "wps_app_id1"
+            );
+            host.save(cx);
+            host.add_request(cx);
+            assert!(host.snapshot(cx).plugins.is_empty());
+            host.choose(0, cx);
+            host.persist(cx);
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.read_with(window, |host, cx| {
+            assert_eq!(
+                host.snapshot(cx).plugins[0].environment_bindings["wps_app_id"],
+                "wps_app_id1"
+            );
+        });
+    }
+
     #[gpui::test]
     fn enabled_plugins_persist_per_request_and_restore_from_versions(
         cx: &mut gpui::TestAppContext,
@@ -1070,6 +1308,7 @@ mod enable_tests {
                 .find(|p| p.manifest.id == "com.wps.kso1")
                 .unwrap();
             host.requests[0].draft.plugins = vec![model::BeforeAction {
+                environment_bindings: Default::default(),
                 approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                 action_id: "sign-request".into(),
                 enabled: true,
@@ -1153,7 +1392,7 @@ mod enable_tests {
             host.group_name.update(cx,|e,cx|e.set_value("WS",cx));
             host.save_group(cx);host.add_request(cx);
             let decoder=host.plugin_catalog.iter().find(|p|p.manifest.id=="com.wps.event-decrypt").unwrap();
-            host.requests[0].draft.event_decoder=Some(model::BeforeAction {approval:gpui_glint::plugins::Approval::for_plugin(decoder),action_id:"decrypt-event".into(),enabled:true});
+            host.requests[0].draft.event_decoder=Some(model::BeforeAction { environment_bindings: Default::default(),approval:gpui_glint::plugins::Approval::for_plugin(decoder),action_id:"decrypt-event".into(),enabled:true});
             host.ws_detail_tab=1;
             host.set_plugin_enabled("com.wps.event-decrypt",false,cx).unwrap();
             assert!(host.ws_decrypted.as_ref().unwrap().as_ref().unwrap_err().contains("已禁用"));
@@ -1196,6 +1435,7 @@ mod enable_tests {
             host.plugin_catalog
                 .retain(|p| p.identity() != first.identity());
             let old_binding = model::BeforeAction {
+                environment_bindings: Default::default(),
                 approval: gpui_glint::plugins::Approval::for_plugin(&first),
                 action_id: "sign-request".into(),
                 enabled: true,

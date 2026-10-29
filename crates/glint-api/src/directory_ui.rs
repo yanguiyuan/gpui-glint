@@ -205,6 +205,7 @@ impl DirectorySettings {
                     actions.push((
                         title,
                         model::BeforeAction {
+                            environment_bindings: Default::default(),
                             approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                             action_id: id,
                             enabled: false,
@@ -788,6 +789,7 @@ mod tests {
             ),
         );
         let action = model::BeforeAction {
+            environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval {
                 id: "test".into(),
                 fingerprint: "fingerprint".into(),
@@ -900,6 +902,7 @@ mod tests {
             );
             let plugin = &host.plugin_catalog[0];
             let binding = model::BeforeAction {
+                environment_bindings: Default::default(),
                 approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                 action_id: plugin
                     .manifest

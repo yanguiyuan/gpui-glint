@@ -457,6 +457,7 @@ impl Workbench {
                                     return Err("插件动作不存在".into());
                                 }
                                 Ok(model::BeforeAction {
+                                    environment_bindings: Default::default(),
                                     approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                                     action_id: action.into(),
                                     enabled: binding["enabled"] != false,
@@ -1088,6 +1089,10 @@ impl Workbench {
                             return Err("插件动作不存在".into());
                         }
                         let binding = model::BeforeAction {
+                            environment_bindings: existing
+                                .and_then(|position| bindings.get(position))
+                                .map(|binding| binding.environment_bindings.clone())
+                                .unwrap_or_default(),
                             approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                             action_id: action.into(),
                             enabled: args["enabled"] != false,

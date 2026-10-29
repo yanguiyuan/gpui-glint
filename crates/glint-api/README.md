@@ -295,6 +295,8 @@ WPS 与飞书的预设配置分别来自独立插件 `plugins/wps-oauth/glint-pl
 
 内置 `WPS KSO-1 签名`：在当前环境中保存 `wps_app_id` 和 `wps_app_key`，将后者标记为敏感，再在请求的前置动作页启用。它可以与 Bearer 同时使用。算法只存在于 `plugins/wps-kso1/main.js`，不写入公共运行时；使用实际编码后的 URI、原始发送 body 和最终 Content-Type，空 body 的摘要为空字符串。
 
+卡片的「更多设置」默认收起，可指定优先读取的变量名，例如 wps_app_id1；名称不存在或设置留空时回退到原变量名。匹配到空值时会提示补全。配置按请求保存，并随版本、历史和工作区恢复；插件仅接收已声明的输入。
+
 自定义插件放在工作区 SQLite 文件旁的 `plugins/<插件目录>/`，包含 `glint-plugin.json` 和 `main.js`，在插件管理页点击“刷新已安装插件”重新发现，再在请求中显式启用。可从内置模板复制，使用不同的插件 ID。通过 `contributions` 注册 `request.before-send` 类型动作，每个动作独立指定 ID、标题和同步 hook；不接受页面贡献；未安装或权限无效的已启用插件会阻止发送。
 
 环境读取需要逐变量声明 `environment.read.<变量名>`；请求头修改需要 `request.header.<小写请求头名>`；读取请求需 `request.read`，加密需 `crypto`。Rust 宿主拒绝未声明变量、未授权请求头、Host/Content-Length 等传输头、CRLF 和过大输出。钩子接收 `{ method, uri, body, headers }`，返回 `{ setHeaders: { "Header": "value" } }`；不能修改 URL、方法或 body。需变更 body 的算法应在未来增加独立的准备阶段钩子，不能在签名后偷偷修改正文。

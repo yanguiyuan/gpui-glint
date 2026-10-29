@@ -82,6 +82,7 @@ pub(super) fn decoder_bindings(
                     (
                         format!("{}#{}", plugin.identity(), action.id),
                         model::BeforeAction {
+                            environment_bindings: Default::default(),
                             approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                             action_id: action.id.clone(),
                             enabled: true,
