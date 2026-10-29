@@ -472,9 +472,16 @@ impl Request {
         key: String,
         mut messages: Vec<Value>,
         thinking: Thinking,
-        context: Option<crate::tools::ToolContext>,
+        mut context: Option<crate::tools::ToolContext>,
     ) -> Result<Self, String> {
         config.validate()?;
+        if let Some(context) = &mut context {
+            if !matches!(context.delegation, crate::subagent::Delegation::Child) {
+                context.delegation = crate::subagent::Delegation::Root(
+                    crate::subagent::Runner::new(config.clone(), key.clone(), thinking, &messages),
+                );
+            }
+        }
         Ok(Self(runtime()?.spawn(async move {
             if let Some(context) = &context {
                 messages.insert(0, json!({"role":"system","content":context.mcp.instructions()}));
@@ -674,9 +681,7 @@ async fn single_request(
         json!({"model":config.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}})
     };
     if let Some(context) = context {
-        body["tools"] = context
-            .mcp
-            .definitions(config.protocol == Protocol::Anthropic);
+        body["tools"] = context.definitions(config.protocol == Protocol::Anthropic);
     }
     thinking.apply(&mut body, config.protocol);
     let mut request = client.post(endpoint).json(&body);
@@ -1094,6 +1099,7 @@ mod tests {
                 };
                 let (events, _receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
+                    delegation: Default::default(),
                     mcp: Default::default(),
                     skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                         directory.path().join("sessions.json"),

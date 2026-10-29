@@ -29,6 +29,7 @@ mod session_history;
 mod skills;
 mod skills_ui;
 mod storage;
+mod subagent;
 mod titles;
 mod tools;
 
@@ -644,6 +645,7 @@ impl AgentWorkspace {
             .map(|settings| settings.automatic_recall)
             .unwrap_or(false);
         let tool_context = tools::ToolContext {
+            delegation: Default::default(),
             mcp: mcp::Client::new(self.path.with_file_name("mcp.json")),
             skills: skills.clone(),
             memory: self.memory.clone(),

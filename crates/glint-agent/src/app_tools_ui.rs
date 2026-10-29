@@ -105,6 +105,22 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     let args = &record.call.arguments;
     let path = args["path"].as_str().unwrap_or(".");
     let (icon, action, target) = match record.call.name.as_str() {
+        "subagent" => (
+            Icon::Workflow,
+            if running {
+                "子代理执行中"
+            } else if success {
+                "子代理已完成"
+            } else {
+                "子代理失败"
+            },
+            args["task"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect(),
+        ),
         "run_command" => (
             Icon::Shell,
             if running {
