@@ -451,16 +451,19 @@ impl Render for GroupList {
                     let leading = div()
                         .size(px(14.))
                         .flex_shrink_0()
-                        .text_color(rgb(p.text_muted))
-                        .child(icon.render(14.));
+                        .text_color(rgb(p.text_muted));
                     row = if matches!(icon, Icon::Spinner) {
-                        row.child(leading.with_animation(
+                        row.child(leading.child(icon.render(14.).with_animation(
                             SharedString::from(format!("group-list-running:{}", item.id)),
                             Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                            |icon, delta| icon.opacity(0.3 + 0.7 * delta),
-                        ))
+                            |icon, delta| {
+                                icon.with_transformation(gpui::Transformation::rotate(
+                                    gpui::radians(std::f32::consts::TAU * delta),
+                                ))
+                            },
+                        )))
                     } else {
-                        row.child(leading)
+                        row.child(leading.child(icon.render(14.)))
                     };
                 } else if item.reserve_icon_space {
                     row = row.child(div().size(px(14.)).flex_shrink_0());

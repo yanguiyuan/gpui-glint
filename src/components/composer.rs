@@ -1024,17 +1024,17 @@ impl Render for Composer {
             )
             .child(div().flex_1());
         if self.busy {
-            bar = bar.child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(p.text_muted))
-                    .child(Icon::Spinner.render(14.))
-                    .with_animation(
-                        "glass-composer-spinner",
-                        Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                        |spinner, delta| spinner.opacity(0.3 + 0.7 * delta),
-                    ),
-            );
+            bar = bar.child(div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
+                Icon::Spinner.render(14.).with_animation(
+                    "glass-composer-spinner",
+                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                    |spinner, delta| {
+                        spinner.with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            std::f32::consts::TAU * delta,
+                        )))
+                    },
+                ),
+            ));
         }
         if let Some(usage) = self.context_usage {
             let ring = div()
