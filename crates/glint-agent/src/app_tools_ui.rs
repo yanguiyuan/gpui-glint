@@ -1,4 +1,5 @@
 use super::*;
+use std::hash::{Hash, Hasher};
 
 pub struct MarkdownView {
     source: String,
@@ -13,7 +14,7 @@ pub struct ToolPanel {
 }
 
 pub struct ProcessPanel {
-    signature: String,
+    signature: u64,
     theme: ThemePreset,
     complete: bool,
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -31,15 +32,43 @@ struct ToolPresentation {
 }
 
 fn tool_signature(record: &tools::ToolRecord) -> String {
-    use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
     record.call.name.hash(&mut hash);
-    record.call.arguments.to_string().hash(&mut hash);
+    record.call.arguments.hash(&mut hash);
     record.result.hash(&mut hash);
     record.success.hash(&mut hash);
     record.elapsed_ms.hash(&mut hash);
     record.live_output.hash(&mut hash);
     hash.finish().to_string()
+}
+
+fn process_signature(
+    blocks: &[generation::ContentBlock],
+    thinking_ms: &std::collections::BTreeMap<usize, u64>,
+    summary: &str,
+    activity: &[tools::ToolRecord],
+) -> u64 {
+    use generation::ContentBlock;
+    let mut hash = std::hash::DefaultHasher::new();
+    summary.hash(&mut hash);
+    thinking_ms.hash(&mut hash);
+    for block in blocks {
+        std::mem::discriminant(block).hash(&mut hash);
+        match block {
+            ContentBlock::Text(text) | ContentBlock::Thinking(text) => text.hash(&mut hash),
+            ContentBlock::ToolCall(call) => {
+                call.id.hash(&mut hash);
+                call.name.hash(&mut hash);
+                call.arguments.hash(&mut hash);
+            }
+            ContentBlock::ToolResult(record) => tool_signature(record).hash(&mut hash),
+        }
+    }
+    for record in activity {
+        record.call.id.hash(&mut hash);
+        tool_signature(record).hash(&mut hash);
+    }
+    hash.finish()
 }
 
 fn command_summary(call: &tools::ToolCall) -> String {
@@ -337,54 +366,64 @@ impl AgentWorkspace {
     }
 
     pub fn tool_records(&self, records: &[tools::ToolRecord], cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(records.iter().map(|record| self.tool_panel(record, cx)))
+    }
+
+    fn tool_panel(
+        &self,
+        record: &tools::ToolRecord,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::CollapsePanel> {
         use gpui_glint::components::CollapsePanel;
         let theme = self.theme;
         let p = theme.palette();
         let mut cache = self.tool_panels.borrow_mut();
-        let mut list = div().w_full().min_w_0().flex().flex_col().gap_1();
-        for record in records {
-            let signature = tool_signature(record);
-            let entry = cache
-                .entry(record.call.id.clone())
-                .or_insert_with(|| ToolPanel {
-                    signature: String::new(),
-                    theme,
-                    panel: cx.new(|_| {
-                        CollapsePanel::new("")
-                            .icon(tool_presentation(record).icon)
-                            .theme(theme)
-                    }),
-                });
-            if entry.signature != signature || entry.theme != theme {
-                let presentation = tool_presentation(record);
-                let result: SharedString = presentation.body.into();
-                entry.panel.update(cx, |panel, cx| {
-                    panel.set_theme(theme, cx);
-                    panel.set_summary(presentation.summary, cx);
-                    panel.set_content(
-                        move |_, _| {
-                            div()
-                                .id("tool-output")
-                                .w_full()
-                                .min_w_0()
-                                .max_h(px(320.))
-                                .overflow_y_scroll()
-                                .text_size(px(12.))
-                                .line_height(px(20.))
-                                .font_family("monospace")
-                                .text_color(rgb(p.text_muted))
-                                .child(result.clone())
-                                .into_any_element()
-                        },
-                        cx,
-                    );
-                });
-                entry.signature = signature;
-                entry.theme = theme;
-            }
-            list = list.child(entry.panel.clone());
+        let signature = tool_signature(record);
+        let entry = cache
+            .entry(record.call.id.clone())
+            .or_insert_with(|| ToolPanel {
+                signature: String::new(),
+                theme,
+                panel: cx.new(|_| {
+                    CollapsePanel::new("")
+                        .icon(tool_presentation(record).icon)
+                        .theme(theme)
+                }),
+            });
+        if entry.signature != signature || entry.theme != theme {
+            let presentation = tool_presentation(record);
+            let result: SharedString = presentation.body.into();
+            entry.panel.update(cx, |panel, cx| {
+                panel.set_theme(theme, cx);
+                panel.set_summary(presentation.summary, cx);
+                panel.set_content(
+                    move |_, _| {
+                        div()
+                            .id("tool-output")
+                            .w_full()
+                            .min_w_0()
+                            .max_h(px(320.))
+                            .overflow_y_scroll()
+                            .text_size(px(12.))
+                            .line_height(px(20.))
+                            .font_family("monospace")
+                            .text_color(rgb(p.text_muted))
+                            .child(result.clone())
+                            .into_any_element()
+                    },
+                    cx,
+                );
+            });
+            entry.signature = signature;
+            entry.theme = theme;
         }
-        list
+        entry.panel.clone()
     }
 
     pub fn markdown_text(
@@ -425,10 +464,27 @@ impl AgentWorkspace {
         complete: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(self.transcript_rows(key, blocks, thinking_ms, complete, cx))
+    }
+
+    fn transcript_rows(
+        &self,
+        key: &str,
+        blocks: &[generation::ContentBlock],
+        thinking_ms: &std::collections::BTreeMap<usize, u64>,
+        complete: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyView> {
         use generation::ContentBlock;
         use gpui_glint::components::CollapsePanel;
         let theme = self.theme;
-        let mut body = div().w_full().min_w_0().flex().flex_col().gap_2();
+        let mut rows = Vec::with_capacity(blocks.len());
         let completed: std::collections::HashSet<_> = blocks
             .iter()
             .filter_map(|block| match block {
@@ -439,13 +495,15 @@ impl AgentWorkspace {
         for (index, block) in blocks.iter().enumerate() {
             match block {
                 ContentBlock::Text(text) => {
-                    body = body.child(self.markdown_text(format!("{key}:{index}"), text, cx));
+                    rows.push(
+                        self.markdown_text(format!("{key}:{index}"), text, cx)
+                            .into(),
+                    );
                 }
                 ContentBlock::Thinking(text) => {
                     let active = !complete && index + 1 == blocks.len();
                     let summary = thinking_summary(text, active, thinking_ms.get(&index).copied());
                     let signature = format!("{active}:{summary}:{text}");
-                    let editor = self.markdown_text(format!("{key}:{index}:thinking"), text, cx);
                     let mut cache = self.tool_panels.borrow_mut();
                     let entry = cache
                         .entry(format!("{key}:{index}:thinking"))
@@ -456,6 +514,11 @@ impl AgentWorkspace {
                                 .new(|_| CollapsePanel::new("思考").icon(Icon::Pulse).theme(theme)),
                         });
                     if entry.signature != signature || entry.theme != theme {
+                        // A collapsed thinking row needs only its summary. Do not
+                        // parse its Markdown or allocate editors until expanded.
+                        let weak = cx.entity().downgrade();
+                        let editor_key = format!("{key}:{index}:thinking");
+                        let source: SharedString = text.clone().into();
                         entry.panel.update(cx, |panel, cx| {
                             panel.set_theme(theme, cx);
                             if active {
@@ -464,12 +527,16 @@ impl AgentWorkspace {
                                 panel.set_summary(summary, cx);
                             }
                             panel.set_content(
-                                move |_, _| {
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .child(editor.clone())
-                                        .into_any_element()
+                                move |_, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        div().w_full().min_w_0().child(this.markdown_text(
+                                            editor_key.clone(),
+                                            &source,
+                                            cx,
+                                        ))
+                                    })
+                                    .unwrap_or_else(|_| div())
+                                    .into_any_element()
                                 },
                                 cx,
                             );
@@ -477,7 +544,7 @@ impl AgentWorkspace {
                         entry.signature = signature;
                         entry.theme = theme;
                     }
-                    body = body.child(entry.panel.clone());
+                    rows.push(entry.panel.clone().into());
                 }
                 ContentBlock::ToolCall(call) => {
                     // Completed calls use their result row and the same panel
@@ -498,15 +565,15 @@ impl AgentWorkspace {
                         } else {
                             &running
                         };
-                        body = body.child(self.tool_records(std::slice::from_ref(running), cx));
+                        rows.push(self.tool_panel(running, cx).into());
                     }
                 }
                 ContentBlock::ToolResult(record) => {
-                    body = body.child(self.tool_records(std::slice::from_ref(record), cx))
+                    rows.push(self.tool_panel(record, cx).into());
                 }
             }
         }
-        body
+        rows
     }
 
     pub fn response_view(
@@ -536,21 +603,14 @@ impl AgentWorkspace {
         } else {
             "工作过程".into()
         };
-        let signature = format!(
-            "{}:{summary}:{}",
-            serde_json::to_string(&blocks[..split]).unwrap_or_default(),
-            if complete {
-                String::new()
-            } else {
-                self.tool_activity
-                    .iter()
-                    .map(tool_signature)
-                    .collect::<Vec<_>>()
-                    .join(":")
-            }
+        let signature = process_signature(
+            &blocks[..split],
+            thinking_ms,
+            &summary,
+            if complete { &[] } else { &self.tool_activity },
         );
         let entry = cache.entry(key.into()).or_insert_with(|| ProcessPanel {
-            signature: String::new(),
+            signature: 0,
             theme,
             complete,
             panel: cx.new(|_| {
@@ -561,6 +621,10 @@ impl AgentWorkspace {
             }),
         });
         if entry.signature != signature || entry.theme != theme || entry.complete != complete {
+            // Build child entities once on expansion, then reuse them while the
+            // source is unchanged. Scrolling must not hash every tool result or
+            // repeat Markdown/cache lookups; collapsed history stays lazy.
+            let rows = std::cell::RefCell::new(None::<Vec<gpui::AnyView>>);
             let weak = cx.entity().downgrade();
             let process = blocks[..split].to_vec();
             let thinking_ms = thinking_ms.clone();
@@ -573,11 +637,27 @@ impl AgentWorkspace {
                 }
                 panel.set_content(
                     move |_, cx| {
-                        weak.update(cx, |this, cx| {
-                            this.transcript_view(&content_key, &process, &thinking_ms, complete, cx)
-                        })
-                        .unwrap_or_else(|_| div())
-                        .into_any_element()
+                        let mut rows = rows.borrow_mut();
+                        let rows = rows.get_or_insert_with(|| {
+                            weak.update(cx, |this, cx| {
+                                this.transcript_rows(
+                                    &content_key,
+                                    &process,
+                                    &thinking_ms,
+                                    complete,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or_default()
+                        });
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(rows.iter().cloned())
+                            .into_any_element()
                     },
                     cx,
                 );
@@ -654,6 +734,53 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[test]
+    fn process_cache_tracks_live_output_timings_and_tool_results() {
+        use generation::ContentBlock::{ToolCall, ToolResult};
+        let mut record = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "command".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({"program":"cargo", "args":["test"]}),
+            },
+            result: "执行中…".into(),
+            success: false,
+            elapsed_ms: 0,
+            live_output: None,
+        };
+        let blocks = vec![Thinking("checking".into()), ToolCall(record.call.clone())];
+        let mut timings = std::collections::BTreeMap::new();
+        let signature = process_signature(&blocks, &timings, "正在工作…", &[record.clone()]);
+        assert_eq!(
+            signature,
+            process_signature(&blocks.clone(), &timings, "正在工作…", &[record.clone()])
+        );
+        record.live_output = Some("Compiling".into());
+        assert_ne!(
+            signature,
+            process_signature(&blocks, &timings, "正在工作…", &[record.clone()])
+        );
+        let signature = process_signature(&blocks, &timings, "正在工作…", &[record.clone()]);
+        timings.insert(0, 1234);
+        assert_ne!(
+            signature,
+            process_signature(&blocks, &timings, "正在工作…", &[record.clone()])
+        );
+        record.result = "exit: 0\ntest passed".into();
+        record.success = true;
+        record.live_output = None;
+        let mut completed = blocks;
+        completed.push(ToolResult(record));
+        let signature = process_signature(&completed, &timings, "工作过程", &[]);
+        if let Some(ToolResult(record)) = completed.last_mut() {
+            record.result.push_str("\nextra output");
+        }
+        assert_ne!(
+            signature,
+            process_signature(&completed, &timings, "工作过程", &[])
+        );
+    }
     #[test]
     fn thinking_summary_follows_latest_nonempty_line_then_shows_duration() {
         assert_eq!(
