@@ -213,6 +213,7 @@ mod tests {
             elapsed_ms: 2,
             live_output: None,
             subagent: None,
+            change: None,
         });
         let id = session.id;
         database::save_history(&anchor, &history).unwrap();

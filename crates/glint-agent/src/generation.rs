@@ -214,6 +214,7 @@ impl Metrics {
 /// arbitrary network chunks cannot split UTF-8 characters in JSON payloads.
 #[derive(Default)]
 pub struct StreamCompletion {
+    stop_reason: Option<String>,
     order: Vec<StreamPart>,
     blocks: std::collections::BTreeMap<usize, Value>,
     inputs: std::collections::HashMap<usize, String>,
@@ -306,7 +307,12 @@ impl StreamCompletion {
                 self.blocks.insert(index, event["content_block"].clone());
             }
             Some("message_start") => self.metrics.usage(&event["message"]["usage"]),
-            Some("message_delta") => self.metrics.usage(&event["usage"]),
+            Some("message_delta") => {
+                self.metrics.usage(&event["usage"]);
+                if let Some(reason) = event["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(reason.into());
+                }
+            }
             Some("message_stop") => {
                 self.finished = true;
                 self.ended = true;
@@ -392,6 +398,7 @@ impl StreamCompletion {
                 self.metrics.output(elapsed_ms);
             }
             if choice["finish_reason"].is_string() {
+                self.stop_reason = choice["finish_reason"].as_str().map(str::to_owned);
                 self.finished = true;
             }
         }
@@ -405,6 +412,9 @@ impl StreamCompletion {
         self.flush(elapsed_ms)?;
         if !self.finished {
             return Err("Provider 响应流中断，回复尚未完成".into());
+        }
+        if let Some(error) = stop_error(self.stop_reason.as_deref()) {
+            return Err(error);
         }
         for (index, input) in std::mem::take(&mut self.inputs) {
             self.blocks.entry(index).or_insert(Value::Null)["input"] =
@@ -421,7 +431,12 @@ impl StreamCompletion {
             )?
         };
         if self.text.trim().is_empty() && calls.is_empty() {
-            return Err("Provider 未返回文本回复".into());
+            return Err(empty_reply_error(
+                self.stop_reason.as_deref(),
+                blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Thinking(_))),
+            ));
         }
         Ok(Completion {
             blocks,
@@ -435,9 +450,51 @@ impl StreamCompletion {
     }
 }
 
+pub fn stop_error(reason: Option<&str>) -> Option<String> {
+    match reason {
+        Some("max_tokens" | "length") => Some("模型达到本次输出 token 上限，回复被截断（思考也占用输出额度）。请提高输出预算或降低思考强度后重试；已收到的过程已保留。".into()),
+        Some("content_filter" | "refusal") => Some("模型因内容过滤或拒绝策略结束回复，已收到的过程已保留。".into()),
+        _ => None,
+    }
+}
+
+pub fn empty_reply_error(reason: Option<&str>, thinking: bool) -> String {
+    format!(
+        "{}（结束原因：{}）。已收到的过程已保留，可重试或降低思考强度。",
+        if thinking {
+            "Provider 仅返回思考，未返回最终回答或工具调用"
+        } else {
+            "Provider 未返回文本回复或工具调用"
+        },
+        reason.unwrap_or("服务端未提供")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reasoning_only_and_budget_exhaustion_report_the_actual_stop_reason() {
+        for anthropic in [false, true] {
+            let event = if anthropic {
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"long reasoning\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"long reasoning\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+            };
+            let mut stream = StreamCompletion::default();
+            stream.push(event.as_bytes(), 50).unwrap();
+            assert!(matches!(
+                stream.snapshot().first(),
+                Some(ContentBlock::Thinking(_))
+            ));
+            assert!(stream.finish(100).unwrap_err().contains("token 上限"));
+        }
+        let mut stream = StreamCompletion::default();
+        stream.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"only reasoning\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", 50).unwrap();
+        let error = stream.finish(100).unwrap_err();
+        assert!(error.contains("仅返回思考"));
+        assert!(error.contains("stop"));
+    }
     #[test]
     fn thinking_time_stops_before_tools_and_separates_later_thinking() {
         use std::time::{Duration, Instant};

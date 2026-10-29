@@ -304,6 +304,19 @@ impl ComposerSubmission {
 
 #[derive(Clone, Debug)]
 pub enum ComposerEvent {
+    QueueSteerRequested {
+        id: u64,
+        submission: ComposerSubmission,
+    },
+    QueueAdded {
+        id: u64,
+        submission: ComposerSubmission,
+    },
+    QueueSubmitted {
+        id: u64,
+        submission: ComposerSubmission,
+    },
+    QueueRemoved(u64),
     /// The prompt text changed.
     Changed(SharedString),
     AttachmentsChanged,
@@ -338,6 +351,27 @@ pub enum ComposerEvent {
 /// Submitting while [`Composer::busy`] queues the prompt: queued items render
 /// as rows above the card with 立即 / edit / dismiss actions, and the next
 /// queued prompt is submitted automatically once the host clears `busy`.
+struct QueueEntry {
+    id: u64,
+    submission: ComposerSubmission,
+    label: Option<SharedString>,
+}
+impl std::ops::Deref for QueueEntry {
+    type Target = ComposerSubmission;
+    fn deref(&self) -> &Self::Target {
+        &self.submission
+    }
+}
+impl From<ComposerSubmission> for QueueEntry {
+    fn from(submission: ComposerSubmission) -> Self {
+        Self {
+            id: 0,
+            submission,
+            label: None,
+        }
+    }
+}
+
 pub struct Composer {
     editor: Entity<PromptEditor>,
     theme: ThemePreset,
@@ -346,7 +380,9 @@ pub struct Composer {
     chip_values: HashMap<SharedString, SharedString>,
     open_chip: Option<SharedString>,
     context_usage: Option<ComposerContextState>,
-    queue: Vec<ComposerSubmission>,
+    queue: Vec<QueueEntry>,
+    managed_queue: bool,
+    next_queue_id: u64,
     /// Images pasted with ⌘/Ctrl-V, submitted with the next send.
     attachments: Vec<PastedImage>,
     context_trigger: Option<SharedString>,
@@ -435,6 +471,8 @@ impl Composer {
             open_chip: None,
             context_usage: None,
             queue: Vec::new(),
+            managed_queue: false,
+            next_queue_id: 0,
             attachments: Vec::new(),
             context_trigger: None,
             context_title: "添加".into(),
@@ -719,6 +757,31 @@ impl Composer {
         self
     }
 
+    /// Enables FIFO dispatch through QueueSubmitted, allowing hosts to bind each
+    /// queued prompt to its original session/model. Keeps stop available separately.
+    pub fn managed_queue(mut self, enabled: bool) -> Self {
+        self.managed_queue = enabled;
+        self
+    }
+
+    pub fn set_queue_label(
+        &mut self,
+        id: u64,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.queue.iter_mut().find(|entry| entry.id == id) {
+            entry.label = Some(label.into());
+            cx.notify();
+        }
+    }
+
+    pub fn remove_queued(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.queue.iter().position(|entry| entry.id == id) {
+            self.queue_remove(index, cx);
+        }
+    }
+
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.busy = busy;
         if !busy {
@@ -811,12 +874,12 @@ impl Composer {
     }
 
     fn submission(&mut self, text: SharedString, cx: &mut Context<Self>) -> ComposerSubmission {
-        let images = if self.clear_on_submit {
+        let images = if self.clear_on_submit || self.busy {
             std::mem::take(&mut self.attachments)
         } else {
             self.attachments.clone()
         };
-        if self.clear_on_submit {
+        if self.clear_on_submit || self.busy {
             for image in &images {
                 image.source().remove_asset(cx);
             }
@@ -829,13 +892,25 @@ impl Composer {
             return;
         }
         let text: SharedString = self.editor.read(cx).value().to_owned().into();
-        if self.clear_on_submit {
+        if self.clear_on_submit || self.busy {
             self.editor
                 .update(cx, |editor, cx| editor.set_value("", cx));
         }
         let submission = self.submission(text.clone(), cx);
         if self.busy {
-            self.queue.push(submission.clone());
+            self.next_queue_id += 1;
+            let id = self.next_queue_id;
+            self.queue.push(QueueEntry {
+                id,
+                submission: submission.clone(),
+                label: None,
+            });
+            if self.managed_queue {
+                cx.emit(ComposerEvent::QueueAdded {
+                    id,
+                    submission: submission.clone(),
+                });
+            }
             cx.emit(ComposerEvent::Queued(submission));
         } else {
             cx.emit(ComposerEvent::Submitted(submission));
@@ -848,23 +923,36 @@ impl Composer {
             return;
         }
         let next = self.queue.remove(0);
-        cx.emit(ComposerEvent::Submitted(next));
+        if self.managed_queue {
+            cx.emit(ComposerEvent::QueueSubmitted {
+                id: next.id,
+                submission: next.submission,
+            });
+        } else {
+            cx.emit(ComposerEvent::Submitted(next.submission));
+        }
     }
 
     fn queue_submit_now(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.managed_queue {
+            return;
+        }
         if index >= self.queue.len() {
             return;
         }
         let submission = self.queue.remove(index);
-        cx.emit(ComposerEvent::Submitted(submission));
+        cx.emit(ComposerEvent::Submitted(submission.submission));
         cx.notify();
     }
 
     fn queue_edit(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.managed_queue {
+            return;
+        }
         if index >= self.queue.len() {
             return;
         }
-        let submission = self.queue.remove(index);
+        let submission = self.queue.remove(index).submission;
         for image in std::mem::replace(&mut self.attachments, submission.images) {
             image.source().remove_asset(cx);
         }
@@ -876,7 +964,10 @@ impl Composer {
 
     fn queue_remove(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.queue.len() {
-            self.queue.remove(index);
+            let removed = self.queue.remove(index);
+            if self.managed_queue {
+                cx.emit(ComposerEvent::QueueRemoved(removed.id));
+            }
             cx.notify();
         }
     }
@@ -982,7 +1073,7 @@ impl Render for Composer {
             chip_element
         };
 
-        let stopping = self.busy && self.stop_on_busy;
+        let stopping = self.busy && self.stop_on_busy && (!self.managed_queue || !sendable);
         let send_button = div()
             .id("glass-composer-send")
             .size(px(28.))
@@ -1005,7 +1096,7 @@ impl Render for Composer {
             })
             .debug_selector(|| "composer-send-or-stop".into())
             .on_click(cx.listener(|this, _, _, cx| {
-                if this.busy && this.stop_on_busy {
+                if this.busy && this.stop_on_busy && (!this.managed_queue || !this.sendable(cx)) {
                     cx.emit(ComposerEvent::StopRequested);
                 } else {
                     this.submit(cx);
@@ -1100,6 +1191,23 @@ impl Render for Composer {
                     .render(cx),
             );
         }
+        if self.managed_queue && self.busy && self.stop_on_busy && sendable {
+            bar = bar.child(
+                div()
+                    .id("composer-stop-current")
+                    .debug_selector(|| "composer-stop-current".into())
+                    .size(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(14.))
+                    .bg(rgb(p.text))
+                    .cursor_pointer()
+                    .child(div().size(px(9.)).rounded(px(1.)).bg(rgb(p.surface)))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::StopRequested))),
+            );
+        }
         bar = bar
             .children(self.menu_chips.iter().map(|chip| chip_button(chip, cx)))
             .child(send_button);
@@ -1141,6 +1249,7 @@ impl Render for Composer {
                 blur_radius: px(20.),
                 spread_radius: px(-6.),
             }]);
+        let mut todo_panel = None;
         if self.context_open {
             card = card.child(self.context_panel_element(cx));
         } else if !self.todos.is_empty() {
@@ -1155,19 +1264,22 @@ impl Render for Composer {
                     });
                 })
                 .render();
-            card = card.child(deferred(
-                div()
-                    .id("glass-composer-todo-panel")
-                    .debug_selector(|| "glass-composer-todo-panel".into())
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom(relative(1.))
-                    .mb(px(8.))
-                    .shadow_lg()
-                    .occlude()
-                    .child(panel),
-            ));
+            todo_panel = Some(
+                deferred(
+                    div()
+                        .id("glass-composer-todo-panel")
+                        .debug_selector(|| "glass-composer-todo-panel".into())
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(relative(1.))
+                        .mb(px(8.))
+                        .shadow_lg()
+                        .occlude()
+                        .child(panel),
+                )
+                .into_any_element(),
+            );
         }
         let card = card
             .when(!self.attachments.is_empty(), |card| {
@@ -1176,8 +1288,9 @@ impl Render for Composer {
             .child(editor_scroll)
             .child(bar);
 
-        let mut root = div()
+        let root = div()
             .id("glass-composer")
+            .relative()
             .key_context("GlassComposer")
             .track_focus(&self.focus)
             .w_full()
@@ -1199,6 +1312,13 @@ impl Render for Composer {
                 }
             }));
 
+        let mut queue_rows = div()
+            .id("composer-queue-list")
+            .max_h(px(180.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(6.));
         for (index, submission) in self.queue.iter().enumerate() {
             let row = div()
                 .w_full()
@@ -1222,46 +1342,83 @@ impl Render for Composer {
                         .truncate()
                         .text_size(px(13.))
                         .text_color(rgb(p.text))
-                        .child(submission.text.clone()),
+                        .child(if let Some(label) = &submission.label {
+                            format!("排队 {} · {label} · {}", index + 1, submission.text)
+                        } else {
+                            submission.text.to_string()
+                        }),
                 )
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "glass-composer-queue-now-{index}"
-                        )))
-                        .h(px(26.))
-                        .px(px(8.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .rounded(px(7.))
-                        .text_size(px(12.))
-                        .text_color(rgb(p.text_muted))
-                        .cursor_pointer()
-                        .hover(move |style| {
-                            style.bg(if dark {
-                                rgba(0xffffff14)
-                            } else {
-                                rgb(p.surface_subtle)
+                .when(!self.managed_queue, |row| {
+                    row.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "glass-composer-queue-now-{index}"
+                            )))
+                            .h(px(26.))
+                            .px(px(8.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .rounded(px(7.))
+                            .text_size(px(12.))
+                            .text_color(rgb(p.text_muted))
+                            .cursor_pointer()
+                            .hover(move |style| {
+                                style.bg(if dark {
+                                    rgba(0xffffff14)
+                                } else {
+                                    rgb(p.surface_subtle)
+                                })
                             })
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.queue_submit_now(index, cx);
-                        }))
-                        .child(Icon::ArrowUp.render(12.))
-                        .child("立即"),
-                )
-                .child(
-                    icon_action(
-                        SharedString::from(format!("glass-composer-queue-edit-{index}")),
-                        Icon::Pencil,
-                        p,
-                        dark,
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.queue_submit_now(index, cx);
+                            }))
+                            .child(Icon::ArrowUp.render(12.))
+                            .child("立即"),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.queue_edit(index, cx);
-                    })),
+                })
+                .when(!self.managed_queue, |row| {
+                    row.child(
+                        icon_action(
+                            SharedString::from(format!("glass-composer-queue-edit-{index}")),
+                            Icon::Pencil,
+                            p,
+                            dark,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.queue_edit(index, cx);
+                        })),
+                    )
+                })
+                .when(
+                    self.managed_queue && self.busy && submission.images.is_empty(),
+                    |row| {
+                        let id = submission.id;
+                        let submission = submission.submission.clone();
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("composer-queue-steer-{id}")))
+                                .debug_selector(move || format!("composer-queue-steer-{id}"))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .text_color(rgb(p.accent))
+                                .hover(|style| style.bg(rgb(p.surface_subtle)))
+                                .child(Icon::Workflow.render(14.))
+                                .child("引导")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(ComposerEvent::QueueSteerRequested {
+                                        id,
+                                        submission: submission.clone(),
+                                    })
+                                })),
+                        )
+                    },
                 )
                 .child(
                     icon_action(
@@ -1274,10 +1431,12 @@ impl Render for Composer {
                         this.queue_remove(index, cx);
                     })),
                 );
-            root = root.child(row);
+            queue_rows = queue_rows.child(row);
         }
 
-        root.child(card)
+        root.when(!self.queue.is_empty(), |root| root.child(queue_rows))
+            .child(card)
+            .children(todo_panel)
     }
 }
 
@@ -1721,6 +1880,99 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn managed_queue_sends_fifo_keeps_drafts_and_requires_explicit_steering_acceptance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        struct Preview(Entity<Composer>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .child(self.0.clone())
+            }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                Composer::new("Message", cx)
+                    .clear_on_submit(false)
+                    .stop_on_busy(true)
+                    .managed_queue(true)
+            }))
+        });
+        let composer = preview.read_with(window, |view, _| view.0.clone());
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let steering = Rc::new(RefCell::new(Vec::new()));
+        let dispatch_events = dispatched.clone();
+        let steer_events = steering.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::QueueSubmitted { id, submission } = event {
+                    dispatch_events
+                        .borrow_mut()
+                        .push((*id, submission.text.to_string()));
+                }
+                if let ComposerEvent::QueueSteerRequested { id, .. } = event {
+                    steer_events.borrow_mut().push(*id);
+                }
+            })
+        });
+        composer.update(window, |composer, cx| {
+            composer.set_busy(true, cx);
+            composer.set_todos(
+                vec![super::super::TodoListItem {
+                    content: "Active task".into(),
+                    status: super::super::TodoListStatus::InProgress,
+                }],
+                cx,
+            );
+            composer.set_value("first", cx);
+        });
+        assert!(window.debug_bounds("composer-stop-current").is_some());
+        let send = window.debug_bounds("composer-send-or-stop").unwrap();
+        window.simulate_click(send.center(), gpui::Modifiers::default());
+        composer.update(window, |composer, cx| {
+            assert_eq!(composer.queue_len(), 1);
+            assert!(composer.value(cx).is_empty());
+            composer.set_value("second", cx);
+            composer.submit(cx);
+        });
+        let (first, second) = composer.read_with(window, |composer, _| {
+            (composer.queue[0].id, composer.queue[1].id)
+        });
+        assert_eq!(second, 2);
+        let button = window.debug_bounds("composer-queue-steer-2").unwrap();
+        let todo = window.debug_bounds("glass-composer-todo-panel").unwrap();
+        assert!(
+            todo.bottom() < button.top(),
+            "todo must not cover queued prompt controls"
+        );
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(*steering.borrow(), vec![second]);
+        composer.read_with(window, |composer, _| assert_eq!(composer.queue_len(), 2));
+        composer.update(window, |composer, cx| {
+            composer.set_value("keep this unsent draft", cx);
+            composer.set_busy(false, cx);
+        });
+        assert_eq!(*dispatched.borrow(), vec![(first, "first".to_string())]);
+        composer.update(window, |composer, cx| {
+            composer.set_busy(true, cx);
+            composer.set_busy(false, cx);
+        });
+        assert_eq!(
+            *dispatched.borrow(),
+            vec![(first, "first".to_string()), (second, "second".to_string())]
+        );
+        composer.read_with(window, |composer, cx| {
+            assert_eq!(composer.queue_len(), 0);
+            assert_eq!(composer.value(cx).as_ref(), "keep this unsent draft");
+        });
+    }
+
+    #[gpui::test]
     fn todo_panel_sits_above_editor_yields_to_at_panel_and_keeps_draft(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2066,7 +2318,7 @@ mod tests {
             composer.set_value("未发送的内容\n第二行", cx);
             composer
                 .queue
-                .push(ComposerSubmission::text("排队中的内容"));
+                .push(ComposerSubmission::text("排队中的内容").into());
             composer.chip_values.insert("model".into(), "b".into());
             composer.set_menu_chip(
                 ComposerChip::new("model").option("b", "B").option("c", "C"),

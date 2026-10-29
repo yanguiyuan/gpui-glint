@@ -1,11 +1,15 @@
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    rc::Rc,
+};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Render, ShapedLine,
-    SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun, Window, div, px,
-    rgb,
+    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Render, ScrollHandle,
+    ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun,
+    Window, div, px, rgb,
 };
 
 use super::Icon;
@@ -27,35 +31,6 @@ pub struct DiffLine {
     pub old_number: Option<usize>,
     pub new_number: Option<usize>,
     pub text: SharedString,
-}
-
-impl DiffLine {
-    fn context(number: usize, text: impl Into<SharedString>) -> Self {
-        Self {
-            kind: DiffLineKind::Context,
-            old_number: None,
-            new_number: Some(number),
-            text: text.into(),
-        }
-    }
-
-    fn added(number: usize, text: impl Into<SharedString>) -> Self {
-        Self {
-            kind: DiffLineKind::Added,
-            old_number: None,
-            new_number: Some(number),
-            text: text.into(),
-        }
-    }
-
-    fn deleted(number: usize, text: impl Into<SharedString>) -> Self {
-        Self {
-            kind: DiffLineKind::Deleted,
-            old_number: Some(number),
-            new_number: None,
-            text: text.into(),
-        }
-    }
 }
 
 /// Colors for diff tints. Independent of the syntax palette; pick by appearance.
@@ -98,69 +73,29 @@ impl DiffColors {
     };
 }
 
-/// Line-level diff via LCS. Very large inputs fall back to a whole replace so
-/// memory stays bounded.
-pub(crate) fn diff_lines(old_text: &str, new_text: &str) -> Vec<DiffLine> {
-    let mut old: Vec<&str> = old_text.split('\n').collect();
-    let mut new: Vec<&str> = new_text.split('\n').collect();
-    if old.last() == Some(&"") {
-        old.pop();
-    }
-    if new.last() == Some(&"") {
-        new.pop();
-    }
-    if old.len() * new.len() > 400 * 400 {
-        let mut lines: Vec<DiffLine> = old
-            .iter()
-            .enumerate()
-            .map(|(i, text)| DiffLine::deleted(i + 1, (*text).to_string()))
-            .collect();
-        lines.extend(
-            new.iter()
-                .enumerate()
-                .map(|(i, text)| DiffLine::added(i + 1, (*text).to_string())),
-        );
-        return lines;
-    }
-
-    // lcs[i][j] = LCS length of old[i..] and new[j..]
-    let mut lcs = vec![vec![0u32; new.len() + 1]; old.len() + 1];
-    for i in (0..old.len()).rev() {
-        for j in (0..new.len()).rev() {
-            lcs[i][j] = if old[i] == new[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-
-    let mut lines = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < old.len() && j < new.len() {
-        if old[i] == new[j] {
-            lines.push(DiffLine::context(j + 1, new[j].to_string()));
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            lines.push(DiffLine::deleted(i + 1, old[i].to_string()));
-            i += 1;
-        } else {
-            lines.push(DiffLine::added(j + 1, new[j].to_string()));
-            j += 1;
-        }
-    }
-    while i < old.len() {
-        lines.push(DiffLine::deleted(i + 1, old[i].to_string()));
-        i += 1;
-    }
-    while j < new.len() {
-        lines.push(DiffLine::added(j + 1, new[j].to_string()));
-        j += 1;
-    }
-    lines
+/// Line-level diff with bounded computation time and original line numbers.
+pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<DiffLine> {
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(250))
+        .diff_lines(old_text, new_text);
+    diff.iter_all_changes()
+        .map(|change| DiffLine {
+            kind: match change.tag() {
+                similar::ChangeTag::Equal => DiffLineKind::Context,
+                similar::ChangeTag::Insert => DiffLineKind::Added,
+                similar::ChangeTag::Delete => DiffLineKind::Deleted,
+            },
+            old_number: change.old_index().map(|index| index + 1),
+            new_number: change.new_index().map(|index| index + 1),
+            text: change
+                .value()
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_owned()
+                .into(),
+        })
+        .collect()
 }
-
 /// Byte ranges of changed words between a deleted and its replacement line,
 /// for the word-level tint used on paired rows.
 pub(crate) fn changed_word_ranges(
@@ -190,6 +125,11 @@ pub(crate) fn changed_word_ranges(
     }
     let old_words = words(deleted);
     let new_words = words(added);
+    // Generated/minified lines can contain thousands of tokens. Keep optional
+    // word highlighting from allocating a quadratic table on the UI thread.
+    if old_words.len().saturating_mul(new_words.len()) > 100_000 {
+        return (vec![0..deleted.len()], vec![0..added.len()]);
+    }
     // LCS over word tokens.
     let mut lcs = vec![vec![0u32; new_words.len() + 1]; old_words.len() + 1];
     for i in (0..old_words.len()).rev() {
@@ -241,7 +181,14 @@ pub struct DiffCard {
     word_tints: Vec<Option<(Vec<Range<usize>>, Vec<Range<usize>>)>>,
     expanded_hunks: HashSet<usize>,
     body_visible: bool,
+    header_visible: bool,
     theme: ThemePreset,
+    rows: Option<Rc<Vec<Row>>>,
+    row_offsets: Vec<f32>,
+    runs: HashMap<usize, Vec<TextRun>>,
+    scroll: ScrollHandle,
+    rendered_rows: Range<usize>,
+    totals: (usize, usize),
 }
 
 impl DiffCard {
@@ -259,7 +206,14 @@ impl DiffCard {
             word_tints: Vec::new(),
             expanded_hunks: HashSet::new(),
             body_visible: true,
+            header_visible: true,
             theme: ThemePreset::default(),
+            rows: None,
+            row_offsets: Vec::new(),
+            runs: HashMap::new(),
+            scroll: ScrollHandle::new(),
+            rendered_rows: 0..0,
+            totals: (0, 0),
         };
         card.set_diff(old_text, new_text, cx);
         card
@@ -280,7 +234,14 @@ impl DiffCard {
             word_tints: Vec::new(),
             expanded_hunks: HashSet::new(),
             body_visible: true,
+            header_visible: true,
             theme: ThemePreset::default(),
+            rows: None,
+            row_offsets: Vec::new(),
+            runs: HashMap::new(),
+            scroll: ScrollHandle::new(),
+            rendered_rows: 0..0,
+            totals: (0, 0),
         };
         card.recompute_word_tints();
         cx.notify();
@@ -297,6 +258,12 @@ impl DiffCard {
         self
     }
 
+    /// Hosts with their own file disclosure header can display just the diff.
+    pub fn header_visible(mut self, visible: bool) -> Self {
+        self.header_visible = visible;
+        self
+    }
+
     pub fn theme(mut self, theme: ThemePreset) -> Self {
         self.theme = theme;
         self
@@ -305,6 +272,7 @@ impl DiffCard {
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
+            self.runs.clear();
             cx.notify();
         }
     }
@@ -348,7 +316,9 @@ impl DiffCard {
     }
 
     pub fn expand_all(&mut self, cx: &mut Context<Self>) {
+        self.expanded_hunks.clear();
         self.expanded_hunks = (0..self.hunk_count()).collect();
+        self.rows = None;
         cx.notify();
     }
 
@@ -357,17 +327,7 @@ impl DiffCard {
     }
 
     pub fn stats(&self) -> (usize, usize) {
-        let adds = self
-            .lines
-            .iter()
-            .filter(|line| line.kind == DiffLineKind::Added)
-            .count();
-        let dels = self
-            .lines
-            .iter()
-            .filter(|line| line.kind == DiffLineKind::Deleted)
-            .count();
-        (adds, dels)
+        self.totals
     }
 
     fn hunk_count(&self) -> usize {
@@ -378,6 +338,14 @@ impl DiffCard {
     }
 
     fn recompute_word_tints(&mut self) {
+        self.rows = None;
+        self.runs.clear();
+        self.totals = self.lines.iter().fold((0, 0), |(adds, dels), line| {
+            (
+                adds + usize::from(line.kind == DiffLineKind::Added),
+                dels + usize::from(line.kind == DiffLineKind::Deleted),
+            )
+        });
         self.word_tints = vec![None; self.lines.len()];
         let mut index = 0;
         while index < self.lines.len() {
@@ -394,6 +362,40 @@ impl DiffCard {
                 index += 1;
             }
         }
+    }
+
+    fn visible_rows(&mut self) -> (Rc<Vec<Row>>, Range<usize>) {
+        let rows = if self.rows.is_none() {
+            let rows = Rc::new(self.hunks());
+            self.row_offsets = Vec::with_capacity(rows.len() + 1);
+            self.row_offsets.push(0.);
+            for row in rows.iter() {
+                let height = match row {
+                    Row::Line(_) => LINE_HEIGHT,
+                    Row::Hunk { .. } => 46.,
+                };
+                self.row_offsets
+                    .push(self.row_offsets.last().copied().unwrap_or(0.) + height);
+            }
+            self.rows = Some(rows.clone());
+            rows
+        } else {
+            self.rows.as_ref().unwrap().clone()
+        };
+        let top = (-f32::from(self.scroll.offset().y)).max(0.);
+        let height = f32::from(self.scroll.bounds().size.height).max(24. * LINE_HEIGHT);
+        let start = self
+            .row_offsets
+            .partition_point(|offset| *offset < top)
+            .saturating_sub(9)
+            .min(rows.len());
+        let end = (self
+            .row_offsets
+            .partition_point(|offset| *offset <= top + height)
+            + 8)
+        .min(rows.len());
+        self.rendered_rows = start..end;
+        (rows, self.rendered_rows.clone())
     }
 
     /// Walks the rows, grouping long context runs into collapsible hunks.
@@ -446,6 +448,7 @@ impl DiffCard {
     }
 }
 
+#[derive(Clone)]
 enum Row {
     Line(usize),
     Hunk {
@@ -476,6 +479,7 @@ impl Render for DiffCard {
             .id("glass-diff-card-header")
             .w_full()
             .h(px(46.))
+            .flex_shrink_0()
             .px(px(12.))
             .flex()
             .items_center()
@@ -539,18 +543,40 @@ impl Render for DiffCard {
             .bg(rgb(colors.surface))
             .overflow_hidden()
             .font_family("Menlo")
-            .child(header);
+            .when(self.header_visible, |root| root.child(header));
 
         if self.body_visible {
+            let (rows, visible) = self.visible_rows();
+            let paint_offset = self.scroll.offset();
+            let card = cx.entity();
             let mut body = div()
+                .on_children_prepainted(move |_, _, cx| {
+                    card.update(cx, |this, cx| {
+                        if this.scroll.offset() != paint_offset {
+                            let id = cx.entity_id();
+                            cx.defer(move |cx| cx.notify(id));
+                        }
+                    });
+                })
                 .id("glass-diff-card-body")
+                .debug_selector(|| "glass-diff-card-body".into())
                 .w_full()
                 .max_h(px(24. * LINE_HEIGHT))
                 .overflow_y_scroll()
+                .track_scroll(&self.scroll)
                 .flex()
                 .flex_col();
-            let rows = self.hunks();
-            for row in rows {
+            let top = self.row_offsets.get(visible.start).copied().unwrap_or(0.);
+            body = body.child(div().h(px(top)).flex_shrink_0());
+            // Bound cached syntax runs as well as live UI elements.
+            if self.runs.len() > 512 {
+                self.runs.retain(|index, _| {
+                    rows[visible.clone()]
+                        .iter()
+                        .any(|row| matches!(row, Row::Line(i) if i == index))
+                });
+            }
+            for row in rows[visible.clone()].iter().cloned() {
                 match row {
                     Row::Line(index) => {
                         let line = &self.lines[index];
@@ -580,15 +606,23 @@ impl Render for DiffCard {
                             DiffLineKind::Deleted => Some(diff_colors.deleted_marker),
                             DiffLineKind::Context => None,
                         };
-                        let runs = line_runs(
-                            &line.text,
-                            &self.language,
-                            colors,
-                            word_ranges.as_deref(),
-                            word_bg,
-                        );
+                        let runs = self
+                            .runs
+                            .entry(index)
+                            .or_insert_with(|| {
+                                line_runs(
+                                    &line.text,
+                                    &self.language,
+                                    colors,
+                                    word_ranges.as_deref(),
+                                    word_bg,
+                                )
+                            })
+                            .clone();
                         let mut row = div()
                             .w_full()
+                            .h(px(LINE_HEIGHT))
+                            .flex_shrink_0()
                             .flex()
                             .when_some(tint, |row: gpui::Div, tint| row.bg(tint));
                         if let Some(color) = marker {
@@ -637,6 +671,7 @@ impl Render for DiffCard {
                                 .mx(px(8.))
                                 .my(px(6.))
                                 .h(px(34.))
+                                .flex_shrink_0()
                                 .px(px(10.))
                                 .flex()
                                 .items_center()
@@ -650,6 +685,7 @@ impl Render for DiffCard {
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.expanded_hunks.insert(id);
+                                    this.rows = None;
                                     let _ = first;
                                     cx.notify();
                                 }))
@@ -659,6 +695,9 @@ impl Render for DiffCard {
                     }
                 }
             }
+            let bottom = self.row_offsets.last().copied().unwrap_or(0.)
+                - self.row_offsets.get(visible.end).copied().unwrap_or(0.);
+            body = body.child(div().h(px(bottom.max(0.))).flex_shrink_0());
             root = root.child(body);
         }
         root
@@ -686,21 +725,28 @@ fn line_runs(
     boundaries.push(text.len());
     boundaries.sort_unstable();
     boundaries.dedup();
+    let mut syntax_index = 0;
+    let mut word_index = 0;
+    let words = word_ranges.unwrap_or_default();
     let mut runs: Vec<TextRun> = boundaries
         .windows(2)
         .map(|pair| {
             let start = pair[0];
+            while syntax_index < syntax.len() && syntax[syntax_index].0.end <= start {
+                syntax_index += 1;
+            }
+            while word_index < words.len() && words[word_index].end <= start {
+                word_index += 1;
+            }
             let color = syntax
-                .iter()
-                .find(|(range, _)| range.start <= start && start < range.end)
+                .get(syntax_index)
+                .filter(|(range, _)| range.start <= start && start < range.end)
                 .map(|(_, color)| *color)
                 .unwrap_or(colors.text);
             let tinted = word_bg.is_some()
-                && word_ranges.is_some_and(|words| {
-                    words
-                        .iter()
-                        .any(|range| range.start <= start && start < range.end)
-                });
+                && words
+                    .get(word_index)
+                    .is_some_and(|range| range.start <= start && start < range.end);
             TextRun {
                 letter_spacing: None,
                 len: pair[1] - start,
@@ -833,6 +879,61 @@ impl Element for DiffLineElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn long_diff_only_builds_visible_rows_reuses_highlights_and_scrolls_to_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..3000)
+            .map(|index| format!("let item_{index} = {index};\n"))
+            .collect::<String>();
+        let (card, window) = cx.add_window_view(|_, cx| DiffCard::new(cx, "rust", "", text));
+        window.run_until_parked();
+        let rows = card.update(window, |card, cx| {
+            assert!(card.rendered_rows.len() < 50);
+            assert!(card.runs.len() < 50);
+            assert!(card.scroll.max_offset().y > px(50_000.));
+            let rows = card.rows.as_ref().unwrap().clone();
+            cx.notify();
+            rows
+        });
+        window.run_until_parked();
+        let bounds = window.debug_bounds("glass-diff-card-body").unwrap();
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-2000.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        card.update(window, |card, _| assert!(card.rendered_rows.start > 50));
+        card.update(window, |card, cx| {
+            assert!(Rc::ptr_eq(&rows, card.rows.as_ref().unwrap()));
+            card.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        card.update(window, |card, cx| {
+            assert_eq!(card.rendered_rows.end, 3000);
+            assert!(card.rendered_rows.len() < 50);
+            assert!(card.runs.contains_key(&2999));
+            card.set_lines(Vec::new(), cx);
+        });
+        window.run_until_parked();
+        card.update(window, |card, _| {
+            assert_eq!(card.stats(), (0, 0));
+            assert_eq!(card.row_offsets, vec![0.]);
+            assert!(card.runs.is_empty());
+        });
+    }
+
+    #[test]
+    fn minified_word_diff_has_bounded_cost() {
+        let old = "a + ".repeat(2000);
+        let new = "b + ".repeat(2000);
+        let (deleted, added) = changed_word_ranges(&old, &new);
+        assert_eq!(deleted, vec![0..old.len()]);
+        assert_eq!(added, vec![0..new.len()]);
+    }
 
     #[test]
     fn diff_produces_context_and_pairs() {

@@ -125,6 +125,7 @@ impl Recording {
                     elapsed_ms: 0,
                     live_output: None,
                     subagent: None,
+                    change: None,
                 });
             }
             ToolEvent::Output { call_id, output } => {
@@ -294,6 +295,7 @@ impl Runner {
         child.delegation = Delegation::Child;
         child.events = events;
         child.recall = None;
+        child.steering = None;
         child.todos = Default::default();
         let mut messages = self.instructions.clone();
         messages.push(json!({"role":"system","content":"You are a subagent executing a single delegated task. Work independently using the provided tools and return a concise result with evidence and any limitations to the parent agent. You cannot delegate work or create further subagents. Follow the inherited project boundaries and approval policy. You share the project files with the parent; avoid unrelated changes."}));
@@ -352,6 +354,7 @@ mod tests {
             delegation: Delegation::default(),
             subagents: Default::default(),
             todos: Default::default(),
+            steering: None,
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(path.join("sessions.json"))),
             memory: crate::memory::Repository::new(path.join("sessions.json")),

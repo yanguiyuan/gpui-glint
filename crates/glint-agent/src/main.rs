@@ -9,6 +9,8 @@ mod chatgpt;
 mod context_usage;
 mod database;
 mod discovery;
+mod edits;
+mod edits_ui;
 mod generation;
 mod images;
 mod mcp;
@@ -57,6 +59,9 @@ use uuid::Uuid;
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
 struct AgentWorkspace {
+    edits_ui: edits_ui::State,
+    steering_sender: Option<(Uuid, async_channel::Sender<String>)>,
+    queued_requests: std::collections::HashMap<u64, (Uuid, provider::Config)>,
     todo_live: todo::Store,
     group_list: Entity<GroupList>,
     calendar: Entity<Calendar>,
@@ -172,6 +177,7 @@ impl AgentWorkspace {
             Composer::new("描述任务，或继续追问…", cx)
                 .clear_on_submit(false)
                 .stop_on_busy(true)
+                .managed_queue(true)
                 .chip(ComposerChip::new("attach").icon(Icon::Plus))
                 .context_panel(
                     "attach",
@@ -304,6 +310,80 @@ impl AgentWorkspace {
                         cx.notify();
                     }
                     ComposerEvent::Submitted(submission) => this.send(submission.clone(), cx),
+                    ComposerEvent::QueueAdded { id, .. } => {
+                        this.queued_requests
+                            .insert(*id, (this.history.active, this.provider.clone()));
+                        let label =
+                            format!("{} · {}", this.history.active().title, this.provider.model);
+                        this.composer
+                            .update(cx, |composer, cx| composer.set_queue_label(*id, label, cx));
+                    }
+                    ComposerEvent::QueueSteerRequested { id, submission } => {
+                        let target = this.queued_requests.get(id).map(|(session, _)| *session);
+                        let sent =
+                            this.steering_sender
+                                .as_ref()
+                                .is_some_and(|(session, sender)| {
+                                    Some(*session) == target
+                                        && sender.try_send(submission.text.to_string()).is_ok()
+                                });
+                        if sent {
+                            if let Some((session, _)) = this.queued_requests.remove(id) {
+                                if let Some(session) = this
+                                    .history
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|item| item.id == session)
+                                {
+                                    session.push(
+                                        Role::User,
+                                        format!("执行中补充：{}", submission.text),
+                                    );
+                                }
+                            }
+                            this.composer
+                                .update(cx, |composer, cx| composer.remove_queued(*id, cx));
+                            this.save(cx);
+                        } else {
+                            this.provider_error = Some(
+                                "引导未发送：只能引导同一会话中仍在执行的任务，消息已保留在队列。"
+                                    .into(),
+                            );
+                            cx.notify();
+                        }
+                    }
+                    ComposerEvent::QueueRemoved(id) => {
+                        this.queued_requests.remove(id);
+                    }
+                    ComposerEvent::QueueSubmitted { id, submission } => {
+                        if let Some((session, config)) = this.queued_requests.remove(id) {
+                            if this.history.sessions.iter().any(|item| item.id == session) {
+                                this.send_to(session, submission.clone(), config, false, cx);
+                                if this.pending.is_none() && this.preparing.is_none() {
+                                    if let Some(error) = this.provider_error.clone() {
+                                        if let Some(target) = this
+                                            .history
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|item| item.id == session)
+                                        {
+                                            target.push(
+                                                Role::Notice,
+                                                format!(
+                                                    "排队任务未启动：{}\n{error}",
+                                                    submission.text
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if this.pending.is_none() && this.preparing.is_none() {
+                            this.composer
+                                .update(cx, |composer, cx| composer.set_busy(false, cx));
+                        }
+                    }
                     ComposerEvent::StopRequested => this.stop(cx),
                     ComposerEvent::ContextOpened => {
                         this.reload_skills(cx);
@@ -375,6 +455,9 @@ impl AgentWorkspace {
             scheduler_task: None,
             running_schedule: None,
             tool_listener: None,
+            queued_requests: Default::default(),
+            edits_ui: Default::default(),
+            steering_sender: None,
             todo_live: Default::default(),
             tool_activity: vec![],
             transcript: vec![],
@@ -645,6 +728,7 @@ impl AgentWorkspace {
             return;
         };
         let (events, receiver) = async_channel::unbounded();
+        let (steering_sender, steering_receiver) = async_channel::unbounded();
         let (recall_sender, recall_receiver) = async_channel::bounded(1);
         let recall_config = config.clone();
         let recall_project = self.history.sessions[index].project.clone();
@@ -658,6 +742,7 @@ impl AgentWorkspace {
             self.history.sessions[index].todos.clone(),
         ));
         let tool_context = tools::ToolContext {
+            steering: Some(steering_receiver),
             todos: self.todo_live.clone(),
             subagents: self.subagent_ui.live.clone(),
             delegation: Default::default(),
@@ -716,6 +801,7 @@ impl AgentWorkspace {
             }
         };
         self.provider_error = None;
+        self.steering_sender = Some((id, steering_sender));
         self.watch_tools(receiver, cx);
         self.memory_ui.notice = None;
         let message_index = self.history.sessions[index].messages.len();
@@ -734,8 +820,10 @@ impl AgentWorkspace {
                 );
             });
         }
-        self.history.sessions[index].draft.clear();
-        self.history.sessions[index].draft_images.clear();
+        if clear_composer {
+            self.history.sessions[index].draft.clear();
+            self.history.sessions[index].draft_images.clear();
+        }
         if clear_composer && self.history.active == id {
             self.composer.update(cx, |editor, cx| {
                 editor.set_value("", cx);
@@ -795,6 +883,7 @@ impl AgentWorkspace {
                     }
                 }
                 this.pending = None;
+                this.steering_sender = None;
                 this.tool_listener = None;
                 this.approval = None;
                 this.tool_activity.clear();
@@ -820,7 +909,7 @@ impl AgentWorkspace {
         self.pending = Some((id, task));
         self.composer.update(cx, |composer, cx| {
             composer.set_busy(true, cx);
-            composer.set_disabled(true, cx);
+            composer.set_disabled(false, cx);
         });
         cx.notify();
     }
@@ -834,6 +923,7 @@ impl AgentWorkspace {
             cx.notify();
         }
         if let Some((id, _task)) = self.pending.take() {
+            self.steering_sender = None;
             self.finish_subagent_records();
             self.finish_todos(id, cx);
             self.thinking_timings.finish();
@@ -1489,6 +1579,13 @@ impl AgentWorkspace {
                                         ),
                                     ))
                                 })
+                                .when(!user && !message.tools.is_empty(), |body| {
+                                    body.child(self.edits_summary(
+                                        &format!("{}:{index}:edits", self.history.active),
+                                        &message.tools,
+                                        cx,
+                                    ))
+                                })
                                 .when_some(message.stats.as_ref(), |body, stats| {
                                     body.child(
                                         div()
@@ -1613,6 +1710,7 @@ impl AgentWorkspace {
                             .child(session.title.clone()),
                     )
                     .child(self.subagent_selector(cx))
+                    .child(self.edits_button(cx))
                     .child(
                         div()
                             .text_size(px(10.))
@@ -1693,7 +1791,14 @@ impl Render for AgentWorkspace {
                     } else if self.show_calendar {
                         self.calendar_page(cx)
                     } else {
-                        self.content(cx)
+                        div()
+                            .size_full()
+                            .min_w_0()
+                            .flex()
+                            .child(div().flex_1().min_w_0().h_full().child(self.content(cx)))
+                            .when(self.edits_ui.open, |body| {
+                                body.child(self.edits_sidebar(cx))
+                            })
                     },
                 )
                 .navigation_rail(self.rail(cx))

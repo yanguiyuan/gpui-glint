@@ -19,6 +19,8 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<crate::edits::Change>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<crate::subagent::Trace>,
     pub call: ToolCall,
     pub result: String,
@@ -29,6 +31,7 @@ pub struct ToolRecord {
 }
 
 pub enum ToolEvent {
+    SteeringFailed(String),
     TodoUpdated(Vec<crate::todo::Item>),
     SubagentUpdated,
     ApprovalResolved,
@@ -82,6 +85,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub steering: Option<async_channel::Receiver<String>>,
     pub todos: crate::todo::Store,
     pub subagents: crate::subagent::Registry,
     pub delegation: crate::subagent::Delegation,
@@ -99,6 +103,15 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn take_steering(&self) -> Vec<String> {
+        let mut messages = Vec::new();
+        if let Some(receiver) = &self.steering {
+            while let Ok(message) = receiver.try_recv() {
+                messages.push(message);
+            }
+        }
+        messages
+    }
     pub fn definitions(&self, anthropic: bool) -> Value {
         let mut definitions = self.mcp.definitions(anthropic);
         if !matches!(self.delegation, crate::subagent::Delegation::Root(_)) {
@@ -329,6 +342,7 @@ fn needs_approval(call: &ToolCall) -> bool {
 }
 
 pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
+    let mut change = None;
     let started = Instant::now();
     let _ = context.events.send(ToolEvent::Started(call.clone())).await;
     let result = async {
@@ -350,7 +364,13 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
                 return Err("用户拒绝了此工具调用".into());
             }
         }
-        execute_inner(&call, context).await
+        if matches!(call.name.as_str(), "write_file" | "replace_in_file") {
+            let (result, observed) = crate::edits::apply(&call, context)?;
+            change = observed;
+            Ok(result)
+        } else {
+            execute_inner(&call, context).await
+        }
     }
     .await;
     let success = result.is_ok();
@@ -358,6 +378,7 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
         Ok(result) | Err(result) => result,
     };
     let record = ToolRecord {
+        change,
         subagent: if call.name == "subagent"
             && matches!(context.delegation, crate::subagent::Delegation::Root(_))
         {
@@ -382,6 +403,28 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
         .send(ToolEvent::Completed(record.clone()))
         .await;
     record
+}
+
+pub(crate) fn resolve_file(
+    context: &ToolContext,
+    relative: &str,
+    writing: bool,
+) -> Result<PathBuf, String> {
+    let access = *context.access.lock().map_err(|_| "无法读取权限设置")?;
+    let root = context
+        .root
+        .clone()
+        .or_else(|| {
+            (access == AccessMode::FullAccess)
+                .then(|| std::env::current_dir().ok())
+                .flatten()
+        })
+        .ok_or("请先打开项目，再使用文件工具")?;
+    if access == AccessMode::FullAccess {
+        Ok(root.join(relative))
+    } else {
+        safe_path(&root, relative, writing)
+    }
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
@@ -546,24 +589,6 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             args_list.extend(["--".into(), text(args, "pattern")?.into(), ".".into()]);
             let result = command(root, "rg", &args_list, None).await?;
             Ok(result.lines().take(200).collect::<Vec<_>>().join("\n"))
-        }
-        "write_file" | "replace_in_file" => {
-            let path = resolve(text(args, "path")?, true)?;
-            let content = if call.name == "write_file" {
-                text(args, "content")?.to_owned()
-            } else {
-                let current = std::fs::read_to_string(&path).map_err(|_| "无法读取目标文件")?;
-                let old = text(args, "old")?;
-                if old.is_empty() || current.matches(old).count() != 1 {
-                    return Err("待替换内容不存在或不唯一，未修改文件".into());
-                }
-                current.replacen(old, text(args, "new")?, 1)
-            };
-            if content.len() > 2 * 1024 * 1024 {
-                return Err("单次写入超过 2MB".into());
-            }
-            std::fs::write(path, content).map_err(|_| "写入失败")?;
-            Ok("文件已更新".into())
         }
         "run_command" => {
             let program = text(args, "program")?;
@@ -891,6 +916,7 @@ mod tests {
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
+            steering: None,
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(
                 directory.path().join("sessions.json"),
@@ -921,9 +947,17 @@ mod tests {
         };
         let (record, _) = tokio::join!(execute(call.clone(), &context), approve);
         assert!(!record.success);
+        assert!(record.change.is_none());
         assert!(!root.join("inside.txt").exists());
         *context.access.lock().unwrap() = AccessMode::AutoApprove;
-        assert!(execute(call.clone(), &context).await.success);
+        let written = execute(call.clone(), &context).await;
+        assert!(written.success);
+        assert!(
+            written
+                .change
+                .as_ref()
+                .is_some_and(|change| change.before.is_none() && change.after.as_ref() == "hello")
+        );
         let outside_call = ToolCall {
             arguments: json!({"path": outside, "content": "outside"}),
             ..call
@@ -957,6 +991,7 @@ mod tests {
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
+            steering: None,
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(anchor.clone())),
             memory: crate::memory::Repository::new(anchor),
@@ -1023,6 +1058,7 @@ mod tests {
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
+            steering: None,
             mcp: Default::default(),
             skills: Arc::new(manager.catalog_with_home(None, None).unwrap()),
             memory: crate::memory::Repository::new(anchor),

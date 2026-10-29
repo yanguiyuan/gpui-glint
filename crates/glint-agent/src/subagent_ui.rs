@@ -131,6 +131,7 @@ impl AgentWorkspace {
                     elapsed_ms: trace.elapsed_ms,
                     live_output: None,
                     subagent: Some(trace.clone()),
+                    change: None,
                 });
             }
             let record = self
@@ -356,6 +357,7 @@ impl AgentWorkspace {
                     .child(trace_caption(trace)),
             )
             .child(self.subagent_selector(cx));
+        let header = header.child(self.edits_button(cx));
         let key = format!("{}:subagent:{id}", self.history.active);
         let rows = self.transcript_rows(
             &key,
@@ -381,6 +383,13 @@ impl AgentWorkspace {
                 )
             })
             .children(rows);
+        if complete {
+            body = body.child(self.edits_summary(
+                &format!("subagent:{}:edits", trace.id),
+                &trace.tools,
+                cx,
+            ));
+        }
         if let Some(error) = &trace.error {
             body = body.child(div().text_color(rgb(0xd9342b)).child(error.clone()));
         }

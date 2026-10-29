@@ -339,6 +339,16 @@ pub async fn complete(
     let mut replies = Vec::new();
     loop {
         if let Some(turn_id) = &turn_id {
+            let steering = connection
+                .tools
+                .as_ref()
+                .map(|context| context.take_steering())
+                .unwrap_or_default();
+            for text in steering {
+                if let Err(error) = connection.rpc("turn/steer", json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]})).await {
+                    if let Some(context) = &connection.tools { let _ = context.events.try_send(crate::tools::ToolEvent::SteeringFailed(error)); }
+                }
+            }
             if let Some(recalled) = connection
                 .tools
                 .as_ref()

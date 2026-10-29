@@ -548,6 +548,14 @@ async fn complete(
     loop {
         // Never wait for recall. Consume it once at the next request boundary,
         // after all preceding tool calls have their matching results.
+        if let Some(context) = &context {
+            messages.extend(
+                context
+                    .take_steering()
+                    .into_iter()
+                    .map(|text| json!({"role":"user","content":text})),
+            );
+        }
         if let Some(recalled) = context
             .as_ref()
             .and_then(|context| context.take_recalled_context())
@@ -598,6 +606,23 @@ async fn complete(
             total = Some(reply.stats.clone());
         }
         if reply.tool_calls.is_empty() {
+            let steering = context
+                .as_ref()
+                .map(|context| context.take_steering())
+                .unwrap_or_default();
+            if !steering.is_empty() {
+                if config.protocol == Protocol::Anthropic {
+                    messages.push(json!({"role":"assistant","content":reply.raw_content}));
+                } else {
+                    messages.push(json!({"role":"assistant","content":reply.text,"reasoning_content":reply.reasoning}));
+                }
+                messages.extend(
+                    steering
+                        .into_iter()
+                        .map(|text| json!({"role":"user","content":text})),
+                );
+                continue;
+            }
             reply.stats = total.unwrap();
             reply.stats.elapsed_ms = started.elapsed().as_millis() as u64;
             reply.tool_records = records;
@@ -679,6 +704,11 @@ async fn single_request(
             .collect();
         let mut body =
             json!({"model":config.model,"messages":dialogue,"max_tokens":8192,"stream":true});
+        // DeepSeek's default reasoning can consume the entire old 8K budget
+        // before producing an answer. Match the budget already used for High.
+        if config.model.starts_with("deepseek") && thinking != Thinking::Off {
+            body["max_tokens"] = json!(32768);
+        }
         if !system.is_empty() {
             body["system"] = system.join("\n\n").into();
         }
@@ -723,6 +753,7 @@ async fn single_request(
         let mut stream = crate::generation::StreamCompletion::default();
         let mut bytes = 0;
         let mut last_context = None;
+        let mut last_snapshot = std::time::Instant::now() - Duration::from_millis(50);
         while let Some(chunk) = response
             .chunk()
             .await
@@ -746,19 +777,57 @@ async fn single_request(
                             capacity_tokens: None,
                         });
                 }
-                let mut blocks = prefix.to_vec();
-                blocks.extend(stream.snapshot());
-                let _ = context
-                    .events
-                    .try_send(crate::tools::ToolEvent::Transcript(blocks));
+                if stream.ended || last_snapshot.elapsed() >= Duration::from_millis(50) {
+                    let mut blocks = prefix.to_vec();
+                    blocks.extend(stream.snapshot());
+                    let _ = context
+                        .events
+                        .try_send(crate::tools::ToolEvent::Transcript(blocks));
+                    last_snapshot = std::time::Instant::now();
+                }
             }
             if stream.ended {
                 break;
             }
         }
+        if let Some(context) = context {
+            let mut blocks = prefix.to_vec();
+            blocks.extend(stream.snapshot());
+            let _ = context
+                .events
+                .try_send(crate::tools::ToolEvent::Transcript(blocks));
+        }
         return stream.finish(started.elapsed().as_millis() as u64);
     }
     let parsed = response_json(response).await?;
+    if let Some(context) = context {
+        let mut received = prefix.to_vec();
+        if config.protocol == Protocol::Anthropic {
+            received.extend(crate::generation::anthropic_blocks(&parsed["content"]));
+        } else {
+            let message = &parsed["choices"][0]["message"];
+            if let Some(text) = message["reasoning_content"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+            {
+                received.push(crate::generation::ContentBlock::Thinking(text.into()));
+            }
+            if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+                received.push(crate::generation::ContentBlock::Text(text.into()));
+            }
+        }
+        let _ = context
+            .events
+            .try_send(crate::tools::ToolEvent::Transcript(received));
+    }
+    let stop = if config.protocol == Protocol::Anthropic {
+        parsed["stop_reason"].as_str()
+    } else {
+        parsed["choices"][0]["finish_reason"].as_str()
+    };
+    if let Some(error) = crate::generation::stop_error(stop) {
+        return Err(error);
+    }
     let mut metrics = crate::generation::Metrics::default();
     metrics.usage(&parsed["usage"]);
     let stats = metrics.finish(started.elapsed().as_millis() as u64);
@@ -773,7 +842,12 @@ async fn single_request(
             .join("\n");
         let tool_calls = crate::tools::parse_calls(&parsed["content"], true)?;
         return if text.trim().is_empty() && tool_calls.is_empty() {
-            Err("Provider 未返回文本回复".into())
+            Err(crate::generation::empty_reply_error(
+                stop,
+                parsed["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking")),
+            ))
         } else {
             Ok(crate::generation::Completion {
                 text,
@@ -802,7 +876,12 @@ async fn single_request(
     let text = text.unwrap_or_default();
     let tool_calls = crate::tools::parse_calls(message, false)?;
     if text.trim().is_empty() && tool_calls.is_empty() {
-        return Err("Provider 未返回文本回复，请确认支持 Chat Completions 协议".into());
+        return Err(crate::generation::empty_reply_error(
+            stop,
+            message["reasoning_content"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+        ));
     }
     let mut blocks = Vec::new();
     if let Some(reasoning) = message["reasoning_content"]
@@ -958,6 +1037,41 @@ mod tests {
         server_for("post /v1/chat/completions ", status, body)
     }
 
+    #[test]
+    fn deepseek_default_reasoning_has_answer_headroom_and_budget_failures_are_specific() {
+        for thinking in [Thinking::Default, Thinking::Off] {
+            let (base_url, server) = server_for(
+                "post /v1/messages ",
+                "200 OK",
+                r#"{"content":[{"type":"thinking","thinking":"reasoning only"}],"stop_reason":"max_tokens"}"#,
+            );
+            let config = Config {
+                base_url,
+                model: "deepseek-flash".into(),
+                protocol: Protocol::Anthropic,
+                ..Default::default()
+            };
+            let request = Request::start(
+                config,
+                "test-only-key".into(),
+                vec![json!({"role":"user","content":"Create a page"})],
+                thinking,
+            )
+            .unwrap();
+            let error = runtime().unwrap().block_on(request.response()).unwrap_err();
+            assert!(error.contains("token 上限"));
+            let body = server.join().unwrap();
+            assert_eq!(
+                body["max_tokens"],
+                if thinking == Thinking::Off {
+                    8192
+                } else {
+                    32768
+                }
+            );
+        }
+    }
+
     fn server_for(
         expected: &'static str,
         status: &str,
@@ -1022,6 +1136,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
                 let (recall_sender, recall_receiver) = async_channel::bounded(1);
+                let (steering_sender, steering_receiver) = async_channel::unbounded();
                 let server = std::thread::spawn(move || {
                     for round in 0..2 {
                         let (mut stream, _) = listener.accept().unwrap();
@@ -1051,7 +1166,14 @@ mod tests {
                         assert!(!request["tools"].as_array().unwrap().is_empty());
                         let occurrences = request.to_string().matches("recall-sentinel").count();
                         assert_eq!(occurrences, usize::from(deliver_recall && round == 1));
+                        assert_eq!(
+                            request.to_string().matches("steering-sentinel").count(),
+                            usize::from(deliver_recall && round == 1)
+                        );
                         if round == 0 && deliver_recall {
+                            steering_sender
+                                .try_send("steering-sentinel".into())
+                                .unwrap();
                             // Recall cannot start/finish before the main request:
                             // release it only once the server has seen round one.
                             recall_sender
@@ -1064,7 +1186,13 @@ mod tests {
                             let result = messages
                                 .iter()
                                 .rev()
-                                .find(|message| message["role"] != "system")
+                                .find(|message| {
+                                    if anthropic {
+                                        message["content"][0]["type"] == "tool_result"
+                                    } else {
+                                        message["role"] == "tool"
+                                    }
+                                })
                                 .unwrap();
                             if anthropic {
                                 assert_eq!(result["content"][0]["tool_use_id"], "call-1");
@@ -1108,6 +1236,7 @@ mod tests {
                     delegation: Default::default(),
                     subagents: Default::default(),
                     todos: Default::default(),
+                    steering: Some(steering_receiver),
                     mcp: Default::default(),
                     skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                         directory.path().join("sessions.json"),

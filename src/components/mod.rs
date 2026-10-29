@@ -113,7 +113,7 @@ mod collapse_panel;
 pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent};
 
 mod diff_card;
-pub use diff_card::{DiffCard, DiffColors, DiffLine, DiffLineKind};
+pub use diff_card::{DiffCard, DiffColors, DiffLine, DiffLineKind, diff_lines};
 
 #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
 mod webview;

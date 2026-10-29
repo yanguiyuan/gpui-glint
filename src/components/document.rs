@@ -200,6 +200,7 @@ impl RenderBlock {
 /// by subscribers to DocumentEvent::Changed. Register bind_document_editor_keys once.
 pub struct DocumentEditor {
     embedded_preview: bool,
+    scrollable_preview: bool,
     render_blocks: HashMap<u64, Rc<RenderBlock>>,
     render_references: String,
     character_count: usize,
@@ -255,6 +256,7 @@ impl DocumentEditor {
         });
         let mut this = Self {
             embedded_preview: false,
+            scrollable_preview: false,
             render_blocks: HashMap::new(),
             render_references: String::new(),
             character_count: 0,
@@ -306,6 +308,16 @@ impl DocumentEditor {
     pub fn embedded_preview(mut self) -> Self {
         self.embedded_preview = true;
         self.preview = true;
+        self.status_bar_visible = false;
+        self.toc_collapsed = true;
+        self.rounded_corners = false;
+        self
+    }
+
+    /// Read-only bounded Markdown with its own virtualized scroll viewport.
+    pub fn scrollable_preview(mut self) -> Self {
+        self.preview = true;
+        self.scrollable_preview = true;
         self.status_bar_visible = false;
         self.toc_collapsed = true;
         self.rounded_corners = false;
@@ -2679,8 +2691,8 @@ impl Render for DocumentEditor {
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .pt_8()
-                    .pb_8()
+                    .pt(px(if self.scrollable_preview { 8. } else { 32. }))
+                    .pb(px(if self.scrollable_preview { 8. } else { 32. }))
             })
             .when(self.embedded_preview, |paper| {
                 paper.w_full().flex_shrink_0()
@@ -2696,7 +2708,7 @@ impl Render for DocumentEditor {
             } else {
                 0.
             }))
-            .bg(if self.embedded_preview {
+            .bg(if self.embedded_preview || self.scrollable_preview {
                 rgba(0x00000000)
             } else if theme.is_dark() {
                 rgba(theme.panel_material())
@@ -3016,6 +3028,16 @@ impl Render for DocumentEditor {
                     .child("＋ 添加块"),
             )
         });
+        if self.scrollable_preview {
+            return div()
+                .id("glass-document-scroll-preview")
+                .debug_selector(|| "glass-document-scroll-preview".into())
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .child(paper);
+        }
         if self.embedded_preview {
             return div()
                 .id("glass-document-preview")
@@ -3118,6 +3140,36 @@ impl Render for DocumentEditor {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn bounded_read_only_preview_culls_long_thinking_and_keeps_all_content(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        let text = (0..150)
+            .map(|index| format!("Paragraph {index} with **reasoning** and details."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (document, window) =
+            cx.add_window_view(|_, cx| DocumentEditor::new(cx, &text).scrollable_preview());
+        window.run_until_parked();
+        document.update(window, |editor, cx| {
+            assert!(editor.preview);
+            assert!(editor.rendered_blocks.len() < editor.blocks.len() / 2);
+            assert!(editor.scroll.max_offset().y > px(0.));
+            editor.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        document.update(window, |editor, _| {
+            assert!(editor.rendered_blocks.len() < editor.blocks.len() / 2);
+            assert!(
+                editor
+                    .rendered_blocks
+                    .contains(&editor.blocks.last().unwrap().id)
+            );
+            assert_eq!(editor.blocks.len(), 150);
+        });
+    }
     #[gpui::test]
     fn embedded_markdown_uses_content_height_and_hides_document_chrome(
         cx: &mut gpui::TestAppContext,

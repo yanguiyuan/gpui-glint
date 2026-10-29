@@ -40,6 +40,11 @@ fn tool_signature(record: &tools::ToolRecord) -> String {
     record.success.hash(&mut hash);
     record.elapsed_ms.hash(&mut hash);
     record.live_output.hash(&mut hash);
+    record
+        .change
+        .as_ref()
+        .map(|change| change.id)
+        .hash(&mut hash);
     hash.finish().to_string()
 }
 
@@ -328,6 +333,10 @@ impl AgentWorkspace {
                             this.scroll.scroll_to_bottom();
                         }
                         match event {
+                            tools::ToolEvent::SteeringFailed(error) => {
+                                this.provider_error =
+                                    Some(format!("引导未生效：{error}。补充要求已保存到会话。"));
+                            }
                             tools::ToolEvent::TodoUpdated(todos) => {
                                 if let Some((id, _)) = &this.pending {
                                     if let Some(session) = this
@@ -402,6 +411,7 @@ impl AgentWorkspace {
                                     elapsed_ms: 0,
                                     live_output: None,
                                     subagent: None,
+                                    change: None,
                                 })
                             }
                             tools::ToolEvent::Output { call_id, output } => {
@@ -487,11 +497,44 @@ impl AgentWorkspace {
         if entry.signature != signature || entry.theme != theme {
             let presentation = tool_presentation(record);
             let result: SharedString = presentation.body.into();
+            let change = record.change.clone();
+            let weak = cx.entity().downgrade();
+            let scope = format!("{key}:tool:{}", record.call.id);
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
                 panel.set_summary(presentation.summary, cx);
                 panel.set_content(
-                    move |_, _| {
+                    move |_, cx| {
+                        if let Some(change) = &change {
+                            return weak
+                                .update(cx, |this, cx| {
+                                    let path = change.path.clone();
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("tool-edit-diff")
+                                                .max_h(px(360.))
+                                                .overflow_y_scroll()
+                                                .child(this.edit_diff(&scope, change, cx)),
+                                        )
+                                        .child(
+                                            Button::new("在侧栏查看")
+                                                .kind(ButtonKind::Plain)
+                                                .theme(this.theme)
+                                                .render()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_edits(Some(path.clone()), cx)
+                                                })),
+                                        )
+                                        .into_any_element()
+                                })
+                                .unwrap_or_else(|_| div().into_any_element());
+                        }
                         div()
                             .id("tool-output")
                             .w_full()
@@ -522,13 +565,17 @@ impl AgentWorkspace {
     ) -> Entity<gpui_glint::components::DocumentEditor> {
         let mut cache = self.markdown_views.borrow_mut();
         let theme = self.theme;
+        let thinking = key.ends_with(":thinking");
         let view = cache.entry(key).or_insert_with(|| MarkdownView {
             source: text.into(),
             theme,
             editor: cx.new(|cx| {
-                gpui_glint::components::DocumentEditor::new(cx, text)
-                    .theme(theme)
-                    .embedded_preview()
+                let editor = gpui_glint::components::DocumentEditor::new(cx, text).theme(theme);
+                if thinking {
+                    editor.scrollable_preview()
+                } else {
+                    editor.embedded_preview()
+                }
             }),
         });
         if view.source != text || view.theme != theme {
@@ -615,6 +662,10 @@ impl AgentWorkspace {
                         let weak = cx.entity().downgrade();
                         let editor_key = format!("{key}:{index}:thinking");
                         let source: SharedString = text.clone().into();
+                        let height =
+                            ((text.lines().count() + text.len() / 100).clamp(2, 15) as f32 * 24.
+                                + 16.)
+                                .min(376.);
                         entry.panel.update(cx, |panel, cx| {
                             panel.set_theme(theme, cx);
                             if active {
@@ -625,11 +676,9 @@ impl AgentWorkspace {
                             panel.set_content(
                                 move |_, cx| {
                                     weak.update(cx, |this, cx| {
-                                        div().w_full().min_w_0().child(this.markdown_text(
-                                            editor_key.clone(),
-                                            &source,
-                                            cx,
-                                        ))
+                                        div().w_full().min_w_0().h(px(height)).child(
+                                            this.markdown_text(editor_key.clone(), &source, cx),
+                                        )
                                     })
                                     .unwrap_or_else(|_| div())
                                     .into_any_element()
@@ -653,6 +702,7 @@ impl AgentWorkspace {
                             elapsed_ms: 0,
                             live_output: None,
                             subagent: None,
+                            change: None,
                         };
                         let running = if !complete {
                             activity
@@ -873,6 +923,7 @@ mod tests {
             elapsed_ms: 0,
             live_output: None,
             subagent: None,
+            change: None,
         };
         let blocks = vec![Thinking("checking".into()), ToolCall(record.call.clone())];
         let mut timings = std::collections::BTreeMap::new();
@@ -936,6 +987,7 @@ mod tests {
             elapsed_ms: 1200,
             live_output: None,
             subagent: None,
+            change: None,
         };
         let view = tool_presentation(&record);
         assert_eq!(
