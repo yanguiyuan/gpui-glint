@@ -24,6 +24,8 @@ pub struct Request {
     pub op: String,
     pub origin: String,
     pub entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 pub struct Pending {
     pub request: Request,
@@ -185,7 +187,7 @@ fn serve(mut stream: TcpStream, token: &str, sender: SyncSender<Pending>) -> Res
     }
     let request = envelope.request;
     let reply = if origin(&request.origin).as_deref() != Some(request.origin.as_str())
-        || !matches!(request.op.as_str(), "list" | "fill")
+        || !matches!(request.op.as_str(), "list" | "fill" | "copy")
         || request.entry_id.as_ref().is_some_and(|id| id.len() > 64)
     {
         Reply::error("网站或操作无效")
@@ -441,6 +443,7 @@ mod tests {
             op: "list".into(),
             origin: "https://example.com".into(),
             entry_id: None,
+            offset: None,
         })
         .unwrap();
         let mut framed = (body.len() as u32).to_ne_bytes().to_vec();

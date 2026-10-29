@@ -95,7 +95,41 @@ impl VaultStore {
             connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS vault(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,revision INTEGER NOT NULL,salt BLOB NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL); PRAGMA user_version=1; COMMIT;")
                 .map_err(|_|"无法初始化密码箱")?;
         }
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS vault_settings(key TEXT PRIMARY KEY, value INTEGER NOT NULL CHECK(value IN (0,1)))")
+            .map_err(|_| "无法读取密码箱设置")?;
         Ok(connection)
+    }
+    pub fn browser_auto_approve(&self) -> Result<bool, String> {
+        self.browser_setting("browser_auto_approve")
+    }
+    pub fn browser_match_website(&self) -> Result<bool, String> {
+        self.browser_setting("browser_match_website")
+    }
+    fn browser_setting(&self, key: &str) -> Result<bool, String> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        self.connection()?
+            .query_row(
+                "SELECT value FROM vault_settings WHERE key=?1",
+                [key],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(|_| "无法读取浏览器确认设置".into())
+    }
+    pub fn set_browser_auto_approve(&self, enabled: bool) -> Result<(), String> {
+        self.set_browser_setting("browser_auto_approve", enabled)
+    }
+    pub fn set_browser_match_website(&self, enabled: bool) -> Result<(), String> {
+        self.set_browser_setting("browser_match_website", enabled)
+    }
+    fn set_browser_setting(&self, key: &str, enabled: bool) -> Result<(), String> {
+        self.connection()?.execute(
+            "INSERT INTO vault_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, enabled],
+        ).map(|_| ()).map_err(|_| "无法保存浏览器确认设置".into())
     }
     pub fn initialized(&self) -> Result<bool, String> {
         if !self.path.exists() {

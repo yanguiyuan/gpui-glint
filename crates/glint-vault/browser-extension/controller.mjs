@@ -28,14 +28,24 @@ export function createController(api, native) {
         const [tab] = await api.tabs.query({active: true, lastFocusedWindow: true});
         if (!tab || !Number.isInteger(tab.id)) throw new Error("无法读取当前标签页");
         const origin = await website(tab);
-        const reply = await native({op: "list", origin, entry_id: null});
-        if (!reply?.ok) throw new Error(reply?.error ?? "密码箱未连接");
-        if (!Array.isArray(reply.entries)) throw new Error("密码箱回复格式无效");
-        // Send only account metadata to the popup, never secrets.
-        const entries = reply.entries.slice(0, 50).map(({id, title, username}) => ({id, title, username}));
-        return {ok: true, origin, tabId: tab.id, entries};
+        const entries = [];
+        let offset = 0;
+        let matchWebsite = true;
+        do {
+          const reply = await native({op: "list", origin, entry_id: null, ...(offset ? {offset} : {})});
+          if (!reply?.ok) throw new Error(reply?.error ?? "密码箱未连接");
+          if (!Array.isArray(reply.entries)) throw new Error("密码箱回复格式无效");
+          // Page metadata only; never return credentials to the popup.
+          entries.push(...reply.entries.slice(0, 50).map(({id, title, username}) => ({id, title, username})));
+          matchWebsite = reply.match_website !== false;
+          if (reply.next_offset == null) break;
+          if (!Number.isInteger(reply.next_offset) || reply.next_offset <= offset || reply.next_offset >= 10000)
+            throw new Error("密码箱分页回复无效");
+          offset = reply.next_offset;
+        } while (entries.length < 10000);
+        return {ok: true, origin, tabId: tab.id, entries, matchWebsite};
       }
-      if (message.op !== "fill" || !Number.isInteger(message.tabId) ||
+      if (!["fill", "copy"].includes(message.op) || !Number.isInteger(message.tabId) ||
           typeof message.entryId !== "string" || message.entryId.length > 64)
         throw new Error("填充请求无效");
       if (filling.has(message.tabId)) throw new Error("正在等待本机确认");
@@ -44,8 +54,12 @@ export function createController(api, native) {
       filling.add(message.tabId);
       let reply;
       try {
-        reply = await native({op: "fill", origin, entry_id: message.entryId});
+        reply = await native({op: message.op, origin, entry_id: message.entryId});
         if (!reply?.ok) throw new Error(reply?.error ?? "未获准填充");
+        if (message.op === "copy") {
+          if (reply.copied !== true) throw new Error("复制未完成，请更新并重启本机密码箱");
+          return {ok: true, copied: true};
+        }
         if (reply.origin !== origin || typeof reply.username !== "string" ||
             typeof reply.password !== "string" || reply.password.length > 8192)
           throw new Error("密码箱回复格式无效");
@@ -56,7 +70,8 @@ export function createController(api, native) {
           func: fillLoginForm,
           args: [origin, reply.username, reply.password],
         });
-        if (!results[0]?.result?.filled) throw new Error("未能填充登录表单");
+        if (!results[0]?.result?.filled)
+          throw new Error(results[0]?.result?.error ?? "未能填充登录表单");
         return {ok: true, filled: true};
       } finally {
         if (reply) { reply.password = ""; reply.username = ""; }

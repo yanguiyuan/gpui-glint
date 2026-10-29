@@ -7,7 +7,7 @@ use gpui::{
 use gpui_glint::{
     components::{
         Button, ButtonKind, ButtonSize, Dialog, Icon, IconButton, InputField, Popover, SearchInput,
-        TextEntry, Toast, ToastHost, ToastKind,
+        Switch, TextEntry, Toast, ToastHost, ToastKind,
     },
     theme::ThemePreset,
 };
@@ -46,6 +46,8 @@ pub struct VaultPage {
     clipboard: Option<([u8; 32], Instant)>,
     bridge: Option<Bridge>,
     browser_pending: Option<(Pending, Instant)>,
+    browser_auto_approve: bool,
+    browser_match_website: bool,
     last_refresh: Instant,
     unlock_task: Option<Task<()>>,
     _timer: Task<()>,
@@ -56,6 +58,8 @@ impl VaultPage {
     pub fn new(path: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
         let store = VaultStore::new(path);
         let initialized = store.initialized();
+        let browser_auto_approve = store.browser_auto_approve().unwrap_or(false);
+        let browser_match_website = store.browser_match_website().unwrap_or(true);
         let master = cx.new(|cx| TextEntry::new(cx, "主密码", "").masked(true));
         let confirmation = cx.new(|cx| TextEntry::new(cx, "再次输入主密码", "").masked(true));
         let search = cx.new(|cx| TextEntry::new(cx, "搜索名称、账号或网站", ""));
@@ -128,6 +132,8 @@ impl VaultPage {
             clipboard: None,
             bridge: None,
             browser_pending: None,
+            browser_auto_approve,
+            browser_match_website,
             last_refresh: Instant::now(),
             unlock_task: None,
             _timer: timer,
@@ -378,6 +384,16 @@ impl VaultPage {
             return;
         }
         self.last_refresh = Instant::now();
+        let browser_match_website = self.store.browser_match_website().unwrap_or(true);
+        if self.browser_match_website != browser_match_website {
+            self.browser_match_website = browser_match_website;
+            cx.notify();
+        }
+        let browser_auto_approve = self.store.browser_auto_approve().unwrap_or(false);
+        if self.browser_auto_approve != browser_auto_approve {
+            self.browser_auto_approve = browser_auto_approve;
+            cx.notify();
+        }
         let result = self.vault.as_mut().map(Vault::refresh);
         match result {
             Some(Ok(true)) => {
@@ -432,41 +448,122 @@ impl VaultPage {
             .map(|bridge| bridge.pending.try_iter().take(8).collect())
             .unwrap_or_default();
         for pending in requests {
-            let Some(vault) = self.vault.as_ref() else {
-                let _ = pending.respond.send(Reply::error("密码箱已锁定"));
-                continue;
-            };
-            if pending.request.op == "list" {
-                let matches:Vec<_>=vault.entries().iter().filter(|entry|browser::matches(&entry.website,&pending.request.origin)).take(50)
-                    .map(|entry|serde_json::json!({"id":entry.id,"title":entry.title,"username":entry.username})).collect();
-                let _ = pending
-                    .respond
-                    .send(Reply(serde_json::json!({"ok":true,"entries":matches})));
-            } else if self.browser_pending.is_some() {
-                let _ = pending.respond.send(Reply::error("请先处理当前填充请求"));
-            } else if vault.entries().iter().any(|entry| {
-                Some(&entry.id) == pending.request.entry_id.as_ref()
-                    && browser::matches(&entry.website, &pending.request.origin)
-            }) {
-                self.browser_pending = Some((pending, Instant::now()));
-                cx.emit(VaultEvent::BrowserFillRequested);
-                cx.activate(true);
-                cx.notify();
-            } else {
-                let _ = pending.respond.send(Reply::error("该条目不属于当前网站"));
-            }
+            self.handle_browser_request(pending, cx);
         }
+    }
+    fn handle_browser_request(&mut self, pending: Pending, cx: &mut Context<Self>) {
+        let Some(vault) = self.vault.as_ref() else {
+            let _ = pending.respond.send(Reply::error("密码箱已锁定"));
+            return;
+        };
+        let match_website = self.store.browser_match_website().unwrap_or(true);
+        if pending.request.op == "list" {
+            let offset = pending.request.offset.unwrap_or(0).min(10000);
+            let entries: Vec<_> = vault
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    !match_website || browser::matches(&entry.website, &pending.request.origin)
+                })
+                .skip(offset)
+                .take(51)
+                .collect();
+            let next_offset = (entries.len() > 50).then_some(offset + 50);
+            let matches: Vec<_> = entries.iter().take(50).map(|entry| serde_json::json!({"id":entry.id,"title":entry.title,"username":entry.username})).collect();
+            let _ = pending
+                .respond
+                .send(Reply(serde_json::json!({"ok":true,"entries":matches,"next_offset":next_offset,"match_website":match_website})));
+        } else if self.browser_pending.is_some() {
+            let _ = pending.respond.send(Reply::error("请先处理当前填充请求"));
+        } else if vault.entries().iter().any(|entry| {
+            Some(&entry.id) == pending.request.entry_id.as_ref()
+                && (!match_website || browser::matches(&entry.website, &pending.request.origin))
+        }) {
+            self.browser_pending = Some((pending, Instant::now()));
+            // Read the shared preference for every request so disabling it
+            // in another host takes effect without relying on the UI cache.
+            if self.store.browser_auto_approve().unwrap_or(false) {
+                self.reply_browser(true, cx);
+                return;
+            }
+            cx.emit(VaultEvent::BrowserFillRequested);
+            cx.activate(true);
+            cx.notify();
+        } else {
+            let _ = pending.respond.send(Reply::error("该条目不属于当前网站"));
+        }
+    }
+    fn set_browser_auto_approve(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match self.store.set_browser_auto_approve(enabled) {
+            Ok(()) => self.browser_auto_approve = enabled,
+            Err(error) => self.notice = Some(error),
+        }
+        cx.notify();
+    }
+    fn browser_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let weak = cx.entity().downgrade();
+        let match_owner = weak.clone();
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_3()
+            .child(
+                Switch::new("浏览器操作免二次确认")
+                    .checked(self.browser_auto_approve)
+                    .theme(self.theme)
+                    .on_change(move |enabled, _, cx| {
+                        let _ =
+                            weak.update(cx, |this, cx| this.set_browser_auto_approve(enabled, cx));
+                    })
+                    .render()
+                    .debug_selector(|| "vault-browser-auto-approve".into()),
+            )
+            .child(
+                Switch::new("按当前网址匹配账号")
+                    .checked(self.browser_match_website)
+                    .theme(self.theme)
+                    .on_change(move |enabled, _, cx| {
+                        let _ = match_owner.update(cx, |this, cx| {
+                            match this.store.set_browser_match_website(enabled) {
+                                Ok(()) => this.browser_match_website = enabled,
+                                Err(error) => this.notice = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .render()
+                    .debug_selector(|| "vault-browser-match-website".into()),
+            )
     }
     fn reply_browser(&mut self, approved: bool, cx: &mut Context<Self>) {
         let Some((pending, _)) = self.browser_pending.take() else {
             return;
         };
         let reply = if approved {
-            self.vault.as_ref().and_then(|vault|vault.entries().iter().find(|entry|Some(&entry.id)==pending.request.entry_id.as_ref() && browser::matches(&entry.website,&pending.request.origin)))
-                .map(|entry|Reply(serde_json::json!({"ok":true,"origin":pending.request.origin,"username":entry.username,"password":entry.password})))
-                .unwrap_or_else(||Reply::error("密码箱已锁定或条目已改变"))
+            let match_website = self.store.browser_match_website().unwrap_or(true);
+            match self.vault.as_ref().and_then(|vault| {
+                vault.entries().iter().find(|entry| {
+                    Some(&entry.id) == pending.request.entry_id.as_ref()
+                        && (!match_website
+                            || browser::matches(&entry.website, &pending.request.origin))
+                })
+            }) {
+                Some(entry) if pending.request.op == "copy" => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(entry.password.clone()));
+                    self.clipboard = Some((
+                        Sha256::digest(entry.password.as_bytes()).into(),
+                        Instant::now(),
+                    ));
+                    Reply(serde_json::json!({"ok":true,"copied":true}))
+                }
+                Some(entry) => Reply(
+                    serde_json::json!({"ok":true,"origin":pending.request.origin,"username":entry.username,"password":entry.password}),
+                ),
+                None => Reply::error("密码箱已锁定或条目已改变"),
+            }
         } else {
-            Reply::error("已取消填充")
+            Reply::error("已取消操作")
         };
         let _ = pending.respond.send(reply);
 
@@ -474,6 +571,7 @@ impl VaultPage {
     }
     fn browser_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (pending, _) = self.browser_pending.as_ref()?;
+        let copying = pending.request.op == "copy";
         let title = self
             .vault
             .as_ref()?
@@ -494,26 +592,38 @@ impl VaultPage {
                         div()
                             .text_size(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("允许浏览器填充密码？"),
+                            .child(if copying {
+                                "允许复制密码？"
+                            } else {
+                                "允许浏览器填充密码？"
+                            }),
                     )
                     .child(pending.request.origin.clone())
                     .child(title)
                     .child(
                         div()
                             .text_color(rgb(self.theme.palette().text_muted))
-                            .child("仅将所选账号交给这个网站，不会自动提交登录。"),
+                            .child(if copying {
+                                "将所选账号的密码复制到系统剪贴板，随后可手动粘贴。"
+                            } else {
+                                "仅将所选账号交给这个网站，不会自动提交登录。"
+                            }),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_3()
                             .child(
-                                Button::new("允许本次填充")
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.reply_browser(true, cx)),
-                                    ),
+                                Button::new(if copying {
+                                    "允许本次复制"
+                                } else {
+                                    "允许本次填充"
+                                })
+                                .theme(self.theme)
+                                .render()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.reply_browser(true, cx)),
+                                ),
                             )
                             .child(
                                 Button::new("取消")
@@ -897,6 +1007,7 @@ impl Render for VaultPage {
                     div()
                         .id("vault-toolbar")
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_3()
                         .p_4()
@@ -911,6 +1022,7 @@ impl Render for VaultPage {
                                 .child("本机加密 · 本次运行已解锁"),
                         )
                         .child(div().flex_1())
+                        .child(self.browser_settings(cx))
                         .child(
                             Button::new("添加密码")
                                 .kind(ButtonKind::Gray)
@@ -969,6 +1081,175 @@ impl Render for VaultPage {
 mod tests {
     use super::*;
     #[gpui::test]
+    fn browser_lists_all_entries_by_default_and_matching_is_optional(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.sqlite3");
+        let store = VaultStore::new(path.clone());
+        let mut vault = store.create("a safe test master password").unwrap();
+        assert!(!store.browser_match_website().unwrap());
+        let mut first = String::new();
+        for index in 0..52 {
+            let mut entry = Entry::default();
+            entry.title = format!("Entry {index}");
+            entry.website = "https://example.com/login".into();
+            entry.password = "test-password".into();
+            let id = vault.upsert(entry).unwrap();
+            if index == 0 {
+                first = id;
+            }
+        }
+        store.set_browser_auto_approve(true).unwrap();
+        let (page, window) =
+            cx.add_window_view(|_, cx| VaultPage::new(path.clone(), ThemePreset::Moonstone, cx));
+        page.update(window, |this, cx| {
+            this.vault = Some(vault);
+            let request = |op: &str, offset: Option<usize>| {
+                let (respond, response) = std::sync::mpsc::sync_channel(1);
+                (
+                    Pending {
+                        request: browser::Request {
+                            op: op.into(),
+                            origin: "https://other.test".into(),
+                            entry_id: Some(first.clone()),
+                            offset,
+                        },
+                        respond,
+                    },
+                    response,
+                )
+            };
+            for (offset, count) in [(None, 50), (Some(50), 2)] {
+                let (pending, response) = request("list", offset);
+                this.handle_browser_request(pending, cx);
+                let reply = response.try_recv().unwrap();
+                assert_eq!(reply.0["entries"].as_array().unwrap().len(), count);
+                assert_eq!(reply.0["match_website"], false);
+                if offset.is_none() {
+                    assert_eq!(reply.0["next_offset"], 50);
+                } else {
+                    assert!(reply.0["next_offset"].is_null());
+                }
+                assert!(!reply.0.to_string().contains("test-password"));
+            }
+            for op in ["fill", "copy"] {
+                let (pending, response) = request(op, None);
+                this.handle_browser_request(pending, cx);
+                assert_eq!(response.try_recv().unwrap().0["ok"], true);
+            }
+            cx.notify();
+        });
+        let toggle = window.debug_bounds("vault-browser-match-website").unwrap();
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert!(VaultStore::new(path).browser_match_website().unwrap());
+        page.update(window, |this, cx| {
+            for op in ["list", "fill", "copy"] {
+                let (respond, response) = std::sync::mpsc::sync_channel(1);
+                this.handle_browser_request(
+                    Pending {
+                        request: browser::Request {
+                            op: op.into(),
+                            origin: "https://other.test".into(),
+                            entry_id: Some(first.clone()),
+                            offset: None,
+                        },
+                        respond,
+                    },
+                    cx,
+                );
+                let reply = response.try_recv().unwrap();
+                if op == "list" {
+                    assert!(reply.0["entries"].as_array().unwrap().is_empty());
+                } else {
+                    assert_eq!(reply.0["ok"], false);
+                }
+            }
+        });
+    }
+    #[gpui::test]
+    fn browser_auto_approval_is_persistent_and_respects_lock_origin_and_opt_out(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.sqlite3");
+        let store = VaultStore::new(path.clone());
+        let mut vault = store.create("a safe test master password").unwrap();
+        store.set_browser_match_website(true).unwrap();
+        let mut entry = Entry::default();
+        entry.title = "Example".into();
+        entry.website = "https://example.com/login".into();
+        entry.username = "test-user".into();
+        entry.password = "test-password".into();
+        let id = vault.upsert(entry).unwrap();
+        let (page, window) =
+            cx.add_window_view(|_, cx| VaultPage::new(path.clone(), ThemePreset::Moonstone, cx));
+        page.update(window, |this, cx| {
+            this.vault = Some(vault);
+            cx.notify();
+        });
+        assert!(!store.browser_auto_approve().unwrap());
+        let toggle = window.debug_bounds("vault-browser-auto-approve").unwrap();
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert!(VaultStore::new(path).browser_auto_approve().unwrap());
+        page.update(window, |this, cx| {
+            let request = |op: &str, origin: &str| {
+                let (respond, response) = std::sync::mpsc::sync_channel(1);
+                (
+                    Pending {
+                        request: browser::Request {
+                            op: op.into(),
+                            origin: origin.into(),
+                            entry_id: Some(id.clone()),
+                            offset: None,
+                        },
+                        respond,
+                    },
+                    response,
+                )
+            };
+            for op in ["fill", "copy"] {
+                let (pending, response) = request(op, "https://example.com");
+                this.handle_browser_request(pending, cx);
+                let reply = response.try_recv().unwrap();
+                assert_eq!(reply.0["ok"], true);
+                assert!(this.browser_pending.is_none());
+                if op == "fill" {
+                    assert_eq!(reply.0["password"], "test-password");
+                } else {
+                    assert_eq!(reply.0["copied"], true);
+                    assert!(reply.0.get("password").is_none());
+                    assert_eq!(
+                        cx.read_from_clipboard().unwrap().text().unwrap(),
+                        "test-password"
+                    );
+                }
+                let (pending, response) = request(op, "https://other.test");
+                this.handle_browser_request(pending, cx);
+                assert_eq!(response.try_recv().unwrap().0["ok"], false);
+            }
+            // Another host disables the preference while this view still shows it on.
+            assert!(this.browser_auto_approve);
+            store.set_browser_auto_approve(false).unwrap();
+            for op in ["fill", "copy"] {
+                let (pending, response) = request(op, "https://example.com");
+                this.handle_browser_request(pending, cx);
+                assert!(response.try_recv().is_err());
+                assert!(this.browser_pending.is_some());
+                this.reply_browser(false, cx);
+                assert_eq!(response.try_recv().unwrap().0["ok"], false);
+            }
+            this.set_browser_auto_approve(true, cx);
+            this.lock(cx);
+            for op in ["fill", "copy"] {
+                let (pending, response) = request(op, "https://example.com");
+                this.handle_browser_request(pending, cx);
+                assert_eq!(response.try_recv().unwrap().0["ok"], false);
+                assert!(this.browser_pending.is_none());
+            }
+        });
+    }
+    #[gpui::test]
     fn navigation_retains_unlock_explicit_lock_clears_secrets_and_browser_requires_approval(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -976,6 +1257,7 @@ mod tests {
         let path = directory.path().join("vault.sqlite3");
         let store = VaultStore::new(path.clone());
         let mut vault = store.create("a safe test master password").unwrap();
+        store.set_browser_match_website(true).unwrap();
         let mut entry = Entry::default();
         entry.title = "Example".into();
         entry.username = "alice".into();
@@ -1020,6 +1302,7 @@ mod tests {
                         op: "fill".into(),
                         origin: "https://example.com".into(),
                         entry_id: Some(id.clone()),
+                        offset: None,
                     },
                     respond,
                 },
@@ -1034,6 +1317,7 @@ mod tests {
                         op: "fill".into(),
                         origin: "https://example.com".into(),
                         entry_id: Some(id.clone()),
+                        offset: None,
                     },
                     respond,
                 },
@@ -1043,6 +1327,41 @@ mod tests {
             this.reply_browser(true, cx);
             let reply = response.recv().unwrap();
             assert_eq!(reply.0["password"], "test-password");
+            // Browser copy is approved locally, and only returns a status to
+            // the extension. It uses the existing clipboard expiry/lock cleanup.
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            for approved in [false, true] {
+                let (respond, response) = std::sync::mpsc::sync_channel(1);
+                this.browser_pending = Some((
+                    Pending {
+                        request: browser::Request {
+                            op: "copy".into(),
+                            origin: "https://example.com".into(),
+                            entry_id: Some(id.clone()),
+                            offset: None,
+                        },
+                        respond,
+                    },
+                    Instant::now(),
+                ));
+                assert!(response.try_recv().is_err());
+                this.reply_browser(approved, cx);
+                let reply = response.recv().unwrap();
+                assert_eq!(reply.0["ok"], approved);
+                assert!(reply.0.get("password").is_none());
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().unwrap(),
+                    if approved {
+                        "test-password"
+                    } else {
+                        "unchanged"
+                    }
+                );
+                if approved {
+                    assert_eq!(reply.0["copied"], true);
+                    assert!(this.clipboard.is_some());
+                }
+            }
             let (respond, response) = std::sync::mpsc::sync_channel(1);
             this.browser_pending = Some((
                 Pending {
@@ -1050,6 +1369,7 @@ mod tests {
                         op: "fill".into(),
                         origin: "https://example.com.evil.test".into(),
                         entry_id: Some(id),
+                        offset: None,
                     },
                     respond,
                 },
