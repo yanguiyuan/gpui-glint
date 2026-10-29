@@ -1353,7 +1353,10 @@ impl AgentWorkspace {
             .flex_col()
             .items_center()
             .px(px(40.))
-            .py_6()
+            .pt_6()
+            // The todo panel floats above the composer. Keep enough scrollable
+            // space for its expanded height so the final message stays visible.
+            .pb(px(if session.todos.is_empty() { 96. } else { 300. }))
             .gap_6()
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 // Keep the outline's active tick tracking the scroll position.
