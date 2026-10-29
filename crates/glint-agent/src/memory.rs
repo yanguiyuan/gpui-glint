@@ -921,6 +921,32 @@ mod tests {
         (dir, repo)
     }
     #[test]
+    fn disabling_proactive_recall_persists_and_skips_model_calls() {
+        let (_dir, repo) = repo();
+        let project = Path::new("/project/a");
+        repo.save(draft("饮食偏好", "喜欢清淡口味"), None, json!({}))
+            .unwrap();
+        let mut settings = repo.settings().unwrap();
+        assert!(settings.automatic_recall);
+        settings.automatic_recall = false;
+        repo.save_settings(settings).unwrap();
+        let reopened = Repository::new(repo.anchor.clone());
+        assert!(!reopened.settings().unwrap().automatic_recall);
+        // An invalid endpoint/key would fail if recall tried calling a model.
+        let recalled = provider::runtime()
+            .unwrap()
+            .block_on(reopened.recall(provider::Config::default(), project, "明天吃什么"))
+            .unwrap();
+        assert!(recalled.matches.is_empty());
+        assert!(
+            !reopened
+                .candidates("清淡", &[], Some(project), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn stopwords_scopes_fuzzy_candidates_and_deduplication() {
         let (_dir, repo) = repo();
         let a = Path::new("/project/a");

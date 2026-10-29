@@ -79,6 +79,14 @@ pub struct ToolContext {
     pub provider_id: Uuid,
     pub model: String,
     pub events: async_channel::Sender<ToolEvent>,
+    /// One result, scoped to this request. Poll only at model/tool boundaries.
+    pub recall: Option<async_channel::Receiver<crate::memory::Recall>>,
+}
+
+impl ToolContext {
+    pub fn take_recalled_context(&self) -> Option<String> {
+        self.recall.as_ref()?.try_recv().ok()?.context()
+    }
 }
 
 fn definition(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -731,6 +739,7 @@ mod tests {
             provider_id: Uuid::new_v4(),
             model: "test".into(),
             events,
+            recall: None,
         };
         let call = ToolCall {
             id: "write".into(),
@@ -791,6 +800,7 @@ mod tests {
             provider_id: Uuid::new_v4(),
             model: "test".into(),
             events,
+            recall: None,
         };
         let call = ToolCall {
             id: "read-history".into(),
@@ -853,6 +863,7 @@ mod tests {
             provider_id: Uuid::new_v4(),
             model: "test".into(),
             events,
+            recall: None,
         };
         let read = ToolCall {
             id: "skill".into(),

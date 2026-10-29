@@ -249,13 +249,16 @@ impl AgentWorkspace {
             .flex_col()
             .gap_3()
             .child(
-                Switch::new("自动语义回忆")
+                Switch::new("记忆主动匹配")
                     .checked(state.settings.automatic_recall)
                     .theme(self.theme)
                     .on_change(move |checked, _, cx| {
                         let _ = recall_weak.update(cx, |this, cx| {
                             this.memory_ui.settings.automatic_recall = checked;
                             this.save_memory_settings(cx);
+                            if !checked {
+                                this.recall_runner.update(cx, |runner, _| runner.cancel_all());
+                            }
                         });
                     })
                     .render(),
@@ -264,7 +267,7 @@ impl AgentWorkspace {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child("根据问题意图筛选相关记忆，使用当前模型进行判断，按需读取全文。"),
+                    .child("发送消息后在后台匹配记忆，不等待匹配即可开始执行；结果在后续模型轮次加入上下文。关闭后仍可按需搜索和读取记忆。"),
             )
             .child(
                 Switch::new("每天整理对话")
@@ -336,7 +339,7 @@ impl AgentWorkspace {
             .filter(|card| matches_memory(card, &query, state.scope))
             .collect();
         let status = format!(
-            "自动回忆{} · {}",
+            "记忆主动匹配{} · {}",
             if state.settings.automatic_recall {
                 "已开启"
             } else {

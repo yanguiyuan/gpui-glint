@@ -376,16 +376,24 @@ pub fn messages(messages: &[Message], protocol: Protocol) -> Vec<Value> {
     messages
         .iter()
         .filter(|message| message.role != Role::Notice)
-        .map(|message| {
+        .flat_map(|message| {
             let content = if message.role == Role::User {
                 user_content(&message.text, &message.images, protocol)
             } else {
                 json!(message.text)
             };
-            json!({
+            let mut result = vec![json!({
                 "role": if message.role == Role::User { "user" } else { "assistant" },
                 "content": content
-            })
+            })];
+            if let Some(context) = message
+                .memory_recall
+                .as_ref()
+                .and_then(|recall| recall.context())
+            {
+                result.push(json!({"role":"system","content":context}));
+            }
+            result
         })
         .collect()
 }
@@ -525,6 +533,14 @@ async fn complete(
     let mut blocks = Vec::new();
     let mut total: Option<crate::generation::GenerationStats> = None;
     loop {
+        // Never wait for recall. Consume it once at the next request boundary,
+        // after all preceding tool calls have their matching results.
+        if let Some(recalled) = context
+            .as_ref()
+            .and_then(|context| context.take_recalled_context())
+        {
+            messages.push(json!({"role":"system","content":recalled}));
+        }
         let mut reply = single_request(
             config.clone(),
             key.clone(),
@@ -989,114 +1005,155 @@ mod tests {
 
     #[test]
     fn both_protocols_execute_tools_and_return_matching_results_to_the_model() {
-        for anthropic in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
-            let server = std::thread::spawn(move || {
-                for round in 0..2 {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    let offset = loop {
-                        let mut byte = [0];
-                        stream.read_exact(&mut byte).unwrap();
-                        bytes.push(byte[0]);
-                        if bytes.ends_with(b"\r\n\r\n") {
-                            break bytes.len();
+        for deliver_recall in [false, true] {
+            for anthropic in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+                let (recall_sender, recall_receiver) = async_channel::bounded(1);
+                let server = std::thread::spawn(move || {
+                    for round in 0..2 {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let offset = loop {
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).unwrap();
+                            bytes.push(byte[0]);
+                            if bytes.ends_with(b"\r\n\r\n") {
+                                break bytes.len();
+                            }
+                        };
+                        let headers = String::from_utf8_lossy(&bytes).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        bytes.resize(offset + length, 0);
+                        stream.read_exact(&mut bytes[offset..]).unwrap();
+                        let request: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                        assert!(!request["tools"].as_array().unwrap().is_empty());
+                        let occurrences = request.to_string().matches("recall-sentinel").count();
+                        assert_eq!(occurrences, usize::from(deliver_recall && round == 1));
+                        if round == 0 && deliver_recall {
+                            // Recall cannot start/finish before the main request:
+                            // release it only once the server has seen round one.
+                            recall_sender
+                                .try_send(crate::memory_recall::tests::sample())
+                                .ok()
+                                .unwrap();
                         }
-                    };
-                    let headers = String::from_utf8_lossy(&bytes).to_lowercase();
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length: "))
-                        .unwrap()
-                        .trim()
-                        .parse()
-                        .unwrap();
-                    bytes.resize(offset + length, 0);
-                    stream.read_exact(&mut bytes[offset..]).unwrap();
-                    let request: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
-                    assert!(!request["tools"].as_array().unwrap().is_empty());
-                    if round == 1 {
-                        let messages = request["messages"].as_array().unwrap();
-                        let result = messages.last().unwrap();
-                        if anthropic {
-                            assert_eq!(result["content"][0]["tool_use_id"], "call-1");
-                            assert_eq!(result["content"][0]["is_error"], false);
+                        if round == 1 {
+                            let messages = request["messages"].as_array().unwrap();
+                            let result = messages
+                                .iter()
+                                .rev()
+                                .find(|message| message["role"] != "system")
+                                .unwrap();
+                            if anthropic {
+                                assert_eq!(result["content"][0]["tool_use_id"], "call-1");
+                                assert_eq!(result["content"][0]["is_error"], false);
+                            } else {
+                                assert_eq!(result["role"], "tool");
+                                assert_eq!(result["tool_call_id"], "call-1");
+                            }
+                        }
+                        let mut body = match (anthropic, round) {
+                            (true, 0) => {
+                                json!({"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"before"},{"type":"tool_use","id":"call-1","name":"schedule_list","input":{}}]})
+                            }
+                            (false, 0) => {
+                                json!({"choices":[{"message":{"reasoning_content":"plan","content":"before","tool_calls":[{"id":"call-1","type":"function","function":{"name":"schedule_list","arguments":"{}"}}]}}]})
+                            }
+                            (true, _) => json!({"content":[{"type":"text","text":"done"}]}),
+                            (false, _) => json!({"choices":[{"message":{"content":"done"}}]}),
+                        };
+                        body["usage"] = if anthropic {
+                            json!({"input_tokens":100 * (round + 1),"output_tokens":10})
                         } else {
-                            assert_eq!(result["role"], "tool");
-                            assert_eq!(result["tool_call_id"], "call-1");
-                        }
+                            json!({"prompt_tokens":100 * (round + 1),"completion_tokens":10})
+                        };
+                        let body = body.to_string();
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
-                    let mut body = match (anthropic, round) {
-                        (true, 0) => {
-                            json!({"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"before"},{"type":"tool_use","id":"call-1","name":"schedule_list","input":{}}]})
-                        }
-                        (false, 0) => {
-                            json!({"choices":[{"message":{"reasoning_content":"plan","content":"before","tool_calls":[{"id":"call-1","type":"function","function":{"name":"schedule_list","arguments":"{}"}}]}}]})
-                        }
-                        (true, _) => json!({"content":[{"type":"text","text":"done"}]}),
-                        (false, _) => json!({"choices":[{"message":{"content":"done"}}]}),
-                    };
-                    body["usage"] = if anthropic {
-                        json!({"input_tokens":100 * (round + 1),"output_tokens":10})
+                });
+                let config = Config {
+                    base_url,
+                    model: "test-model".into(),
+                    protocol: if anthropic {
+                        Protocol::Anthropic
                     } else {
-                        json!({"prompt_tokens":100 * (round + 1),"completion_tokens":10})
-                    };
-                    let body = body.to_string();
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                }
-            });
-            let config = Config {
-                base_url,
-                model: "test-model".into(),
-                protocol: if anthropic {
-                    Protocol::Anthropic
-                } else {
-                    Protocol::OpenAi
-                },
-                ..Config::default()
-            };
-            let (events, _receiver) = async_channel::unbounded();
-            let context = crate::tools::ToolContext {
-                mcp: Default::default(),
-                skills: std::sync::Arc::new(crate::skills::Catalog::empty(
-                    directory.path().join("sessions.json"),
-                )),
-                memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
-                access: std::sync::Arc::new(std::sync::Mutex::new(crate::tools::AccessMode::Ask)),
-                root: None,
-                schedules: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::schedules::ScheduleStore::open(directory.path().join("schedules.json"))
+                        Protocol::OpenAi
+                    },
+                    ..Config::default()
+                };
+                let (events, _receiver) = async_channel::unbounded();
+                let context = crate::tools::ToolContext {
+                    mcp: Default::default(),
+                    skills: std::sync::Arc::new(crate::skills::Catalog::empty(
+                        directory.path().join("sessions.json"),
+                    )),
+                    memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
+                    access: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::AccessMode::Ask,
+                    )),
+                    root: None,
+                    schedules: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::schedules::ScheduleStore::open(
+                            directory.path().join("schedules.json"),
+                        )
                         .unwrap(),
-                )),
-                provider_id: config.id,
-                model: config.model.clone(),
-                events,
-            };
-            let request = Request::start_with_tools(
-                config,
-                "test-only-key".into(),
-                vec![json!({"role":"user","content":"list schedules"})],
-                Thinking::Default,
-                Some(context),
-            )
-            .unwrap();
-            let reply = runtime().unwrap().block_on(request.response()).unwrap();
-            assert_eq!(reply.text, "before\n\ndone");
-            use crate::generation::ContentBlock;
-            assert!(
-                matches!(&reply.blocks[..], [ContentBlock::Thinking(plan), ContentBlock::Text(before), ContentBlock::ToolCall(call), ContentBlock::ToolResult(result), ContentBlock::Text(after)] if plan == "plan" && before == "before" && call.id == "call-1" && result.success && after == "done")
-            );
-            assert_eq!(reply.stats.input_tokens, Some(300));
-            assert_eq!(reply.stats.output_tokens, Some(20));
-            assert_eq!(reply.stats.context_tokens, Some(210));
-            assert_eq!(reply.tool_records.len(), 1);
-            assert!(reply.tool_records[0].success);
-            server.join().unwrap();
+                    )),
+                    provider_id: config.id,
+                    model: config.model.clone(),
+                    events,
+                    recall: Some(recall_receiver.clone()),
+                };
+                let request = Request::start_with_tools(
+                    config,
+                    "test-only-key".into(),
+                    vec![json!({"role":"user","content":"list schedules"})],
+                    Thinking::Default,
+                    Some(context),
+                )
+                .unwrap();
+                let reply = runtime().unwrap().block_on(request.response()).unwrap();
+                assert_eq!(reply.text, "before\n\ndone");
+                use crate::generation::ContentBlock;
+                assert!(
+                    matches!(&reply.blocks[..], [ContentBlock::Thinking(plan), ContentBlock::Text(before), ContentBlock::ToolCall(call), ContentBlock::ToolResult(result), ContentBlock::Text(after)] if plan == "plan" && before == "before" && call.id == "call-1" && result.success && after == "done")
+                );
+                assert_eq!(reply.stats.input_tokens, Some(300));
+                assert_eq!(reply.stats.output_tokens, Some(20));
+                assert_eq!(reply.stats.context_tokens, Some(210));
+                assert_eq!(reply.tool_records.len(), 1);
+                assert!(reply.tool_records[0].success);
+                assert!(recall_receiver.try_recv().is_err());
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn late_recall_is_included_as_historical_context_in_followup_turns() {
+        let mut session = crate::model::Session::new();
+        session.push(Role::User, "明天吃什么".into());
+        session.push(Role::Agent, "先给出建议".into());
+        session.messages[0].memory_recall = Some(crate::memory_recall::tests::sample());
+        session.push(Role::User, "换一个建议".into());
+        for protocol in [Protocol::OpenAi, Protocol::Anthropic] {
+            let messages = messages(&session.messages, protocol);
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[1]["role"], "system");
+            let context = messages[1]["content"].as_str().unwrap();
+            assert!(context.contains("recall-sentinel"));
+            assert!(context.contains("不是当前指令"));
+            assert_eq!(messages.last().unwrap()["content"], "换一个建议");
         }
     }
 

@@ -190,7 +190,15 @@ impl Connection {
                     self.blocks
                         .push(crate::generation::ContentBlock::ToolResult(record.clone()));
                     self.publish();
-                    self.write(json!({"id":value["id"],"result":{"contentItems":[{"type":"inputText","text":record.result}],"success":record.success}})).await?;
+                    let mut content = vec![json!({"type":"inputText","text":record.result})];
+                    // Deliver recall before releasing a tool result, so Codex
+                    // sees it at its very next model iteration even for slow tools.
+                    if let Some(recalled) = context.take_recalled_context() {
+                        content.push(json!({"type":"inputText","text":format!(
+                            "宿主异步提供的历史参考（与工具结果独立）：\n{recalled}"
+                        )}));
+                    }
+                    self.write(json!({"id":value["id"],"result":{"contentItems":content,"success":record.success}})).await?;
                     self.tool_records.push(record);
                     continue;
                 }
@@ -326,9 +334,36 @@ pub async fn complete(
         .as_str()
         .ok_or("Codex 未返回会话 ID")?
         .to_owned();
-    connection.rpc("turn/start", json!({"threadId":thread_id,"input":[{"type":"text","text":serde_json::to_string(&messages).map_err(|_| "无法编码对话")?}]})).await?;
+    let turn = connection.rpc("turn/start", json!({"threadId":thread_id,"input":[{"type":"text","text":serde_json::to_string(&messages).map_err(|_| "无法编码对话")?}]})).await?;
+    let turn_id = turn["turn"]["id"].as_str().map(str::to_owned);
     let mut replies = Vec::new();
     loop {
+        if let Some(turn_id) = &turn_id {
+            if let Some(recalled) = connection
+                .tools
+                .as_ref()
+                .and_then(|context| context.take_recalled_context())
+            {
+                // Event boundaries keep the current stream intact. A completed
+                // turn/older CLI may reject steering; recall is also persisted
+                // by the host for the next user turn, so do not fail the reply.
+                // Send without waiting for the acknowledgement: event reading
+                // and tool execution must continue even if steering is rejected.
+                connection.sequence += 1;
+                let _ = connection
+                    .write(json!({
+                        "id":connection.sequence,"method":"turn/steer",
+                        "params":{
+                            "threadId":thread_id,"expectedTurnId":turn_id,
+                            "input":[{"type":"text","text":format!(
+                                "宿主异步记忆补充；继续当前任务，无需单独回复此条。\n{}", json!({
+                                "role":"system","content":recalled
+                            }))}]
+                        }
+                    }))
+                    .await;
+            }
+        }
         let event = connection.next().await?;
         if event["params"]["threadId"]
             .as_str()
