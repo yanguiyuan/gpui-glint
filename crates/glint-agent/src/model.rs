@@ -14,6 +14,8 @@ pub enum Role {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thinking_ms: std::collections::BTreeMap<usize, u64>,
     #[serde(default)]
     pub blocks: Vec<crate::generation::ContentBlock>,
     #[serde(default)]
@@ -96,6 +98,7 @@ impl Session {
         }
         self.updated = Local::now();
         self.messages.push(Message {
+            thinking_ms: Default::default(),
             blocks: vec![],
             tools: vec![],
             stats: None,
@@ -429,6 +432,13 @@ mod tests {
             .active_mut()
             .push(Role::User, "检查中文布局 🦀".into());
         history.active_mut().push(Role::Agent, "测试回复".into());
+        history
+            .active_mut()
+            .messages
+            .last_mut()
+            .unwrap()
+            .thinking_ms
+            .insert(0, 12345);
         history.active_mut().messages.last_mut().unwrap().blocks = vec![
             crate::generation::ContentBlock::Thinking("plan".into()),
             crate::generation::ContentBlock::Text("**测试回复**".into()),
@@ -438,6 +448,17 @@ mod tests {
         history.access_mode = crate::tools::AccessMode::AutoApprove;
         history.save(&path).unwrap();
         let loaded = History::load(&path).unwrap();
+        assert_eq!(
+            loaded
+                .sessions
+                .iter()
+                .find(|session| session.id == first)
+                .unwrap()
+                .messages[1]
+                .thinking_ms
+                .get(&0),
+            Some(&12345)
+        );
         let blocks = &loaded
             .sessions
             .iter()

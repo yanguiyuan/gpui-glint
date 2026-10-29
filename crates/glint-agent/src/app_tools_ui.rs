@@ -241,6 +241,7 @@ impl AgentWorkspace {
     ) {
         self.tool_activity.clear();
         self.transcript.clear();
+        self.thinking_timings = Default::default();
         self.tool_listener = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
                 if weak
@@ -280,7 +281,10 @@ impl AgentWorkspace {
                                 }
                                 this.sync_context_usage(cx);
                             }
-                            tools::ToolEvent::Transcript(blocks) => this.transcript = blocks,
+                            tools::ToolEvent::Transcript(blocks) => {
+                                this.thinking_timings.observe(&blocks);
+                                this.transcript = blocks;
+                            }
                             tools::ToolEvent::Started(call) => {
                                 this.tool_activity.push(tools::ToolRecord {
                                     call,
@@ -404,6 +408,8 @@ impl AgentWorkspace {
         &self,
         key: &str,
         blocks: &[generation::ContentBlock],
+        thinking_ms: &std::collections::BTreeMap<usize, u64>,
+        complete: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         use generation::ContentBlock;
@@ -423,6 +429,9 @@ impl AgentWorkspace {
                     body = body.child(self.markdown_text(format!("{key}:{index}"), text, cx));
                 }
                 ContentBlock::Thinking(text) => {
+                    let active = !complete && index + 1 == blocks.len();
+                    let summary = thinking_summary(text, active, thinking_ms.get(&index).copied());
+                    let signature = format!("{active}:{summary}:{text}");
                     let editor = self.markdown_text(format!("{key}:{index}:thinking"), text, cx);
                     let mut cache = self.tool_panels.borrow_mut();
                     let entry = cache
@@ -433,9 +442,14 @@ impl AgentWorkspace {
                             panel: cx
                                 .new(|_| CollapsePanel::new("思考").icon(Icon::Pulse).theme(theme)),
                         });
-                    if entry.signature != *text || entry.theme != theme {
+                    if entry.signature != signature || entry.theme != theme {
                         entry.panel.update(cx, |panel, cx| {
                             panel.set_theme(theme, cx);
+                            if active {
+                                panel.set_streaming_summary(summary, cx);
+                            } else {
+                                panel.set_summary(summary, cx);
+                            }
                             panel.set_content(
                                 move |_, _| {
                                     div()
@@ -447,7 +461,7 @@ impl AgentWorkspace {
                                 cx,
                             );
                         });
-                        entry.signature = text.clone();
+                        entry.signature = signature;
                         entry.theme = theme;
                     }
                     body = body.child(entry.panel.clone());
@@ -478,12 +492,13 @@ impl AgentWorkspace {
         key: &str,
         blocks: &[generation::ContentBlock],
         stats: Option<&generation::GenerationStats>,
+        thinking_ms: &std::collections::BTreeMap<usize, u64>,
         complete: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let split = process_prefix_len(blocks, complete);
         if split == 0 {
-            return self.transcript_view(key, blocks, cx);
+            return self.transcript_view(key, blocks, thinking_ms, complete, cx);
         }
         let theme = self.theme;
         let mut cache = self.process_panels.borrow_mut();
@@ -517,6 +532,7 @@ impl AgentWorkspace {
         if entry.signature != signature || entry.theme != theme || entry.complete != complete {
             let weak = cx.entity().downgrade();
             let process = blocks[..split].to_vec();
+            let thinking_ms = thinking_ms.clone();
             let content_key = key.to_owned();
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
@@ -527,7 +543,7 @@ impl AgentWorkspace {
                 panel.set_content(
                     move |_, cx| {
                         weak.update(cx, |this, cx| {
-                            this.transcript_view(&content_key, &process, cx)
+                            this.transcript_view(&content_key, &process, &thinking_ms, complete, cx)
                         })
                         .unwrap_or_else(|_| div())
                         .into_any_element()
@@ -572,6 +588,22 @@ impl AgentWorkspace {
     }
 }
 
+fn thinking_summary(text: &str, active: bool, elapsed_ms: Option<u64>) -> String {
+    if active {
+        text.lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("正在思考…")
+            .to_owned()
+    } else if let Some(elapsed_ms) = elapsed_ms {
+        format!("已思考 {:.1} s", elapsed_ms as f64 / 1000.)
+    } else {
+        // Old history has no per-block timing. Do not substitute total work time.
+        "已思考".into()
+    }
+}
+
 /// The process is a contiguous prefix; only trailing answer text stays outside.
 fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> usize {
     let Some(last_process) = blocks
@@ -591,6 +623,23 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+    #[test]
+    fn thinking_summary_follows_latest_nonempty_line_then_shows_duration() {
+        assert_eq!(
+            thinking_summary("第一步\n正在检查文件\n  ", true, Some(1200)),
+            "正在检查文件"
+        );
+        assert_eq!(
+            thinking_summary("第一步\n新的内容持续到达", true, Some(1500)),
+            "新的内容持续到达"
+        );
+        assert_eq!(thinking_summary("", true, None), "正在思考…");
+        assert_eq!(
+            thinking_summary("不再展示预览", false, Some(12345)),
+            "已思考 12.3 s"
+        );
+        assert_eq!(thinking_summary("旧历史", false, None), "已思考");
+    }
     #[test]
     fn builtin_summaries_describe_commands_and_files_and_bodies_are_only_results() {
         let mut record = tools::ToolRecord {

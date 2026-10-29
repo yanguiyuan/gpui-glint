@@ -1,6 +1,52 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Observed streaming time per thinking block; tool and answer time are excluded.
+#[derive(Default)]
+pub struct ThinkingTimings {
+    finished: std::collections::BTreeMap<usize, u64>,
+    active: Option<(usize, std::time::Instant)>,
+}
+
+impl ThinkingTimings {
+    pub fn observe(&mut self, blocks: &[ContentBlock]) {
+        self.observe_at(blocks, std::time::Instant::now());
+    }
+
+    fn observe_at(&mut self, blocks: &[ContentBlock], now: std::time::Instant) {
+        let next = blocks
+            .len()
+            .checked_sub(1)
+            .filter(|index| matches!(blocks[*index], ContentBlock::Thinking(_)));
+        if self.active.as_ref().map(|(index, _)| *index) == next {
+            return;
+        }
+        self.finish_at(now);
+        if let Some(index) = next.filter(|index| !self.finished.contains_key(index)) {
+            self.active = Some((index, now));
+        }
+    }
+
+    fn finish_at(&mut self, now: std::time::Instant) {
+        if let Some((index, started)) = self.active.take() {
+            self.finished
+                .insert(index, now.duration_since(started).as_millis() as u64);
+        }
+    }
+
+    pub fn finish(&mut self) {
+        self.finish_at(std::time::Instant::now());
+    }
+
+    pub fn snapshot(&self) -> std::collections::BTreeMap<usize, u64> {
+        let mut result = self.finished.clone();
+        if let Some((index, started)) = self.active {
+            result.insert(index, started.elapsed().as_millis() as u64);
+        }
+        result
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GenerationStats {
     pub input_tokens: Option<u64>,
@@ -392,6 +438,29 @@ impl StreamCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn thinking_time_stops_before_tools_and_separates_later_thinking() {
+        use std::time::{Duration, Instant};
+        let mut timings = ThinkingTimings::default();
+        let start = Instant::now();
+        let mut blocks = vec![ContentBlock::Thinking("first".into())];
+        timings.observe_at(&blocks, start);
+        timings.observe_at(&blocks, start + Duration::from_secs(2));
+        blocks.push(ContentBlock::ToolCall(crate::tools::ToolCall {
+            id: "call".into(),
+            name: "read_file".into(),
+            arguments: Value::Null,
+        }));
+        timings.observe_at(&blocks, start + Duration::from_secs(4));
+        blocks.push(ContentBlock::Thinking("second".into()));
+        timings.observe_at(&blocks, start + Duration::from_secs(14));
+        blocks.push(ContentBlock::Text("answer".into()));
+        timings.observe_at(&blocks, start + Duration::from_secs(17));
+        timings.finish_at(start + Duration::from_secs(30));
+        assert_eq!(timings.snapshot(), [(0, 4000), (2, 3000)].into());
+        timings.finish_at(start + Duration::from_secs(60));
+        assert_eq!(timings.snapshot(), [(0, 4000), (2, 3000)].into());
+    }
 
     #[test]
     fn context_occupancy_includes_anthropic_cache_and_waits_for_measured_counts() {

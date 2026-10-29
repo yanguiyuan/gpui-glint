@@ -3,7 +3,7 @@ use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
 };
 
 /// Builds the panel body on every frame, so hosts can stream updates into
@@ -23,6 +23,8 @@ pub enum CollapsePanelEvent {
 pub struct CollapsePanel {
     icon: Option<Icon>,
     summary: SharedString,
+    streaming_summary: bool,
+    summary_scroll: ScrollHandle,
     content: Option<CollapsePanelContent>,
     expanded: bool,
     compact: bool,
@@ -36,6 +38,8 @@ impl CollapsePanel {
         Self {
             icon: None,
             summary: summary.into(),
+            streaming_summary: false,
+            summary_scroll: ScrollHandle::new(),
             content: None,
             expanded: false,
             compact: false,
@@ -82,6 +86,19 @@ impl CollapsePanel {
 
     pub fn set_summary(&mut self, summary: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.summary = summary.into();
+        self.streaming_summary = false;
+        cx.notify();
+    }
+
+    /// Follow the last visible line of a changing summary in a one-line viewport.
+    pub fn set_streaming_summary(
+        &mut self,
+        summary: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.summary = summary.into();
+        self.streaming_summary = true;
+        self.summary_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -128,6 +145,32 @@ impl Render for CollapsePanel {
         } else {
             rgb(p.surface_subtle)
         };
+        let summary = div()
+            .when(!self.compact, |summary| summary.flex_1())
+            .min_w_0()
+            .text_size(px(13.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(p.text_muted));
+        let summary = if self.streaming_summary {
+            summary
+                .id("streaming-summary")
+                .debug_selector(|| "streaming-summary".into())
+                .h(px(20.))
+                .overflow_y_scroll()
+                .track_scroll(&self.summary_scroll)
+                .child(
+                    div()
+                        .w_full()
+                        .line_height(px(20.))
+                        .child(self.summary.clone()),
+                )
+                .into_any_element()
+        } else {
+            summary
+                .truncate()
+                .child(self.summary.clone())
+                .into_any_element()
+        };
 
         let trigger =
             div()
@@ -150,16 +193,7 @@ impl Render for CollapsePanel {
                             .child(icon.render(15.)),
                     )
                 })
-                .child(
-                    div()
-                        .when(!self.compact, |summary| summary.flex_1())
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(13.))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgb(p.text_muted))
-                        .child(self.summary.clone()),
-                )
+                .child(summary)
                 .child(div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
                     if self.expanded {
                         Icon::ChevronDown.render(12.)
@@ -190,5 +224,46 @@ impl Render for CollapsePanel {
             );
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, Entity, TestAppContext};
+
+    struct Preview(Entity<CollapsePanel>);
+    impl Render for Preview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(240.)).child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn streaming_summary_stays_one_line_and_follows_the_tail(cx: &mut TestAppContext) {
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|_| CollapsePanel::new("思考").icon(Icon::Pulse)))
+        });
+        let panel = preview.read_with(window, |preview, _| preview.0.clone());
+        panel.update(window, |panel, cx| {
+            panel.set_streaming_summary(
+                "正在分析内容并检查文件的相关依赖与实现细节。".repeat(20),
+                cx,
+            );
+        });
+        let bounds = window.debug_bounds("streaming-summary").unwrap();
+        assert_eq!(bounds.size.height, px(20.));
+        panel.read_with(window, |panel, _| {
+            assert!(panel.summary_scroll.offset().y < px(0.));
+            assert!(!panel.is_expanded());
+        });
+        panel.update(window, |panel, cx| {
+            panel.set_expanded(true, cx);
+            panel.set_summary("已思考 12.3 s", cx);
+        });
+        panel.read_with(window, |panel, _| {
+            assert!(!panel.streaming_summary);
+            assert!(panel.is_expanded());
+        });
     }
 }

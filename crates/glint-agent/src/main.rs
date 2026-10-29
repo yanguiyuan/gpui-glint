@@ -66,6 +66,7 @@ struct AgentWorkspace {
     tool_listener: Option<Task<()>>,
     tool_activity: Vec<tools::ToolRecord>,
     transcript: Vec<generation::ContentBlock>,
+    thinking_timings: generation::ThinkingTimings,
     markdown_views:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
     image_views: std::cell::RefCell<images::PreviewCache>,
@@ -371,6 +372,7 @@ impl AgentWorkspace {
             tool_listener: None,
             tool_activity: vec![],
             transcript: vec![],
+            thinking_timings: Default::default(),
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_views: std::cell::RefCell::new(images::PreviewCache::default()),
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -730,6 +732,11 @@ impl AgentWorkspace {
             let reply = result.as_ref().ok().map(|reply| reply.text.clone());
             let _ = weak.update(cx, |this, cx| {
                 let error = result.as_ref().err().cloned();
+                if let Ok(completion) = &result {
+                    this.thinking_timings.observe(&completion.blocks);
+                }
+                this.thinking_timings.finish();
+                let thinking_ms = this.thinking_timings.snapshot();
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
                         Ok(completion) => {
@@ -743,11 +750,13 @@ impl AgentWorkspace {
                             session.messages.last_mut().unwrap().blocks = completion.blocks;
                             session.messages.last_mut().unwrap().stats = Some(completion.stats);
                             session.messages.last_mut().unwrap().tools = completion.tool_records;
+                            session.messages.last_mut().unwrap().thinking_ms = thinking_ms;
                         }
                         Err(error) => {
                             session.push(Role::Notice, format!("请求失败：{error}"));
                             session.messages.last_mut().unwrap().tools = this.tool_activity.clone();
                             session.messages.last_mut().unwrap().blocks = this.transcript.clone();
+                            session.messages.last_mut().unwrap().thinking_ms = thinking_ms;
                         }
                     }
                 }
@@ -806,6 +815,7 @@ impl AgentWorkspace {
             cx.notify();
         }
         if let Some((id, _task)) = self.pending.take() {
+            self.thinking_timings.finish();
             self.recall_runner.update(cx, |runner, _| runner.cancel(id));
             self.tool_listener = None;
             self.approval = None;
@@ -824,6 +834,7 @@ impl AgentWorkspace {
                 session.messages.last_mut().unwrap().blocks = std::mem::take(&mut self.transcript);
                 session.messages.last_mut().unwrap().tools =
                     std::mem::take(&mut self.tool_activity);
+                session.messages.last_mut().unwrap().thinking_ms = self.thinking_timings.snapshot();
             }
             self.save(cx);
             cx.notify();
@@ -1397,6 +1408,7 @@ impl AgentWorkspace {
                                             &format!("{}:{index}", self.history.active),
                                             &message.blocks,
                                             message.stats.as_ref(),
+                                            &message.thinking_ms,
                                             true,
                                             cx,
                                         ))
@@ -1475,6 +1487,7 @@ impl AgentWorkspace {
                         &key,
                         &self.transcript,
                         None,
+                        &self.thinking_timings.snapshot(),
                         false,
                         cx,
                     )));
