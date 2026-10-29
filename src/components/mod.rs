@@ -97,10 +97,12 @@ mod select_field;
 pub use select_field::{SelectField, SelectFieldEvent, SelectFieldValue};
 
 mod composer;
+mod todo_list;
 pub use composer::{
     Composer, ComposerChip, ComposerContextEntry, ComposerContextSection, ComposerContextState,
     ComposerContextUsage, ComposerEvent, ComposerSubmission, bind_composer_keys,
 };
+pub use todo_list::{TodoList, TodoListItem, TodoListStatus};
 mod prompt_editor;
 pub use prompt_editor::{PastedImage, PromptEditor, PromptEditorEvent, bind_prompt_editor_keys};
 

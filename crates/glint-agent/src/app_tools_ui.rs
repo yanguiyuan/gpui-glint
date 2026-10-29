@@ -106,6 +106,21 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     let args = &record.call.arguments;
     let path = args["path"].as_str().unwrap_or(".");
     let (icon, action, target) = match record.call.name.as_str() {
+        "todo_read" | "todo_write" => (
+            Icon::Workflow,
+            if running {
+                "正在更新任务清单"
+            } else if success {
+                "任务清单"
+            } else {
+                "任务清单更新失败"
+            },
+            if record.call.name == "todo_read" {
+                "读取进度".into()
+            } else {
+                format!("{} 项", args["todos"].as_array().map_or(0, Vec::len))
+            },
+        ),
         "subagent" => (
             Icon::Workflow,
             if running {
@@ -313,6 +328,20 @@ impl AgentWorkspace {
                             this.scroll.scroll_to_bottom();
                         }
                         match event {
+                            tools::ToolEvent::TodoUpdated(todos) => {
+                                if let Some((id, _)) = &this.pending {
+                                    if let Some(session) = this
+                                        .history
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|session| session.id == *id)
+                                    {
+                                        session.todos = todos;
+                                    }
+                                }
+                                this.sync_todos(cx);
+                                this.save(cx);
+                            }
                             tools::ToolEvent::SubagentUpdated => {
                                 if this
                                     .approval

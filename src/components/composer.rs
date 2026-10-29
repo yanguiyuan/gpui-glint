@@ -354,6 +354,8 @@ pub struct Composer {
     context_sections: Vec<ComposerContextSection>,
     context_hints: Vec<(SharedString, SharedString)>,
     context_open: bool,
+    todos: Vec<super::TodoListItem>,
+    todos_expanded: bool,
     observed_context_query: SharedString,
     context_on_at: bool,
     observed_text: SharedString,
@@ -439,6 +441,8 @@ impl Composer {
             context_sections: Vec::new(),
             context_hints: Vec::new(),
             context_open: false,
+            todos: Vec::new(),
+            todos_expanded: true,
             observed_context_query: "".into(),
             context_on_at: false,
             observed_text: "".into(),
@@ -669,6 +673,16 @@ impl Composer {
 
     pub fn context_panel_open(&self) -> bool {
         self.context_open
+    }
+
+    pub fn set_todos(&mut self, todos: Vec<super::TodoListItem>, cx: &mut Context<Self>) {
+        if self.todos != todos {
+            self.todos_expanded = todos
+                .iter()
+                .any(|item| item.status != super::TodoListStatus::Completed);
+            self.todos = todos;
+            cx.notify();
+        }
     }
 
     pub fn open_context_panel(&mut self, cx: &mut Context<Self>) {
@@ -1129,6 +1143,31 @@ impl Render for Composer {
             }]);
         if self.context_open {
             card = card.child(self.context_panel_element(cx));
+        } else if !self.todos.is_empty() {
+            let weak = cx.entity().downgrade();
+            let panel = super::TodoList::new(self.todos.clone())
+                .expanded(self.todos_expanded)
+                .theme(theme)
+                .on_toggle(move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.todos_expanded = !this.todos_expanded;
+                        cx.notify();
+                    });
+                })
+                .render();
+            card = card.child(deferred(
+                div()
+                    .id("glass-composer-todo-panel")
+                    .debug_selector(|| "glass-composer-todo-panel".into())
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(relative(1.))
+                    .mb(px(8.))
+                    .shadow_lg()
+                    .occlude()
+                    .child(panel),
+            ));
         }
         let card = card
             .when(!self.attachments.is_empty(), |card| {
@@ -1680,6 +1719,73 @@ fn icon_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn todo_panel_sits_above_editor_yields_to_at_panel_and_keeps_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Preview(Entity<Composer>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .p_4()
+                    .child(self.0.clone())
+            }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                Composer::new("Message", cx).context_panel(
+                    "attach",
+                    "Context",
+                    [ComposerContextSection::untitled([
+                        ComposerContextEntry::new("file", "File"),
+                    ])],
+                )
+            }))
+        });
+        let composer = preview.read_with(window, |preview, _| preview.0.clone());
+        composer.update(window, |composer, cx| {
+            composer.set_value("keep my draft", cx);
+            composer.set_todos(
+                vec![super::super::TodoListItem {
+                    content: "检查实现".into(),
+                    status: super::super::TodoListStatus::InProgress,
+                }],
+                cx,
+            );
+        });
+        let panel = window.debug_bounds("glass-composer-todo-panel").unwrap();
+        let toggle = window.debug_bounds("todo-list-toggle").unwrap();
+        assert!(
+            panel.bottom() < window.update(|window, _| window.viewport_size()).height - px(40.)
+        );
+        assert!(window.debug_bounds("todo-list-rows").is_some());
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds("todo-list-rows").is_none());
+        composer.update(window, |composer, cx| composer.open_context_panel(cx));
+        assert!(window.debug_bounds("glass-composer-todo-panel").is_none());
+        composer.update(window, |composer, cx| composer.close_context_panel(cx));
+        assert!(window.debug_bounds("glass-composer-todo-panel").is_some());
+        composer.update(window, |composer, cx| {
+            composer.set_todos(
+                vec![super::super::TodoListItem {
+                    content: "检查实现".into(),
+                    status: super::super::TodoListStatus::Completed,
+                }],
+                cx,
+            )
+        });
+        assert!(window.debug_bounds("todo-list-rows").is_none());
+        composer.read_with(window, |composer, cx| {
+            assert_eq!(composer.value(cx).as_ref(), "keep my draft")
+        });
+        composer.update(window, |composer, cx| composer.set_todos(Vec::new(), cx));
+        assert!(window.debug_bounds("glass-composer-todo-panel").is_none());
+    }
 
     #[test]
     fn context_queries_are_caret_scoped_and_do_not_match_email_addresses() {

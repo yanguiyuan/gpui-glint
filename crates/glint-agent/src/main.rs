@@ -32,6 +32,7 @@ mod storage;
 mod subagent;
 mod subagent_ui;
 mod titles;
+mod todo;
 mod tools;
 
 use gpui::{
@@ -56,6 +57,7 @@ use uuid::Uuid;
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
 struct AgentWorkspace {
+    todo_live: todo::Store,
     group_list: Entity<GroupList>,
     calendar: Entity<Calendar>,
     show_calendar: bool,
@@ -373,6 +375,7 @@ impl AgentWorkspace {
             scheduler_task: None,
             running_schedule: None,
             tool_listener: None,
+            todo_live: Default::default(),
             tool_activity: vec![],
             transcript: vec![],
             thinking_timings: Default::default(),
@@ -445,6 +448,7 @@ impl AgentWorkspace {
     }
 
     fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        self.sync_todos(cx);
         self.subagent_ui.selected = None;
         self.subagent_ui.picker_open = false;
         self.sync_context_usage(cx);
@@ -650,7 +654,11 @@ impl AgentWorkspace {
             .map(|settings| settings.automatic_recall)
             .unwrap_or(false);
         self.subagent_ui.live = Default::default();
+        self.todo_live = std::sync::Arc::new(std::sync::Mutex::new(
+            self.history.sessions[index].todos.clone(),
+        ));
         let tool_context = tools::ToolContext {
+            todos: self.todo_live.clone(),
             subagents: self.subagent_ui.live.clone(),
             delegation: Default::default(),
             mcp: mcp::Client::new(self.path.with_file_name("mcp.json")),
@@ -746,6 +754,7 @@ impl AgentWorkspace {
                 }
                 this.thinking_timings.finish();
                 this.finish_subagent_records();
+                this.finish_todos(id, cx);
                 let thinking_ms = this.thinking_timings.snapshot();
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
@@ -826,6 +835,7 @@ impl AgentWorkspace {
         }
         if let Some((id, _task)) = self.pending.take() {
             self.finish_subagent_records();
+            self.finish_todos(id, cx);
             self.thinking_timings.finish();
             self.recall_runner.update(cx, |runner, _| runner.cancel(id));
             self.tool_listener = None;

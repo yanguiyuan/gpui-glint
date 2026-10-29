@@ -29,6 +29,7 @@ pub struct ToolRecord {
 }
 
 pub enum ToolEvent {
+    TodoUpdated(Vec<crate::todo::Item>),
     SubagentUpdated,
     ApprovalResolved,
     ContextUsage {
@@ -81,6 +82,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub todos: crate::todo::Store,
     pub subagents: crate::subagent::Registry,
     pub delegation: crate::subagent::Delegation,
     pub mcp: crate::mcp::Client,
@@ -124,6 +126,18 @@ fn definition(name: &str, description: &str, properties: Value, required: &[&str
 pub fn definitions(anthropic: bool) -> Value {
     let string = || json!({"type":"string"});
     let mut definitions = vec![
+        definition(
+            "todo_read",
+            "Read this agent's current execution checklist. This is a local task plan, separate from scheduled tasks.",
+            json!({}),
+            &[],
+        ),
+        definition(
+            "todo_write",
+            "Create or replace the full execution checklist for multi-step work. Keep it updated as work progresses. Each item has content and status (pending, in_progress, completed); at most one item may be in_progress. Send todos=[] to clear. This only updates the progress UI; it does not execute or schedule work. Subagents have independent checklists.",
+            json!({"todos":{"type":"array","maxItems":30,"items":{"type":"object","properties":{"content":{"type":"string","minLength":1,"maxLength":500},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"],"additionalProperties":false}}}),
+            &["todos"],
+        ),
         definition(
             "subagent",
             "Delegate a self-contained task to a subagent using the current model and a fresh conversation. Supply all necessary context in task. Waits for the result (120 second limit); at most 8 tasks per user request. Shares project files and the current approval policy. The subagent cannot create further subagents.",
@@ -371,6 +385,17 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
+    if call.name == "todo_read" {
+        let todos = context.todos.lock().map_err(|_| "无法读取任务清单")?;
+        return serde_json::to_string(&*todos).map_err(|_| "无法编码任务清单".into());
+    }
+    if call.name == "todo_write" {
+        let todos = crate::todo::write(&call.arguments, &context.todos)?;
+        let _ = context
+            .events
+            .try_send(ToolEvent::TodoUpdated(todos.clone()));
+        return Ok(serde_json::json!({"todos":todos}).to_string());
+    }
     if call.name == "subagent" {
         return match &context.delegation {
             crate::subagent::Delegation::Root(runner) => runner.run(call, context).await,
@@ -865,6 +890,7 @@ mod tests {
         let context = ToolContext {
             delegation: Default::default(),
             subagents: Default::default(),
+            todos: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(
                 directory.path().join("sessions.json"),
@@ -930,6 +956,7 @@ mod tests {
         let context = ToolContext {
             delegation: Default::default(),
             subagents: Default::default(),
+            todos: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(anchor.clone())),
             memory: crate::memory::Repository::new(anchor),
@@ -995,6 +1022,7 @@ mod tests {
         let context = ToolContext {
             delegation: Default::default(),
             subagents: Default::default(),
+            todos: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(manager.catalog_with_home(None, None).unwrap()),
             memory: crate::memory::Repository::new(anchor),

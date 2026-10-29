@@ -373,6 +373,13 @@ impl AgentWorkspace {
             .gap_4()
             .child(self.subagent_task_panel(trace, cx))
             .child(div().h(px(1.)).bg(rgb(p.border)))
+            .when(!trace.todos.is_empty(), |body| {
+                body.child(
+                    gpui_glint::components::TodoList::new(crate::todo::items(&trace.todos))
+                        .theme(self.theme)
+                        .render(),
+                )
+            })
             .children(rows);
         if let Some(error) = &trace.error {
             body = body.child(div().text_color(rgb(0xd9342b)).child(error.clone()));

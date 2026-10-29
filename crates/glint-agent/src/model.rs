@@ -50,6 +50,8 @@ struct DraftImageFile {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<crate::todo::Item>,
     #[serde(default)]
     pub project: Option<std::path::PathBuf>,
     pub id: Uuid,
@@ -68,6 +70,7 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self {
+            todos: Vec::new(),
             project: None,
             id: Uuid::new_v4(),
             title: "新会话".into(),

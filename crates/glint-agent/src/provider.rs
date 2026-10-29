@@ -484,6 +484,12 @@ impl Request {
         }
         Ok(Self(runtime()?.spawn(async move {
             if let Some(context) = &context {
+                let plan = context.todos.lock().ok().and_then(|todos| {
+                    (!todos.is_empty()).then(|| serde_json::json!({"todos": &*todos}).to_string())
+                });
+                if let Some(plan) = plan {
+                    messages.insert(0, json!({"role":"system","content":format!("Current execution checklist (historical progress; adjust it to the latest user task using todo_write, or todo_read to inspect it). Only mark work completed after doing and verifying it. {plan}")}));
+                }
                 messages.insert(0, json!({"role":"system","content":context.mcp.instructions()}));
                 if let Err(error) = context.mcp.prepare(context.root.as_deref()).await {
                     messages.insert(0, json!({"role":"system","content":format!("本次 MCP 连接失败，MCP 工具不可用，可通过配置工具修复：{error}")}));
@@ -1101,6 +1107,7 @@ mod tests {
                 let context = crate::tools::ToolContext {
                     delegation: Default::default(),
                     subagents: Default::default(),
+                    todos: Default::default(),
                     mcp: Default::default(),
                     skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                         directory.path().join("sessions.json"),

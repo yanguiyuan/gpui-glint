@@ -42,6 +42,8 @@ impl Status {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trace {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<crate::todo::Item>,
     pub id: uuid::Uuid,
     pub call_id: String,
     pub title: String,
@@ -109,6 +111,7 @@ impl Recording {
     fn observe(&mut self, event: &ToolEvent) {
         use crate::generation::ContentBlock;
         match event {
+            ToolEvent::TodoUpdated(todos) => self.trace.todos = todos.clone(),
             ToolEvent::Transcript(blocks) => {
                 self.timings.observe(blocks);
                 self.trace.blocks = blocks.clone();
@@ -245,6 +248,7 @@ impl Runner {
             }
             let mut recording = Recording {
                 trace: Trace {
+                    todos: Vec::new(),
                     id: uuid::Uuid::new_v4(),
                     call_id: call.id.clone(),
                     title: args
@@ -290,6 +294,7 @@ impl Runner {
         child.delegation = Delegation::Child;
         child.events = events;
         child.recall = None;
+        child.todos = Default::default();
         let mut messages = self.instructions.clone();
         messages.push(json!({"role":"system","content":"You are a subagent executing a single delegated task. Work independently using the provided tools and return a concise result with evidence and any limitations to the parent agent. You cannot delegate work or create further subagents. Follow the inherited project boundaries and approval policy. You share the project files with the parent; avoid unrelated changes."}));
         messages.push(json!({"role":"user","content":task}));
@@ -346,6 +351,7 @@ mod tests {
         ToolContext {
             delegation: Delegation::default(),
             subagents: Default::default(),
+            todos: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(path.join("sessions.json"))),
             memory: crate::memory::Repository::new(path.join("sessions.json")),
@@ -454,6 +460,11 @@ mod tests {
                         )],
                         1 => vec![
                             (
+                                "todo",
+                                "todo_write",
+                                json!({"todos":[{"content":"child-plan-sentinel","status":"pending"}]}),
+                            ),
+                            (
                                 "write",
                                 "write_file",
                                 json!({"path":"denied.txt","content":"must not write"}),
@@ -482,6 +493,11 @@ mod tests {
             });
             let (events, receiver) = async_channel::unbounded();
             let context = context(directory.path(), events);
+            let parent_todos = context.todos.clone();
+            *parent_todos.lock().unwrap() = vec![crate::todo::Item {
+                content: "parent-plan-sentinel".into(),
+                status: crate::todo::Status::Pending,
+            }];
             let request = provider::Request::start_with_tools(
                 config,
                 "test-key".into(),
@@ -495,6 +511,10 @@ mod tests {
             .unwrap();
             let approvals = async {
                 while let Ok(event) = receiver.recv().await {
+                    assert!(
+                        !matches!(&event, ToolEvent::TodoUpdated(_)),
+                        "child checklist must not update the parent panel"
+                    );
                     if let ToolEvent::Approval {
                         call,
                         respond,
@@ -514,7 +534,12 @@ mod tests {
             let trace_id = trace.id;
             assert_eq!(trace.status, Status::Completed);
             assert_eq!(trace.task, "Inspect the project");
-            assert_eq!(trace.tools.len(), 2);
+            assert_eq!(trace.tools.len(), 3);
+            assert_eq!(trace.todos[0].content, "child-plan-sentinel");
+            assert_eq!(
+                parent_todos.lock().unwrap()[0].content,
+                "parent-plan-sentinel"
+            );
             assert!(trace.tools.iter().all(|tool| tool.subagent.is_none()));
             assert!(trace.blocks.iter().any(|block| matches!(block, crate::generation::ContentBlock::Text(text) if text == "child-result")));
             let mut history = crate::model::History::default();
@@ -532,13 +557,15 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.id, trace_id);
             assert_eq!(saved.status, Status::Completed);
-            assert_eq!(saved.tools.len(), 2);
+            assert_eq!(saved.tools.len(), 3);
+            assert_eq!(saved.todos[0].content, "child-plan-sentinel");
             assert!(!directory.path().join("denied.txt").exists());
             let requests = server.join().unwrap();
             assert!(requests[0]["tools"].to_string().contains("\"subagent\""));
             for request in &requests[1..3] {
                 assert!(!request["tools"].to_string().contains("\"subagent\""));
                 assert!(!request.to_string().contains("private-parent-history"));
+                assert!(!request.to_string().contains("parent-plan-sentinel"));
                 assert!(request.to_string().contains("project-instructions"));
             }
             assert!(requests[2].to_string().contains("用户拒绝"));
@@ -556,6 +583,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let mut recording = Recording {
             trace: Trace {
+                todos: Vec::new(),
                 id,
                 call_id: "parent-call".into(),
                 title: "验证".into(),
