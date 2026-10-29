@@ -38,6 +38,7 @@ fn tool_signature(record: &tools::ToolRecord) -> String {
     record.result.hash(&mut hash);
     record.success.hash(&mut hash);
     record.elapsed_ms.hash(&mut hash);
+    record.live_output.hash(&mut hash);
     hash.finish().to_string()
 }
 
@@ -220,7 +221,11 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
         summary.push_str(&format!(" · {:.1}s", record.elapsed_ms as f64 / 1000.));
     }
     let body = if running {
-        "等待工具返回结果…".into()
+        record
+            .live_output
+            .clone()
+            .filter(|output| !output.is_empty())
+            .unwrap_or_else(|| "等待工具返回结果…".into())
     } else if record.call.name == "run_command" && record.result.trim().is_empty() {
         "命令已结束，无输出。".into()
     } else {
@@ -291,7 +296,15 @@ impl AgentWorkspace {
                                     result: "执行中…".into(),
                                     success: false,
                                     elapsed_ms: 0,
+                                    live_output: None,
                                 })
+                            }
+                            tools::ToolEvent::Output { call_id, output } => {
+                                if let Some(record) = this.tool_activity.iter_mut().find(|record| {
+                                    record.call.id == call_id && record.result == "执行中…"
+                                }) {
+                                    record.live_output = Some(output);
+                                }
                             }
                             tools::ToolEvent::Approval { call, respond } => {
                                 if *this.access.lock().unwrap() != tools::AccessMode::Ask {
@@ -475,8 +488,17 @@ impl AgentWorkspace {
                             result: "执行中…".into(),
                             success: false,
                             elapsed_ms: 0,
+                            live_output: None,
                         };
-                        body = body.child(self.tool_records(std::slice::from_ref(&running), cx));
+                        let running = if !complete {
+                            self.tool_activity
+                                .iter()
+                                .find(|record| record.call.id == call.id)
+                                .unwrap_or(&running)
+                        } else {
+                            &running
+                        };
+                        body = body.child(self.tool_records(std::slice::from_ref(running), cx));
                     }
                 }
                 ContentBlock::ToolResult(record) => {
@@ -515,8 +537,17 @@ impl AgentWorkspace {
             "工作过程".into()
         };
         let signature = format!(
-            "{}:{summary}",
-            serde_json::to_string(&blocks[..split]).unwrap_or_default()
+            "{}:{summary}:{}",
+            serde_json::to_string(&blocks[..split]).unwrap_or_default(),
+            if complete {
+                String::new()
+            } else {
+                self.tool_activity
+                    .iter()
+                    .map(tool_signature)
+                    .collect::<Vec<_>>()
+                    .join(":")
+            }
         );
         let entry = cache.entry(key.into()).or_insert_with(|| ProcessPanel {
             signature: String::new(),
@@ -651,6 +682,7 @@ mod tests {
             result: "exit: 0\nM src/main.rs".into(),
             success: true,
             elapsed_ms: 1200,
+            live_output: None,
         };
         let view = tool_presentation(&record);
         assert_eq!(
@@ -659,12 +691,21 @@ mod tests {
         );
         assert_eq!(view.body, record.result);
         record.result = "执行中…".into();
+        assert_eq!(tool_presentation(&record).body, "等待工具返回结果…");
+        let signature = tool_signature(&record);
+        record.live_output = Some("Compiling glint-agent\ntest in progress".into());
+        assert_ne!(tool_signature(&record), signature);
+        assert_eq!(
+            tool_presentation(&record).body,
+            "Compiling glint-agent\ntest in progress"
+        );
         assert!(
             tool_presentation(&record)
                 .summary
                 .starts_with("正在运行 git diff")
         );
         record.result = "exit: 2\nerror".into();
+        record.live_output = None;
         assert!(tool_presentation(&record).summary.starts_with("命令失败"));
         record.call.name = "read_file".into();
         record.call.arguments = serde_json::json!({"path":"src/main.rs","start_line":1});

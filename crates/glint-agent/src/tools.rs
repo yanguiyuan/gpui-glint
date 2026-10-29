@@ -22,6 +22,8 @@ pub struct ToolRecord {
     pub result: String,
     pub success: bool,
     pub elapsed_ms: u64,
+    #[serde(skip)]
+    pub live_output: Option<String>,
 }
 
 pub enum ToolEvent {
@@ -33,6 +35,10 @@ pub enum ToolEvent {
     },
     Transcript(Vec<crate::generation::ContentBlock>),
     Started(ToolCall),
+    Output {
+        call_id: String,
+        output: String,
+    },
     Approval {
         call: ToolCall,
         respond: tokio::sync::oneshot::Sender<bool>,
@@ -311,6 +317,7 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
         result,
         success,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        live_output: None,
     };
     let _ = context
         .events
@@ -461,7 +468,7 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
                 args_list.extend(["--glob".into(), glob.into()]);
             }
             args_list.extend(["--".into(), text(args, "pattern")?.into(), ".".into()]);
-            let result = command(root, "rg", &args_list).await?;
+            let result = command(root, "rg", &args_list, None).await?;
             Ok(result.lines().take(200).collect::<Vec<_>>().join("\n"))
         }
         "write_file" | "replace_in_file" => {
@@ -490,13 +497,23 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
                 .iter()
                 .map(|item| item.as_str().map(str::to_owned).ok_or("参数必须为字符串"))
                 .collect::<Result<Vec<_>, _>>()?;
-            command(root, program, &args).await
+            command(root, program, &args, Some((&call.id, &context.events))).await
         }
         _ => Err("未知工具".into()),
     }
 }
 
-async fn capture(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
+#[derive(Default)]
+struct CommandOutput {
+    streams: [Vec<u8>; 2],
+}
+
+async fn capture(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    stream: usize,
+    output: &Mutex<CommandOutput>,
+    events: Option<(&str, &async_channel::Sender<ToolEvent>)>,
+) -> std::io::Result<String> {
     let mut kept = Vec::new();
     let mut buffer = [0; 8192];
     loop {
@@ -506,6 +523,25 @@ async fn capture(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Resu
         }
         let remaining = (128 * 1024usize).saturating_sub(kept.len());
         kept.extend_from_slice(&buffer[..count.min(remaining)]);
+        if remaining > 0 {
+            let mut output = output.lock().unwrap();
+            output.streams[stream].clone_from(&kept);
+            if let Some((call_id, events)) = events {
+                let _ = events.try_send(ToolEvent::Output {
+                    call_id: call_id.into(),
+                    output: format!(
+                        "{}{}{}",
+                        String::from_utf8_lossy(&output.streams[0]),
+                        if output.streams[0].is_empty() || output.streams[1].is_empty() {
+                            ""
+                        } else {
+                            "\n"
+                        },
+                        String::from_utf8_lossy(&output.streams[1]),
+                    ),
+                });
+            }
+        }
     }
     Ok(String::from_utf8_lossy(&kept).into_owned())
 }
@@ -553,7 +589,12 @@ fn memory_tool(call: &ToolCall, context: &ToolContext) -> Result<String, String>
     }
 }
 
-async fn command(root: &Path, program: &str, args: &[String]) -> Result<String, String> {
+async fn command(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    events: Option<(&str, &async_channel::Sender<ToolEvent>)>,
+) -> Result<String, String> {
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -576,8 +617,13 @@ async fn command(root: &Path, program: &str, args: &[String]) -> Result<String, 
         .map_err(|_| "无法运行命令，请检查程序是否已安装")?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+    let output = Mutex::new(CommandOutput::default());
     let (out, err, status) = tokio::time::timeout(Duration::from_secs(60), async {
-        tokio::join!(capture(stdout), capture(stderr), child.wait())
+        tokio::join!(
+            capture(stdout, 0, &output, events),
+            capture(stderr, 1, &output, events),
+            child.wait()
+        )
     })
     .await
     .map_err(|_| "命令超过 60 秒，已终止")?;
@@ -701,6 +747,46 @@ pub fn parse_calls(message: &Value, anthropic: bool) -> Result<Vec<ToolCall>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn command_streams_both_outputs_before_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let (events, receiver) = async_channel::unbounded();
+        #[cfg(target_os = "windows")]
+        let (program, args) = ("powershell", vec![
+            "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+            "[Console]::Out.WriteLine('early-out'); [Console]::Error.WriteLine('early-err'); Start-Sleep -Seconds 2; [Console]::Out.WriteLine('done')".into(),
+        ]);
+        #[cfg(not(target_os = "windows"))]
+        let (program, args) = (
+            "sh",
+            vec![
+                "-c".into(),
+                "echo early-out; echo early-err >&2; sleep 2; echo done".into(),
+            ],
+        );
+        let execution = command(root.path(), program, &args, Some(("stream-test", &events)));
+        tokio::pin!(execution);
+        let mut live = String::new();
+        while !live.contains("early-out") || !live.contains("early-err") {
+            tokio::select! {
+                result = &mut execution => panic!("command exited before live output: {result:?}"),
+                event = tokio::time::timeout(Duration::from_secs(10), receiver.recv()) => {
+                    if let ToolEvent::Output { call_id, output } = event.unwrap().unwrap() {
+                        assert_eq!(call_id, "stream-test");
+                        live = output;
+                    }
+                }
+            }
+        }
+        assert!(!live.contains("done"));
+        let result = execution.await.unwrap();
+        assert!(result.starts_with("exit: 0"));
+        for expected in ["early-out", "early-err", "done"] {
+            assert!(result.contains(expected));
+        }
+    }
+
     #[test]
     fn mcp_permissions_require_approval_for_configuration_and_remote_calls() {
         for (name, expected) in [
