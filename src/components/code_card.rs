@@ -198,6 +198,7 @@ enum ScrollAxis {
 
 #[derive(Default)]
 struct WindowLayout {
+    scrollbar_drag: Rc<std::cell::Cell<Option<Pixels>>>,
     wrap_width: Pixels,
     line_cache: Option<LineCache>,
     viewport_cache: Option<ViewportCache>,
@@ -212,6 +213,7 @@ struct WindowLayout {
 /// Unknown fence languages render as plain text. Create with `cx.new(...)` and
 /// subscribe to [`CodeCardEvent`] to integrate with a document.
 pub struct CodeCard {
+    scrollbar_drag: Rc<std::cell::Cell<Option<Pixels>>>,
     active_window: Option<gpui::WindowId>,
     window_layouts: HashMap<gpui::WindowId, WindowLayout>,
     viewport: bool,
@@ -275,6 +277,7 @@ impl CodeCard {
             .collect::<HashSet<_>>();
         self.window_layouts.retain(|id, _| open.contains(id));
         let mut layout = self.window_layouts.remove(&id).unwrap_or_default();
+        std::mem::swap(&mut self.scrollbar_drag, &mut layout.scrollbar_drag);
         std::mem::swap(&mut self.wrap_width, &mut layout.wrap_width);
         std::mem::swap(&mut self.line_cache, &mut layout.line_cache);
         std::mem::swap(&mut self.viewport_cache, &mut layout.viewport_cache);
@@ -541,6 +544,7 @@ impl CodeCard {
             fold_revision: 0,
             viewport_cache: None,
             viewport_scroll: gpui::UniformListScrollHandle::default(),
+            scrollbar_drag: Default::default(),
             scroll_axis: None,
             last_scroll: None,
             layout_revision: 0,
@@ -2390,6 +2394,140 @@ fn viewport_gutter_width(line_count: usize) -> Pixels {
 }
 
 impl CodeCard {
+    fn viewport_horizontal_scrollbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let entity = cx.entity();
+        let scroll = self.scroll.clone();
+        let drag = self.scrollbar_drag.clone();
+        let dark = self.dark;
+        div()
+            .h(px(12.))
+            .w_full()
+            .flex_shrink_0()
+            .debug_selector(|| "code-card-horizontal-scrollbar".into())
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let maximum =
+                            entity
+                                .read(cx)
+                                .viewport_cache
+                                .as_ref()
+                                .map_or(px(0.), |cache| {
+                                    let gutter = viewport_gutter_width(cache.ranges.len())
+                                        + if entity.read(cx).json_folding
+                                            && entity.read(cx).is_json()
+                                        {
+                                            px(16.)
+                                        } else {
+                                            px(0.)
+                                        };
+                                    (cache.width + gutter + px(26.) - bounds.size.width).max(px(0.))
+                                });
+                        if maximum <= px(0.) || bounds.size.width <= px(4.) {
+                            return None;
+                        }
+                        let track = bounds.inset(px(2.));
+                        let width = (track.size.width
+                            * (bounds.size.width / (bounds.size.width + maximum)))
+                            .max(px(24.))
+                            .min(track.size.width);
+                        let travel = track.size.width - width;
+                        let left =
+                            track.left() + travel * (-scroll.offset().x / maximum).clamp(0., 1.);
+                        let thumb =
+                            Bounds::new(point(left, bounds.top() + px(3.)), size(width, px(6.)));
+                        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+                        Some((hitbox, thumb, track, maximum, travel, scroll.clone()))
+                    },
+                    move |_, geometry, window, _| {
+                        let Some((hitbox, thumb, track, maximum, travel, scroll)) = geometry else {
+                            return;
+                        };
+                        window.paint_quad(gpui::quad(
+                            thumb,
+                            px(3.),
+                            rgba(if dark { 0xffffff55 } else { 0x00000044 }),
+                            px(0.),
+                            rgba(0),
+                            Default::default(),
+                        ));
+                        window.set_cursor_style(gpui::CursorStyle::Arrow, &hitbox);
+                        let down_scroll = scroll.clone();
+                        let down_drag = drag.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Bubble
+                                || event.button != MouseButton::Left
+                                || !hitbox.is_hovered(window)
+                            {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            let grab = if thumb.contains(&event.position) {
+                                event.position.x - thumb.left()
+                            } else {
+                                thumb.size.width / 2.
+                            };
+                            down_drag.set(Some(grab));
+                            Self::set_horizontal_scrollbar_position(
+                                &down_scroll,
+                                event.position.x - grab - track.left(),
+                                travel,
+                                maximum,
+                            );
+                            window.refresh();
+                        });
+                        let move_scroll = scroll.clone();
+                        let move_drag = drag.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Capture {
+                                return;
+                            }
+                            if let Some(grab) = move_drag.get() {
+                                if !event.dragging() {
+                                    move_drag.set(None);
+                                } else {
+                                    Self::set_horizontal_scrollbar_position(
+                                        &move_scroll,
+                                        event.position.x - grab - track.left(),
+                                        travel,
+                                        maximum,
+                                    );
+                                    cx.stop_propagation();
+                                }
+                                window.refresh();
+                            }
+                        });
+                        let up_drag = drag.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture
+                                && event.button == MouseButton::Left
+                                && up_drag.take().is_some()
+                            {
+                                cx.stop_propagation();
+                                window.refresh();
+                            }
+                        });
+                    },
+                )
+                .size_full(),
+            )
+    }
+
+    fn set_horizontal_scrollbar_position(
+        scroll: &ScrollHandle,
+        position: Pixels,
+        travel: Pixels,
+        maximum: Pixels,
+    ) {
+        let ratio = if travel > px(0.) {
+            (position / travel).clamp(0., 1.)
+        } else {
+            0.
+        };
+        scroll.set_offset(point(-maximum * ratio, px(0.)));
+    }
+
     fn viewport_wheel(
         &mut self,
         event: &gpui::ScrollWheelEvent,
@@ -2398,7 +2536,7 @@ impl CodeCard {
     ) {
         self.activate_window(window, cx);
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-        if delta.x.abs() > delta.y.abs() {
+        if event.modifiers.shift || delta.x.abs() > delta.y.abs() {
             let (width, gutter_width) =
                 self.viewport_cache
                     .as_ref()
@@ -2416,7 +2554,12 @@ impl CodeCard {
             let bounds = self.viewport_scroll.0.borrow().base_handle.bounds();
             let max = (width + gutter_width + px(26.) - bounds.size.width).max(px(0.));
             let offset = self.scroll.offset();
-            let next = (offset.x + delta.x).clamp(-max, px(0.));
+            let horizontal = if event.modifiers.shift && delta.x == px(0.) {
+                delta.y
+            } else {
+                delta.x
+            };
+            let next = (offset.x + horizontal).clamp(-max, px(0.));
             self.scroll.set_offset(point(next, px(0.)));
             cx.stop_propagation();
             if next != offset.x {
@@ -2733,6 +2876,7 @@ impl CodeCard {
                     .child(self.language.clone())
             }))
             .child(div().flex_1().min_h_0().child(list))
+            .child(self.viewport_horizontal_scrollbar(cx))
     }
 }
 
@@ -3911,6 +4055,85 @@ mod tests {
         });
         window.run_until_parked();
         editor.update(window, |input, _| assert!(input.scroll.offset().x < px(0.)));
+    }
+
+    #[gpui::test]
+    fn short_json_long_line_scrolls_with_shift_wheel_and_draggable_bar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Preview(Entity<CodeCard>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(320.)).h(px(200.)).child(self.0.clone())
+            }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                CodeCard::new(
+                    cx,
+                    "json",
+                    format!(
+                        "{{\n  \"message\": \"{}TAIL\"\n}}",
+                        "long error message ".repeat(80)
+                    ),
+                )
+                .read_only(true)
+                .show_header(false)
+                .viewport()
+            }))
+        });
+        let editor = preview.read_with(window, |preview, _| preview.0.clone());
+        let rail = window
+            .debug_bounds("code-card-horizontal-scrollbar")
+            .unwrap();
+        let viewport = editor.read_with(window, |editor, _| {
+            editor.viewport_scroll.0.borrow().base_handle.bounds()
+        });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        window.run_until_parked();
+        editor.read_with(window, |editor, _| {
+            assert!(editor.scroll.offset().x < px(0.))
+        });
+        for (start, end, right) in [
+            (rail.left() + px(3.), rail.right() + px(100.), true),
+            (rail.right() - px(3.), rail.left() - px(100.), false),
+        ] {
+            window.simulate_mouse_move(point(start, rail.center().y), None, Default::default());
+            window.simulate_event(MouseDownEvent {
+                position: point(start, rail.center().y),
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            let target = point(end, rail.center().y + px(50.));
+            window.simulate_event(MouseMoveEvent {
+                position: target,
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            });
+            window.simulate_event(MouseUpEvent {
+                position: target,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            editor.read_with(window, |editor, _| {
+                assert!(editor.scrollbar_drag.get().is_none());
+                if right {
+                    assert!(editor.scroll.offset().x < px(-1000.));
+                } else {
+                    assert_eq!(editor.scroll.offset().x, px(0.));
+                }
+            });
+        }
     }
 
     #[gpui::test]
