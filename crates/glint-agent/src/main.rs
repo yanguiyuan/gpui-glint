@@ -30,6 +30,7 @@ mod skills;
 mod skills_ui;
 mod storage;
 mod subagent;
+mod subagent_ui;
 mod titles;
 mod tools;
 
@@ -68,6 +69,7 @@ struct AgentWorkspace {
     tool_activity: Vec<tools::ToolRecord>,
     transcript: Vec<generation::ContentBlock>,
     thinking_timings: generation::ThinkingTimings,
+    subagent_ui: subagent_ui::State,
     markdown_views:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
     image_views: std::cell::RefCell<images::PreviewCache>,
@@ -374,6 +376,7 @@ impl AgentWorkspace {
             tool_activity: vec![],
             transcript: vec![],
             thinking_timings: Default::default(),
+            subagent_ui: Default::default(),
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_views: std::cell::RefCell::new(images::PreviewCache::default()),
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -442,6 +445,8 @@ impl AgentWorkspace {
     }
 
     fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        self.subagent_ui.selected = None;
+        self.subagent_ui.picker_open = false;
         self.sync_context_usage(cx);
         let session = self.history.active();
         let text = session.draft.clone();
@@ -644,7 +649,9 @@ impl AgentWorkspace {
             .settings()
             .map(|settings| settings.automatic_recall)
             .unwrap_or(false);
+        self.subagent_ui.live = Default::default();
         let tool_context = tools::ToolContext {
+            subagents: self.subagent_ui.live.clone(),
             delegation: Default::default(),
             mcp: mcp::Client::new(self.path.with_file_name("mcp.json")),
             skills: skills.clone(),
@@ -738,6 +745,7 @@ impl AgentWorkspace {
                     this.thinking_timings.observe(&completion.blocks);
                 }
                 this.thinking_timings.finish();
+                this.finish_subagent_records();
                 let thinking_ms = this.thinking_timings.snapshot();
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
@@ -794,7 +802,7 @@ impl AgentWorkspace {
                     composer.set_busy(false, cx);
                 });
                 this.save(cx);
-                if this.history.active == id {
+                if this.history.active == id && this.subagent_ui.selected.is_none() {
                     this.scroll.scroll_to_bottom();
                 }
                 cx.notify();
@@ -817,6 +825,7 @@ impl AgentWorkspace {
             cx.notify();
         }
         if let Some((id, _task)) = self.pending.take() {
+            self.finish_subagent_records();
             self.thinking_timings.finish();
             self.recall_runner.update(cx, |runner, _| runner.cancel(id));
             self.tool_listener = None;
@@ -1302,6 +1311,9 @@ impl AgentWorkspace {
     }
 
     fn content(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if let Some(trace) = self.selected_subagent() {
+            return self.subagent_page(&trace, cx);
+        }
         self.sync_context_usage(cx);
         let p = self.theme.palette();
         let session = self.history.active();
@@ -1402,7 +1414,11 @@ impl AgentWorkspace {
                                             cx,
                                         ))
                                         .when(!message.tools.is_empty(), |body| {
-                                            body.child(self.tool_records(&message.tools, cx))
+                                            body.child(self.tool_records(
+                                                &format!("{}:{index}", self.history.active),
+                                                &message.tools,
+                                                cx,
+                                            ))
                                         })
                                 } else {
                                     div()
@@ -1503,7 +1519,7 @@ impl AgentWorkspace {
                     .gap_2()
                     .text_color(rgb(p.text_muted))
                     .child(
-                        ShimmerText::new("agent-waiting-reply", "正在等待模型回复…")
+                        ShimmerText::new("agent-waiting-reply", self.subagent_waiting_label())
                             .theme(self.theme),
                     ),
             );
@@ -1583,6 +1599,7 @@ impl AgentWorkspace {
                             .font_weight(FontWeight::MEDIUM)
                             .child(session.title.clone()),
                     )
+                    .child(self.subagent_selector(cx))
                     .child(
                         div()
                             .text_size(px(10.))

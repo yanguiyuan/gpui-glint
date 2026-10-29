@@ -21,6 +21,7 @@ pub struct ProcessPanel {
 }
 
 pub struct Approval {
+    pub agent_id: Option<Uuid>,
     pub call: tools::ToolCall,
     pub respond: tokio::sync::oneshot::Sender<bool>,
 }
@@ -299,7 +300,11 @@ impl AgentWorkspace {
                         // Request the bottom on the next layout, when the new
                         // text/tool rows have their updated heights. Background
                         // sessions and token-usage updates must not move this view.
-                        if !matches!(&event, tools::ToolEvent::ContextUsage { .. })
+                        if !matches!(
+                            &event,
+                            tools::ToolEvent::ContextUsage { .. }
+                                | tools::ToolEvent::SubagentUpdated
+                        ) && this.subagent_ui.selected.is_none()
                             && this
                                 .pending
                                 .as_ref()
@@ -308,6 +313,31 @@ impl AgentWorkspace {
                             this.scroll.scroll_to_bottom();
                         }
                         match event {
+                            tools::ToolEvent::SubagentUpdated => {
+                                if this
+                                    .approval
+                                    .as_ref()
+                                    .and_then(|approval| approval.agent_id)
+                                    .is_some_and(|id| {
+                                        this.subagent_ui.live.lock().ok().is_some_and(|traces| {
+                                            traces.iter().any(|trace| {
+                                                trace.id == id && !trace.status.active()
+                                            })
+                                        })
+                                    })
+                                {
+                                    this.approval = None;
+                                }
+                                if this
+                                    .selected_subagent()
+                                    .is_some_and(|trace| trace.status.active())
+                                {
+                                    if let Some(scroll) = this.selected_subagent_scroll() {
+                                        scroll.scroll_to_bottom();
+                                    }
+                                }
+                            }
+                            tools::ToolEvent::ApprovalResolved => {}
                             tools::ToolEvent::ContextUsage {
                                 provider_id,
                                 model,
@@ -342,6 +372,7 @@ impl AgentWorkspace {
                                     success: false,
                                     elapsed_ms: 0,
                                     live_output: None,
+                                    subagent: None,
                                 })
                             }
                             tools::ToolEvent::Output { call_id, output } => {
@@ -351,11 +382,19 @@ impl AgentWorkspace {
                                     record.live_output = Some(output);
                                 }
                             }
-                            tools::ToolEvent::Approval { call, respond } => {
+                            tools::ToolEvent::Approval {
+                                call,
+                                respond,
+                                agent_id,
+                            } => {
                                 if *this.access.lock().unwrap() != tools::AccessMode::Ask {
                                     let _ = respond.send(true);
                                 } else {
-                                    this.approval = Some(Approval { call, respond });
+                                    this.approval = Some(Approval {
+                                        call,
+                                        respond,
+                                        agent_id,
+                                    });
                                 }
                             }
                             tools::ToolEvent::Completed(record) => {
@@ -381,18 +420,22 @@ impl AgentWorkspace {
         }));
     }
 
-    pub fn tool_records(&self, records: &[tools::ToolRecord], cx: &mut Context<Self>) -> gpui::Div {
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(records.iter().map(|record| self.tool_panel(record, cx)))
+    pub fn tool_records(
+        &self,
+        key: &str,
+        records: &[tools::ToolRecord],
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div().w_full().min_w_0().flex().flex_col().gap_1().children(
+            records
+                .iter()
+                .map(|record| self.tool_panel(key, record, cx)),
+        )
     }
 
     fn tool_panel(
         &self,
+        key: &str,
         record: &tools::ToolRecord,
         cx: &mut Context<Self>,
     ) -> Entity<gpui_glint::components::CollapsePanel> {
@@ -402,7 +445,7 @@ impl AgentWorkspace {
         let mut cache = self.tool_panels.borrow_mut();
         let signature = tool_signature(record);
         let entry = cache
-            .entry(record.call.id.clone())
+            .entry(format!("{key}:tool:{}", record.call.id))
             .or_insert_with(|| ToolPanel {
                 signature: String::new(),
                 theme,
@@ -486,15 +529,23 @@ impl AgentWorkspace {
             .flex()
             .flex_col()
             .gap_2()
-            .children(self.transcript_rows(key, blocks, thinking_ms, complete, cx))
+            .children(self.transcript_rows(
+                key,
+                blocks,
+                thinking_ms,
+                complete,
+                if complete { &[] } else { &self.tool_activity },
+                cx,
+            ))
     }
 
-    fn transcript_rows(
+    pub fn transcript_rows(
         &self,
         key: &str,
         blocks: &[generation::ContentBlock],
         thinking_ms: &std::collections::BTreeMap<usize, u64>,
         complete: bool,
+        activity: &[tools::ToolRecord],
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyView> {
         use generation::ContentBlock;
@@ -572,20 +623,29 @@ impl AgentWorkspace {
                             success: false,
                             elapsed_ms: 0,
                             live_output: None,
+                            subagent: None,
                         };
                         let running = if !complete {
-                            self.tool_activity
+                            activity
                                 .iter()
                                 .find(|record| record.call.id == call.id)
                                 .unwrap_or(&running)
                         } else {
                             &running
                         };
-                        rows.push(self.tool_panel(running, cx).into());
+                        if let Some(trace) = self.trace_for_record(running) {
+                            rows.push(self.subagent_summary(&trace, cx));
+                        } else {
+                            rows.push(self.tool_panel(key, running, cx).into());
+                        }
                     }
                 }
                 ContentBlock::ToolResult(record) => {
-                    rows.push(self.tool_panel(record, cx).into());
+                    if let Some(trace) = self.trace_for_record(record) {
+                        rows.push(self.subagent_summary(&trace, cx));
+                    } else {
+                        rows.push(self.tool_panel(key, record, cx).into());
+                    }
                 }
             }
         }
@@ -624,7 +684,7 @@ impl AgentWorkspace {
             thinking_ms,
             &summary,
             if complete { &[] } else { &self.tool_activity },
-        );
+        ) ^ self.subagent_revision();
         let entry = cache.entry(key.into()).or_insert_with(|| ProcessPanel {
             signature: 0,
             theme,
@@ -644,6 +704,11 @@ impl AgentWorkspace {
             let weak = cx.entity().downgrade();
             let process = blocks[..split].to_vec();
             let thinking_ms = thinking_ms.clone();
+            let activity = if complete {
+                Vec::new()
+            } else {
+                self.tool_activity.clone()
+            };
             let content_key = key.to_owned();
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
@@ -661,6 +726,7 @@ impl AgentWorkspace {
                                     &process,
                                     &thinking_ms,
                                     complete,
+                                    &activity,
                                     cx,
                                 )
                             })
@@ -703,8 +769,21 @@ impl AgentWorkspace {
         let p = self.theme.palette();
         let mut panel = div();
         if let Some(approval) = &self.approval {
+            let source = approval
+                .agent_id
+                .and_then(|id| {
+                    self.subagent_ui
+                        .live
+                        .lock()
+                        .ok()?
+                        .iter()
+                        .find(|trace| trace.id == id)
+                        .cloned()
+                })
+                .map(|trace| format!("子代理「{}」 · ", trace.title))
+                .unwrap_or_default();
             panel = panel.w_full().max_w(px(800.)).p_4().flex().flex_col().gap_3().rounded(px(10.)).border_1().border_color(rgb(p.accent)).bg(rgb(p.panel))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("确认工具调用：{}", approval.call.name)))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{source}确认工具调用：{}", approval.call.name)))
                 .child(div().id("approval-arguments").max_h(px(180.)).overflow_y_scroll().text_size(px(11.)).child(serde_json::to_string_pretty(&approval.call.arguments).unwrap_or_default()))
                 .when(approval.call.name == "run_command", |panel| panel.child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("命令在项目目录运行，批准前请检查程序和参数；命令自身可以访问项目外部。")))
                 .child(div().flex().gap_3()
@@ -764,6 +843,7 @@ mod tests {
             success: false,
             elapsed_ms: 0,
             live_output: None,
+            subagent: None,
         };
         let blocks = vec![Thinking("checking".into()), ToolCall(record.call.clone())];
         let mut timings = std::collections::BTreeMap::new();
@@ -826,6 +906,7 @@ mod tests {
             success: true,
             elapsed_ms: 1200,
             live_output: None,
+            subagent: None,
         };
         let view = tool_presentation(&record);
         assert_eq!(

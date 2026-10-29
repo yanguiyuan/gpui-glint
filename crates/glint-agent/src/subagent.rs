@@ -2,17 +2,188 @@ use crate::{
     provider,
     tools::{ToolCall, ToolContext, ToolEvent},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+pub type Registry = Arc<Mutex<Vec<Trace>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Status {
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Status {
+    pub fn active(self) -> bool {
+        matches!(self, Self::Running | Self::WaitingApproval)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "运行中",
+            Self::WaitingApproval => "待批准",
+            Self::Completed => "已完成",
+            Self::Failed => "失败",
+            Self::Cancelled => "已取消",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Trace {
+    pub id: uuid::Uuid,
+    pub call_id: String,
+    pub title: String,
+    pub task: String,
+    pub status: Status,
+    pub blocks: Vec<crate::generation::ContentBlock>,
+    pub tools: Vec<crate::tools::ToolRecord>,
+    pub thinking_ms: std::collections::BTreeMap<usize, u64>,
+    pub stats: Option<crate::generation::GenerationStats>,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+impl Trace {
+    pub fn interrupt(&mut self) {
+        if !self.status.active() {
+            return;
+        }
+        self.status = Status::Cancelled;
+        self.error = Some("执行已中断".into());
+        self.close_tools();
+    }
+
+    fn close_tools(&mut self) {
+        for tool in &mut self.tools {
+            if tool.result == "执行中…" {
+                tool.result = format!(
+                    "{}\n{}",
+                    self.status.label(),
+                    tool.live_output.take().unwrap_or_default()
+                );
+                tool.success = false;
+            }
+            if !self.blocks.iter().any(|block| matches!(block, crate::generation::ContentBlock::ToolResult(record) if record.call.id == tool.call.id)) {
+                self.blocks.push(crate::generation::ContentBlock::ToolResult(tool.clone()));
+            }
+        }
+    }
+}
+
+/// Persists each event before notifying the UI; the final record is also available
+/// when cancellation drops the provider future before the UI drains its channel.
+struct Recording {
+    trace: Trace,
+    timings: crate::generation::ThinkingTimings,
+    started: std::time::Instant,
+    registry: Registry,
+    events: async_channel::Sender<ToolEvent>,
+}
+
+impl Recording {
+    fn publish(&mut self) {
+        self.trace.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        self.trace.thinking_ms = self.timings.snapshot();
+        if let Ok(mut traces) = self.registry.lock() {
+            if let Some(trace) = traces.iter_mut().find(|trace| trace.id == self.trace.id) {
+                *trace = self.trace.clone();
+            } else {
+                traces.push(self.trace.clone());
+            }
+        }
+        let _ = self.events.try_send(ToolEvent::SubagentUpdated);
+    }
+
+    fn observe(&mut self, event: &ToolEvent) {
+        use crate::generation::ContentBlock;
+        match event {
+            ToolEvent::Transcript(blocks) => {
+                self.timings.observe(blocks);
+                self.trace.blocks = blocks.clone();
+            }
+            ToolEvent::Started(call) => {
+                self.trace.status = Status::Running;
+                self.trace.tools.push(crate::tools::ToolRecord {
+                    call: call.clone(),
+                    result: "执行中…".into(),
+                    success: false,
+                    elapsed_ms: 0,
+                    live_output: None,
+                    subagent: None,
+                });
+            }
+            ToolEvent::Output { call_id, output } => {
+                if let Some(tool) = self
+                    .trace
+                    .tools
+                    .iter_mut()
+                    .find(|tool| &tool.call.id == call_id)
+                {
+                    tool.live_output = Some(output.clone());
+                }
+            }
+            ToolEvent::Completed(record) => {
+                self.trace.status = Status::Running;
+                if let Some(tool) = self
+                    .trace
+                    .tools
+                    .iter_mut()
+                    .find(|tool| tool.call.id == record.call.id)
+                {
+                    *tool = record.clone();
+                } else {
+                    self.trace.tools.push(record.clone());
+                }
+                if !self.trace.blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult(tool) if tool.call.id == record.call.id)) { self.trace.blocks.push(ContentBlock::ToolResult(record.clone())); }
+            }
+            ToolEvent::Approval { .. } => self.trace.status = Status::WaitingApproval,
+            ToolEvent::ApprovalResolved => self.trace.status = Status::Running,
+            _ => {}
+        }
+        self.publish();
+    }
+
+    fn finish(&mut self, result: &Result<crate::generation::Completion, String>) {
+        match result {
+            Ok(completion) => {
+                self.timings.observe(&completion.blocks);
+                self.trace.blocks = completion.blocks.clone();
+                self.trace.tools = completion.tool_records.clone();
+                self.trace.stats = Some(completion.stats.clone());
+                self.trace.status = Status::Completed;
+            }
+            Err(error) => {
+                self.trace.status = Status::Failed;
+                self.trace.error = Some(error.clone());
+                self.trace.close_tools();
+            }
+        }
+        self.timings.finish();
+        self.publish();
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        if self.trace.status.active() {
+            self.trace.interrupt();
+            self.timings.finish();
+            self.publish();
+        }
+    }
+}
 
 /// This capability is request-local and is never serialized into conversation history.
 #[derive(Clone, Default)]
@@ -62,6 +233,7 @@ impl Runner {
             #[serde(deny_unknown_fields)]
             struct Args {
                 task: String,
+                title: Option<String>,
             }
             let args: Args = serde_json::from_value(call.arguments.clone())
                 .map_err(|_| "subagent 参数无效，需要 task")?;
@@ -71,59 +243,88 @@ impl Runner {
             if self.calls.fetch_add(1, Ordering::Relaxed) >= 8 {
                 return Err("每次用户请求最多执行 8 个子任务".into());
             }
-            let (events, receiver) = async_channel::unbounded();
-            let mut child = context.clone();
-            child.delegation = Delegation::Child;
-            child.events = events;
-            child.recall = None;
-            let mut messages = self.instructions.clone();
-            messages.push(json!({"role":"system","content":"You are a subagent executing a single delegated task. Work independently using the provided tools and return a concise result with evidence and any limitations to the parent agent. You cannot delegate work or create further subagents. Follow the inherited project boundaries and approval policy. You share the project files with the parent; avoid unrelated changes."}));
-            messages.push(json!({"role":"user","content":args.task}));
-            let request = provider::Request::start_with_tools(
-                self.config.clone(),
-                self.key.clone(),
-                messages,
-                self.thinking,
-                Some(child),
-            )?;
-            let response = tokio::time::timeout(Duration::from_secs(120), request.response());
-            tokio::pin!(response);
-            let mut output = String::new();
-            let mut events_open = true;
-            loop {
-                tokio::select! {
-                    result = &mut response => {
-                        let completion = result.map_err(|_| "子代理执行超时，已取消")??;
-                        if completion.text.trim().is_empty() {
-                            return Err("子代理未返回文本结果".into());
-                        }
-                        return Ok(completion.text);
-                    }
-                    event = receiver.recv(), if events_open => {
-                        let Ok(event) = event else {
-                            events_open = false;
-                            continue;
-                        };
-                        match event {
-                            // Forward the original responder so approval and live access-mode changes apply normally.
-                            ToolEvent::Approval { call, respond } => {
-                                context.events.send(ToolEvent::Approval { call, respond }).await.map_err(|_| "界面已关闭")?;
-                            }
-                            ToolEvent::Started(child_call) => {
-                                output.push_str(&format!("子代理调用 {}\n", child_call.name));
-                                let _ = context.events.try_send(ToolEvent::Output { call_id: call.id.clone(), output: output.clone() });
-                            }
-                            ToolEvent::Completed(record) => {
-                                output.push_str(&format!("{}: {}\n", record.call.name, if record.success { "完成" } else { "失败" }));
-                                let _ = context.events.try_send(ToolEvent::Output { call_id: call.id.clone(), output: output.clone() });
-                            }
-                            // Child transcripts and token occupancy must not replace the parent's UI state.
-                            _ => {}
-                        }
+            let mut recording = Recording {
+                trace: Trace {
+                    id: uuid::Uuid::new_v4(),
+                    call_id: call.id.clone(),
+                    title: args
+                        .title
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            args.task.split_whitespace().collect::<Vec<_>>().join(" ")
+                        })
+                        .chars()
+                        .take(28)
+                        .collect(),
+                    task: args.task.clone(),
+                    status: Status::Running,
+                    blocks: Vec::new(),
+                    tools: Vec::new(),
+                    thinking_ms: Default::default(),
+                    stats: None,
+                    elapsed_ms: 0,
+                    error: None,
+                },
+                timings: Default::default(),
+                started: std::time::Instant::now(),
+                registry: context.subagents.clone(),
+                events: context.events.clone(),
+            };
+            recording.publish();
+            let result = self
+                .complete_child(&args.task, context, &mut recording)
+                .await;
+            recording.finish(&result);
+            result.map(|completion| completion.text)
+        })
+    }
+
+    async fn complete_child(
+        &self,
+        task: &str,
+        context: &ToolContext,
+        recording: &mut Recording,
+    ) -> Result<crate::generation::Completion, String> {
+        let (events, receiver) = async_channel::unbounded();
+        let mut child = context.clone();
+        child.delegation = Delegation::Child;
+        child.events = events;
+        child.recall = None;
+        let mut messages = self.instructions.clone();
+        messages.push(json!({"role":"system","content":"You are a subagent executing a single delegated task. Work independently using the provided tools and return a concise result with evidence and any limitations to the parent agent. You cannot delegate work or create further subagents. Follow the inherited project boundaries and approval policy. You share the project files with the parent; avoid unrelated changes."}));
+        messages.push(json!({"role":"user","content":task}));
+        let request = provider::Request::start_with_tools(
+            self.config.clone(),
+            self.key.clone(),
+            messages,
+            self.thinking,
+            Some(child),
+        )?;
+        let response = tokio::time::timeout(Duration::from_secs(120), request.response());
+        tokio::pin!(response);
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                event = receiver.recv(), if events_open => {
+                    let Ok(event) = event else {
+                        events_open = false;
+                        continue;
+                    };
+                    recording.observe(&event);
+                    if let ToolEvent::Approval { call, respond, .. } = event {
+                        context.events.send(ToolEvent::Approval { call, respond, agent_id: Some(recording.trace.id) }).await.map_err(|_| "界面已关闭")?;
                     }
                 }
+                result = &mut response => {
+                    let completion = result.map_err(|_| "子代理执行超时，已取消")??;
+                    if completion.text.trim().is_empty() {
+                        return Err("子代理未返回文本结果".into());
+                    }
+                    return Ok(completion);
+                }
             }
-        })
+        }
     }
 }
 
@@ -144,6 +345,7 @@ mod tests {
     fn context(path: &std::path::Path, events: async_channel::Sender<ToolEvent>) -> ToolContext {
         ToolContext {
             delegation: Delegation::default(),
+            subagents: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(path.join("sessions.json"))),
             memory: crate::memory::Repository::new(path.join("sessions.json")),
@@ -293,14 +495,44 @@ mod tests {
             .unwrap();
             let approvals = async {
                 while let Ok(event) = receiver.recv().await {
-                    if let ToolEvent::Approval { call, respond } = event {
+                    if let ToolEvent::Approval {
+                        call,
+                        respond,
+                        agent_id,
+                    } = event
+                    {
                         assert_eq!(call.name, "write_file");
+                        assert!(agent_id.is_some());
                         respond.send(false).unwrap();
                     }
                 }
             };
             let (result, _) = tokio::join!(request.response(), approvals);
-            assert_eq!(result.unwrap().text, "parent-result");
+            let completion = result.unwrap();
+            assert_eq!(completion.text, "parent-result");
+            let trace = completion.tool_records[0].subagent.as_ref().unwrap();
+            let trace_id = trace.id;
+            assert_eq!(trace.status, Status::Completed);
+            assert_eq!(trace.task, "Inspect the project");
+            assert_eq!(trace.tools.len(), 2);
+            assert!(trace.tools.iter().all(|tool| tool.subagent.is_none()));
+            assert!(trace.blocks.iter().any(|block| matches!(block, crate::generation::ContentBlock::Text(text) if text == "child-result")));
+            let mut history = crate::model::History::default();
+            history
+                .active_mut()
+                .push(crate::model::Role::Agent, completion.text);
+            history.active_mut().messages.last_mut().unwrap().tools = completion.tool_records;
+            history.active_mut().messages.last_mut().unwrap().blocks = completion.blocks;
+            let path = directory.path().join("roundtrip/sessions.json");
+            history.save(&path).unwrap();
+            let loaded = crate::model::History::load(&path).unwrap();
+            let saved = loaded.active().messages[0].tools[0]
+                .subagent
+                .as_ref()
+                .unwrap();
+            assert_eq!(saved.id, trace_id);
+            assert_eq!(saved.status, Status::Completed);
+            assert_eq!(saved.tools.len(), 2);
             assert!(!directory.path().join("denied.txt").exists());
             let requests = server.join().unwrap();
             assert!(requests[0]["tools"].to_string().contains("\"subagent\""));
@@ -314,5 +546,114 @@ mod tests {
             assert!(requests[3].to_string().contains("child-result"));
             assert!(!requests[3].to_string().contains("must not write"));
         }
+    }
+
+    #[test]
+    fn cancellation_keeps_streamed_blocks_output_and_approval_state_without_ui_events() {
+        use crate::generation::ContentBlock;
+        let registry = Registry::default();
+        let (events, _receiver) = async_channel::unbounded();
+        let id = uuid::Uuid::new_v4();
+        let mut recording = Recording {
+            trace: Trace {
+                id,
+                call_id: "parent-call".into(),
+                title: "验证".into(),
+                task: "Run verification".into(),
+                status: Status::Running,
+                blocks: Vec::new(),
+                tools: Vec::new(),
+                thinking_ms: Default::default(),
+                stats: None,
+                elapsed_ms: 0,
+                error: None,
+            },
+            timings: Default::default(),
+            started: std::time::Instant::now(),
+            registry: registry.clone(),
+            events,
+        };
+        let call = ToolCall {
+            id: "same-provider-call-id".into(),
+            name: "run_command".into(),
+            arguments: json!({"program":"cargo","args":["test"]}),
+        };
+        recording.observe(&ToolEvent::Transcript(vec![ContentBlock::Thinking(
+            "Inspect first".into(),
+        )]));
+        recording.observe(&ToolEvent::Transcript(vec![
+            ContentBlock::Thinking("Inspect first".into()),
+            ContentBlock::ToolCall(call.clone()),
+        ]));
+        recording.observe(&ToolEvent::Started(call.clone()));
+        let (respond, _response) = tokio::sync::oneshot::channel();
+        recording.observe(&ToolEvent::Approval {
+            call: call.clone(),
+            respond,
+            agent_id: None,
+        });
+        assert_eq!(registry.lock().unwrap()[0].status, Status::WaitingApproval);
+        recording.observe(&ToolEvent::ApprovalResolved);
+        assert_eq!(registry.lock().unwrap()[0].status, Status::Running);
+        recording.observe(&ToolEvent::Output {
+            call_id: call.id,
+            output: "Compiling glint-agent\n".into(),
+        });
+        drop(recording);
+        let trace = registry.lock().unwrap()[0].clone();
+        assert_eq!(trace.id, id);
+        assert_eq!(trace.status, Status::Cancelled);
+        assert!(trace.error.is_some());
+        assert!(trace.thinking_ms.contains_key(&0));
+        assert!(trace.tools[0].result.contains("Compiling glint-agent"));
+        assert!(
+            matches!(trace.blocks.last(), Some(ContentBlock::ToolResult(record)) if !record.success)
+        );
+        let persisted: Trace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert!(persisted.tools[0].result.contains("Compiling glint-agent"));
+        let mut legacy = serde_json::to_value(&persisted.tools[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("subagent");
+        assert!(
+            serde_json::from_value::<tools::ToolRecord>(legacy)
+                .unwrap()
+                .subagent
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_parent_tool_cancels_the_child_and_keeps_its_trace() {
+        let directory = tempfile::tempdir().unwrap();
+        // Keep the port open without returning an HTTP response.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = provider::Config {
+            model: "test-model".into(),
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            ..Default::default()
+        };
+        let runner = Runner::new(
+            config,
+            "test-only-key".into(),
+            provider::Thinking::Default,
+            &[],
+        );
+        let (events, _receiver) = async_channel::unbounded();
+        let context = context(directory.path(), events);
+        let call = ToolCall {
+            id: "cancel-parent".into(),
+            name: "subagent".into(),
+            arguments: json!({"task":"Wait for response","title":"等待验证"}),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), runner.run(&call, &context))
+                .await
+                .is_err()
+        );
+        let trace = context.subagents.lock().unwrap()[0].clone();
+        assert_eq!(trace.status, Status::Cancelled);
+        assert_eq!(trace.title, "等待验证");
+        assert_eq!(trace.call_id, "cancel-parent");
+        assert!(trace.error.is_some());
     }
 }

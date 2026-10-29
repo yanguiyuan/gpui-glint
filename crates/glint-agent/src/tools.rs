@@ -18,6 +18,8 @@ pub struct ToolCall {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<crate::subagent::Trace>,
     pub call: ToolCall,
     pub result: String,
     pub success: bool,
@@ -27,6 +29,8 @@ pub struct ToolRecord {
 }
 
 pub enum ToolEvent {
+    SubagentUpdated,
+    ApprovalResolved,
     ContextUsage {
         provider_id: Uuid,
         model: String,
@@ -40,6 +44,7 @@ pub enum ToolEvent {
         output: String,
     },
     Approval {
+        agent_id: Option<Uuid>,
         call: ToolCall,
         respond: tokio::sync::oneshot::Sender<bool>,
     },
@@ -76,6 +81,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub subagents: crate::subagent::Registry,
     pub delegation: crate::subagent::Delegation,
     pub mcp: crate::mcp::Client,
     pub skills: Arc<crate::skills::Catalog>,
@@ -121,7 +127,7 @@ pub fn definitions(anthropic: bool) -> Value {
         definition(
             "subagent",
             "Delegate a self-contained task to a subagent using the current model and a fresh conversation. Supply all necessary context in task. Waits for the result (120 second limit); at most 8 tasks per user request. Shares project files and the current approval policy. The subagent cannot create further subagents.",
-            json!({"task":string()}),
+            json!({"task":string(),"title":{"type":"string","description":"Short task title for the subagent list, up to 28 characters."}}),
             &["task"],
         ),
         definition(
@@ -318,12 +324,15 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
             context
                 .events
                 .send(ToolEvent::Approval {
+                    agent_id: None,
                     call: call.clone(),
                     respond,
                 })
                 .await
                 .map_err(|_| "界面已关闭")?;
-            if !response.await.unwrap_or(false) {
+            let approved = response.await.unwrap_or(false);
+            let _ = context.events.try_send(ToolEvent::ApprovalResolved);
+            if !approved {
                 return Err("用户拒绝了此工具调用".into());
             }
         }
@@ -335,6 +344,19 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
         Ok(result) | Err(result) => result,
     };
     let record = ToolRecord {
+        subagent: if call.name == "subagent"
+            && matches!(context.delegation, crate::subagent::Delegation::Root(_))
+        {
+            context.subagents.lock().ok().and_then(|traces| {
+                traces
+                    .iter()
+                    .rev()
+                    .find(|trace| trace.call_id == call.id)
+                    .cloned()
+            })
+        } else {
+            None
+        },
         call,
         result,
         success,
@@ -842,6 +864,7 @@ mod tests {
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
             delegation: Default::default(),
+            subagents: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(
                 directory.path().join("sessions.json"),
@@ -906,6 +929,7 @@ mod tests {
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
             delegation: Default::default(),
+            subagents: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(anchor.clone())),
             memory: crate::memory::Repository::new(anchor),
@@ -970,6 +994,7 @@ mod tests {
         let (events, _) = async_channel::unbounded();
         let context = ToolContext {
             delegation: Default::default(),
+            subagents: Default::default(),
             mcp: Default::default(),
             skills: Arc::new(manager.catalog_with_home(None, None).unwrap()),
             memory: crate::memory::Repository::new(anchor),

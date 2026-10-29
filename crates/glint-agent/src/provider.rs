@@ -1100,6 +1100,7 @@ mod tests {
                 let (events, _receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
                     delegation: Default::default(),
+                    subagents: Default::default(),
                     mcp: Default::default(),
                     skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                         directory.path().join("sessions.json"),
