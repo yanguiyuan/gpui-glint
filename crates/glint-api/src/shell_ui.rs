@@ -4,6 +4,11 @@ use super::*;
 
 impl Workbench {
     pub(super) fn topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let request_controls = !self.show_vault
+            && !self.show_proxies
+            && !self.show_mcp
+            && !self.show_plugins
+            && !self.show_environments;
         div()
             .size_full()
             .flex()
@@ -13,8 +18,16 @@ impl Workbench {
             .pr_3()
             .text_size(px(12.))
             .child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("Glint API"))
-            .child(self.workspace_trigger(cx))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                if self.host_navigation.is_some() {
+                    "Glint Workbench"
+                } else {
+                    "Glint API"
+                },
+            ))
+            .when(!self.show_vault, |bar| {
+                bar.child(self.workspace_trigger(cx))
+            })
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
@@ -49,63 +62,68 @@ impl Workbench {
                     }),
             )
             .child(gpui_glint::components::window_drag_region())
-            .child(
-                div()
-                    .id("open-command-search")
-                    .w(px(240.))
-                    .h(px(30.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(rgb(self.theme.palette().border))
-                    .bg(rgb(self.theme.palette().panel))
-                    .text_color(rgb(self.theme.palette().text_muted))
-                    .text_size(px(11.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(self.theme.palette().surface)))
-                    .child(Icon::Search.render(15.).flex_shrink_0())
-                    .child(div().flex_1().child("搜索命令与请求"))
-                    .child(div().flex_shrink_0().text_size(px(10.)).child(
-                        if cfg!(target_os = "macos") {
-                            "⌘ K"
-                        } else {
-                            "Ctrl K"
-                        },
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_commands(window, cx))),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .debug_selector(|| "global-environment-selector".into())
-                    .child(self.environment.clone()),
-            )
-            .child(self.background_tasks_menu(cx))
-            .when(
-                !self.show_vault && !self.show_environments && !self.show_plugins && !self.show_mcp,
-                |bar| {
-                    bar.child(
-                        IconButton::new(Icon::Sidebar, "展开或收起记录")
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(editor) = this.shared_request_editor(this.active) {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.show_activity = !editor.show_activity;
-                                        cx.notify();
-                                    });
-                                } else {
-                                    this.show_activity = !this.show_activity;
-                                }
-                                cx.notify();
-                            })),
-                    )
-                },
-            )
+            .when(request_controls, |bar| {
+                bar.child(
+                    div()
+                        .id("open-command-search")
+                        .w(px(240.))
+                        .h(px(30.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(self.theme.palette().border))
+                        .bg(rgb(self.theme.palette().panel))
+                        .text_color(rgb(self.theme.palette().text_muted))
+                        .text_size(px(11.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(self.theme.palette().surface)))
+                        .child(Icon::Search.render(15.).flex_shrink_0())
+                        .child(div().flex_1().child("搜索命令与请求"))
+                        .child(div().flex_shrink_0().text_size(px(10.)).child(
+                            if cfg!(target_os = "macos") {
+                                "⌘ K"
+                            } else {
+                                "Ctrl K"
+                            },
+                        ))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_commands(window, cx)),
+                        ),
+                )
+            })
+            .when(request_controls, |bar| {
+                bar.child(
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| "global-environment-selector".into())
+                        .child(self.environment.clone()),
+                )
+            })
+            .when(request_controls, |bar| {
+                bar.child(self.background_tasks_menu(cx))
+            })
+            .when(request_controls, |bar| {
+                bar.child(
+                    IconButton::new(Icon::Sidebar, "展开或收起记录")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(editor) = this.shared_request_editor(this.active) {
+                                editor.update(cx, |editor, cx| {
+                                    editor.show_activity = !editor.show_activity;
+                                    cx.notify();
+                                });
+                            } else {
+                                this.show_activity = !this.show_activity;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
     }
 
     pub(super) fn rail(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -730,7 +748,12 @@ impl Render for Workbench {
             content.into_any_element()
         } else {
             AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
-                .navigation_rail(self.rail(cx))
+                .navigation_rail(
+                    self.host_navigation
+                        .clone()
+                        .map(|rail| rail.into_any_element())
+                        .unwrap_or_else(|| self.rail(cx).into_any_element()),
+                )
                 .navigation_rail_width(46.)
                 .sidebar_visible(!self.show_vault)
                 .sidebar_width(self.sidebar_width)
@@ -875,7 +898,10 @@ impl Render for Workbench {
                 if this.request_binding.is_some() {
                     // An embedded shared editor uses the main window's workspace
                     // commands; standalone request windows keep their local palette.
-                    if w.window_handle().downcast::<Workbench>().is_some() {
+                    if w.window_handle()
+                        .downcast::<request_window::RequestWindow>()
+                        .is_none()
+                    {
                         cx.propagate();
                         return;
                     }

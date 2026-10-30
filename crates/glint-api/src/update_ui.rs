@@ -184,6 +184,10 @@ impl Workbench {
         true
     }
     pub(super) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        // An embedded module cannot install a release for the standalone application.
+        if self.host_navigation.is_some() {
+            return;
+        }
         if self.update_state.busy() || matches!(self.update_state, UpdateState::Ready { .. }) {
             return;
         }

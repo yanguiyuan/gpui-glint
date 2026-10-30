@@ -516,7 +516,7 @@ pub(super) struct SharedRequest {
     _subscription: Subscription,
 }
 
-struct RequestWindow {
+pub(super) struct RequestWindow {
     editor: Entity<Workbench>,
     _subscription: Subscription,
 }

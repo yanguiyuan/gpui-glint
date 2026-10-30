@@ -30,7 +30,8 @@ pub(super) struct PairInput {
     pub(super) note: Entity<TextEntry>,
     pub(super) expires_in: Entity<TextEntry>,
 }
-pub(super) struct Workbench {
+pub struct Workbench {
+    pub(super) host_navigation: Option<gpui::AnyView>,
     pub(super) request_editors: HashMap<String, request_window::SharedRequest>,
     pub(super) request_binding: Option<request_window::Binding>,
     pub(super) directory_settings: Option<Entity<directory_ui::DirectorySettings>>,
@@ -712,6 +713,7 @@ impl Workbench {
             request_editors: Default::default(),
             request_binding: None,
             toasts: cx.new(|_| ToastHost::new()),
+            host_navigation: None,
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
             show_update_details: false,

@@ -3252,6 +3252,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "glint-workbench"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "glint-agent",
+ "glint-api",
+ "gpui-ce",
+ "gpui-glint",
+ "gpui_ce_platform",
+ "serde_json",
+ "tokio",
+ "winresource",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

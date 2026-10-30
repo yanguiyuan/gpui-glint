@@ -492,7 +492,7 @@ impl Request {
                 }
                 messages.insert(0, json!({"role":"system","content":context.mcp.instructions()}));
                 if let Err(error) = context.mcp.prepare(context.root.as_deref()).await {
-                    messages.insert(0, json!({"role":"system","content":format!("本次 MCP 连接失败，MCP 工具不可用，可通过配置工具修复：{error}")}));
+                    messages.insert(0, json!({"role":"system","content":format!("本次外部 MCP 连接失败，外部 MCP 工具不可用，可通过配置工具修复；已注册的内置工作台工具仍可使用：{error}")}));
                 }
             }
             if config.kind == Kind::ChatGpt {

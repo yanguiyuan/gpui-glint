@@ -347,7 +347,12 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
     let _ = context.events.send(ToolEvent::Started(call.clone())).await;
     let result = async {
         let access = *context.access.lock().map_err(|_| "无法读取权限设置")?;
-        if access == AccessMode::Ask && needs_approval(&call) {
+        if access == AccessMode::Ask
+            && (needs_approval(&call)
+                || context
+                    .mcp
+                    .host_requires_approval(&call.name, &call.arguments))
+        {
             let (respond, response) = tokio::sync::oneshot::channel();
             context
                 .events
@@ -428,6 +433,12 @@ pub(crate) fn resolve_file(
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
+    if context.mcp.has_host_tool(&call.name) {
+        return context
+            .mcp
+            .call_host(&call.id, &call.name, &call.arguments)
+            .await;
+    }
     if call.name == "todo_read" {
         let todos = context.todos.lock().map_err(|_| "无法读取任务清单")?;
         return serde_json::to_string(&*todos).map_err(|_| "无法编码任务清单".into());

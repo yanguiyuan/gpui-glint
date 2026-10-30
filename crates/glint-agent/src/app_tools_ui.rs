@@ -111,6 +111,17 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     let args = &record.call.arguments;
     let path = args["path"].as_str().unwrap_or(".");
     let (icon, action, target) = match record.call.name.as_str() {
+        name if name.starts_with("glint_") => (
+            Icon::ApiDoc,
+            if running {
+                "正在操作 API 工作区"
+            } else if success {
+                "API 工具已完成"
+            } else {
+                "API 工具执行失败"
+            },
+            name.trim_start_matches("glint_").into(),
+        ),
         "todo_read" | "todo_write" => (
             Icon::Workflow,
             if running {
