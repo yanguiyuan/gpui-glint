@@ -46,9 +46,9 @@ mod tests {
         let config = directory.path().join("mcp.json");
         std::fs::write(&config, "invalid external MCP config").unwrap();
         let count = Arc::new(AtomicUsize::new(0));
-        let mcp = crate::mcp::Client::new(config)
+        let mcp = crate::tool_registry::ToolRegistry::new(config)
             .with_host_tools(Some(Arc::new(FakeTools(count.clone()))));
-        assert!(mcp.prepare(None).await.is_err());
+        assert!(mcp.remote.prepare(None).await.is_err());
         assert!(mcp.instructions().contains("内置 Glint API"));
         let (events, receiver) = async_channel::unbounded();
         let mut context = ToolContext {
@@ -56,7 +56,7 @@ mod tests {
             todos: Default::default(),
             subagents: Default::default(),
             delegation: Default::default(),
-            mcp,
+            registry: mcp,
             skills: Arc::new(crate::skills::Catalog::empty(path.clone())),
             memory: crate::memory::Repository::new(path),
             access: Arc::new(Mutex::new(AccessMode::Ask)),
@@ -169,6 +169,8 @@ mod tests {
                 .iter()
                 .any(|tool| tool["name"] == "glint_workspace_get")
         );
-        assert!(!crate::mcp::Client::default().has_host_tool("glint_workspace_get"));
+        assert!(
+            !crate::tool_registry::ToolRegistry::default().has_host_tool("glint_workspace_get")
+        );
     }
 }

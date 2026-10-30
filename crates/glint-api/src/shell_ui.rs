@@ -595,9 +595,6 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.vault.update(cx, |vault, cx| {
-            vault.set_host_state(self.page == crate::Page::Vault, self.theme, cx)
-        });
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         {
             self.activate_html_window(window, cx);

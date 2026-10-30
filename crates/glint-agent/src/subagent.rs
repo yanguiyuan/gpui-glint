@@ -355,7 +355,7 @@ mod tests {
             subagents: Default::default(),
             todos: Default::default(),
             steering: None,
-            mcp: Default::default(),
+            registry: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(path.join("sessions.json"))),
             memory: crate::memory::Repository::new(path.join("sessions.json")),
             access: Arc::new(Mutex::new(AccessMode::Ask)),

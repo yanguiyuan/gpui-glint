@@ -17,6 +17,7 @@ use gpui_glint::{
 use navigation::{Action, Navigation, Route};
 
 struct Workbench {
+    vault: Entity<glint_vault::VaultPage>,
     _api_tools_task: gpui::Task<()>,
     api: Entity<glint_api::Workbench>,
     agent: Entity<glint_agent::AgentWorkspace>,
@@ -51,14 +52,34 @@ impl Workbench {
                 .navigation_rail_width(46.)
                 .into_any_element()
         });
-        let api = cx.new(|cx| glint_api::Workbench::hosted(shell.clone(), cx));
+        let vault = cx.new(|cx| {
+            glint_vault::VaultPage::new(glint_vault::default_path(), ThemePreset::Moonstone, cx)
+        });
+        let api = cx.new(|cx| {
+            glint_api::Workbench::hosted_with_vault(shell.clone(), Some(vault.clone()), cx)
+        });
         let (tools, api_tools_task) = api_tools::ApiTools::connect(&api, cx);
         let agent = cx.new(|cx| {
-            let mut agent = glint_agent::AgentWorkspace::hosted(shell.clone(), cx);
+            let mut agent = glint_agent::AgentWorkspace::hosted_with_vault(
+                shell.clone(),
+                Some(vault.clone()),
+                cx,
+            );
             agent.set_host_tools(tools);
             agent
         });
         let subscriptions = vec![
+            cx.subscribe_in(
+                &vault,
+                window,
+                |this, _, _: &glint_vault::VaultEvent, window, cx| {
+                    this.dispatch(
+                        Action::Navigate(Route::Api(glint_api::Page::Vault)),
+                        window,
+                        cx,
+                    );
+                },
+            ),
             cx.subscribe_in(
                 &navigation,
                 window,
@@ -67,23 +88,36 @@ impl Workbench {
                 },
             ),
             cx.observe(&api, |this, _, cx| {
-                if matches!(this.route, Route::Api(_)) {
-                    this.route = Route::Api(this.api.read(cx).page());
+                let route = if matches!(this.route, Route::Api(_)) {
+                    Route::Api(this.api.read(cx).page())
+                } else {
+                    this.route
+                };
+                let theme = this.api.read(cx).host_theme();
+                if route != this.route || theme != this.theme {
+                    this.route = route;
+                    this.sync_theme(theme, cx);
+                    this.sync_navigation(cx);
+                    cx.notify();
                 }
-                this.sync_theme(this.api.read(cx).host_theme(), cx);
-                this.sync_navigation(cx);
-                cx.notify();
             }),
             cx.observe(&agent, |this, _, cx| {
-                if matches!(this.route, Route::Agent(_)) {
-                    this.route = Route::Agent(this.agent.read(cx).page());
+                let route = if matches!(this.route, Route::Agent(_)) {
+                    Route::Agent(this.agent.read(cx).page())
+                } else {
+                    this.route
+                };
+                let theme = this.agent.read(cx).host_theme();
+                if route != this.route || theme != this.theme {
+                    this.route = route;
+                    this.sync_theme(theme, cx);
+                    this.sync_navigation(cx);
+                    cx.notify();
                 }
-                this.sync_theme(this.agent.read(cx).host_theme(), cx);
-                this.sync_navigation(cx);
-                cx.notify();
             }),
         ];
         Self {
+            vault,
             _api_tools_task: api_tools_task,
             api,
             agent,
@@ -135,6 +169,16 @@ impl Workbench {
     }
 
     fn sync_navigation(&self, cx: &mut Context<Self>) {
+        self.vault.update(cx, |vault, cx| {
+            vault.set_host_state(
+                matches!(
+                    self.route,
+                    Route::Api(glint_api::Page::Vault) | Route::Agent(glint_agent::Page::Vault)
+                ),
+                self.theme,
+                cx,
+            );
+        });
         self.navigation.update(cx, |navigation, cx| {
             navigation.set_state(self.route, self.theme, cx)
         });

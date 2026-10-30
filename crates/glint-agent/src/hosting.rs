@@ -15,7 +15,15 @@ impl AgentWorkspace {
         self.host_tools = Some(tools);
     }
     pub fn hosted(shell: gpui_glint::components::ShellRenderer, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::new(cx);
+        Self::hosted_with_vault(shell, None, cx)
+    }
+
+    pub fn hosted_with_vault(
+        shell: gpui_glint::components::ShellRenderer,
+        vault: Option<Entity<glint_vault::VaultPage>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::with_path_vault(history_path(), vault, cx);
         this.host_shell = Some(shell);
         this
     }
@@ -77,8 +85,15 @@ mod tests {
             r#"{"providers":[],"active":null,"active_model":""}"#,
         )
         .unwrap();
+        let vault = cx.new(|cx| {
+            glint_vault::VaultPage::new(directory.path().join("vault"), ThemePreset::Moonstone, cx)
+        });
         let (host, window) = cx.add_window_view(|_, cx| {
-            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            let mut host = AgentWorkspace::with_path_vault(
+                directory.path().join("sessions.json"),
+                Some(vault.clone()),
+                cx,
+            );
             host.host_shell = Some(std::rc::Rc::new(|slots| {
                 gpui_glint::components::AppLayout::from_slots(slots)
                     .navigation_rail(div().debug_selector(|| "host-navigation".into()))
@@ -99,6 +114,7 @@ mod tests {
                 window.update(|window, cx| assert!(host.read(cx).focus.is_focused(window)));
             }
             host.read_with(window, |host, cx| {
+                assert_eq!(host.vault.entity_id(), vault.entity_id());
                 assert_eq!(host.page(), page);
                 assert_eq!(host.history.active, session);
                 assert_eq!(host.composer.entity_id(), composer);

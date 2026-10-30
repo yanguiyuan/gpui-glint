@@ -2,6 +2,22 @@ use super::*;
 use gpui_glint::components::Switch;
 use std::sync::Arc;
 
+// Windows canonicalization adds extended-length syntax for file access. Keep
+// that path internally, but show familiar drive/UNC paths in settings labels.
+fn display_skill_path(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{share}");
+    }
+    if let Some(drive) = path.strip_prefix(r"\\?\") {
+        let bytes = drive.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\" {
+            return drive.to_owned();
+        }
+    }
+    path.into_owned()
+}
+
 // Metadata is shown above the instructions. Keep YAML descriptions from
 // becoming accidental Markdown headings in the reading pane.
 fn skill_instructions(source: &str) -> &str {
@@ -59,7 +75,6 @@ pub struct State {
     search: Entity<TextEntry>,
     notice: Option<String>,
     selected: Option<(String, Result<String, String>)>,
-    detail_scroll: ScrollHandle,
 }
 impl State {
     pub fn set_theme(&self, theme: ThemePreset, cx: &mut Context<AgentWorkspace>) {
@@ -75,7 +90,6 @@ impl State {
             search,
             notice: None,
             selected: None,
-            detail_scroll: ScrollHandle::new(),
         }
     }
 }
@@ -189,7 +203,9 @@ impl AgentWorkspace {
         if let Some(catalog) = &self.skills_ui.catalog {
             let content = catalog.preview(&id);
             self.skills_ui.selected = Some((id, content));
-            self.skills_ui.detail_scroll = ScrollHandle::new();
+            self.markdown_views
+                .borrow_mut()
+                .remove("skill-settings-preview");
             cx.notify();
         }
     }
@@ -202,8 +218,9 @@ impl AgentWorkspace {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_6()
+            .gap_2()
+            .px_4()
+            .py_3()
             .border_b_1()
             .border_color(rgb(p.border))
             .child(
@@ -213,10 +230,19 @@ impl AgentWorkspace {
                     .gap_3()
                     .child(
                         div()
-                            .flex_1()
-                            .text_size(px(24.))
+                            .flex_shrink_0()
+                            .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("技能"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .text_ellipsis()
+                            .child("查看技能指令，提问时用 $技能名 指定使用"),
                     )
                     .child(
                         Button::new(if state.task.is_some() {
@@ -224,22 +250,21 @@ impl AgentWorkspace {
                         } else {
                             "刷新技能"
                         })
+                        .size(gpui_glint::components::ButtonSize::Small)
                         .kind(ButtonKind::Gray)
                         .theme(self.theme)
                         .render()
+                        .flex_shrink_0()
                         .on_click(cx.listener(|this, _, _, cx| this.reload_skills(cx))),
                     )
                     .child(
                         Button::new("添加技能目录")
+                            .size(gpui_glint::components::ButtonSize::Small)
                             .theme(self.theme)
                             .render()
+                            .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| this.choose_skills_root(cx))),
                     ),
-            )
-            .child(
-                div()
-                    .text_color(rgb(p.text_muted))
-                    .child("点击技能查看指令，在提问中用 $技能名 指定使用。"),
             )
             .when_some(state.notice.clone(), |page, notice| {
                 page.child(
@@ -379,7 +404,7 @@ impl AgentWorkspace {
                             div()
                                 .text_size(px(10.))
                                 .text_color(rgb(p.text_muted))
-                                .child(format!("{source} · {}", path.display())),
+                                .child(format!("{source} · {}", display_skill_path(path))),
                         )
                         .when(source == "自定义", |row| {
                             row.child(
@@ -524,11 +549,16 @@ impl AgentWorkspace {
             let mut body = div()
                 .id("skill-detail-scroll")
                 .debug_selector(|| "skill-detail-scroll".into())
-                .track_scroll(&state.detail_scroll)
                 .flex_1()
                 .min_h_0()
+                .flex()
+                .flex_col();
+            let metadata = div()
+                .id("skill-detail-metadata")
+                .flex_shrink_0()
+                .max_h(px(160.))
                 .overflow_y_scroll()
-                .p_6()
+                .p_4()
                 .child(
                     div()
                         .mb_4()
@@ -549,13 +579,16 @@ impl AgentWorkspace {
                         .mb_4()
                         .text_size(px(10.))
                         .text_color(rgb(p.text_muted))
-                        .child(skill.root.join("SKILL.md").display().to_string()),
+                        .child(display_skill_path(&skill.root.join("SKILL.md"))),
                 );
+            body = body.child(metadata);
             body = match content {
-                Ok(text) => body.child(self.markdown_text(
-                    "skill-settings-preview".into(),
-                    skill_instructions(text),
-                    cx,
+                Ok(text) => body.child(div().flex_1().min_h_0().child(
+                    self.scrollable_markdown_text(
+                        "skill-settings-preview".into(),
+                        skill_instructions(text),
+                        cx,
+                    ),
                 )),
                 Err(error) => body.child(
                     div()
@@ -613,6 +646,89 @@ mod tests {
             "---\nname: incomplete"
         );
     }
+    struct SkillPage(Entity<AgentWorkspace>);
+    impl Render for SkillPage {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(1100.))
+                .h(px(700.))
+                .child(self.0.update(cx, |workspace, cx| workspace.skills_page(cx)))
+        }
+    }
+
+    #[gpui::test]
+    fn long_skill_uses_bounded_preview_and_switching_replaces_its_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("sessions.json");
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let manager = skills::Manager::new(anchor.clone());
+        let root = manager.user_root().join("long-skill");
+        std::fs::create_dir_all(&root).unwrap();
+        let instructions = (0..120).map(|index| format!("## Section {index}\n\nText **details** {index}.\n\n| Key | Value |\n| --- | --- |\n| Row | {index} |")).collect::<Vec<_>>().join("\n\n");
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: long-skill\ndescription: Long document\n---\n{instructions}"),
+        )
+        .unwrap();
+        let catalog = manager.catalog_with_home(None, None).unwrap();
+        let id = catalog
+            .skills
+            .iter()
+            .find(|skill| skill.name == "long-skill")
+            .unwrap()
+            .id
+            .clone();
+        let workspace = cx.new(|cx| {
+            let mut workspace = AgentWorkspace::with_path(anchor, cx);
+            workspace.skills_ui.catalog = Some(Arc::new(catalog));
+            workspace.open_skill_preview(id.clone(), cx);
+            workspace
+        });
+        let (_, window) = cx.add_window_view(|_, _| SkillPage(workspace.clone()));
+        window.run_until_parked();
+        let viewport = window
+            .debug_bounds("glass-document-scroll-preview")
+            .unwrap();
+        assert!(viewport.size.height > px(100.) && viewport.size.height < px(700.));
+        assert!(window.debug_bounds("glass-document-preview").is_none());
+        let first = workspace.update(window, |workspace, cx| {
+            let editor = workspace.scrollable_markdown_text(
+                "skill-settings-preview".into(),
+                &instructions,
+                cx,
+            );
+            assert!(editor.read(cx).markdown().contains("Section 119"));
+            editor
+        });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-1800.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        workspace.update(window, |workspace, cx| {
+            let cached = workspace.scrollable_markdown_text(
+                "skill-settings-preview".into(),
+                &instructions,
+                cx,
+            );
+            assert_eq!(cached.entity_id(), first.entity_id());
+            workspace.open_skill_preview(id, cx);
+            let reopened = workspace.scrollable_markdown_text(
+                "skill-settings-preview".into(),
+                &instructions,
+                cx,
+            );
+            assert_ne!(reopened.entity_id(), first.entity_id());
+        });
+    }
+
     struct Preview {
         composer: Entity<Composer>,
         _subscription: Subscription,

@@ -58,6 +58,7 @@ pub struct Workbench {
     pub(super) theme: ThemePreset,
 
     pub(super) vault: Entity<glint_vault::VaultPage>,
+    pub(super) host_owns_vault: bool,
     pub(super) current_collection: usize,
     pub(super) show_collection_menu: bool,
     pub(super) current_directory: String,
@@ -284,7 +285,16 @@ impl Workbench {
 
     pub(super) fn with_workspace(
         storage: storage::Store,
+        data: storage::Workspace,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_workspace_vault(storage, data, None, cx)
+    }
+
+    pub(super) fn with_workspace_vault(
+        storage: storage::Store,
         mut data: storage::Workspace,
+        vault: Option<Entity<glint_vault::VaultPage>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let migrated_proxies = data.migrate_proxies();
@@ -734,8 +744,15 @@ impl Workbench {
             focus: cx.focus_handle(),
             theme: ThemePreset::Moonstone,
 
-            vault: cx.new(|cx| {
-                glint_vault::VaultPage::new(glint_vault::default_path(), ThemePreset::Moonstone, cx)
+            host_owns_vault: vault.is_some(),
+            vault: vault.unwrap_or_else(|| {
+                cx.new(|cx| {
+                    glint_vault::VaultPage::new(
+                        glint_vault::default_path(),
+                        ThemePreset::Moonstone,
+                        cx,
+                    )
+                })
             }),
             current_collection: 0,
             show_collection_menu: false,
@@ -953,11 +970,20 @@ impl Workbench {
             std::future::ready(())
         }));
         this.set_theme(ThemePreset::Moonstone, cx);
+        this.subscriptions.push(cx.observe_self(|this, cx| {
+            if !this.host_owns_vault {
+                this.vault.update(cx, |vault, cx| {
+                    vault.set_host_state(this.page == crate::Page::Vault, this.theme, cx);
+                });
+            }
+        }));
         this.subscriptions.push(cx.subscribe(
             &this.vault,
             |this, _, _: &glint_vault::VaultEvent, cx| {
-                this.page = crate::Page::Vault;
-                cx.notify();
+                if !this.host_owns_vault {
+                    this.page = crate::Page::Vault;
+                    cx.notify();
+                }
             },
         ));
         this

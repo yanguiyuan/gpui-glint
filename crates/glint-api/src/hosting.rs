@@ -100,6 +100,7 @@ mod tests {
                 matches!(page, Page::Requests | Page::History)
             );
         }
+        let vault_id = host.read_with(window, |host, _| host.vault.entity_id());
         let shell = host.read_with(window, |host, _| host.host_shell.clone().unwrap());
         let workspace_id = host.update(window, |host, _| {
             host.workspace.storage.create_workspace("Second").unwrap()
@@ -112,6 +113,7 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("host-navigation").is_some());
         host.read_with(window, |host, _| {
+            assert_eq!(host.vault.entity_id(), vault_id);
             assert!(std::rc::Rc::ptr_eq(
                 host.host_shell.as_ref().unwrap(),
                 &shell
@@ -167,9 +169,18 @@ impl Workbench {
     /// Uses the existing API store and services, with navigation owned by the host.
     /// API-specific application updates are intentionally only started by `run`.
     pub fn hosted(shell: gpui_glint::components::ShellRenderer, cx: &mut Context<Self>) -> Self {
+        Self::hosted_with_vault(shell, None, cx)
+    }
+
+    pub fn hosted_with_vault(
+        shell: gpui_glint::components::ShellRenderer,
+        vault: Option<Entity<glint_vault::VaultPage>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let path = storage::Store::default_path().expect("无法确定 SQLite 数据目录");
-        let storage = storage::Store::open(&path).expect("无法打开 SQLite 数据库");
-        let mut this = Self::with_store(storage, cx);
+        let mut storage = storage::Store::open(&path).expect("无法打开 SQLite 数据库");
+        let data = storage.load().expect("无法加载 SQLite 工作区");
+        let mut this = Self::with_workspace_vault(storage, data, vault, cx);
         this.host_shell = Some(shell);
         this.start_mcp(cx);
         this

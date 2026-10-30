@@ -34,6 +34,7 @@ mod subagent;
 mod subagent_ui;
 mod titles;
 mod todo;
+mod tool_registry;
 mod tools;
 
 use gpui::{
@@ -70,6 +71,7 @@ pub struct AgentWorkspace {
     calendar: Entity<Calendar>,
 
     vault: Entity<glint_vault::VaultPage>,
+    host_owns_vault: bool,
     schedules: std::sync::Arc<std::sync::Mutex<schedules::ScheduleStore>>,
     schedule_editor: schedule_ui::ScheduleEditor,
     scheduler_task: Option<Task<()>>,
@@ -131,6 +133,14 @@ impl AgentWorkspace {
     }
 
     fn with_path(path: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::with_path_vault(path, None, cx)
+    }
+
+    fn with_path_vault(
+        path: PathBuf,
+        vault: Option<Entity<glint_vault::VaultPage>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (history, storage_error, storage_readable) = match History::load(&path) {
             Ok(history) => (history, None, true),
             Err(error) => (
@@ -455,7 +465,10 @@ impl AgentWorkspace {
             schedules,
             schedule_editor,
 
-            vault: cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx)),
+            host_owns_vault: vault.is_some(),
+            vault: vault.unwrap_or_else(|| {
+                cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx))
+            }),
             scheduler_task: None,
             running_schedule: None,
             tool_listener: None,
@@ -509,11 +522,20 @@ impl AgentWorkspace {
             memory_task: None,
             memory_last_probe: None,
         };
+        workspace._subscriptions.push(cx.observe_self(|this, cx| {
+            if !this.host_owns_vault {
+                this.vault.update(cx, |vault, cx| {
+                    vault.set_host_state(this.page == crate::Page::Vault, this.theme, cx);
+                });
+            }
+        }));
         workspace._subscriptions.push(cx.subscribe(
             &workspace.vault,
             |this, _, _: &glint_vault::VaultEvent, cx| {
-                this.page = crate::Page::Vault;
-                cx.notify();
+                if !this.host_owns_vault {
+                    this.page = crate::Page::Vault;
+                    cx.notify();
+                }
             },
         ));
         workspace.start_storage(cx);
@@ -747,7 +769,7 @@ impl AgentWorkspace {
             todos: self.todo_live.clone(),
             subagents: self.subagent_ui.live.clone(),
             delegation: Default::default(),
-            mcp: mcp::Client::new(self.path.with_file_name("mcp.json"))
+            registry: tool_registry::ToolRegistry::new(self.path.with_file_name("mcp.json"))
                 .with_host_tools(self.host_tools.clone()),
             skills: skills.clone(),
             memory: self.memory.clone(),
@@ -1796,9 +1818,6 @@ impl AgentWorkspace {
 
 impl Render for AgentWorkspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.vault.update(cx, |vault, cx| {
-            vault.set_host_state(self.page == crate::Page::Vault, self.theme, cx)
-        });
         div()
             .relative()
             .size_full()

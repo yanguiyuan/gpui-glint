@@ -69,16 +69,16 @@ Windows 10/11 x64 的安装包由 Inno Setup 6 生成，安装到 `%LOCALAPPDATA
 安装 Rust MSVC 工具链、Visual Studio C++ Build Tools（含 Windows SDK）和 Inno Setup 6 后，在仓库根目录使用系统自带的 Windows PowerShell 5.1（也支持 PowerShell 7）：
 
 ```powershell
-powershell.exe -NoProfile -File crates/glint-api/packaging/windows/build-windows.ps1
+powershell.exe -NoProfile -File packaging/windows/build-windows.ps1 -Product api
 ```
 
 也可在仓库根目录通过 GNU Make 执行同一构建流程：
 
 ```sh
-make win-setup
+make win-installer PRODUCT=api
 ```
 
-Windows 下 Make 默认调用 `powershell.exe`，无需安装 `pwsh`；如需使用 PowerShell 7，可执行 `make win-setup POWERSHELL="C:/path/to/pwsh.exe"`。脚本自动查找 PATH、当前用户安装目录和 Program Files 下的 Inno Setup 6。自定义安装位置可执行 `make win-setup ISCC="C:/path/to/Inno Setup 6/ISCC.exe"`，或直接给 PowerShell 脚本传入 `-IsccPath`。默认读取应用 `Cargo.toml` 的版本号；可用 `VERSION=0.1.6` 显式校验版本，须与清单一致。
+Windows 下 Make 默认调用 `powershell.exe`，无需安装 `pwsh`；如需使用 PowerShell 7，可执行 `make win-installer PRODUCT=api POWERSHELL="C:/path/to/pwsh.exe"`。脚本自动查找 PATH、当前用户安装目录和 Program Files 下的 Inno Setup 6。自定义安装位置可执行 `make win-installer PRODUCT=api ISCC="C:/path/to/Inno Setup 6/ISCC.exe"`，或直接给 PowerShell 脚本传入 `-IsccPath`。默认读取应用 `Cargo.toml` 的版本号；可用 `VERSION=0.1.6` 显式校验版本，须与清单一致。
 
 已下载的 WebView2 bootstrapper 会复用，每次打包仍验证其微软数字签名；首次构建需要联网下载。需要重新下载时，可删除 `target/windows-installer/stage/MicrosoftEdgeWebview2Setup.exe` 后重试。
 

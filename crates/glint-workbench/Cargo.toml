@@ -12,6 +12,7 @@ default = ["webview"]
 webview = ["glint-api/webview"]
 
 [dependencies]
+glint-vault = { path = "../glint-vault" }
 glint-api = { path = "../glint-api", default-features = false }
 glint-agent = { path = "../glint-agent" }
 gpui-glint = { path = "../.." }

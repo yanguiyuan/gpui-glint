@@ -574,15 +574,34 @@ impl AgentWorkspace {
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<gpui_glint::components::DocumentEditor> {
+        let scrollable = key.ends_with(":thinking");
+        self.markdown_preview(key, text, scrollable, cx)
+    }
+
+    pub fn scrollable_markdown_text(
+        &self,
+        key: String,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::DocumentEditor> {
+        self.markdown_preview(key, text, true, cx)
+    }
+
+    fn markdown_preview(
+        &self,
+        key: String,
+        text: &str,
+        scrollable: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::DocumentEditor> {
         let mut cache = self.markdown_views.borrow_mut();
         let theme = self.theme;
-        let thinking = key.ends_with(":thinking");
         let view = cache.entry(key).or_insert_with(|| MarkdownView {
             source: text.into(),
             theme,
             editor: cx.new(|cx| {
                 let editor = gpui_glint::components::DocumentEditor::new(cx, text).theme(theme);
-                if thinking {
+                if scrollable {
                     editor.scrollable_preview()
                 } else {
                     editor.embedded_preview()

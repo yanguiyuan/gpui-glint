@@ -9,22 +9,22 @@
 #endif
 
 [Setup]
-AppId={{7B7931DA-05B8-4E6B-9FD4-F33D82DD4B23}
-AppName=Glint Workbench
+AppId={{{#ProductId}}
+AppName={#ProductName}
 AppVersion={#AppVersion}
 AppPublisher=Yanguiyuan
 AppPublisherURL=https://github.com/yanguiyuan/gpui-glint
-DefaultDirName={localappdata}\Programs\Glint Workbench
-DefaultGroupName=Glint Workbench
+DefaultDirName={localappdata}\Programs\{#ProductName}
+DefaultGroupName={#ProductName}
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
-OutputBaseFilename=Glint-Workbench-{#AppVersion}-windows-x64-setup
-SetupIconFile={#StageDir}\glint-workbench-icon.ico
-UninstallDisplayIcon={app}\glint-workbench.exe
+OutputBaseFilename={#FilePrefix}-{#AppVersion}-windows-x64-setup
+SetupIconFile={#StageDir}\{#IconName}
+UninstallDisplayIcon={app}\{#Executable}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -35,15 +35,15 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#StageDir}\glint-workbench.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\{#Executable}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsWebView2
 
 [Icons]
-Name: "{userdesktop}\Glint Workbench"; Filename: "{app}\glint-workbench.exe"; WorkingDir: "{app}"; IconFilename: "{app}\glint-workbench.exe"; AppUserModelID: "dev.glint.workbench"
-Name: "{userprograms}\Glint Workbench\Glint Workbench"; Filename: "{app}\glint-workbench.exe"; WorkingDir: "{app}"; IconFilename: "{app}\glint-workbench.exe"; AppUserModelID: "dev.glint.workbench"
+Name: "{userdesktop}\{#ProductName}"; Filename: "{app}\{#Executable}"; WorkingDir: "{app}"; IconFilename: "{app}\{#Executable}"; AppUserModelID: "{#ModelId}"
+Name: "{userprograms}\{#ProductName}\{#ProductName}"; Filename: "{app}\{#Executable}"; WorkingDir: "{app}"; IconFilename: "{app}\{#Executable}"; AppUserModelID: "{#ModelId}"
 
 [Run]
-Filename: "{app}\glint-workbench.exe"; Description: "Launch Glint Workbench"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#Executable}"; Description: "Launch {#ProductName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function HasWebView2(Root: Integer; Key: String): Boolean;

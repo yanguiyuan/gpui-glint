@@ -111,9 +111,10 @@ impl Workbench {
         self.workspace_switch_ready(cx)?;
         let (store, data) = self.workspace.storage.prepare_workspace(id)?;
         store.select_workspace()?;
-        let mut next = Self::with_workspace(store, data, cx);
+        let mut next = Self::with_workspace_vault(store, data, Some(self.vault.clone()), cx);
         // Keep application-level services alive; request/editor entities belong to the workspace.
         next.host_shell = self.host_shell.clone();
+        next.host_owns_vault = self.host_owns_vault;
         next.mcp_server = self.mcp_server.take();
         next.mcp_task = self.mcp_task.take();
         next.mcp_error = self.mcp_error.take();

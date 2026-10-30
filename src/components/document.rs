@@ -1714,6 +1714,20 @@ impl DocumentEditor {
         ordered_item: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        // Debug builds have large GPUI element temporaries. Check before entering
+        // the large recursive frame, even for ordinary multi-level skill lists.
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            self.render_nodes_inner(nodes, ordered_item, cx)
+        })
+    }
+
+    #[inline(never)]
+    fn render_nodes_inner(
+        &self,
+        nodes: &[Node],
+        ordered_item: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let theme = self.theme;
         let mut output = div().w_full().min_w_0().flex().flex_col().gap(px(10.));
         let mut index = 0;
@@ -2601,6 +2615,19 @@ fn plain(nodes: &[Node]) -> String {
 }
 impl Render for DocumentEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            self.render_document(window, cx)
+        })
+    }
+}
+
+impl DocumentEditor {
+    #[inline(never)]
+    fn render_document(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         // new() builds the initial child entities before the builder can set a
         // theme. Synchronize those existing views once, before their first paint.
@@ -2932,14 +2959,16 @@ impl Render for DocumentEditor {
                         this.move_block(drag.id, Some(id), cx);
                     }
                 }))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    if *hovered {
-                        this.hovered = Some(id);
-                    } else if this.hovered == Some(id) {
-                        this.hovered = None;
-                    }
-                    cx.notify();
-                }))
+                .when(!self.preview, |row| {
+                    row.on_hover(cx.listener(move |this, hovered, _, cx| {
+                        if *hovered {
+                            this.hovered = Some(id);
+                        } else if this.hovered == Some(id) {
+                            this.hovered = None;
+                        }
+                        cx.notify();
+                    }))
+                })
                 .when(!self.embedded_preview, |row| row.child(handle))
                 .child(content);
             if self.menu == Some(id) {
@@ -3141,6 +3170,32 @@ impl Render for DocumentEditor {
 #[cfg(test)]
 mod tests {
     #[gpui::test]
+    fn nested_skill_lists_render_without_exhausting_the_ui_stack(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let nested = (0..6)
+            .map(|depth| {
+                format!(
+                    "{}- Level {depth} with **text** and `code`",
+                    "    ".repeat(depth)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown = format!(
+            "# Development guide\n\n{nested}\n\n| Kind | Value |\n| --- | --- |\n| List | Nested |\n\n```rust\nfn example() {{}}\n```"
+        );
+        let (document, window) =
+            cx.add_window_view(|_, cx| DocumentEditor::new(cx, &markdown).scrollable_preview());
+        window.run_until_parked();
+        document.read_with(window, |editor, _| {
+            assert!(editor.markdown().contains("Level 5"));
+            assert!(editor.rendered_blocks.contains(&editor.blocks[1].id));
+        });
+        window.simulate_resize(gpui::size(px(700.), px(500.)));
+        window.run_until_parked();
+    }
+
+    #[gpui::test]
     fn bounded_read_only_preview_culls_long_thinking_and_keeps_all_content(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3170,6 +3225,24 @@ mod tests {
             assert_eq!(editor.blocks.len(), 150);
         });
     }
+    #[gpui::test]
+    fn read_only_preview_does_not_track_editing_hover(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let (document, window) = cx.add_window_view(|_, cx| {
+            DocumentEditor::new(cx, "# Skill\n\nRead **instructions**.").scrollable_preview()
+        });
+        window.run_until_parked();
+        let heading = document.read_with(window, |editor, _| {
+            editor.scroll.bounds_for_item(0).unwrap()
+        });
+        window.simulate_event(gpui::MouseMoveEvent {
+            position: heading.center(),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        document.read_with(window, |editor, _| assert!(editor.hovered.is_none()));
+    }
+
     #[gpui::test]
     fn embedded_markdown_uses_content_height_and_hides_document_chrome(
         cx: &mut gpui::TestAppContext,

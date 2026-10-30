@@ -33,7 +33,7 @@ jobs:
           "APP_VERSION=$version" >> $env:GITHUB_ENV
       - name: Build Windows installer
         shell: pwsh
-        run: ./crates/glint-api/packaging/windows/build-windows.ps1 -Version $env:APP_VERSION
+        run: ./packaging/windows/build-windows.ps1 -Product api -Version $env:APP_VERSION
       - name: Test installation, upgrade and uninstall
         shell: pwsh
         env:

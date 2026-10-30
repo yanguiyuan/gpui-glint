@@ -490,8 +490,8 @@ impl Request {
                 if let Some(plan) = plan {
                     messages.insert(0, json!({"role":"system","content":format!("Current execution checklist (historical progress; adjust it to the latest user task using todo_write, or todo_read to inspect it). Only mark work completed after doing and verifying it. {plan}")}));
                 }
-                messages.insert(0, json!({"role":"system","content":context.mcp.instructions()}));
-                if let Err(error) = context.mcp.prepare(context.root.as_deref()).await {
+                messages.insert(0, json!({"role":"system","content":context.registry.instructions()}));
+                if let Err(error) = context.registry.remote.prepare(context.root.as_deref()).await {
                     messages.insert(0, json!({"role":"system","content":format!("本次外部 MCP 连接失败，外部 MCP 工具不可用，可通过配置工具修复；已注册的内置工作台工具仍可使用：{error}")}));
                 }
             }
@@ -1237,7 +1237,7 @@ mod tests {
                     subagents: Default::default(),
                     todos: Default::default(),
                     steering: Some(steering_receiver),
-                    mcp: Default::default(),
+                    registry: Default::default(),
                     skills: std::sync::Arc::new(crate::skills::Catalog::empty(
                         directory.path().join("sessions.json"),
                     )),

@@ -89,7 +89,7 @@ pub struct ToolContext {
     pub todos: crate::todo::Store,
     pub subagents: crate::subagent::Registry,
     pub delegation: crate::subagent::Delegation,
-    pub mcp: crate::mcp::Client,
+    pub registry: crate::tool_registry::ToolRegistry,
     pub skills: Arc<crate::skills::Catalog>,
     pub memory: crate::memory::Repository,
     pub access: Arc<Mutex<AccessMode>>,
@@ -113,7 +113,7 @@ impl ToolContext {
         messages
     }
     pub fn definitions(&self, anthropic: bool) -> Value {
-        let mut definitions = self.mcp.definitions(anthropic);
+        let mut definitions = self.registry.definitions(anthropic);
         if !matches!(self.delegation, crate::subagent::Delegation::Root(_)) {
             definitions.as_array_mut().unwrap().retain(|tool| {
                 let name = if anthropic {
@@ -350,7 +350,7 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
         if access == AccessMode::Ask
             && (needs_approval(&call)
                 || context
-                    .mcp
+                    .registry
                     .host_requires_approval(&call.name, &call.arguments))
         {
             let (respond, response) = tokio::sync::oneshot::channel();
@@ -433,9 +433,9 @@ pub(crate) fn resolve_file(
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
-    if context.mcp.has_host_tool(&call.name) {
+    if context.registry.has_host_tool(&call.name) {
         return context
-            .mcp
+            .registry
             .call_host(&call.id, &call.name, &call.arguments)
             .await;
     }
@@ -458,13 +458,20 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
         };
     }
     if call.name == "mcp_config_read" {
-        return context.mcp.read_config();
+        return context.registry.remote.read_config();
     }
     if call.name == "mcp_config_write" {
-        return context.mcp.write_config(&call.arguments["config"]);
+        return context
+            .registry
+            .remote
+            .write_config(&call.arguments["config"]);
     }
     if call.name.starts_with("mcp_") {
-        return context.mcp.call(&call.name, &call.arguments).await;
+        return context
+            .registry
+            .remote
+            .call(&call.name, &call.arguments)
+            .await;
     }
     let args = &call.arguments;
     if call.name == "skill_list" {
@@ -928,7 +935,7 @@ mod tests {
             subagents: Default::default(),
             todos: Default::default(),
             steering: None,
-            mcp: Default::default(),
+            registry: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(
                 directory.path().join("sessions.json"),
             )),
@@ -1003,7 +1010,7 @@ mod tests {
             subagents: Default::default(),
             todos: Default::default(),
             steering: None,
-            mcp: Default::default(),
+            registry: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(anchor.clone())),
             memory: crate::memory::Repository::new(anchor),
             access: Arc::new(Mutex::new(AccessMode::Ask)),
@@ -1070,7 +1077,7 @@ mod tests {
             subagents: Default::default(),
             todos: Default::default(),
             steering: None,
-            mcp: Default::default(),
+            registry: Default::default(),
             skills: Arc::new(manager.catalog_with_home(None, None).unwrap()),
             memory: crate::memory::Repository::new(anchor),
             access: Arc::new(Mutex::new(AccessMode::Ask)),

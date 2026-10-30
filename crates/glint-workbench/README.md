@@ -13,12 +13,14 @@ cargo run -p glint-workbench
 在 Windows 上安装 Inno Setup 6 后，从仓库根目录执行：
 
 ```sh
-make win-workbench-setup
+make win-installer PRODUCT=workbench
 ```
 
 命令构建 Windows x64 release 程序，打包当前用户安装的 setup，并生成 SHA-256 校验文件。默认版本读取本项目 `Cargo.toml`。产物位于 `target/windows-workbench-installer/output/Glint-Workbench-<版本>-windows-x64-setup.exe`，校验文件为同名 `.exe.sha256`。
 
-与 `win-setup` 相同，支持 `VERSION`、`ISCC`、`POWERSHELL` 覆盖，例如：`make win-workbench-setup VERSION=0.1.0 ISCC="C:/Program Files (x86)/Inno Setup 6/ISCC.exe"`。脚本会校验版本、静态链接 MSVC 运行库，并下载和校验 Microsoft WebView2 安装引导程序。安装目录、快捷方式及卸载标识独立于 Glint API。
+安装流程和 Inno Setup 模板统一位于 `packaging/windows/`，产品名称、安装标识和路径由 `products.psd1` 配置。可用 `powershell -File packaging/windows/build-windows.ps1 -Product workbench -Plan` 只查看构建参数。
+
+支持 `VERSION`、`ISCC`、`POWERSHELL` 覆盖，例如：`make win-installer PRODUCT=workbench VERSION=0.1.0 ISCC="C:/Program Files (x86)/Inno Setup 6/ISCC.exe"`。脚本会校验版本、静态链接 MSVC 运行库，并下载和校验 Microsoft WebView2 安装引导程序。安装目录、快捷方式及卸载标识独立于 Glint API。
 
 ## 导航与顶部栏
 
@@ -32,7 +34,7 @@ API 请求页顶部显示工作区、命令搜索、环境选择、后台任务�
 
 API 和 Agent 提供 `WorkspaceSlots`（顶部栏、侧栏、内容、侧栏尺寸和主题）；Workbench 注入同一个 `ShellRenderer`，统一组装 `AppLayout`、品牌标题、导航及窗口控件。独立应用未注入宿主时自行创建外壳。切换 API 工作区也会保留宿主外壳。
 
-页面状态由各模块的 `Page` 枚举表示，宿主使用 `Route::Api(Page)` / `Route::Agent(Page)`。互斥页面不再通过多个 `show_*` 布尔值组合。主题和导航通过模块通知同步，宿主 `render` 只选择当前模块。
+页面状态由各模块的 `Page` 枚举表示，宿主使用 `Route::Api(Page)` / `Route::Agent(Page)`。互斥页面不再通过多个 `show_*` 布尔值组合。主题和导航通过模块通知同步，宿主 `render` 只选择当前模块。宿主仅在页面或主题变化时刷新导航，流式消息等模块内部更新不再触发整个 Shell 刷新。密码箱主题和显隐通过状态通知更新，不在 render 中更新其他 Entity。
 
 `glint-api/src/workspace_service.rs` 中的 `ApiWorkspace` 持有工作区业务数据、集合／目录／请求与环境操作、版本追加、持久化、工具参数校验和脱敏审计；这些操作不依赖窗口或 GPUI Context。`workspace_adapter.rs` 将工具调用衔接到服务和现有执行器，刷新界面与调用历史。输入控件同步、窗口选择、HTTP／WebSocket 的 GPUI 任务编排以及 `ui_set` 等界面效果仍由适配层处理。
 
@@ -42,13 +44,15 @@ API 和 Agent 提供 `WorkspaceSlots`（顶部栏、侧栏、内容、侧栏尺�
 
 Agent 页面自动注册 Glint API 已有的全部 `glint_*` MCP 工具，可直接查询和修改当前 API 工作区的集合、目录、请求、环境及历史，也可以发送请求并查询执行结果。例如：“创建一个测试集合，新增 GET 请求，然后发送并检查响应”。无需配置 MCP 服务，也无需先打开项目。
 
+`ToolRegistry` 统一组合普通工具、宿主工具和远程工具，缓存每次请求的宿主目录快照；`mcp::Client` 只负责远程 MCP 的连接、发现和调用。工具定义、批准判定和执行使用同一份宿主目录，避免反复构造 catalog。
+
 内置工具通过进程内通道调用当前 API entity，复用 MCP 的参数校验、业务处理、脱敏和调用历史；修改会同步到 API 页面。外部 MCP 配置仍可使用，配置或连接失败不会移除内置 API 工具。兼容 OpenAI、Anthropic 和 ChatGPT Provider，定时任务和子代理沿用同一工具连接。
 
-“请求批准”模式下，写操作、发送请求及显式读取敏感信息需要批准；普通只读操作直接执行。自动批准和完全访问权限模式沿用原有行为。调用会显示在 Agent 工具记录中，API 的 MCP 调用历史中来源标记为 `Glint Workbench Agent`。取消会话后，尚未开始的排队调用不会继续修改工作区；已经启动的 HTTP / WebSocket 任务使用原有 API 工具查询或取消。
+“请求批准”模式下，写操作、发送请求及显式读取敏感信息需要批准；普通只读操作直接执行。自动批准和完全访问权限模式沿用原有行为。调用会显示在 Agent 工具记录中，API 的 MCP 调用历史中来源标记为 `Glint Workbench Agent`。取消会话后，尚未开始的排队调用不会继续修改工作区；已经启动的 HTTP / WebSocket 任务使用原有 API 工具查询或取消。30 秒超时覆盖排队及返回结果：排队超时明确表示未执行；开始执行后等待超时表示结果未确认，提示查询状态／调用历史，避免盲目重试写操作。
 
 ## 数据与兼容性
 
-沿用独立应用的数据目录和凭据存储，无需迁移；`GLINT_API_DB_PATH`、`GLINT_AGENT_DATA_DIR`、`GLINT_VAULT_DATA_DIR` 仍有效。密码箱使用公共入口。
+沿用独立应用的数据目录和凭据存储，无需迁移；`GLINT_API_DB_PATH`、`GLINT_AGENT_DATA_DIR`、`GLINT_VAULT_DATA_DIR` 仍有效。密码箱由宿主创建单个 `VaultPage` 并注入两个模块；切换 API 工作区也复用此实例，保留解锁状态。独立运行的应用仍自行创建密码箱。
 
 Glint Workbench 与 Glint API 共用 API 工作区的进程锁，因此同一 API 数据目录只允许一个程序运行。原有 `cargo run -p glint-api` 和 `cargo run -p glint-agent` 入口保留。
 

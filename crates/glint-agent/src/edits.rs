@@ -115,7 +115,7 @@ mod tests {
             todos: Default::default(),
             subagents: Default::default(),
             delegation: Default::default(),
-            mcp: Default::default(),
+            registry: Default::default(),
             skills: Arc::new(crate::skills::Catalog::empty(path.join("sessions.json"))),
             memory: crate::memory::Repository::new(path.join("sessions.json")),
             access: Arc::new(std::sync::Mutex::new(crate::tools::AccessMode::AutoApprove)),
