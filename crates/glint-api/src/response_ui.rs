@@ -5,7 +5,7 @@ use super::*;
 impl Workbench {
     pub(super) fn trace_view(&self) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
-        let entries = &self.traces[self.active];
+        let entries = &self.workspace.traces[self.active];
         let mut body = div()
             .id("execution-trace-scroll")
             .flex_1()
@@ -285,6 +285,7 @@ impl Workbench {
 
     pub(super) fn sync_request_preview(&mut self, cx: &mut Context<Self>) {
         let content = self
+            .workspace
             .sent_requests
             .get(self.active)
             .and_then(|s| s.as_ref())
@@ -296,7 +297,11 @@ impl Workbench {
 
     pub(super) fn request_view(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        let content = self.sent_requests.get(self.active).and_then(|s| s.clone());
+        let content = self
+            .workspace
+            .sent_requests
+            .get(self.active)
+            .and_then(|s| s.clone());
         let mut view = div().flex_1().min_h_0().flex().flex_col();
         if let Some(content) = content {
             view = view
@@ -461,7 +466,8 @@ impl Workbench {
                 .size(ButtonSize::Mini)
                 .theme(self.theme)
                 .when(
-                    self.sent_curls
+                    self.workspace
+                        .sent_curls
                         .get(self.active)
                         .and_then(|c| c.as_ref())
                         .is_none(),
@@ -491,7 +497,7 @@ impl Workbench {
                         self.trace_started
                             .filter(|_| self.sending.is_some())
                             .map(|started| started.elapsed().as_millis())
-                            .or_else(|| self.requests[self.active]
+                            .or_else(|| self.workspace.requests[self.active]
                                 .history
                                 .get(
                                     self.selected_history

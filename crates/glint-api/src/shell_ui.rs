@@ -4,48 +4,51 @@ use super::*;
 
 impl Workbench {
     pub(super) fn topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let request_controls = !self.show_vault
-            && !self.show_proxies
-            && !self.show_mcp
-            && !self.show_plugins
-            && !self.show_environments;
+        let request_controls = self.page != crate::Page::Vault
+            && self.page != crate::Page::Proxies
+            && self.page != crate::Page::Mcp
+            && self.page != crate::Page::Plugins
+            && self.page != crate::Page::Environments;
         div()
             .size_full()
             .flex()
             .items_center()
             .gap_3()
-            .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
+            .pl(px(if self.host_shell.is_some() {
+                0.
+            } else if cfg!(target_os = "macos") {
+                80.
+            } else {
+                16.
+            }))
             .pr_3()
             .text_size(px(12.))
-            .child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                if self.host_navigation.is_some() {
-                    "Glint Workbench"
-                } else {
-                    "Glint API"
-                },
-            ))
-            .when(!self.show_vault, |bar| {
+            .when(self.host_shell.is_none(), |bar| {
+                bar.child(img(app_icon::image()).size(px(22.)).flex_shrink_0())
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Glint API"))
+            })
+            .when(self.page != crate::Page::Vault, |bar| {
                 bar.child(self.workspace_trigger(cx))
             })
             .child(
                 div()
                     .text_color(rgb(self.theme.palette().text_muted))
-                    .child(if self.show_vault {
+                    .child(if self.page == crate::Page::Vault {
                         "›  密码箱".into()
-                    } else if self.show_proxies {
+                    } else if self.page == crate::Page::Proxies {
                         "›  代理管理".into()
-                    } else if self.show_mcp {
+                    } else if self.page == crate::Page::Mcp {
                         "›  MCP".into()
-                    } else if self.show_plugins {
+                    } else if self.page == crate::Page::Plugins {
                         "›  插件管理".into()
-                    } else if self.show_environments {
+                    } else if self.page == crate::Page::Environments {
                         format!(
                             "›  环境管理  ›  {}",
                             self.environment_name(self.editing_environment)
                         )
                     } else {
-                        self.requests
+                        self.workspace
+                            .requests
                             .get(self.active)
                             .map(|request| {
                                 if request.group.is_empty() {
@@ -139,11 +142,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = false;
-                        this.show_proxies = false;
-                        this.show_mcp = false;
-                        this.show_environments = false;
-                        this.show_plugins = false;
+                        this.page = crate::Page::Requests;
                         this.show_collection_menu = false;
                         cx.notify();
                     })),
@@ -153,11 +152,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = false;
-                        this.show_proxies = false;
-                        this.show_mcp = false;
-                        this.show_plugins = false;
-                        this.show_environments = true;
+                        this.page = crate::Page::Environments;
                         this.editing_environment = this.selected_environment(cx);
                         this.revealed_variables.clear();
                         this.variable_delete = None;
@@ -172,16 +167,12 @@ impl Workbench {
                 IconButton::new(Icon::Shuffle, "代理管理")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_proxies, |button| {
+                    .when(self.page == crate::Page::Proxies, |button| {
                         button.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .debug_selector(|| "open-proxy-manager".into())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = false;
-                        this.show_proxies = true;
-                        this.show_environments = false;
-                        this.show_plugins = false;
-                        this.show_mcp = false;
+                        this.page = crate::Page::Proxies;
                         this.variable_error = None;
                         cx.notify();
                     })),
@@ -198,11 +189,7 @@ impl Workbench {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = false;
-                        this.show_proxies = false;
-                        this.show_mcp = false;
-                        this.show_plugins = false;
-                        this.show_environments = false;
+                        this.page = crate::Page::History;
                         this.activity = 1;
                         this.show_activity = true;
                         cx.notify();
@@ -212,7 +199,7 @@ impl Workbench {
                 IconButton::new(Icon::Workflow, "MCP 调用历史")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_mcp, |button| {
+                    .when(self.page == crate::Page::Mcp, |button| {
                         button.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .debug_selector(|| "open-mcp-history".into())
@@ -222,15 +209,11 @@ impl Workbench {
                 IconButton::new(Icon::Key, "密码箱")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_vault, |button| {
+                    .when(self.page == crate::Page::Vault, |button| {
                         button.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = true;
-                        this.show_proxies = false;
-                        this.show_mcp = false;
-                        this.show_plugins = false;
-                        this.show_environments = false;
+                        this.page = crate::Page::Vault;
                         this.directory_settings = None;
                         cx.notify();
                     })),
@@ -257,7 +240,7 @@ impl Workbench {
                 .p_5()
                 .child("请求已删除、工作区已切换或主窗口已关闭。此窗口已停止编辑和执行。");
         }
-        if self.requests.is_empty() {
+        if self.workspace.requests.is_empty() {
             return div()
                 .size_full()
                 .flex()
@@ -269,7 +252,7 @@ impl Workbench {
                 .text_color(rgb(p.text_muted))
                 .child("暂无请求")
                 .child(
-                    Button::new(if self.collections.is_empty() {
+                    Button::new(if self.workspace.collections.is_empty() {
                         "创建集合"
                     } else {
                         "新建请求"
@@ -286,7 +269,7 @@ impl Workbench {
         let context_owner = select_owner.clone();
         let add_owner = select_owner.clone();
         let tabs = ClosableTabs::new(self.tabs.iter().map(|&i| {
-            let r = &self.requests[i];
+            let r = &self.workspace.requests[i];
             let method = if i == self.active {
                 &draft.method
             } else {
@@ -612,11 +595,8 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.show_proxies || self.show_mcp || self.show_plugins || self.show_environments {
-            self.show_vault = false;
-        }
         self.vault.update(cx, |vault, cx| {
-            vault.set_host_state(self.show_vault, self.theme, cx)
+            vault.set_host_state(self.page == crate::Page::Vault, self.theme, cx)
         });
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         {
@@ -656,10 +636,10 @@ impl Render for Workbench {
                 && self.sending.is_none()
                 && self.error.is_none()
                 && self.response_data.is_some()
-                && !self.show_proxies
-                && !self.show_environments
-                && !self.show_plugins
-                && !self.show_mcp
+                && self.page != crate::Page::Proxies
+                && self.page != crate::Page::Environments
+                && self.page != crate::Page::Plugins
+                && self.page != crate::Page::Mcp
                 && !self.show_curl_import
                 && !self.show_workspaces
                 && self.workspace_transfer.is_none()
@@ -679,15 +659,15 @@ impl Render for Workbench {
             .min_h_0()
             .min_w_0()
             .flex()
-            .child(if self.show_vault {
+            .child(if self.page == crate::Page::Vault {
                 div().size_full().child(self.vault.clone())
-            } else if self.show_proxies {
+            } else if self.page == crate::Page::Proxies {
                 self.proxy_workspace(cx)
-            } else if self.show_mcp {
+            } else if self.page == crate::Page::Mcp {
                 self.mcp_history_workspace(cx)
-            } else if self.show_plugins {
+            } else if self.page == crate::Page::Plugins {
                 self.plugin_workspace(cx)
-            } else if self.show_environments {
+            } else if self.page == crate::Page::Environments {
                 self.environment_workspace(cx)
             } else if let Some(editor) = &self.directory_settings {
                 div().size_full().child(editor.clone())
@@ -696,12 +676,12 @@ impl Render for Workbench {
             })
             .when(
                 self.show_activity
-                    && !self.show_vault
+                    && self.page != crate::Page::Vault
                     && self.shared_request_editor(self.active).is_none()
-                    && !self.show_proxies
-                    && !self.show_environments
-                    && !self.show_plugins
-                    && !self.show_mcp
+                    && self.page != crate::Page::Proxies
+                    && self.page != crate::Page::Environments
+                    && self.page != crate::Page::Plugins
+                    && self.page != crate::Page::Mcp
                     && self.directory_settings.is_none(),
                 |s| s.child(self.activity_panel(cx)),
             );
@@ -713,7 +693,7 @@ impl Render for Workbench {
                 self.request_binding
                     .as_ref()
                     .and_then(|binding| binding.storage_error.clone())
-                    .or_else(|| self.storage_error.clone()),
+                    .or_else(|| self.workspace.storage_error.clone()),
                 |el, error| {
                     el.child(
                         div()
@@ -747,19 +727,23 @@ impl Render for Workbench {
         let shell = if self.request_binding.is_some() {
             content.into_any_element()
         } else {
-            AppLayout::new(self.topbar(cx), self.sidebar(cx), content)
-                .navigation_rail(
-                    self.host_navigation
-                        .clone()
-                        .map(|rail| rail.into_any_element())
-                        .unwrap_or_else(|| self.rail(cx).into_any_element()),
-                )
-                .navigation_rail_width(46.)
-                .sidebar_visible(!self.show_vault)
-                .sidebar_width(self.sidebar_width)
-                .sidebar_resize_handle(resize_handle)
-                .theme(self.theme)
-                .into_any_element()
+            let slots = gpui_glint::components::WorkspaceSlots {
+                topbar: self.topbar(cx).into_any_element(),
+                sidebar: self.sidebar(cx).into_any_element(),
+                content: content.into_any_element(),
+                sidebar_width: self.sidebar_width,
+                sidebar_visible: self.page != crate::Page::Vault,
+                sidebar_resize_handle: Some(resize_handle.into_any_element()),
+                theme: self.theme,
+            };
+            if let Some(shell) = &self.host_shell {
+                shell(slots)
+            } else {
+                AppLayout::from_slots(slots)
+                    .navigation_rail(self.rail(cx))
+                    .navigation_rail_width(46.)
+                    .into_any_element()
+            }
         };
         let overlay = self
             .commands
@@ -818,7 +802,7 @@ impl Render for Workbench {
                 }),
             )
             .on_action(cx.listener(|this, _: &SendRequest, _, cx| {
-                if this.show_vault {
+                if this.page == crate::Page::Vault {
                     cx.stop_propagation();
                     return;
                 }
@@ -832,9 +816,9 @@ impl Render for Workbench {
                 {
                     return;
                 }
-                if !this.show_mcp
-                    && !this.show_plugins
-                    && !this.show_environments
+                if this.page != crate::Page::Mcp
+                    && this.page != crate::Page::Plugins
+                    && this.page != crate::Page::Environments
                     && this.directory_settings.is_none()
                 {
                     if this.ws_connected {
@@ -845,7 +829,7 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveRequest, _, cx| {
-                if this.show_vault {
+                if this.page == crate::Page::Vault {
                     cx.stop_propagation();
                     return;
                 }
@@ -859,9 +843,9 @@ impl Render for Workbench {
                 {
                     return;
                 }
-                if this.show_plugins || this.show_mcp {
+                if this.page == crate::Page::Plugins || this.page == crate::Page::Mcp {
                     return;
-                } else if this.show_environments {
+                } else if this.page == crate::Page::Environments {
                     this.save_environment_variables(cx);
                 } else if let Some(editor) = this.directory_settings.clone() {
                     editor.update(cx, |editor, cx| editor.save(cx));
@@ -870,7 +854,7 @@ impl Render for Workbench {
                 }
             }))
             .on_action(cx.listener(|this, _: &SearchResponse, window, cx| {
-                if this.show_vault {
+                if this.page == crate::Page::Vault {
                     cx.stop_propagation();
                     return;
                 }
@@ -880,9 +864,9 @@ impl Render for Workbench {
                 if this.group_edit.is_none()
                     && !this.show_workspaces
                     && this.workspace_transfer.is_none()
-                    && !this.show_mcp
-                    && !this.show_plugins
-                    && !this.show_environments
+                    && this.page != crate::Page::Mcp
+                    && this.page != crate::Page::Plugins
+                    && this.page != crate::Page::Environments
                     && this.response_data.is_some()
                 {
                     this.response_tab = 0;

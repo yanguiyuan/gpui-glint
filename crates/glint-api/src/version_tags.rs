@@ -7,13 +7,14 @@ impl Workbench {
         };
         let tag = self.version_tag_input.read(cx).value().trim().to_owned();
         if let Some(record) = self
+            .workspace
             .requests
             .get_mut(request)
             .and_then(|r| r.versions.iter_mut().find(|r| r.label == label))
         {
             if record.tag != tag {
                 record.tag = tag;
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
                 self.persist(cx);
             }
         }
@@ -127,6 +128,7 @@ impl Workbench {
                 let _ = owner.update(cx, |this, cx| {
                     if open {
                         let tag = this
+                            .workspace
                             .requests
                             .get(target.0)
                             .and_then(|r| r.versions.iter().find(|r| r.label == target.1))
@@ -189,9 +191,9 @@ mod tests {
         window.simulate_keystrokes("enter");
         host.update(window, |h, cx| {
             assert!(h.version_tag_edit.is_none());
-            assert_eq!(h.requests[0].versions.len(), 2);
-            assert_eq!(h.requests[0].versions[1].label, "v1");
-            assert_eq!(h.requests[0].versions[1].tag, "联调通过 ✅");
+            assert_eq!(h.workspace.requests[0].versions.len(), 2);
+            assert_eq!(h.workspace.requests[0].versions[1].label, "v1");
+            assert_eq!(h.workspace.requests[0].versions[1].tag, "联调通过 ✅");
             assert_eq!(h.snapshot(cx), latest);
             assert_eq!(h.current_versions[0], 0);
         });
@@ -218,7 +220,7 @@ mod tests {
             }
             host.update(window, |h, cx| {
                 assert!(h.version_tag_edit.is_none());
-                assert_eq!(h.requests[0].versions[1].tag, "联调通过 ✅");
+                assert_eq!(h.workspace.requests[0].versions[1].tag, "联调通过 ✅");
                 assert_eq!(h.snapshot(cx), latest);
             });
         }
@@ -231,7 +233,7 @@ mod tests {
         click(window, "save-version-tag");
         assert!(window.debug_bounds("version-tag-1").unwrap().size.width <= px(100.));
         host.update(window, |h, cx| {
-            assert_eq!(h.requests[0].versions[1].tag, long_tag);
+            assert_eq!(h.workspace.requests[0].versions[1].tag, long_tag);
             assert_eq!(h.snapshot(cx), latest);
         });
         click(window, "version-tag-1");

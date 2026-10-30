@@ -107,6 +107,7 @@ impl Workbench {
     pub(super) fn ws_refresh_decoder_select(&mut self, cx: &mut Context<Self>) {
         let mut options = decoder_options(&self.enabled_plugin_catalog());
         if let Some(binding) = self
+            .workspace
             .requests
             .get(self.active)
             .and_then(|r| r.draft.event_decoder.as_ref())
@@ -126,6 +127,7 @@ impl Workbench {
             }
         }
         let selected = self
+            .workspace
             .requests
             .get(self.active)
             .and_then(|r| r.draft.event_decoder.as_ref())
@@ -141,6 +143,7 @@ impl Workbench {
         self.ws_decrypted = None;
         if self.ws_detail_tab == 1
             || self
+                .workspace
                 .requests
                 .get(self.active)
                 .is_some_and(|request| request.draft.event_decoder.is_some())
@@ -158,6 +161,7 @@ impl Workbench {
             return;
         }
         let Some(binding) = self
+            .workspace
             .requests
             .get(self.active)
             .and_then(|r| r.draft.event_decoder.clone())
@@ -215,6 +219,7 @@ impl Workbench {
             return;
         }
         let Some(binding) = self
+            .workspace
             .requests
             .get(self.active)
             .and_then(|request| request.draft.event_decoder.clone())
@@ -231,7 +236,7 @@ impl Workbench {
         let generation = self.ws_decode_generation;
         let catalog = self.enabled_plugin_catalog();
         let variables = self.websocket_variables(cx);
-        let request_id = self.requests[self.active].id.clone();
+        let request_id = self.workspace.requests[self.active].id.clone();
         let expected_binding = binding.clone();
         let expected_variables = variables.0.clone();
         self.ws_sync_detail(cx);
@@ -245,6 +250,7 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| {
                 this.with_ws_request(&request_id, cx, |this, cx| {
                     if this
+                        .workspace
                         .requests
                         .get(this.active)
                         .and_then(|request| request.draft.event_decoder.as_ref())
@@ -277,6 +283,7 @@ impl Workbench {
         }
         if let Some((request_id, record_id, _)) = &self.ws_history {
             if let Some(event) = self
+                .workspace
                 .requests
                 .iter_mut()
                 .find(|request| &request.id == request_id)
@@ -295,7 +302,7 @@ impl Workbench {
                 })
             {
                 event.title = result.as_ref().ok().and_then(|result| result.title.clone());
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
             }
         }
         if self.ws_decode_generation == generation && self.ws_selected == Some(event_id) {
@@ -544,10 +551,10 @@ impl Workbench {
         self.ws_finish_history("WS 已结束");
         self.ws_history = None;
         self.clear_websocket_messages(cx);
-        if let Some(preview) = self.sent_requests.get_mut(self.active) {
+        if let Some(preview) = self.workspace.sent_requests.get_mut(self.active) {
             *preview = None;
         }
-        let Some(request) = self.requests.get(self.active) else {
+        let Some(request) = self.workspace.requests.get(self.active) else {
             return;
         };
         let request_id = request.id.clone();
@@ -579,7 +586,7 @@ impl Workbench {
             },
         );
         self.ws_history = Some((request_id, record_id, Instant::now()));
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
     }
     fn ws_record_event(&mut self) {
         let Some((request_id, record_id, _)) = &self.ws_history else {
@@ -588,10 +595,15 @@ impl Workbench {
         let Some(event) = self.ws_log.back().cloned() else {
             return;
         };
-        let Some(index) = self.requests.iter().position(|r| &r.id == request_id) else {
+        let Some(index) = self
+            .workspace
+            .requests
+            .iter()
+            .position(|r| &r.id == request_id)
+        else {
             return;
         };
-        let Some(record) = self.requests[index]
+        let Some(record) = self.workspace.requests[index]
             .history
             .iter_mut()
             .find(|r| &r.id == record_id)
@@ -601,7 +613,7 @@ impl Workbench {
         let Some(exchange) = &mut record.exchange else {
             return;
         };
-        exchange.preview = self.sent_requests[index].clone();
+        exchange.preview = self.workspace.sent_requests[index].clone();
         if event.kind == MessageKind::Error {
             exchange.error = Some(event.payload.clone());
             record.label = "WS 失败".into();
@@ -624,13 +636,14 @@ impl Workbench {
             "WebSocket 会话 · {} 条事件",
             exchange.websocket_events.len()
         );
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
     }
     pub(super) fn ws_finish_history(&mut self, label: &str) {
         let Some((request_id, record_id, started)) = &self.ws_history else {
             return;
         };
         if let Some(record) = self
+            .workspace
             .requests
             .iter_mut()
             .find(|request| &request.id == request_id)
@@ -649,7 +662,7 @@ impl Workbench {
             {
                 record.label = label.into();
             }
-            self.storage_dirty = true;
+            self.workspace.storage_dirty = true;
         }
     }
     pub(super) fn restore_ws_history(&mut self, events: &[WsMessage], cx: &mut Context<Self>) {
@@ -673,7 +686,7 @@ impl Workbench {
         let proxy = self.effective_proxy(environment_index);
         let variables = self.active_environment_values(cx);
         self.ws_environment = Some(variables.clone());
-        let request_id = self.requests[self.active].id.clone();
+        let request_id = self.workspace.requests[self.active].id.clone();
         let prepared = PreparedRequest::new(&draft, &variables)
             .and_then(|request| self.oauth_attach(request, &draft, cx))
             .and_then(|request| request.with_proxy(&proxy))
@@ -701,11 +714,11 @@ impl Workbench {
         };
         self.capture_draft(cx);
         self.config = 3;
-        self.sent_curls[self.active] = None;
-        self.sent_requests[self.active] = Some(request.preview.clone());
+        self.workspace.sent_curls[self.active] = None;
+        self.workspace.sent_requests[self.active] = Some(request.preview.clone());
         self.sync_request_preview(cx);
         self.error = None;
-        self.responses[self.active] = None;
+        self.workspace.responses[self.active] = None;
         self.response_data = None;
         self.response_json = None;
         self.status = None;
@@ -723,7 +736,7 @@ impl Workbench {
             if let Ok(request) = &prepared {
                 let _ = this.update(cx, |this, cx| {
                     this.with_ws_request(&request_id, cx, |this, cx| {
-                        this.sent_requests[this.active] = Some(request.preview.clone());
+                        this.workspace.sent_requests[this.active] = Some(request.preview.clone());
                         if !this.ws_background_update {
                             this.sync_request_preview(cx);
                         }
@@ -1285,7 +1298,7 @@ mod tests {
             host.ws_push(MessageKind::Received, "after clear".into(), cx);
             host.ws_finish_history("WS 已断开");
             host.ws_history = None;
-            let record = &host.requests[0].history[0];
+            let record = &host.workspace.requests[0].history[0];
             assert_eq!(record.exchange.as_ref().unwrap().websocket_events.len(), 4);
             assert_eq!(record.label, "WS 已断开");
             assert!(record.elapsed_ms.is_some());
@@ -1307,9 +1320,9 @@ mod tests {
             host.ws_begin_history(&draft, cx);
             host.ws_push(MessageKind::Error, "connection failed".into(), cx);
             host.ws_finish_history("WS 已断开");
-            assert_eq!(host.requests[0].history[0].label, "WS 失败");
+            assert_eq!(host.workspace.requests[0].history[0].label, "WS 失败");
             assert_eq!(
-                host.requests[0].history[1]
+                host.workspace.requests[0].history[1]
                     .exchange
                     .as_ref()
                     .unwrap()
@@ -1318,15 +1331,15 @@ mod tests {
                 4
             );
             host.persist(cx);
-            host.requests[0].history.remove(0);
+            host.workspace.requests[0].history.remove(0);
             host.ws_push(MessageKind::Received, "ignored deleted record".into(), cx);
-            assert_eq!(host.requests[0].history.len(), 1);
+            assert_eq!(host.workspace.requests[0].history.len(), 1);
         });
         let reopened =
             window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(window, |host, _| {
-            assert_eq!(host.requests[0].history.len(), 2);
-            let events = &host.requests[0].history[1]
+            assert_eq!(host.workspace.requests[0].history.len(), 2);
+            let events = &host.workspace.requests[0].history[1]
                 .exchange
                 .as_ref()
                 .unwrap()
@@ -1499,7 +1512,7 @@ mod tests {
         });
         select.update(window, |_, cx| cx.emit(SelectEvent::Changed(value.into())));
         host.update(window, |host, cx| {
-            assert!(host.requests[0].draft.event_decoder.is_some());
+            assert!(host.workspace.requests[0].draft.event_decoder.is_some());
             host.ws_detail_tab = 1;
             host.ws_decrypted = Some(Ok(r#"{"message":"decrypted"}"#.into()));
             host.ws_sync_detail(cx);

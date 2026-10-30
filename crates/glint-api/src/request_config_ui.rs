@@ -181,7 +181,7 @@ impl Workbench {
                         });
                     })
                     .render().debug_selector(|| "skip-tls-verification".into())))
-                .when(self.requests.get(self.active).is_some_and(|request| request.draft.method == "WS"), |settings| settings
+                .when(self.workspace.requests.get(self.active).is_some_and(|request| request.draft.method == "WS"), |settings| settings
                     .child(self.request_setting_row("事件解密插件", "用于解密当前请求接收的 WebSocket 事件，配置随请求保存。",
                         div().id("websocket-event-decoder").debug_selector(|| "websocket-event-decoder".into()).child(self.ws_decoder_select.clone())))
                     .child(self.request_setting_row("跟随最新事件", "收到新事件时自动选中并滚动到最新一条；手动查看历史事件时临时暂停。",

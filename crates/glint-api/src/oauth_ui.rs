@@ -144,7 +144,7 @@ impl Workbench {
             cx.notify();
             return true;
         }
-        let request_id = self.requests[self.active].id.clone();
+        let request_id = self.workspace.requests[self.active].id.clone();
         let environment = self.selected_environment(cx);
         let proxy = self.effective_proxy(environment);
         self.notice = "检查 OAuth 授权及有效期…".into();
@@ -157,7 +157,7 @@ impl Workbench {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.sending = None;
-                if this.requests.get(this.active).map(|r| &r.id) != Some(&request_id)
+                if this.workspace.requests.get(this.active).map(|r| &r.id) != Some(&request_id)
                     || this.selected_environment(cx) != environment
                     || this.snapshot(cx) != draft
                 {
@@ -946,7 +946,8 @@ mod tests {
                 storage::Store::open(&directory.path().join("templates.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("OAuth", &[]).unwrap());
             host.add_request(cx);
             host.authentication.update(cx, |field, cx| {
@@ -967,10 +968,10 @@ mod tests {
         });
         host.update(window, |host, cx| {
             let environment = host.selected_environment(cx);
-            let id = host.environment_inputs[environment]
+            let id = host.workspace.environment_inputs[environment]
                 .save(None, "wps_app_id", "app-one", false)
                 .unwrap();
-            host.environment_inputs[environment]
+            host.workspace.environment_inputs[environment]
                 .save(None, "wps_app_secret", "secret-one", true)
                 .unwrap();
             host.oauth
@@ -989,9 +990,11 @@ mod tests {
             ));
             assert!(!host.oauth_before_send(cx));
             let draft = host.snapshot(cx);
-            let request =
-                PreparedRequest::new(&draft, &host.environment_inputs[environment].values())
-                    .unwrap();
+            let request = PreparedRequest::new(
+                &draft,
+                &host.workspace.environment_inputs[environment].values(),
+            )
+            .unwrap();
             assert!(host.oauth_attach(request, &draft, cx).is_ok());
             assert_eq!(draft.oauth.as_ref().unwrap().client_id, "{{wps_app_id}}");
             // Manual callbacks compare the resolved snapshot, rather than the literal template.
@@ -1000,14 +1003,16 @@ mod tests {
             host.oauth.pending_key = Some(key.clone());
             host.oauth_exchange_manual(cx); // No callback entered yet: retains this session.
             assert!(host.oauth.pending.is_some());
-            host.environment_inputs[environment]
+            host.workspace.environment_inputs[environment]
                 .save(Some(id), "wps_app_id", "app-two", false)
                 .unwrap();
             let changed = host.oauth_resolve(&host.oauth.snapshot(cx), cx).unwrap();
             assert_ne!(host.oauth_key(&changed, cx), key);
-            let request =
-                PreparedRequest::new(&draft, &host.environment_inputs[environment].values())
-                    .unwrap();
+            let request = PreparedRequest::new(
+                &draft,
+                &host.workspace.environment_inputs[environment].values(),
+            )
+            .unwrap();
             assert!(host.oauth_attach(request, &draft, cx).is_err());
             host.oauth_exchange_manual(cx);
             assert!(host.oauth.pending.is_none());
@@ -1019,13 +1024,14 @@ mod tests {
             host.oauth_authorize(cx);
             assert!(host.oauth.error.as_ref().unwrap().contains("Client Secret"));
             assert!(host.oauth.pending.is_none() && host.oauth.task.is_none());
-            host.environment_inputs[environment].remove(id);
+            host.workspace.environment_inputs[environment].remove(id);
             assert!(host.oauth_before_send(cx));
             assert!(host.oauth.error.as_ref().unwrap().contains("wps_app_id"));
             host.oauth_manage(false, cx);
             assert!(host.oauth.task.is_none());
             host.persist(cx);
             let saved: String = host
+                .workspace
                 .storage
                 .connection
                 .query_row("SELECT data FROM workspace", [], |row| row.get(0))
@@ -1044,7 +1050,8 @@ mod tests {
         let path = directory.path().join("oauth.sqlite3");
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("OAuth", &[]).unwrap());
             host.add_request(cx);
             host.config = 1;
@@ -1065,6 +1072,7 @@ mod tests {
             assert!(!snapshot.auth);
             assert!(snapshot.oauth.is_some());
             let saved: String = host
+                .workspace
                 .storage
                 .connection
                 .query_row("SELECT data FROM workspace", [], |row| row.get(0))
@@ -1110,7 +1118,8 @@ mod tests {
                 storage::Store::open(&directory.path().join("layout.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("OAuth", &[]).unwrap());
             host.add_request(cx);
             host.config = 1;
@@ -1207,7 +1216,8 @@ mod preset_tests {
                 storage::Store::open(&directory.path().join("workspace.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("OAuth", &[]).unwrap());
             host.add_request(cx);
             host.config = 1;

@@ -15,10 +15,10 @@ fn template_suggestions_follow_global_environment_and_extraction(cx: &mut gpui::
                 .update(cx, |entry, cx| entry.set_value(name, cx));
             host.save_group(cx);
         }
-        host.environment_inputs[1]
+        host.workspace.environment_inputs[1]
             .save(None, "token_dev", "secret-dev", true)
             .unwrap();
-        host.environment_inputs[2]
+        host.workspace.environment_inputs[2]
             .save(None, "token_prod", "secret-prod", true)
             .unwrap();
         host.add_request(cx);
@@ -76,7 +76,7 @@ fn template_suggestions_follow_global_environment_and_extraction(cx: &mut gpui::
             host.apply_extractors(
                 &draft,
                 2,
-                &host.requests[host.active].collection.clone(),
+                &host.workspace.requests[host.active].collection.clone(),
                 &response,
                 cx,
             )
@@ -121,6 +121,7 @@ fn global_environment_survives_request_switch_versions_and_restart(cx: &mut gpui
     });
     host.update(window, |host, cx| {
         let drafts: Vec<_> = host
+            .workspace
             .requests
             .iter()
             .map(|request| request.draft.clone())
@@ -129,7 +130,7 @@ fn global_environment_survives_request_switch_versions_and_restart(cx: &mut gpui
         assert_eq!(host.selected_environment(cx), 2);
         host.save(cx);
         assert_eq!(
-            host.requests[0].versions.len(),
+            host.workspace.requests[0].versions.len(),
             1,
             "global environment changes must not create request versions"
         );
@@ -230,7 +231,7 @@ fn sidebar_resize_drags_across_content_clamps_and_stops_on_release(cx: &mut gpui
     );
     assert_eq!(narrow_search.left(), initial_search.left());
     host.update(window, |host, cx| {
-        host.show_environments = true;
+        host.page = crate::Page::Environments;
         cx.notify();
     });
     assert_eq!(
@@ -294,7 +295,7 @@ fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
         point(target.center().x, target.bottom() - px(2.)),
     );
     host.update(window, |host, _| {
-        let order = model::siblings(&host.collections, &host.requests, 0, "");
+        let order = model::siblings(&host.workspace.collections, &host.workspace.requests, 0, "");
         assert!(
             order
                 .iter()
@@ -309,13 +310,13 @@ fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
             host.active, 1,
             "dragging must not switch the active request"
         );
-        assert_eq!(host.requests[0].versions.len(), 1);
+        assert_eq!(host.workspace.requests[0].versions.len(), 1);
     });
     let source = window.debug_bounds("request-leaf:0").unwrap();
     let folder = window.debug_bounds("request-directory:0:Folder").unwrap();
     drag(window, source.center(), folder.center());
     host.update(window, |host, _| {
-        assert_eq!(host.requests[0].group, "Folder")
+        assert_eq!(host.workspace.requests[0].group, "Folder")
     });
     host.update(window, |host, cx| {
         host.group_edit = Some(GroupEdit::CreateCollection);
@@ -327,9 +328,9 @@ fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
     let target = window.debug_bounds("request-directory:1:").unwrap();
     drag(window, source.center(), target.center());
     host.update(window, |host, _| {
-        assert_eq!(host.requests[0].collection, "Other");
-        assert_eq!(host.requests[0].group, "Folder");
-        assert!(host.collections[1].contains("Folder"));
+        assert_eq!(host.workspace.requests[0].collection, "Other");
+        assert_eq!(host.workspace.requests[0].group, "Folder");
+        assert!(host.workspace.collections[1].contains("Folder"));
     });
     host.update(window, |host, cx| {
         host.collapsed_directories.insert((1, "Folder".into()));
@@ -343,16 +344,16 @@ fn native_tree_drag_reorders_moves_and_persists(cx: &mut gpui::TestAppContext) {
         point(target.center().x, target.top() + px(2.)),
     );
     host.update(window, |host, _| {
-        assert_eq!(host.collections[0].collection, "Other");
+        assert_eq!(host.workspace.collections[0].collection, "Other");
         assert!(host.collapsed_directories.contains(&(0, "Folder".into())));
     });
     let reopened = window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
     reopened.update(window, |host, _| {
-        assert_eq!(host.requests[0].collection, "Other");
-        assert_eq!(host.requests[0].group, "Folder");
-        assert!(host.requests[0].tree_order > 0);
-        assert_eq!(host.requests[0].versions.len(), 1);
-        assert_eq!(host.collections[0].collection, "Other");
+        assert_eq!(host.workspace.requests[0].collection, "Other");
+        assert_eq!(host.workspace.requests[0].group, "Folder");
+        assert!(host.workspace.requests[0].tree_order > 0);
+        assert_eq!(host.workspace.requests[0].versions.len(), 1);
+        assert_eq!(host.workspace.collections[0].collection, "Other");
     });
     std::fs::remove_file(path).unwrap();
 }
@@ -374,7 +375,7 @@ fn history_click_restores_matching_response_headers_and_preview(cx: &mut gpui::T
         host.save_group(cx);
         host.add_request(cx);
         for (status, text) in [(200, "first"), (404, "second")] {
-            let mut record = host.requests[0].versions[0].clone();
+            let mut record = host.workspace.requests[0].versions[0].clone();
             record.id = model::new_id();
             record.label = status_label(status);
             record.draft.url = format!("https://example.test/{text}");
@@ -396,14 +397,14 @@ fn history_click_restores_matching_response_headers_and_preview(cx: &mut gpui::T
                     message: text.into(),
                 }],
             });
-            host.requests[0].history.push(record);
+            host.workspace.requests[0].history.push(record);
         }
-        let mut legacy = host.requests[0].versions[0].clone();
+        let mut legacy = host.workspace.requests[0].versions[0].clone();
         legacy.id = model::new_id();
-        host.requests[0].history.push(legacy);
+        host.workspace.requests[0].history.push(legacy);
         host.show_activity = true;
         host.activity = 1;
-        host.storage_dirty = true;
+        host.workspace.storage_dirty = true;
         host.persist(cx);
         host
     });
@@ -425,7 +426,7 @@ fn history_click_restores_matching_response_headers_and_preview(cx: &mut gpui::T
                 host.request_preview.read(cx).content(),
                 format!("GET /{text}")
             );
-            assert_eq!(host.traces[0][0].message, text);
+            assert_eq!(host.workspace.traces[0][0].message, text);
         });
     }
     let bounds = window.debug_bounds("history-record-2").unwrap();
@@ -441,7 +442,7 @@ fn history_click_restores_matching_response_headers_and_preview(cx: &mut gpui::T
     let reopened = window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
     reopened.update(window, |host, _| {
         assert_eq!(
-            host.requests[0].history[1]
+            host.workspace.requests[0].history[1]
                 .exchange
                 .as_ref()
                 .unwrap()
@@ -479,15 +480,19 @@ fn tls_setting_click_persists_and_restores_per_request(cx: &mut gpui::TestAppCon
     host.update(window, |host, cx| {
         assert!(host.snapshot(cx).skip_tls_verification);
         host.save(cx);
-        assert!(host.requests[0].versions[0].draft.skip_tls_verification);
+        assert!(
+            host.workspace.requests[0].versions[0]
+                .draft
+                .skip_tls_verification
+        );
         host.add_request(cx);
         assert!(!host.snapshot(cx).skip_tls_verification);
         host.choose(0, cx);
         assert!(host.snapshot(cx).skip_tls_verification);
-        let baseline = host.requests[0].versions[1].draft.clone();
+        let baseline = host.workspace.requests[0].versions[1].draft.clone();
         host.load(&baseline, cx);
         assert!(!host.snapshot(cx).skip_tls_verification);
-        let saved = host.requests[0].versions[0].draft.clone();
+        let saved = host.workspace.requests[0].versions[0].draft.clone();
         host.load(&saved, cx);
         host.persist(cx);
     });
@@ -523,17 +528,19 @@ fn request_tree_menus_create_root_and_nested_requests_without_toggling_folders(
         let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
         host.add_request(cx);
         assert!(
-            host.requests.is_empty(),
+            host.workspace.requests.is_empty(),
             "a collection is required before creating a request"
         );
         host.group_name
             .update(cx, |entry, cx| entry.set_value("My API", cx));
         host.save_group(cx);
         host.add_request(cx);
-        assert!(host.collections[0].names.is_empty());
-        assert!(host.requests[0].group.is_empty());
-        host.collections[0].add_child("", "目录").unwrap();
-        host.collections[0].add_child("目录", "子目录").unwrap();
+        assert!(host.workspace.collections[0].names.is_empty());
+        assert!(host.workspace.requests[0].group.is_empty());
+        host.workspace.collections[0].add_child("", "目录").unwrap();
+        host.workspace.collections[0]
+            .add_child("目录", "子目录")
+            .unwrap();
         host.add_request_to("目录/子目录".into(), cx);
         host
     });
@@ -554,8 +561,8 @@ fn request_tree_menus_create_root_and_nested_requests_without_toggling_folders(
     let new_request = window.debug_bounds("directory-menu-action:0::0").unwrap();
     window.simulate_click(new_request.center(), gpui::Modifiers::default());
     host.update(window, |host, _| {
-        assert_eq!(host.requests.len(), 3);
-        assert!(host.requests[2].group.is_empty());
+        assert_eq!(host.workspace.requests.len(), 3);
+        assert!(host.workspace.requests[2].group.is_empty());
         assert!(host.tree_menu.is_none());
     });
     let folder = window
@@ -596,9 +603,12 @@ fn request_tree_menus_create_root_and_nested_requests_without_toggling_folders(
     });
     window.simulate_keystrokes("enter");
     host.update(window, |host, cx| {
-        assert!(host.collections[0].contains("目录/子目录/第三层"));
+        assert!(host.workspace.collections[0].contains("目录/子目录/第三层"));
         host.add_request(cx);
-        assert_eq!(host.requests.last().unwrap().group, "目录/子目录/第三层");
+        assert_eq!(
+            host.workspace.requests.last().unwrap().group,
+            "目录/子目录/第三层"
+        );
         host.persist(cx);
     });
     let saved = storage::Store::open(&path).unwrap().load().unwrap();
@@ -652,7 +662,7 @@ fn form_body_mode_edits_switches_versions_and_survives_restart(cx: &mut gpui::Te
     host.update(window, |host, cx| {
         assert_eq!(host.body_format, BodyFormat::Raw);
         assert_eq!(host.body.read(cx).content(), r#"{"raw":true}"#);
-        let saved = host.requests[0].versions[0].draft.clone();
+        let saved = host.workspace.requests[0].versions[0].draft.clone();
         host.load(&saved, cx);
         assert_eq!(host.snapshot(cx).body_format, BodyFormat::UrlEncoded);
         assert_eq!(host.snapshot(cx).form[0].value, "{{api_token}}");
@@ -717,7 +727,7 @@ fn send_validation_shows_specific_error_toasts_without_starting_network(
             .iter()
             .find(|plugin| plugin.manifest.id == "com.wps.kso1")
             .unwrap();
-        host.requests[0].draft.plugins = vec![model::BeforeAction {
+        host.workspace.requests[0].draft.plugins = vec![model::BeforeAction {
             environment_bindings: Default::default(),
             approval: gpui_glint::plugins::Approval::for_plugin(plugin),
             action_id: "sign-request".into(),
@@ -730,7 +740,7 @@ fn send_validation_shows_specific_error_toasts_without_starting_network(
         assert!(description.contains("WPS KSO-1 签名"));
         assert!(description.contains("wps_app_id") && description.contains("wps_app_key"));
         assert!(description.contains("不使用环境"));
-        assert!(host.requests[0].history.is_empty());
+        assert!(host.workspace.requests[0].history.is_empty());
     });
 }
 
@@ -1089,15 +1099,15 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
     window.simulate_keystrokes("enter");
     host.update(window, |host, cx| {
         assert!(host.editing_request_name && host.request_name_error.is_some());
-        assert_eq!(host.requests[0].name, "新建请求 1");
+        assert_eq!(host.workspace.requests[0].name, "新建请求 1");
         host.request_name
             .update(cx, |entry, cx| entry.set_value("  获取用户 🦀  ", cx));
     });
     window.simulate_keystrokes("enter");
     host.update(window, |host, cx| {
         assert!(!host.editing_request_name);
-        assert_eq!(host.requests[0].name, "获取用户 🦀");
-        assert_eq!(host.requests[0].versions.len(), 1);
+        assert_eq!(host.workspace.requests[0].name, "获取用户 🦀");
+        assert_eq!(host.workspace.requests[0].versions.len(), 1);
         host.persist(cx);
     });
     click_title(window);
@@ -1108,7 +1118,7 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
     window.simulate_keystrokes("escape");
     host.update(window, |host, _| {
         assert!(!host.editing_request_name);
-        assert_eq!(host.requests[0].name, "获取用户 🦀");
+        assert_eq!(host.workspace.requests[0].name, "获取用户 🦀");
     });
     click_title(window);
     host.update(window, |host, cx| {
@@ -1116,7 +1126,7 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
             .update(cx, |entry, cx| entry.set_value("切换时未提交", cx));
         host.choose(1, cx);
         host.save_request_name(cx);
-        assert_eq!(host.requests[1].name, "新建请求 2");
+        assert_eq!(host.workspace.requests[1].name, "新建请求 2");
         host.persist(cx);
     });
     let saved = storage::Store::open(&path).unwrap().load().unwrap();
@@ -1124,7 +1134,7 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
     assert_eq!(saved.requests[1].name, "新建请求 2");
     let reopened = window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
     reopened.update(window, |host, _| {
-        assert_eq!(host.requests[0].name, "获取用户 🦀")
+        assert_eq!(host.workspace.requests[0].name, "获取用户 🦀")
     });
     click_title(window);
     host.update(window, |host, cx| {
@@ -1133,7 +1143,7 @@ fn request_title_rename_saves_cancels_and_survives_restart(cx: &mut gpui::TestAp
         host.delete_request(0, cx);
         host.save_request_name(cx);
         assert!(!host.editing_request_name);
-        assert_eq!(host.requests[0].name, "新建请求 2");
+        assert_eq!(host.workspace.requests[0].name, "新建请求 2");
     });
     std::fs::remove_file(path).unwrap();
 }
@@ -1149,26 +1159,26 @@ fn saving_only_versions_unique_request_parameters(cx: &mut gpui::TestAppContext)
             .update(cx, |entry, cx| entry.set_value("API", cx));
         host.save_group(cx);
         host.add_request(cx);
-        let original = host.requests[0].versions[0].draft.clone();
+        let original = host.workspace.requests[0].versions[0].draft.clone();
         host.save(cx);
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 1);
+        assert_eq!(host.workspace.requests[0].versions.len(), 1);
         host.endpoint.update(cx, |entry, cx| {
             entry.set_text("https://example.test/changed", cx)
         });
         // Drafts are persisted automatically; the version baseline must stay separate.
         host.persist(cx);
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 2);
-        assert_eq!(host.requests[0].versions[0].label, "v2");
+        assert_eq!(host.workspace.requests[0].versions.len(), 2);
+        assert_eq!(host.workspace.requests[0].versions[0].label, "v2");
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 2);
+        assert_eq!(host.workspace.requests[0].versions.len(), 2);
         host.load(&original, cx);
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 2);
+        assert_eq!(host.workspace.requests[0].versions.len(), 2);
         assert_eq!(
             host.duplicate_version.as_ref().unwrap().version_id,
-            host.requests[0].versions[1].id
+            host.workspace.requests[0].versions[1].id
         );
         // Editing and undoing back to the latest saved content is also unchanged.
         host.endpoint.update(cx, |entry, cx| {
@@ -1176,13 +1186,13 @@ fn saving_only_versions_unique_request_parameters(cx: &mut gpui::TestAppContext)
         });
         host.load(&original, cx);
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 2);
+        assert_eq!(host.workspace.requests[0].versions.len(), 2);
         host.persist(cx);
     });
     let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
     reopened.update(cx, |host, cx| {
         host.save(cx);
-        assert_eq!(host.requests[0].versions.len(), 2);
+        assert_eq!(host.workspace.requests[0].versions.len(), 2);
         assert_eq!(host.current_versions[0], 1);
         assert!(host.duplicate_version.is_some());
     });
@@ -1203,7 +1213,7 @@ fn edits_and_environment_save_survive_workbench_restart(cx: &mut gpui::TestAppCo
     let store = storage::Store::open(&path).unwrap();
     let host = cx.new(|cx| Workbench::with_store(store, cx));
     host.update(cx, |host, cx| {
-        assert!(host.requests.is_empty() && host.collections.is_empty());
+        assert!(host.workspace.requests.is_empty() && host.workspace.collections.is_empty());
         host.group_edit = Some(GroupEdit::CreateCollection);
         host.group_name
             .update(cx, |e, cx| e.set_value("My API", cx));
@@ -1236,7 +1246,7 @@ fn edits_and_environment_save_survive_workbench_restart(cx: &mut gpui::TestAppCo
         cx.notify();
     });
     cx.run_until_parked();
-    let serializations = host.update(cx, |host, _| host.storage.serializations);
+    let serializations = host.update(cx, |host, _| host.workspace.storage.serializations);
     host.update(cx, |host, cx| {
         host.response_tab = 1;
         host.show_activity = false;
@@ -1244,7 +1254,7 @@ fn edits_and_environment_save_survive_workbench_restart(cx: &mut gpui::TestAppCo
     });
     cx.run_until_parked();
     assert_eq!(
-        host.update(cx, |host, _| host.storage.serializations),
+        host.update(cx, |host, _| host.workspace.storage.serializations),
         serializations,
         "UI tab changes must not serialize the workspace"
     );

@@ -20,10 +20,13 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
     let path = directory.path().join("workspace.sqlite3");
     let (host, window) = cx.add_window_view(|_, cx| {
         let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
-        host.collections
+        host.workspace
+            .collections
             .push(RequestGroups::create_collection("Original", &[]).unwrap());
-        host.collections[0].add_child("", "Folder").unwrap();
-        host.collections[0].defaults.insert(
+        host.workspace.collections[0]
+            .add_child("", "Folder")
+            .unwrap();
+        host.workspace.collections[0].defaults.insert(
             String::new(),
             model::DirectoryDefaults {
                 sections: [model::DefaultSection::Endpoint].into(),
@@ -35,8 +38,9 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
         );
         host.add_request_to("Folder".into(), cx);
         host.save(cx);
-        host.collections
-            .push(RequestGroups::create_collection("Other", &host.collections).unwrap());
+        host.workspace
+            .collections
+            .push(RequestGroups::create_collection("Other", &host.workspace.collections).unwrap());
         host.current_collection = 1;
         host.current_directory.clear();
         host.add_request(cx);
@@ -56,8 +60,8 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
                 .update(cx, |entry, cx| entry.set_value(invalid, cx));
             host.save_group(cx);
             assert!(host.group_error.is_some());
-            assert_eq!(host.collections[0].collection, "Original");
-            assert_eq!(host.requests[0].collection, "Original");
+            assert_eq!(host.workspace.collections[0].collection, "Original");
+            assert_eq!(host.workspace.requests[0].collection, "Original");
         }
         host.group_name
             .update(cx, |entry, cx| entry.set_value("  Renamed  ", cx));
@@ -66,16 +70,16 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
     host.update(window, |host, cx| {
         assert!(host.group_edit.is_none());
         assert!(host.group_error.is_none());
-        assert_eq!(host.collections[0].collection, "Renamed");
-        assert_eq!(host.requests[0].collection, "Renamed");
-        assert_eq!(host.requests[1].collection, "Other");
-        assert_eq!(host.requests[0].group, "Folder");
+        assert_eq!(host.workspace.collections[0].collection, "Renamed");
+        assert_eq!(host.workspace.requests[0].collection, "Renamed");
+        assert_eq!(host.workspace.requests[1].collection, "Other");
+        assert_eq!(host.workspace.requests[0].group, "Folder");
         assert_eq!(host.current_directory, "Folder");
         assert_eq!(host.active, 0);
         assert_eq!(host.snapshot(cx).body, "unsaved body survives");
-        assert!(!host.requests[0].versions.is_empty());
+        assert!(!host.workspace.requests[0].versions.is_empty());
         assert_eq!(
-            host.collections[0].request_defaults("Folder").url,
+            host.workspace.collections[0].request_defaults("Folder").url,
             "https://example.test/api"
         );
         host.persist(cx);
@@ -88,7 +92,7 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
     click(window, "group-name-cancel");
     host.update(window, |host, cx| {
         assert!(host.group_edit.is_none());
-        assert_eq!(host.collections[0].collection, "Renamed");
+        assert_eq!(host.workspace.collections[0].collection, "Renamed");
         host.persist(cx);
     });
     let workspace = storage::Store::open(&path).unwrap().load().unwrap();

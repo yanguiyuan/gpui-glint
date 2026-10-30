@@ -38,9 +38,4 @@ pub(super) fn status_label(status: u16) -> String {
         .unwrap_or("");
     format!("{status} {reason}").trim_end().to_string()
 }
-pub(super) fn record_time() -> String {
-    chrono::Utc::now()
-        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
+pub(super) use crate::workspace_service::record_time;

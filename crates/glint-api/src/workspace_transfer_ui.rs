@@ -106,7 +106,7 @@ mod tests {
                 // Test that replacing a live workspace is rejected without creating one.
                 host.ws_active = true;
                 host.import_workspace_archive(window, cx);
-                assert_eq!(host.storage.workspaces().unwrap().len(), 1);
+                assert_eq!(host.workspace.storage.workspaces().unwrap().len(), 1);
                 assert!(
                     host.workspace_transfer
                         .as_ref()
@@ -136,11 +136,11 @@ mod tests {
         click(window, "transfer-section-Requests");
         click(window, "submit-workspace-transfer");
         host.read_with(window, |host, cx| {
-            assert_ne!(host.storage.workspace_id, "default");
+            assert_ne!(host.workspace.storage.workspace_id, "default");
             assert!(host.workspace_transfer.is_none());
             assert_eq!(host.snapshot(cx).body, "unsaved migration body");
             assert_eq!(
-                host.environment_inputs[1].variables[0].value,
+                host.workspace.environment_inputs[1].variables[0].value,
                 "unsaved environment value"
             );
         });
@@ -219,17 +219,17 @@ impl Workbench {
         if self.has_unsaved_environment(cx) {
             self.save_workspace_environment_drafts(cx)?;
         }
-        if self.proxies != proxies {
-            self.proxies = proxies;
-            self.storage_dirty = true;
+        if self.workspace.proxies != proxies {
+            self.workspace.proxies = proxies;
+            self.workspace.storage_dirty = true;
         }
         self.persist(cx);
-        if let Some(error) = &self.storage_error {
+        if let Some(error) = &self.workspace.storage_error {
             return Err(format!("当前工作区保存失败：{error}"));
         }
-        let data = self.storage.load()?;
+        let data = self.workspace.storage.load()?;
         let calls = if selected.has(Section::McpHistory) {
-            self.storage.export_mcp_calls()?
+            self.workspace.storage.export_mcp_calls()?
         } else {
             vec![]
         };
@@ -297,7 +297,7 @@ impl Workbench {
         };
         let mut name = base.clone();
         let mut suffix = 1;
-        let workspaces = match self.storage.workspaces() {
+        let workspaces = match self.workspace.storage.workspaces() {
             Ok(workspaces) => workspaces,
             Err(error) => {
                 self.transfer_error(error, cx);
@@ -414,19 +414,20 @@ impl Workbench {
                 }
                 if let Some(source) = &mut chosen.data.update_source {
                     source.validate()?;
-                    if let Some(previous) = self
-                        .update_source
-                        .as_ref()
-                        .filter(|old| old.url == source.url && old.public_key == source.public_key)
+                    if let Some(previous) =
+                        self.workspace.update_source.as_ref().filter(|old| {
+                            old.url == source.url && old.public_key == source.public_key
+                        })
                     {
                         source.minimum_sequence =
                             source.minimum_sequence.max(previous.minimum_sequence);
                     }
                 }
             }
-            self.storage.workspace_name(&name, "")?;
+            self.workspace.storage.workspace_name(&name, "")?;
             self.workspace_switch_ready(cx)?;
             let id = self
+                .workspace
                 .storage
                 .import_archive(&name, &chosen, &chosen.contents)?;
             if let Err(error) = self.switch_workspace_with_settings(
@@ -435,7 +436,7 @@ impl Workbench {
                 window,
                 cx,
             ) {
-                self.storage.delete_workspace(&id)?;
+                self.workspace.storage.delete_workspace(&id)?;
                 return Err(error);
             }
             Ok::<_, String>(())

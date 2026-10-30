@@ -58,17 +58,17 @@ use uuid::Uuid;
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
 pub struct AgentWorkspace {
+    page: crate::Page,
     host_tools: Option<std::sync::Arc<dyn host_tools::HostTools>>,
     focus: gpui::FocusHandle,
-    host_navigation: Option<gpui::AnyView>,
+    host_shell: Option<gpui_glint::components::ShellRenderer>,
     edits_ui: edits_ui::State,
     steering_sender: Option<(Uuid, async_channel::Sender<String>)>,
     queued_requests: std::collections::HashMap<u64, (Uuid, provider::Config)>,
     todo_live: todo::Store,
     group_list: Entity<GroupList>,
     calendar: Entity<Calendar>,
-    show_calendar: bool,
-    show_vault: bool,
+
     vault: Entity<glint_vault::VaultPage>,
     schedules: std::sync::Arc<std::sync::Mutex<schedules::ScheduleStore>>,
     schedule_editor: schedule_ui::ScheduleEditor,
@@ -93,7 +93,7 @@ pub struct AgentWorkspace {
     thinking: provider::Thinking,
     provider_settings: provider_ui::Settings,
     provider_error: Option<String>,
-    show_settings: bool,
+
     path: PathBuf,
     storage_error: Option<String>,
     // Do not overwrite a file that failed to load.
@@ -274,9 +274,7 @@ impl AgentWorkspace {
                         this.capture_draft(cx);
                         this.history.new_session_for(Some(path));
                         this.restore_draft(cx);
-                        this.show_settings = false;
-                        this.show_vault = false;
-                        this.show_calendar = false;
+                        this.page = crate::Page::Chat;
                         this.save(cx);
                         cx.notify();
                     }
@@ -403,9 +401,7 @@ impl AgentWorkspace {
                         this.select_project_context(&id[13..], cx)
                     }
                     ComposerEvent::ContextSelected { id, .. } if id.as_ref() == "manage-skills" => {
-                        this.show_vault = false;
-                        this.show_calendar = false;
-                        this.show_settings = true;
+                        this.page = crate::Page::Settings;
                         this.show_auxiliary_sidebar = true;
                         this.provider_settings.section = provider_ui::Section::Skills;
                         this.reload_skills(cx);
@@ -439,7 +435,7 @@ impl AgentWorkspace {
                         cx.notify();
                     }
                     ComposerEvent::ChipClicked(chip) if chip.as_ref() == "model" => {
-                        this.show_settings = true;
+                        this.page = crate::Page::Settings;
                         this.provider_settings.section = provider_ui::Section::Provider;
                         cx.notify();
                     }
@@ -452,13 +448,13 @@ impl AgentWorkspace {
         let mut workspace = Self {
             host_tools: None,
             focus: cx.focus_handle(),
-            host_navigation: None,
+            host_shell: None,
+            page: crate::Page::Chat,
             group_list,
             calendar,
             schedules,
             schedule_editor,
-            show_calendar: false,
-            show_vault: false,
+
             vault: cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx)),
             scheduler_task: None,
             running_schedule: None,
@@ -483,7 +479,7 @@ impl AgentWorkspace {
             thinking: provider::Thinking::Default,
             provider_settings,
             provider_error,
-            show_settings: false,
+
             path,
             storage_error,
             storage_readable,
@@ -516,9 +512,7 @@ impl AgentWorkspace {
         workspace._subscriptions.push(cx.subscribe(
             &workspace.vault,
             |this, _, _: &glint_vault::VaultEvent, cx| {
-                this.show_vault = true;
-                this.show_settings = false;
-                this.show_calendar = false;
+                this.page = crate::Page::Vault;
                 cx.notify();
             },
         ));
@@ -553,9 +547,7 @@ impl AgentWorkspace {
     }
 
     fn switch(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        self.show_settings = false;
-        self.show_vault = false;
-        self.show_calendar = false;
+        self.page = crate::Page::Chat;
         self.provider_error = None;
         self.capture_draft(cx);
         self.history.active = id;
@@ -590,9 +582,7 @@ impl AgentWorkspace {
         }
         if self.history.active != previous_active {
             self.restore_draft(cx);
-            self.show_settings = false;
-            self.show_vault = false;
-            self.show_calendar = false;
+            self.page = crate::Page::Chat;
             self.scroll = ScrollHandle::new();
         }
         self.save(cx);
@@ -600,11 +590,14 @@ impl AgentWorkspace {
     }
 
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_settings = false;
-        self.show_vault = false;
+        if matches!(self.page, crate::Page::Vault | crate::Page::Settings) {
+            self.page = crate::Page::Chat;
+        }
         self.provider_error = None;
         self.capture_draft(cx);
-        self.show_calendar = false;
+        if self.page == crate::Page::Calendar {
+            self.page = crate::Page::Chat;
+        }
         self.history
             .new_session_for(self.history.active().project.clone());
         self.restore_draft(cx);
@@ -962,8 +955,10 @@ impl AgentWorkspace {
     }
 
     fn search_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_vault = false;
-        if self.show_settings {
+        if self.page == crate::Page::Vault {
+            self.page = crate::Page::Chat;
+        }
+        if self.page == crate::Page::Settings {
             self.show_auxiliary_sidebar = true;
             window.focus(&self.provider_settings.search.focus_handle(cx), cx);
             cx.notify();
@@ -975,9 +970,7 @@ impl AgentWorkspace {
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_vault = false;
-        self.show_settings = true;
-        self.show_calendar = false;
+        self.page = crate::Page::Settings;
         self.show_auxiliary_sidebar = true;
         window.focus(&self.provider_settings.search.focus_handle(cx), cx);
         cx.notify();
@@ -990,45 +983,53 @@ impl AgentWorkspace {
             .flex()
             .items_center()
             .gap_3()
-            .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
+            .pl(px(if self.host_shell.is_some() {
+                0.
+            } else if cfg!(target_os = "macos") {
+                80.
+            } else {
+                16.
+            }))
             .pr_3()
             .text_size(px(12.))
-            .when(self.host_navigation.is_some(), |bar| {
-                bar.child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Glint Workbench"),
-                )
-            })
-            .when(self.show_settings || self.show_vault, |bar| {
-                bar.child(
-                    IconButton::new(Icon::ArrowLeft, "返回会话")
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_settings = false;
-                            this.show_vault = false;
-                            window.focus(&this.composer.focus_handle(cx), cx);
-                            cx.notify();
-                        })),
-                )
-            })
+            .when(
+                self.page == crate::Page::Settings || self.page == crate::Page::Vault,
+                |bar| {
+                    bar.child(
+                        IconButton::new(Icon::ArrowLeft, "返回会话")
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if matches!(this.page, crate::Page::Vault | crate::Page::Settings) {
+                                    this.page = crate::Page::Chat;
+                                }
+                                window.focus(&this.composer.focus_handle(cx), cx);
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
             .child(
                 IconButton::new(Icon::Sidebar, "展开或收起侧栏")
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if this.show_settings || this.show_calendar {
+                        if this.page == crate::Page::Settings || this.page == crate::Page::Calendar
+                        {
                             this.show_auxiliary_sidebar = !this.show_auxiliary_sidebar;
                         } else {
-                            this.show_vault = false;
+                            if this.page == crate::Page::Vault {
+                                this.page = crate::Page::Chat;
+                            }
                             this.show_sessions = !this.show_sessions;
                         }
                         cx.notify();
                     })),
             )
             .when(
-                !self.show_settings && !self.show_calendar && !self.show_vault,
+                self.page != crate::Page::Settings
+                    && self.page != crate::Page::Calendar
+                    && self.page != crate::Page::Vault,
                 |bar| {
                     bar.child(
                         div()
@@ -1063,55 +1064,60 @@ impl AgentWorkspace {
                     .max_w(px(260.))
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(if self.show_vault {
+                    .child(if self.page == crate::Page::Vault {
                         "密码箱".into()
-                    } else if self.show_calendar {
+                    } else if self.page == crate::Page::Calendar {
                         "日程与定时任务".into()
-                    } else if self.show_settings {
+                    } else if self.page == crate::Page::Settings {
                         format!("设置  ›  {}", self.provider_settings.section.title())
                     } else {
                         self.history.active().title.clone()
                     }),
             )
             .child(window_drag_region())
-            .when(!self.show_calendar && !self.show_vault, |bar| {
-                bar.child(
-                    div()
-                        .id("topbar-search")
-                        .debug_selector(|| "agent-topbar-search".into())
-                        .w(px(240.))
-                        .h(px(30.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(p.border))
-                        .bg(rgb(p.panel))
-                        .text_color(rgb(p.text_muted))
-                        .text_size(px(11.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(p.surface)))
-                        .child(Icon::Search.render(15.))
-                        .child(div().flex_1().child(if self.show_settings {
-                            "搜索设置"
-                        } else {
-                            "搜索会话"
-                        }))
-                        .child(if cfg!(target_os = "macos") {
-                            "⌘ K"
-                        } else {
-                            "Ctrl K"
-                        })
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.search_sessions(window, cx)),
-                        ),
-                )
-            })
             .when(
-                !self.show_settings && !self.show_calendar && !self.show_vault,
+                self.page != crate::Page::Calendar && self.page != crate::Page::Vault,
+                |bar| {
+                    bar.child(
+                        div()
+                            .id("topbar-search")
+                            .debug_selector(|| "agent-topbar-search".into())
+                            .w(px(240.))
+                            .h(px(30.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .bg(rgb(p.panel))
+                            .text_color(rgb(p.text_muted))
+                            .text_size(px(11.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.surface)))
+                            .child(Icon::Search.render(15.))
+                            .child(div().flex_1().child(if self.page == crate::Page::Settings {
+                                "搜索设置"
+                            } else {
+                                "搜索会话"
+                            }))
+                            .child(if cfg!(target_os = "macos") {
+                                "⌘ K"
+                            } else {
+                                "Ctrl K"
+                            })
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.search_sessions(window, cx)),
+                            ),
+                    )
+                },
+            )
+            .when(
+                self.page != crate::Page::Settings
+                    && self.page != crate::Page::Calendar
+                    && self.page != crate::Page::Vault,
                 |bar| {
                     bar.child(
                         div()
@@ -1154,7 +1160,9 @@ impl AgentWorkspace {
                         s.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_vault = false;
+                        if this.page == crate::Page::Vault {
+                            this.page = crate::Page::Chat;
+                        }
                         this.show_sessions = !this.show_sessions;
                         cx.notify();
                     })),
@@ -1169,13 +1177,11 @@ impl AgentWorkspace {
                 IconButton::new(Icon::Calendar, "日程与定时任务")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_calendar, |button| {
+                    .when(self.page == crate::Page::Calendar, |button| {
                         button.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_settings = false;
-                        this.show_vault = false;
-                        this.show_calendar = true;
+                        this.page = crate::Page::Calendar;
                         this.refresh_calendar(cx);
                         cx.notify();
                     })),
@@ -1184,13 +1190,11 @@ impl AgentWorkspace {
                 IconButton::new(Icon::Key, "密码箱")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_vault, |button| {
+                    .when(self.page == crate::Page::Vault, |button| {
                         button.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_settings = false;
-                        this.show_calendar = false;
-                        this.show_vault = true;
+                        this.page = crate::Page::Vault;
                         cx.notify();
                     })),
             )
@@ -1199,7 +1203,7 @@ impl AgentWorkspace {
                 IconButton::new(Icon::Settings, "设置 Provider")
                     .theme(self.theme)
                     .render()
-                    .when(self.show_settings, |s| {
+                    .when(self.page == crate::Page::Settings, |s| {
                         s.bg(rgb(self.theme.palette().accent_tint))
                     })
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
@@ -1793,7 +1797,7 @@ impl AgentWorkspace {
 impl Render for AgentWorkspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.vault.update(cx, |vault, cx| {
-            vault.set_host_state(self.show_vault, self.theme, cx)
+            vault.set_host_state(self.page == crate::Page::Vault, self.theme, cx)
         });
         div()
             .relative()
@@ -1810,21 +1814,22 @@ impl Render for AgentWorkspace {
                     this.search_sessions(window, cx)
                 }),
             )
-            .child(
-                AppLayout::new(
-                    self.topbar(cx),
-                    if self.show_settings {
+            .child({
+                let slots = gpui_glint::components::WorkspaceSlots {
+                    topbar: self.topbar(cx).into_any_element(),
+                    sidebar: (if self.page == crate::Page::Settings {
                         self.settings_sidebar(cx)
-                    } else if self.show_calendar {
+                    } else if self.page == crate::Page::Calendar {
                         self.calendar_sidebar(cx)
                     } else {
                         self.sidebar(cx)
-                    },
-                    if self.show_vault {
+                    })
+                    .into_any_element(),
+                    content: (if self.page == crate::Page::Vault {
                         div().size_full().child(self.vault.clone())
-                    } else if self.show_settings {
+                    } else if self.page == crate::Page::Settings {
                         self.settings_page(cx)
-                    } else if self.show_calendar {
+                    } else if self.page == crate::Page::Calendar {
                         self.calendar_page(cx)
                     } else {
                         div()
@@ -1835,25 +1840,34 @@ impl Render for AgentWorkspace {
                             .when(self.edits_ui.open, |body| {
                                 body.child(self.edits_sidebar(cx))
                             })
+                    })
+                    .into_any_element(),
+                    sidebar_width: if self.page == crate::Page::Settings {
+                        280.
+                    } else {
+                        260.
                     },
-                )
-                .navigation_rail(
-                    self.host_navigation
-                        .clone()
-                        .map(|rail| rail.into_any_element())
-                        .unwrap_or_else(|| self.rail(cx).into_any_element()),
-                )
-                .navigation_rail_width(46.)
-                .sidebar_width(if self.show_settings { 280. } else { 260. })
-                .sidebar_visible(if self.show_vault {
-                    false
-                } else if self.show_settings || self.show_calendar {
-                    self.show_auxiliary_sidebar
+                    sidebar_visible: if self.page == crate::Page::Vault {
+                        false
+                    } else if self.page == crate::Page::Settings
+                        || self.page == crate::Page::Calendar
+                    {
+                        self.show_auxiliary_sidebar
+                    } else {
+                        self.show_sessions
+                    },
+                    sidebar_resize_handle: None,
+                    theme: self.theme,
+                };
+                if let Some(shell) = &self.host_shell {
+                    shell(slots)
                 } else {
-                    self.show_sessions
-                })
-                .theme(self.theme),
-            )
+                    AppLayout::from_slots(slots)
+                        .navigation_rail(self.rail(cx))
+                        .navigation_rail_width(46.)
+                        .into_any_element()
+                }
+            })
     }
 }
 

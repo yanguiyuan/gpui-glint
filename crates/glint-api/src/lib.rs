@@ -53,6 +53,8 @@ mod version_tags;
 mod websocket;
 mod websocket_ui;
 mod workbench;
+mod workspace_adapter;
+mod workspace_service;
 mod workspace_transfer;
 mod workspace_transfer_ui;
 mod workspace_ui;

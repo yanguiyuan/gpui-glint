@@ -46,7 +46,7 @@ impl Workbench {
     }
 
     pub(super) fn sync_commands(&mut self, cx: &mut Context<Self>) {
-        let items = Self::command_items(&self.requests)
+        let items = Self::command_items(&self.workspace.requests)
             .into_iter()
             .filter(|item| {
                 self.request_binding.is_none()

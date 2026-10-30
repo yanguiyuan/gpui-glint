@@ -19,8 +19,9 @@ impl Workbench {
             }
         };
         // Parse first: failed imports must not create collections or requests.
-        if self.collections.is_empty() {
-            self.collections
+        if self.workspace.collections.is_empty() {
+            self.workspace
+                .collections
                 .push(RequestGroups::create_collection("导入的请求", &[]).unwrap());
             self.current_collection = 0;
             self.current_directory.clear();
@@ -30,7 +31,7 @@ impl Workbench {
             .ok()
             .map(|url| format!("{} {}", draft.method, url.path()))
             .unwrap_or_else(|| format!("{} 导入请求", draft.method));
-        let request = &mut self.requests[self.active];
+        let request = &mut self.workspace.requests[self.active];
         request.name = name;
         request.draft = draft.clone();
         request.versions[0].draft = draft.clone();
@@ -47,14 +48,19 @@ impl Workbench {
         self.show_curl_import = false;
         self.curl_error = None;
         self.curl_input.update(cx, |e, cx| e.set_content("", cx));
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.persist(cx);
         window.focus(&self.focus, cx);
         self.notice = "已从 cURL 导入请求".into();
         cx.notify();
     }
     pub(super) fn copy_response_curl(&mut self, cx: &mut Context<Self>) {
-        if let Some(command) = self.sent_curls.get(self.active).and_then(|c| c.clone()) {
+        if let Some(command) = self
+            .workspace
+            .sent_curls
+            .get(self.active)
+            .and_then(|c| c.clone())
+        {
             cx.write_to_clipboard(ClipboardItem::new_string(curl::filter_response_resolves(
                 &command,
             )));
@@ -69,6 +75,7 @@ impl Workbench {
         }
         let p = self.theme.palette();
         let destination = self
+            .workspace
             .collections
             .get(self.current_collection)
             .map(|c| {
@@ -134,7 +141,7 @@ mod tests {
         host.update(window, |h, _| {
             assert!(h.show_curl_import);
             assert!(h.curl_error.is_some());
-            assert!(h.requests.is_empty() && h.collections.is_empty());
+            assert!(h.workspace.requests.is_empty() && h.workspace.collections.is_empty());
         });
         let source = "curl 'https://example.test/v1?q=two%20words' -H 'Authorization: Bearer synthetic' --json '{\"name\":\"导入\"}'";
         let pasted = format!("{source} --proxy http://127.0.0.1:7890 --location");
@@ -148,14 +155,14 @@ mod tests {
         click(window, "submit-curl-import");
         host.update(window, |h, cx| {
             assert!(!h.show_curl_import);
-            assert_eq!(h.requests.len(), 1);
-            assert_eq!(h.collections.len(), 1);
+            assert_eq!(h.workspace.requests.len(), 1);
+            assert_eq!(h.workspace.collections.len(), 1);
             assert_eq!(h.snapshot(cx), curl::parse(source).unwrap());
-            assert_eq!(h.requests[0].versions[0].draft, h.snapshot(cx));
+            assert_eq!(h.workspace.requests[0].versions[0].draft, h.snapshot(cx));
             assert!(h.sending.is_none());
-            assert!(h.sent_curls[0].is_none());
-            h.collections[0].add_child("", "Folder").unwrap();
-            h.collections[0].defaults.insert(
+            assert!(h.workspace.sent_curls[0].is_none());
+            h.workspace.collections[0].add_child("", "Folder").unwrap();
+            h.workspace.collections[0].defaults.insert(
                 "Folder".into(),
                 model::DirectoryDefaults {
                     sections: [model::DefaultSection::Auth].into_iter().collect(),
@@ -190,7 +197,7 @@ mod tests {
         });
         click(window, "submit-curl-import");
         let (old, new) = host.update(window, |h, cx| {
-            assert_eq!(h.requests[1].group, "Folder");
+            assert_eq!(h.workspace.requests[1].group, "Folder");
             assert_eq!(h.snapshot(cx), curl::parse(second).unwrap());
             assert!(!h.snapshot(cx).auth);
             assert_eq!(h.config, 3);
@@ -216,7 +223,7 @@ mod tests {
             .to_curl()
             .unwrap();
             for (i, curl) in [new.clone(), old.clone()].into_iter().enumerate() {
-                let mut record = h.requests[1].versions[0].clone();
+                let mut record = h.workspace.requests[1].versions[0].clone();
                 record.id = model::new_id();
                 record.label = "200 OK".into();
                 record.exchange = Some(model::Exchange {
@@ -234,12 +241,12 @@ mod tests {
                     preview: Some(format!("request-{i}")),
                     traces: vec![],
                 });
-                h.requests[1].history.push(record);
+                h.workspace.requests[1].history.push(record);
             }
-            h.sent_curls[1] = Some(new.clone());
+            h.workspace.sent_curls[1] = Some(new.clone());
             h.activity = 1;
             h.show_activity = true;
-            h.storage_dirty = true;
+            h.workspace.storage_dirty = true;
             cx.notify();
             (old, new)
         });
@@ -271,7 +278,7 @@ mod tests {
             "https://example.test/edited-after-send"
         );
         host.update(window, |h, cx| h.choose(0, cx));
-        host.update(window, |h, _| assert!(h.sent_curls[0].is_none()));
+        host.update(window, |h, _| assert!(h.workspace.sent_curls[0].is_none()));
         host.update(window, |h, cx| h.choose(1, cx));
         click(window, "export-response-curl");
         assert_eq!(window.read_from_clipboard().unwrap().text().unwrap(), old);

@@ -28,7 +28,7 @@ impl Workbench {
         if let Some(editor) = self.shared_request_editor(index) {
             return editor.read(cx).request_window_snapshot(0, cx);
         }
-        let request = self.requests.get(index)?;
+        let request = self.workspace.requests.get(index)?;
         let active = index == self.active;
         let draft = if active {
             self.snapshot(cx)
@@ -56,9 +56,9 @@ impl Workbench {
             response: if active {
                 self.response_data.clone()
             } else {
-                self.responses.get(index).cloned().flatten()
+                self.workspace.responses.get(index).cloned().flatten()
             },
-            sent_request: self.sent_requests.get(index).cloned().flatten(),
+            sent_request: self.workspace.sent_requests.get(index).cloned().flatten(),
             events,
             error: if active {
                 self.error.clone()
@@ -517,7 +517,7 @@ mod tests {
             host.environment.update(cx, |environment, cx| {
                 environment.set_selected(Some("1".into()), cx)
             });
-            host.environment_inputs[1]
+            host.workspace.environment_inputs[1]
                 .save(None, "openapi_baseurl", "https://global.test", false)
                 .unwrap();
             for (collection, url) in [("A", "https://a.test"), ("B", "https://b.test")] {
@@ -526,8 +526,10 @@ mod tests {
                     .save(None, "openapi_baseurl", url, false)
                     .unwrap();
             }
-            host.requests[0].draft.url = "{{openapi_baseurl}}/v7/recent_chats/tags".into();
-            host.requests[0].draft.params = vec![Pair::new("next", "{{openapi_baseurl}}/next", "")];
+            host.workspace.requests[0].draft.url =
+                "{{openapi_baseurl}}/v7/recent_chats/tags".into();
+            host.workspace.requests[0].draft.params =
+                vec![Pair::new("next", "{{openapi_baseurl}}/next", "")];
             host
         });
         let snapshot = host.read_with(cx, |host, cx| {
@@ -602,8 +604,8 @@ mod tests {
             host.save_group(cx);
             host.add_request(cx);
             host.add_request(cx);
-            host.requests[0].name = "First".into();
-            host.requests[0].draft.url = "https://example.com/first".into();
+            host.workspace.requests[0].name = "First".into();
+            host.workspace.requests[0].draft.url = "https://example.com/first".into();
             let draft = Draft {
                 url: "https://example.com/unsaved".into(),
                 body: "unsaved body".into(),
@@ -693,7 +695,7 @@ mod tests {
             host.body
                 .update(cx, |body, cx| body.set_content("changed", cx));
             host.response_data = None;
-            host.requests[active].draft.body = "changed stored draft".into();
+            host.workspace.requests[active].draft.body = "changed stored draft".into();
         });
         current
             .update(window, |preview, child_window, cx| {

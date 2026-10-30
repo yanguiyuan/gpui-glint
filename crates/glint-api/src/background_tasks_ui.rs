@@ -88,7 +88,12 @@ impl Workbench {
         if !self.ws_active && self.ws_commands.is_none() && self.ws_log.is_empty() {
             return;
         }
-        let Some(id) = self.requests.get(self.active).map(|r| r.id.clone()) else {
+        let Some(id) = self
+            .workspace
+            .requests
+            .get(self.active)
+            .map(|r| r.id.clone())
+        else {
             return;
         };
         let http = if !self.ws_active {
@@ -103,7 +108,12 @@ impl Workbench {
         self.sending = http;
     }
     pub(super) fn unpark_websocket(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.requests.get(self.active).map(|r| r.id.clone()) else {
+        let Some(id) = self
+            .workspace
+            .requests
+            .get(self.active)
+            .map(|r| r.id.clone())
+        else {
             return;
         };
         if let Some(mut state) = self.ws_background.remove(&id) {
@@ -127,7 +137,11 @@ impl Workbench {
         {
             return Some(editor.update(cx, |editor, cx| f(editor, cx)));
         }
-        let index = self.requests.iter().position(|r| r.id == request_id)?;
+        let index = self
+            .workspace
+            .requests
+            .iter()
+            .position(|r| r.id == request_id)?;
         if index == self.active {
             return Some(f(self, cx));
         }
@@ -149,7 +163,8 @@ impl Workbench {
             .unwrap_or_else(|| self.active_environment_values(cx))
     }
     pub(super) fn running_request_tasks(&self) -> Vec<(String, String)> {
-        self.requests
+        self.workspace
+            .requests
             .iter()
             .enumerate()
             .filter_map(|(index, request)| {
@@ -229,14 +244,20 @@ impl Workbench {
                     .debug_selector(move || format!("background-task-{selector}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.show_background_tasks = false;
-                        if let Some(index) = this.requests.iter().position(|r| r.id == id) {
+                        if let Some(index) = this.workspace.requests.iter().position(|r| r.id == id)
+                        {
                             if index != this.active {
                                 this.choose(index, cx);
                             } else {
-                                this.show_plugins = false;
-                                this.show_environments = false;
-                                this.show_proxies = false;
-                                this.show_mcp = false;
+                                if matches!(
+                                    this.page,
+                                    crate::Page::Proxies
+                                        | crate::Page::Plugins
+                                        | crate::Page::Environments
+                                        | crate::Page::Mcp
+                                ) {
+                                    this.page = crate::Page::Requests;
+                                }
                             }
                         }
                         cx.notify();
@@ -354,7 +375,7 @@ mod tests {
         });
         wait_for(&host, window, |host| host.ws_connected);
         let first = host.update(window, |host, cx| {
-            let first = host.requests[0].id.clone();
+            let first = host.workspace.requests[0].id.clone();
             host.choose(1, cx);
             host.connect_websocket(cx);
             first
@@ -385,7 +406,7 @@ mod tests {
                     .all(|event| !event.log_text().contains("first:background"))
             );
             assert_eq!(host.running_request_tasks().len(), 2);
-            let second = host.requests[1].id.clone();
+            let second = host.workspace.requests[1].id.clone();
             host.mcp_call(
                 "glint_request_cancel",
                 serde_json::json!({"request_id":first}),
@@ -403,7 +424,7 @@ mod tests {
             host.running_request_tasks().is_empty()
         });
         host.update(window, |host, cx| {
-            for request in &host.requests {
+            for request in &host.workspace.requests {
                 assert_eq!(request.history.len(), 1);
                 let record = &request.history[0];
                 assert_eq!(record.label, "WS 已断开");
@@ -467,8 +488,8 @@ mod tests {
             host
         });
         let (first, second, first_rx, second_rx) = host.update(window, |host, cx| {
-            let first = host.requests[0].id.clone();
-            let second = host.requests[1].id.clone();
+            let first = host.workspace.requests[0].id.clone();
+            let second = host.workspace.requests[1].id.clone();
             let (sender, first_rx) = async_channel::bounded(16);
             host.ws_commands = Some(sender);
             host.ws_active = true;

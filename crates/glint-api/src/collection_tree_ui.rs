@@ -14,6 +14,7 @@ impl Workbench {
         self.directory_settings = None;
         self.capture_draft(cx);
         let old_names = self
+            .workspace
             .collections
             .iter()
             .map(|c| c.collection.clone())
@@ -34,17 +35,19 @@ impl Workbench {
                 let name = old_names[*from].clone();
                 let destination = old_names[*to].clone();
                 if from != to {
-                    let collection = self.collections.remove(*from);
+                    let collection = self.workspace.collections.remove(*from);
                     let position = self
+                        .workspace
                         .collections
                         .iter()
                         .position(|c| c.collection == destination)
                         .unwrap()
                         + usize::from(placement == Placement::After);
-                    self.collections.insert(position, collection);
+                    self.workspace.collections.insert(position, collection);
                 }
                 Ok(TreeNode::Directory {
                     collection: self
+                        .workspace
                         .collections
                         .iter()
                         .position(|c| c.collection == name)
@@ -53,8 +56,8 @@ impl Workbench {
                 })
             } else {
                 model::move_node(
-                    &mut self.collections,
-                    &mut self.requests,
+                    &mut self.workspace.collections,
+                    &mut self.workspace.requests,
                     source,
                     target,
                     placement,
@@ -62,8 +65,8 @@ impl Workbench {
             }
         } else {
             model::move_node(
-                &mut self.collections,
-                &mut self.requests,
+                &mut self.workspace.collections,
+                &mut self.workspace.requests,
                 source,
                 target,
                 placement,
@@ -91,7 +94,8 @@ impl Workbench {
                         }
                     }
                     (
-                        self.collections
+                        self.workspace
+                            .collections
                             .iter()
                             .position(|c| Some(&c.collection) == old_names.get(collection))
                             .unwrap_or(0),
@@ -108,6 +112,7 @@ impl Workbench {
                 if let Some(name) = selected_name {
                     if matches!(source, TreeNode::Directory { path, .. } if path.is_empty()) {
                         self.current_collection = self
+                            .workspace
                             .collections
                             .iter()
                             .position(|c| c.collection == name)
@@ -119,11 +124,12 @@ impl Workbench {
                         (collection, RequestGroups::parent(&path).to_owned())
                     }
                     TreeNode::Request(index) => (
-                        self.collections
+                        self.workspace
+                            .collections
                             .iter()
-                            .position(|c| c.collection == self.requests[index].collection)
+                            .position(|c| c.collection == self.workspace.requests[index].collection)
                             .unwrap(),
-                        self.requests[index].group.clone(),
+                        self.workspace.requests[index].group.clone(),
                     ),
                 };
                 loop {
@@ -134,7 +140,7 @@ impl Workbench {
                     }
                     parent = RequestGroups::parent(&parent).to_owned();
                 }
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
                 self.tree_menu = None;
                 self.group_edit = None;
                 self.hovered_tree_row = None;
@@ -162,11 +168,13 @@ impl Workbench {
             .strip_prefix("request-leaf:")
             .and_then(|s| s.parse::<usize>().ok())
         {
-            return (index < self.requests.len()).then_some(model::TreeNode::Request(index));
+            return (index < self.workspace.requests.len())
+                .then_some(model::TreeNode::Request(index));
         }
         let (collection, path) = key.strip_prefix("request-directory:")?.split_once(':')?;
         let collection = collection.parse::<usize>().ok()?;
-        self.collections
+        self.workspace
+            .collections
             .get(collection)
             .filter(|c| c.contains(path))?;
         Some(model::TreeNode::Directory {
@@ -231,7 +239,7 @@ impl Workbench {
                 expanded,
             } => {
                 let label = if path.is_empty() {
-                    self.collections[collection].collection.clone()
+                    self.workspace.collections[collection].collection.clone()
                 } else {
                     path.rsplit('/').next().unwrap_or(&path).into()
                 };
@@ -245,7 +253,7 @@ impl Workbench {
             model::TreeEntry::Request { index, depth } => (
                 model::TreeNode::Request(index),
                 depth,
-                self.requests[index].name.clone(),
+                self.workspace.requests[index].name.clone(),
                 None,
             ),
         };
@@ -300,7 +308,7 @@ impl Workbench {
                     )
             }
             model::TreeNode::Request(index) => {
-                let request = &self.requests[index];
+                let request = &self.workspace.requests[index];
                 item = item.selected(index == self.active).content(
                     div()
                         .flex()
@@ -465,17 +473,15 @@ impl Workbench {
                                     cx,
                                 ),
                                 5 => {
-                                    let name = this.collections[collection].collection.clone();
+                                    let name =
+                                        this.workspace.collections[collection].collection.clone();
                                     match this.set_variable_scope(Some(name), cx) {
                                         Ok(()) => {
                                             this.editing_environment = this.selected_environment(cx)
                                         }
                                         Err(error) => this.variable_error = Some(error),
                                     }
-                                    this.show_environments = true;
-                                    this.show_plugins = false;
-                                    this.show_proxies = false;
-                                    this.show_mcp = false;
+                                    this.page = crate::Page::Environments;
                                     this.sync_variable_table(cx);
                                     cx.notify();
                                 }

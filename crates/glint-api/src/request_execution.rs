@@ -14,7 +14,7 @@ impl Workbench {
         if self.directory_settings.is_some() {
             return;
         }
-        if self.requests.is_empty() {
+        if self.workspace.requests.is_empty() {
             return;
         }
         if self.ws_active {
@@ -35,18 +35,19 @@ impl Workbench {
             self.connect_websocket(cx);
             return;
         }
-        self.sent_curls[self.active] = None;
+        self.workspace.sent_curls[self.active] = None;
         let draft = self.snapshot(cx);
         let extraction_collection = self
+            .workspace
             .collections
             .iter()
-            .find(|c| c.collection == self.requests[self.active].collection)
+            .find(|c| c.collection == self.workspace.requests[self.active].collection)
             .map(|c| c.id.clone())
             .unwrap_or_default();
         let environment_index = self.selected_environment(cx);
         let environment_name = self.environment_name(environment_index).to_owned();
         self.trace_started = Some(Instant::now());
-        self.traces[self.active].clear();
+        self.workspace.traces[self.active].clear();
         self.push_trace(
             format!("准备 {} 请求 · {}", draft.method, environment_name),
             cx,
@@ -61,8 +62,9 @@ impl Workbench {
         let proxy = self.effective_proxy(environment_index);
         let variables = self.active_environment_values(cx);
         let refresh = if draft.triggers.iter().any(|r| r.enabled) {
-            let collection = self.requests[self.active].collection.clone();
+            let collection = self.workspace.requests[self.active].collection.clone();
             let local = self
+                .workspace
                 .collections
                 .iter()
                 .find(|c| c.collection == collection)
@@ -72,7 +74,7 @@ impl Workbench {
             let requests = self
                 .trigger_requests
                 .as_deref()
-                .unwrap_or(&self.requests)
+                .unwrap_or(&self.workspace.requests)
                 .iter()
                 .cloned()
                 .map(|mut request| {
@@ -84,7 +86,7 @@ impl Workbench {
                 requests,
                 collection,
                 local,
-                global: self.environment_inputs[environment_index].clone(),
+                global: self.workspace.environment_inputs[environment_index].clone(),
                 proxy: proxy.clone(),
                 catalog: self.plugin_catalog.clone(),
                 completed: vec![],
@@ -117,7 +119,7 @@ impl Workbench {
                     return;
                 }
             };
-            self.sent_requests[self.active] = Some(request.preview.clone());
+            self.workspace.sent_requests[self.active] = Some(request.preview.clone());
             self.sync_request_preview(cx);
             Some(request)
         };
@@ -144,10 +146,10 @@ impl Workbench {
             },
             cx,
         );
-        self.requests[self.active].draft = draft.clone();
+        self.workspace.requests[self.active].draft = draft.clone();
         self.notice = "正在发送 HTTP 请求".into();
         let index = self.active;
-        let request_id = self.requests[index].id.clone();
+        let request_id = self.workspace.requests[index].id.clone();
         let started = Instant::now();
         let plugin_ids = self.enabled_before_actions(&draft.plugins);
         let plugin_catalog = self.plugin_catalog.clone();
@@ -170,6 +172,7 @@ impl Workbench {
                         .update(cx, |this, cx| {
                             this.with_request_executor(&refresh_request_id, cx, |this, cx| {
                                 let collection_name = this
+                                    .workspace
                                     .collections
                                     .iter()
                                     .find(|c| c.id == refresh_collection_id)
@@ -215,7 +218,7 @@ impl Workbench {
                                 }
                                 let variables = this.environment_values(
                                     environment_index,
-                                    Some(&this.requests[this.active].collection),
+                                    Some(&this.workspace.requests[this.active].collection),
                                 );
                                 let prepared = PreparedRequest::new(&draft, &variables)
                                     .and_then(|r| this.oauth_attach(r, &draft, cx))
@@ -257,8 +260,8 @@ impl Workbench {
                         this.with_request_executor(&request_id, cx, |this, cx| {
                             let index = this.active;
                             this.push_trace("发送 HTTP 请求，等待服务器响应", cx);
-                            this.sent_requests[index] = Some(request.preview.clone());
-                            this.sent_curls[index] = request.to_curl().ok();
+                            this.workspace.sent_requests[index] = Some(request.preview.clone());
+                            this.workspace.sent_curls[index] = request.to_curl().ok();
                             if this.active == index {
                                 this.sync_request_preview(cx);
                             }
@@ -322,7 +325,7 @@ impl Workbench {
                                 cx,
                             )
                         });
-                    this.storage_dirty = true;
+                    this.workspace.storage_dirty = true;
                     this.prepend_history(
                         index,
                         Record {
@@ -338,14 +341,14 @@ impl Workbench {
                             exchange: Some(model::Exchange {
                                 websocket_connected: false,
                                 websocket_events: vec![],
-                                curl: this.sent_curls[index].clone(),
+                                curl: this.workspace.sent_curls[index].clone(),
                                 response: result.as_ref().ok().cloned().or_else(|| {
                                     this.response_data
                                         .clone()
                                         .filter(HttpResponse::is_event_stream)
                                 }),
                                 error: result.as_ref().err().cloned(),
-                                preview: this.sent_requests[index].clone(),
+                                preview: this.workspace.sent_requests[index].clone(),
                                 traces: vec![],
                             }),
                         },
@@ -360,7 +363,7 @@ impl Workbench {
                                 },
                                 cx,
                             );
-                            this.responses[index] = Some(response.clone());
+                            this.workspace.responses[index] = Some(response.clone());
                             this.status = Some(response.status);
                             this.response_json = response.json.clone();
                             this.response_data = Some(response);
@@ -374,7 +377,7 @@ impl Workbench {
                             };
                         }
                         Err(error) => {
-                            let environment = this.requests[index].history[0]
+                            let environment = this.workspace.requests[index].history[0]
                                 .environment_name
                                 .clone()
                                 .unwrap_or_default();
@@ -386,7 +389,7 @@ impl Workbench {
                                 .as_ref()
                                 .is_some_and(HttpResponse::is_event_stream)
                             {
-                                this.responses[index] = None;
+                                this.workspace.responses[index] = None;
                                 this.response_data = None;
                                 this.response_json = None;
                                 this.status = None;
@@ -395,11 +398,11 @@ impl Workbench {
                             this.notice = "请求失败".into();
                         }
                     }
-                    this.requests[index].history[0]
+                    this.workspace.requests[index].history[0]
                         .exchange
                         .as_mut()
                         .unwrap()
-                        .traces = this.traces[index].clone();
+                        .traces = this.workspace.traces[index].clone();
                     this.trace_started = None;
                     this.sending = None;
                     cx.notify();
@@ -428,8 +431,8 @@ impl Workbench {
     }
 
     pub(super) fn push_trace(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.storage_dirty = true;
-        self.traces[self.active].push(TraceEntry {
+        self.workspace.storage_dirty = true;
+        self.workspace.traces[self.active].push(TraceEntry {
             elapsed_ms: self
                 .trace_started
                 .map(|start| start.elapsed().as_millis())
@@ -449,7 +452,7 @@ impl Workbench {
             .response_data
             .as_ref()
             .is_some_and(HttpResponse::is_event_stream);
-        self.responses[index] = Some(response.clone());
+        self.workspace.responses[index] = Some(response.clone());
         self.status = Some(response.status);
         self.response_json = None;
         self.response_data = Some(response);

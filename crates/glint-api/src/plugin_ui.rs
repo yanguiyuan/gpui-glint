@@ -68,7 +68,7 @@ impl Workbench {
         first_action: bool,
         cx: &mut Context<Self>,
     ) -> Entity<gpui_glint::components::CollapsePanel> {
-        let request_id = self.requests[self.active].id.clone();
+        let request_id = self.workspace.requests[self.active].id.clone();
         let key = (
             request_id.clone(),
             plugin.identity(),
@@ -76,7 +76,7 @@ impl Workbench {
         );
         let mut cache = self.plugin_environment_settings.borrow_mut();
         // Remove panels for deleted requests while keeping independent state per request/action.
-        cache.retain(|(request, _, _), _| self.requests.iter().any(|r| &r.id == request));
+        cache.retain(|(request, _, _), _| self.workspace.requests.iter().any(|r| &r.id == request));
         let settings = cache.entry(key).or_insert_with(|| {
             let mut subscriptions = Vec::new();
             let fields: Vec<_> = plugin
@@ -101,7 +101,11 @@ impl Workbench {
                     let name_owned = name.to_owned();
                     subscriptions.push(cx.observe(&entry, move |this, entry, cx| {
                         let value = entry.read(cx).value().trim().to_owned();
-                        let Some(request) = this.requests.iter_mut().find(|r| r.id == request_id)
+                        let Some(request) = this
+                            .workspace
+                            .requests
+                            .iter_mut()
+                            .find(|r| r.id == request_id)
                         else {
                             return;
                         };
@@ -140,7 +144,7 @@ impl Workbench {
                                 .environment_bindings
                                 .insert(name_owned.clone(), value);
                         }
-                        this.storage_dirty = true;
+                        this.workspace.storage_dirty = true;
                         cx.notify();
                     }));
                     (name.to_owned(), entry)
@@ -244,7 +248,9 @@ impl Workbench {
             .ok_or("插件不存在，请刷新列表")?;
         let family = plugin.family_identity();
         let name = plugin.manifest.name.clone();
-        self.storage.set_plugin_enabled(&family, enabled)?;
+        self.workspace
+            .storage
+            .set_plugin_enabled(&family, enabled)?;
         if enabled {
             self.disabled_plugins.remove(&family);
         } else {
@@ -260,6 +266,7 @@ impl Workbench {
 
     fn before_action_bindings(&self) -> Vec<model::BeforeAction> {
         let mut actions = self
+            .workspace
             .requests
             .get(self.active)
             .map(|r| r.draft.plugins.clone())
@@ -348,17 +355,18 @@ impl Workbench {
             .position(|a| a.id == target.0 && a.action_id == target.1)
             .unwrap();
         actions.insert(to + usize::from(after), action);
-        let Some(request) = self.requests.get_mut(self.active) else {
+        let Some(request) = self.workspace.requests.get_mut(self.active) else {
             return;
         };
         request.draft.plugins = actions;
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.persist(cx);
         cx.notify();
     }
     pub(super) fn plugin_configuration(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let selected = self
+            .workspace
             .requests
             .get(self.active)
             .map(|r| r.draft.plugins.as_slice())
@@ -483,7 +491,7 @@ impl Workbench {
                     .on_change(move |checked, _, cx| {
                         let _ = owner.update(cx, |this, cx| {
                             let bindings = this.before_action_bindings();
-                            if let Some(request) = this.requests.get_mut(this.active) {
+                            if let Some(request) = this.workspace.requests.get_mut(this.active) {
                                 request.draft.plugins = bindings;
                                 if let Some(binding) = request.draft.plugins.iter_mut().find(|a| {
                                     a.id == id
@@ -503,7 +511,7 @@ impl Workbench {
                                         enabled: true,
                                     });
                                 }
-                                this.storage_dirty = true;
+                                this.workspace.storage_dirty = true;
                                 cx.notify();
                             }
                         });
@@ -626,11 +634,11 @@ impl Workbench {
                             .theme(self.theme)
                             .render()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(r) = this.requests.get_mut(this.active) {
+                                if let Some(r) = this.workspace.requests.get_mut(this.active) {
                                     r.draft
                                         .plugins
                                         .retain(|a| a.id != id || a.action_id != action_id);
-                                    this.storage_dirty = true;
+                                    this.workspace.storage_dirty = true;
                                     cx.notify();
                                 }
                             })),
@@ -680,7 +688,7 @@ mod tests {
         field.update(window, |field, cx| field.set_value("wps_app_id1", cx));
         window.run_until_parked();
         host.read_with(window, |host, _| {
-            let action = &host.requests[host.active].draft.plugins[0];
+            let action = &host.workspace.requests[host.active].draft.plugins[0];
             assert_eq!(action.environment_bindings["wps_app_id"], "wps_app_id1");
             assert!(!action.enabled);
         });
@@ -750,7 +758,7 @@ mod tests {
             let baseline = Draft::default();
             host.load(&baseline, cx);
             assert!(host.snapshot(cx).plugins.is_empty());
-            let saved = host.requests[0].versions[0].draft.clone();
+            let saved = host.workspace.requests[0].versions[0].draft.clone();
             host.load(&saved, cx);
             host.persist(cx);
         });
@@ -928,11 +936,7 @@ mod remote_tests {
 
 impl Workbench {
     pub(super) fn open_plugin_manager(&mut self, cx: &mut Context<Self>) {
-        self.show_vault = false;
-        self.show_proxies = false;
-        self.show_mcp = false;
-        self.show_plugins = true;
-        self.show_environments = false;
+        self.page = crate::Page::Plugins;
         self.show_collection_menu = false;
         self.tree_menu = None;
         (self.plugin_catalog, self.plugin_errors) = plugins::catalog();
@@ -1012,6 +1016,7 @@ impl Workbench {
                 let toggle_id = id.clone();
                 let toggle_owner = cx.entity().downgrade();
                 let uses = self
+                    .workspace
                     .requests
                     .iter()
                     .filter(|r| {
@@ -1240,7 +1245,9 @@ impl Workbench {
                             .render()
                             .debug_selector(|| "close-plugin-manager".into())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_plugins = false;
+                                if this.page == crate::Page::Plugins {
+                                    this.page = crate::Page::Requests;
+                                }
                                 cx.notify();
                             })),
                     ),
@@ -1268,11 +1275,11 @@ mod navigation_tests {
         let (host, window) = cx.add_window_view(|_, cx| {
             Workbench::with_store(storage::Store::open(&path).unwrap(), cx)
         });
-        assert!(host.read_with(window, |host, _| host.requests.is_empty()));
+        assert!(host.read_with(window, |host, _| host.workspace.requests.is_empty()));
         let button = window.debug_bounds("open-plugin-manager").unwrap();
         window.simulate_click(button.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert!(host.show_plugins && !host.show_environments)
+            assert!(host.page == crate::Page::Plugins && host.page != crate::Page::Environments)
         });
         assert!(window.debug_bounds("plugin-manager-scroll").is_some());
         let sources = window.debug_bounds("plugin-manager-section-1").unwrap();
@@ -1283,7 +1290,7 @@ mod navigation_tests {
         });
         let back = window.debug_bounds("close-plugin-manager").unwrap();
         window.simulate_click(back.center(), gpui::Modifiers::default());
-        host.update(window, |host, _| assert!(!host.show_plugins));
+        host.update(window, |host, _| assert!(host.page != crate::Page::Plugins));
     }
 }
 
@@ -1307,13 +1314,13 @@ mod enable_tests {
                 .iter()
                 .find(|p| p.manifest.id == "com.wps.kso1")
                 .unwrap();
-            host.requests[0].draft.plugins = vec![model::BeforeAction {
+            host.workspace.requests[0].draft.plugins = vec![model::BeforeAction {
                 environment_bindings: Default::default(),
                 approval: gpui_glint::plugins::Approval::for_plugin(plugin),
                 action_id: "sign-request".into(),
                 enabled: true,
             }];
-            host.storage_dirty = true;
+            host.workspace.storage_dirty = true;
             host.persist(cx);
             host.open_plugin_manager(cx);
             host
@@ -1323,7 +1330,7 @@ mod enable_tests {
         host.update(window, |host, cx| {
             let actions = host.enabled_before_actions(&host.snapshot(cx).plugins);
             assert!(actions.is_empty());
-            assert_eq!(host.requests[0].draft.plugins.len(), 1);
+            assert_eq!(host.workspace.requests[0].draft.plugins.len(), 1);
             assert!(
                 plugins::validate_variables(
                     &actions,
@@ -1356,7 +1363,7 @@ mod enable_tests {
             window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(window, |host, cx| {
             assert!(host.disabled_plugins.contains("com.wps.kso1"));
-            assert_eq!(host.requests[0].draft.plugins.len(), 1);
+            assert_eq!(host.workspace.requests[0].draft.plugins.len(), 1);
             host.set_plugin_enabled("com.wps.kso1", true, cx).unwrap();
             assert_eq!(
                 host.enabled_before_actions(&host.snapshot(cx).plugins)
@@ -1365,6 +1372,7 @@ mod enable_tests {
             );
             assert!(
                 !host
+                    .workspace
                     .storage
                     .disabled_plugins()
                     .unwrap()
@@ -1392,14 +1400,14 @@ mod enable_tests {
             host.group_name.update(cx,|e,cx|e.set_value("WS",cx));
             host.save_group(cx);host.add_request(cx);
             let decoder=host.plugin_catalog.iter().find(|p|p.manifest.id=="com.wps.event-decrypt").unwrap();
-            host.requests[0].draft.event_decoder=Some(model::BeforeAction { environment_bindings: Default::default(),approval:gpui_glint::plugins::Approval::for_plugin(decoder),action_id:"decrypt-event".into(),enabled:true});
+            host.workspace.requests[0].draft.event_decoder=Some(model::BeforeAction { environment_bindings: Default::default(),approval:gpui_glint::plugins::Approval::for_plugin(decoder),action_id:"decrypt-event".into(),enabled:true});
             host.ws_detail_tab=1;
             host.set_plugin_enabled("com.wps.event-decrypt",false,cx).unwrap();
             assert!(host.ws_decrypted.as_ref().unwrap().as_ref().unwrap_err().contains("已禁用"));
-            assert!(host.requests[0].draft.event_decoder.is_some());
+            assert!(host.workspace.requests[0].draft.event_decoder.is_some());
             assert!(websocket_ui::decoder_bindings(&host.enabled_plugin_catalog()).is_empty());
             assert_eq!(host.plugin_catalog.len(),plugins::catalog().0.len());
-            host.storage.connection.execute_batch("CREATE TRIGGER reject_enable BEFORE DELETE ON disabled_plugins BEGIN SELECT RAISE(FAIL,'test failure'); END;").unwrap();
+            host.workspace.storage.connection.execute_batch("CREATE TRIGGER reject_enable BEFORE DELETE ON disabled_plugins BEGIN SELECT RAISE(FAIL,'test failure'); END;").unwrap();
             assert!(host.set_plugin_enabled("com.wps.event-decrypt",true,cx).is_err());
             assert!(host.disabled_plugins.contains("com.wps.event-decrypt"));
         });
@@ -1442,8 +1450,8 @@ mod enable_tests {
             };
             assert!(host.enabled_before_actions(&[old_binding]).is_empty());
             assert!(host.plugin_enabled(&host.plugin_catalog[0]));
-            let id = host.storage.create_workspace("Other").unwrap();
-            let (store, _) = host.storage.prepare_workspace(&id).unwrap();
+            let id = host.workspace.storage.create_workspace("Other").unwrap();
+            let (store, _) = host.workspace.storage.prepare_workspace(&id).unwrap();
             assert!(
                 store
                     .disabled_plugins()

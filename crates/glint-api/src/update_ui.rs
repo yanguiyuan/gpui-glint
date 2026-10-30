@@ -36,23 +36,32 @@ mod tests {
             let mut same = source.clone();
             same.minimum_sequence = 0;
             assert!(host.apply_update_source(Some(same), cx));
-            assert_eq!(host.update_source.as_ref().unwrap().minimum_sequence, 7);
+            assert_eq!(
+                host.workspace
+                    .update_source
+                    .as_ref()
+                    .unwrap()
+                    .minimum_sequence,
+                7
+            );
             let mut bad = source.clone();
             bad.url = "http://example.com".into();
             assert!(!host.apply_update_source(Some(bad), cx));
-            assert_eq!(host.update_source.as_ref(), Some(&source));
+            assert_eq!(host.workspace.update_source.as_ref(), Some(&source));
             host.update_state = UpdateState::Checking;
             assert!(!host.apply_update_source(None, cx));
             host.update_state = UpdateState::Idle;
         });
         let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(cx, |host, cx| {
-            assert_eq!(host.update_source.as_ref(), Some(&source));
+            assert_eq!(host.workspace.update_source.as_ref(), Some(&source));
             assert_eq!(host.update_source_url.read(cx).value(), source.url);
             assert!(host.apply_update_source(None, cx));
         });
         let reset = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
-        reset.update(cx, |host, _| assert!(host.update_source.is_none()));
+        reset.update(cx, |host, _| {
+            assert!(host.workspace.update_source.is_none())
+        });
     }
     #[gpui::test]
     fn restart_guard_checks_unsaved_environment_drafts_and_name_edits(
@@ -160,6 +169,7 @@ impl Workbench {
                 return false;
             }
             if let Some(old) = self
+                .workspace
                 .update_source
                 .as_ref()
                 .filter(|old| old.url == s.url && old.public_key == s.public_key)
@@ -167,13 +177,13 @@ impl Workbench {
                 s.minimum_sequence = old.minimum_sequence;
             }
         }
-        let previous = self.update_source.clone();
-        self.update_source = source;
-        self.storage_dirty = true;
+        let previous = self.workspace.update_source.clone();
+        self.workspace.update_source = source;
+        self.workspace.storage_dirty = true;
         self.persist(cx);
-        if let Some(error) = &self.storage_error {
-            self.update_source = previous;
-            self.storage_dirty = true;
+        if let Some(error) = &self.workspace.storage_error {
+            self.workspace.update_source = previous;
+            self.workspace.storage_dirty = true;
             self.update_error = Some(format!("保存更新源失败：{error}"));
             cx.notify();
             return false;
@@ -185,7 +195,7 @@ impl Workbench {
     }
     pub(super) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         // An embedded module cannot install a release for the standalone application.
-        if self.host_navigation.is_some() {
+        if self.host_shell.is_some() {
             return;
         }
         if self.update_state.busy() || matches!(self.update_state, UpdateState::Ready { .. }) {
@@ -194,7 +204,7 @@ impl Workbench {
         self.show_update_details |= manual;
         self.update_error = None;
         self.update_state = UpdateState::Checking;
-        let source = self.update_source.clone();
+        let source = self.workspace.update_source.clone();
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let result = if let Some(source) = source {
                 updater::check_custom(source, &semver::Version::parse(updater::VERSION).unwrap())
@@ -206,20 +216,22 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| {
                 this.update_state = match result {
                     Ok((Some(update), sequence)) => {
-                        if let (Some(source), Some(sequence)) = (&mut this.update_source, sequence)
+                        if let (Some(source), Some(sequence)) =
+                            (&mut this.workspace.update_source, sequence)
                         {
                             source.minimum_sequence = sequence;
-                            this.storage_dirty = true;
+                            this.workspace.storage_dirty = true;
                             this.persist(cx);
                         }
                         this.show_update_details = true;
                         UpdateState::Available(update)
                     }
                     Ok((None, sequence)) => {
-                        if let (Some(source), Some(sequence)) = (&mut this.update_source, sequence)
+                        if let (Some(source), Some(sequence)) =
+                            (&mut this.workspace.update_source, sequence)
                         {
                             source.minimum_sequence = sequence;
-                            this.storage_dirty = true;
+                            this.workspace.storage_dirty = true;
                             this.persist(cx);
                         }
                         UpdateState::Current
@@ -245,7 +257,8 @@ impl Workbench {
             Some("请完成名称编辑后更新")
         } else {
             self.persist(cx);
-            self.storage_error
+            self.workspace
+                .storage_error
                 .as_ref()
                 .map(|_| "工作区尚未保存成功，请处理保存错误后更新")
         };
@@ -502,7 +515,8 @@ impl Workbench {
                         .text_color(rgb(p.text_muted))
                         .child(format!(
                             "当前更新源：{}",
-                            self.update_source
+                            self.workspace
+                                .update_source
                                 .as_ref()
                                 .map(|s| s.url.as_str())
                                 .unwrap_or("GitHub（默认）")

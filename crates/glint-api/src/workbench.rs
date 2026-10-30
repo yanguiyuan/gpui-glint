@@ -18,11 +18,7 @@ pub(super) enum TabCloseMode {
     /// 保留被点击标签及其左侧标签
     Right,
 }
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(super) struct TraceEntry {
-    pub(super) elapsed_ms: u128,
-    pub(super) message: String,
-}
+pub(super) use crate::workspace_service::TraceEntry;
 pub(super) struct PairInput {
     pub(super) enabled: bool,
     pub(super) key: Entity<TextEntry>,
@@ -31,7 +27,9 @@ pub(super) struct PairInput {
     pub(super) expires_in: Entity<TextEntry>,
 }
 pub struct Workbench {
-    pub(super) host_navigation: Option<gpui::AnyView>,
+    pub(super) workspace: crate::workspace_service::ApiWorkspace,
+    pub(super) page: crate::Page,
+    pub(super) host_shell: Option<gpui_glint::components::ShellRenderer>,
     pub(super) request_editors: HashMap<String, request_window::SharedRequest>,
     pub(super) request_binding: Option<request_window::Binding>,
     pub(super) directory_settings: Option<Entity<directory_ui::DirectorySettings>>,
@@ -43,11 +41,9 @@ pub struct Workbench {
     pub(super) update_task: Option<Task<()>>,
     pub(super) show_update_details: bool,
     pub(super) update_error: Option<String>,
-    pub(super) update_source: Option<updater::UpdateSource>,
     pub(super) update_source_url: Entity<TextEntry>,
     pub(super) update_source_key: Entity<TextEntry>,
     pub(super) show_update_source_settings: bool,
-    pub(super) storage: storage::Store,
     pub(super) workspace_list: Vec<storage::WorkspaceInfo>,
     pub(super) show_workspaces: bool,
     pub(super) workspace_name_input: Entity<TextEntry>,
@@ -57,17 +53,11 @@ pub struct Workbench {
     pub(super) workspace_transfer: Option<workspace_transfer_ui::TransferDialog>,
     pub(super) workspace_transfer_task: Option<Task<()>>,
     pub(super) workspace_transfer_name: Entity<TextEntry>,
-    pub(super) environment_names: Vec<String>,
-    pub(super) responses: Vec<Option<HttpResponse>>,
-    pub(super) storage_error: Option<String>,
-    pub(super) storage_dirty: bool,
     pub(super) autosave_task: Option<Task<()>>,
     pub(super) focus: FocusHandle,
     pub(super) theme: ThemePreset,
-    pub(super) show_vault: bool,
+
     pub(super) vault: Entity<glint_vault::VaultPage>,
-    pub(super) requests: Vec<Request>,
-    pub(super) collections: Vec<RequestGroups>,
     pub(super) current_collection: usize,
     pub(super) show_collection_menu: bool,
     pub(super) current_directory: String,
@@ -111,9 +101,6 @@ pub struct Workbench {
     pub(super) show_registry_dialog: bool,
     pub(super) registry_adding_source: bool,
     pub(super) response_tab: usize,
-    pub(super) traces: Vec<Vec<TraceEntry>>,
-    pub(super) sent_requests: Vec<Option<String>>,
-    pub(super) sent_curls: Vec<Option<String>>,
     pub(super) curl_input: Entity<CodeCard>,
     pub(super) show_curl_import: bool,
     pub(super) curl_import_needs_focus: bool,
@@ -122,8 +109,7 @@ pub struct Workbench {
     pub(super) trace_started: Option<Instant>,
     pub(super) activity: usize,
     pub(super) show_activity: bool,
-    pub(super) show_environments: bool,
-    pub(super) show_plugins: bool,
+
     pub(super) plugin_manager_tab: usize,
     pub(super) editing_environment: usize,
     pub(super) editing_variable_collection: Option<String>,
@@ -133,11 +119,10 @@ pub struct Workbench {
     pub(super) variable_error: Option<String>,
     pub(super) variable_rows: Vec<Vec<VariableInput>>,
     pub(super) proxy_inputs: Vec<ProxyBindingInput>,
-    pub(super) proxies: Vec<environment::ProxyProfile>,
     pub(super) profile_inputs: Vec<ProxyInput>,
     pub(super) profile_names: Vec<Entity<TextEntry>>,
     pub(super) editing_proxy: usize,
-    pub(super) show_proxies: bool,
+
     pub(super) proxy_tab: usize,
     pub(super) proxy_settings_scroll: gpui::ScrollHandle,
     pub(super) proxy_services: std::collections::HashMap<String, proxy_service::RunningProxy>,
@@ -164,7 +149,6 @@ pub struct Workbench {
     pub(super) endpoint: Entity<SelectField>,
     pub(super) environment: Entity<Select>,
     pub(super) saved_environment: usize,
-    pub(super) environment_inputs: Vec<EnvironmentVariables>,
     pub(super) pair_delete: Option<(usize, gpui::EntityId)>,
     pub(super) params: Vec<PairInput>,
     pub(super) headers: Vec<PairInput>,
@@ -213,7 +197,7 @@ pub struct Workbench {
             Option<String>,
         ),
     >,
-    pub(super) show_mcp: bool,
+
     pub(super) mcp_history_search: Entity<TextEntry>,
     pub(super) mcp_history_filter: usize,
     pub(super) mcp_history_rows: Vec<mcp_history::Summary>,
@@ -688,13 +672,13 @@ impl Workbench {
                     };
                     Some(binding)
                 };
-                if let Some(request) = this.requests.get_mut(this.active) {
+                if let Some(request) = this.workspace.requests.get_mut(this.active) {
                     request.draft.event_decoder = binding;
                 }
                 select.update(cx, |select, cx| {
                     select.set_selected(Some(value.clone()), cx)
                 });
-                this.storage_dirty = true;
+                this.workspace.storage_dirty = true;
                 this.ws_invalidate_titles();
                 this.ws_select_sync(cx);
                 cx.notify();
@@ -710,15 +694,30 @@ impl Workbench {
             .unwrap_or_default();
         let proxy_certificate_status = proxy_listener_ui::certificate_status(&storage);
         let mut this = Self {
+            workspace: crate::workspace_service::ApiWorkspace {
+                storage: storage,
+                storage_error: None,
+                storage_dirty: true,
+                requests: requests,
+                collections: collections,
+                environment_names: environment_names,
+                environment_inputs: environment_inputs,
+                proxies: data.proxies,
+                responses: data.responses,
+                traces: traces,
+                sent_requests: sent_requests,
+                sent_curls: data.curls,
+                update_source: update_source,
+            },
             request_editors: Default::default(),
             request_binding: None,
             toasts: cx.new(|_| ToastHost::new()),
-            host_navigation: None,
+            host_shell: None,
+            page: crate::Page::Requests,
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
             show_update_details: false,
             update_error: None,
-            update_source,
             update_source_url,
             update_source_key,
             show_update_source_settings: false,
@@ -731,20 +730,13 @@ impl Workbench {
             workspace_transfer: None,
             workspace_transfer_task: None,
             workspace_transfer_name: Self::entry("", "导入后的工作区名称", cx),
-            storage,
-            storage_error: None,
-            storage_dirty: true,
             autosave_task: None,
-            environment_names,
-            responses: data.responses,
             focus: cx.focus_handle(),
             theme: ThemePreset::Moonstone,
-            show_vault: false,
+
             vault: cx.new(|cx| {
                 glint_vault::VaultPage::new(glint_vault::default_path(), ThemePreset::Moonstone, cx)
             }),
-            requests,
-            collections,
             current_collection: 0,
             show_collection_menu: false,
             directory_settings: None,
@@ -788,9 +780,6 @@ impl Workbench {
             show_registry_dialog: false,
             registry_adding_source: false,
             response_tab: 0,
-            traces,
-            sent_requests,
-            sent_curls: data.curls,
             curl_input: cx.new(|cx| CodeCard::new(cx, "bash", "").show_header(false)),
             show_curl_import: false,
             curl_import_needs_focus: false,
@@ -799,8 +788,7 @@ impl Workbench {
             trace_started: None,
             activity: 0,
             show_activity: false,
-            show_environments: false,
-            show_plugins: false,
+
             plugin_manager_tab: 0,
             editing_variable_collection: None,
             editing_environment: 0,
@@ -810,11 +798,10 @@ impl Workbench {
             variable_error: None,
             variable_rows: vec![vec![]; environment_count],
             proxy_inputs: vec![],
-            proxies: data.proxies,
             profile_inputs: vec![],
             profile_names: vec![],
             editing_proxy: 0,
-            show_proxies: false,
+
             proxy_tab: 0,
             proxy_settings_scroll: gpui::ScrollHandle::new(),
             proxy_services: Default::default(),
@@ -840,7 +827,6 @@ impl Workbench {
             endpoint,
             environment,
             saved_environment: selected_environment,
-            environment_inputs,
             pair_delete: None,
             params: vec![],
             headers: vec![],
@@ -883,7 +869,7 @@ impl Workbench {
             html_window: None,
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             html_windows: HashMap::new(),
-            show_mcp: false,
+
             mcp_history_search: Self::entry("", "搜索工具、客户端或错误…", cx),
             mcp_history_filter: 0,
             mcp_history_rows: vec![],
@@ -952,7 +938,7 @@ impl Workbench {
             }),
         );
         this.reset_proxy_profiles(cx);
-        this.storage_dirty |= migrated_proxies;
+        this.workspace.storage_dirty |= migrated_proxies;
         this.reset_variable_rows(cx);
         this.load(&initial, cx);
         this.restore_response(cx);
@@ -970,11 +956,7 @@ impl Workbench {
         this.subscriptions.push(cx.subscribe(
             &this.vault,
             |this, _, _: &glint_vault::VaultEvent, cx| {
-                this.show_vault = true;
-                this.show_proxies = false;
-                this.show_environments = false;
-                this.show_plugins = false;
-                this.show_mcp = false;
+                this.page = crate::Page::Vault;
                 cx.notify();
             },
         ));

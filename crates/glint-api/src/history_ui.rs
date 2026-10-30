@@ -2,7 +2,7 @@ use super::*;
 
 impl Workbench {
     pub(super) fn prepend_history(&mut self, request: usize, record: Record) {
-        self.requests[request].history.insert(0, record);
+        self.workspace.requests[request].history.insert(0, record);
         if let Some((r, index)) = &mut self.history_delete {
             if *r == request {
                 *index += 1;
@@ -18,7 +18,12 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.history_delete = None;
-        let Some(history) = self.requests.get_mut(request).map(|r| &mut r.history) else {
+        let Some(history) = self
+            .workspace
+            .requests
+            .get_mut(request)
+            .map(|r| &mut r.history)
+        else {
             return;
         };
         if index >= history.len() {
@@ -40,14 +45,14 @@ impl Workbench {
             self.response_json = None;
             self.status = None;
             self.error = None;
-            self.responses[request] = None;
-            self.sent_requests[request] = None;
-            self.sent_curls[request] = None;
-            self.traces[request].clear();
+            self.workspace.responses[request] = None;
+            self.workspace.sent_requests[request] = None;
+            self.workspace.sent_curls[request] = None;
+            self.workspace.traces[request].clear();
             self.sync_request_preview(cx);
             self.update_response(cx);
         }
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.notice = "已删除请求历史".into();
         self.persist(cx);
         cx.notify();
@@ -158,7 +163,7 @@ mod tests {
             host.save_group(cx);
             host.add_request(cx);
             for (i, status) in [200, 404, 200].into_iter().enumerate() {
-                let mut record = host.requests[0].versions[0].clone();
+                let mut record = host.workspace.requests[0].versions[0].clone();
                 record.id = model::new_id();
                 record.label = status_label(status);
                 record.draft.url = format!("https://example.test/{i}");
@@ -177,11 +182,11 @@ mod tests {
                     preview: Some(format!("GET /{i}")),
                     traces: vec![],
                 });
-                host.requests[0].history.push(record);
+                host.workspace.requests[0].history.push(record);
             }
             host.activity = 1;
             host.show_activity = true;
-            host.storage_dirty = true;
+            host.workspace.storage_dirty = true;
             host.persist(cx);
             host
         });
@@ -190,7 +195,7 @@ mod tests {
             click(window, "delete-history-1");
             assert!(window.debug_bounds("history-delete-confirmation").is_some());
             host.update(window, |h, cx| {
-                assert_eq!(h.requests[0].history.len(), 3);
+                assert_eq!(h.workspace.requests[0].history.len(), 3);
                 assert_eq!(h.snapshot(cx), original);
                 assert!(h.selected_history.is_none());
             });
@@ -201,7 +206,7 @@ mod tests {
             }
             host.update(window, |h, _| {
                 assert!(h.history_delete.is_none());
-                assert_eq!(h.requests[0].history.len(), 3);
+                assert_eq!(h.workspace.requests[0].history.len(), 3);
             });
         }
         click(window, "history-record-2");
@@ -214,18 +219,18 @@ mod tests {
         click(window, "delete-history-1");
         click(window, "confirm-history-delete");
         host.update(window, |h, cx| {
-            assert_eq!(h.requests[0].history.len(), 2);
+            assert_eq!(h.workspace.requests[0].history.len(), 2);
             assert_eq!(h.selected_history, Some((0, 1)));
             assert_eq!(h.response_data.as_ref().unwrap().text, "response-2");
             assert_eq!(h.snapshot(cx).url, "https://example.test/2");
-            assert_eq!(h.requests[0].versions.len(), 1);
+            assert_eq!(h.workspace.requests[0].versions.len(), 1);
             h.history_filter = 0;
             cx.notify();
         });
         // A completed response arriving during confirmation must not change the deletion target.
         click(window, "delete-history-1");
         host.update(window, |h, cx| {
-            let mut fresh = h.requests[0].history[0].clone();
+            let mut fresh = h.workspace.requests[0].history[0].clone();
             fresh.draft.url = "https://example.test/new".into();
             h.prepend_history(0, fresh);
             assert_eq!(h.history_delete, Some((0, 2)));
@@ -233,22 +238,25 @@ mod tests {
         });
         click(window, "confirm-history-delete");
         host.update(window, |h, _| {
-            assert_eq!(h.requests[0].history.len(), 2);
+            assert_eq!(h.workspace.requests[0].history.len(), 2);
             assert_eq!(
-                h.requests[0].history[0].draft.url,
+                h.workspace.requests[0].history[0].draft.url,
                 "https://example.test/new"
             );
-            assert_eq!(h.requests[0].history[1].draft.url, "https://example.test/0");
+            assert_eq!(
+                h.workspace.requests[0].history[1].draft.url,
+                "https://example.test/0"
+            );
         });
         click(window, "history-record-1");
         click(window, "delete-history-1");
         click(window, "confirm-history-delete");
         host.update(window, |h, cx| {
-            assert_eq!(h.requests[0].history.len(), 1);
+            assert_eq!(h.workspace.requests[0].history.len(), 1);
             assert!(h.selected_history.is_none());
             assert!(h.response_data.is_none());
-            assert!(h.responses[0].is_none());
-            assert!(h.sent_requests[0].is_none());
+            assert!(h.workspace.responses[0].is_none());
+            assert!(h.workspace.sent_requests[0].is_none());
             assert_eq!(h.snapshot(cx).url, "https://example.test/0");
         });
         click(window, "delete-history-0");

@@ -20,9 +20,14 @@ impl Workbench {
         index: usize,
         collection: Option<&str>,
     ) -> environment::EnvironmentValues {
-        let mut values = self.environment_inputs[index].values();
+        let mut values = self.workspace.environment_inputs[index].values();
         if let Some(local) = collection
-            .and_then(|name| self.collections.iter().find(|c| c.collection == name))
+            .and_then(|name| {
+                self.workspace
+                    .collections
+                    .iter()
+                    .find(|c| c.collection == name)
+            })
             .and_then(|c| c.environments.get(self.environment_name(index)))
         {
             values.0.extend(local.values().0);
@@ -32,7 +37,8 @@ impl Workbench {
     pub(super) fn active_environment_values(&self, cx: &App) -> environment::EnvironmentValues {
         self.environment_values(
             self.selected_environment(cx),
-            self.requests
+            self.workspace
+                .requests
                 .get(self.active)
                 .map(|r| r.collection.as_str()),
         )
@@ -40,7 +46,8 @@ impl Workbench {
     pub(super) fn environment_completions(&self, cx: &App) -> Vec<TextCompletion> {
         self.environment_completions_for(
             cx,
-            self.requests
+            self.workspace
+                .requests
                 .get(self.active)
                 .map(|r| r.collection.as_str()),
         )
@@ -53,10 +60,15 @@ impl Workbench {
         let index = self.selected_environment(cx);
         let mut entries = std::collections::BTreeMap::new();
         let local = collection
-            .and_then(|name| self.collections.iter().find(|c| c.collection == name))
+            .and_then(|name| {
+                self.workspace
+                    .collections
+                    .iter()
+                    .find(|c| c.collection == name)
+            })
             .and_then(|c| c.environments.get(self.environment_name(index)));
         for (variables, scope) in [
-            (Some(&self.environment_inputs[index]), "全局变量"),
+            (Some(&self.workspace.environment_inputs[index]), "全局变量"),
             (local, "集合变量"),
         ] {
             if let Some(variables) = variables {
@@ -90,14 +102,15 @@ impl Workbench {
     }
     pub(super) fn editor_environment(&self, index: usize) -> EnvironmentVariables {
         if let Some(name) = &self.editing_variable_collection {
-            self.collections
+            self.workspace
+                .collections
                 .iter()
                 .find(|c| &c.collection == name)
                 .and_then(|c| c.environments.get(self.environment_name(index)))
                 .cloned()
                 .unwrap_or_default()
         } else {
-            self.environment_inputs[index].clone()
+            self.workspace.environment_inputs[index].clone()
         }
     }
     pub(super) fn scoped_environment_mut(
@@ -108,13 +121,14 @@ impl Workbench {
         if let Some(name) = collection {
             let environment = self.environment_name(index).to_owned();
             let collection = self
+                .workspace
                 .collections
                 .iter_mut()
                 .find(|c| c.collection == name)
                 .ok_or("集合不存在")?;
             Ok(collection.environments.entry(environment).or_default())
         } else {
-            Ok(&mut self.environment_inputs[index])
+            Ok(&mut self.workspace.environment_inputs[index])
         }
     }
     pub(super) fn set_variable_scope(
@@ -128,10 +142,13 @@ impl Workbench {
         if self.has_unsaved_environment(cx) {
             return Err("请先保存或放弃当前作用域的修改".into());
         }
-        if collection
-            .as_ref()
-            .is_some_and(|name| !self.collections.iter().any(|c| &c.collection == name))
-        {
+        if collection.as_ref().is_some_and(|name| {
+            !self
+                .workspace
+                .collections
+                .iter()
+                .any(|c| &c.collection == name)
+        }) {
             return Err("集合不存在".into());
         }
         self.editing_variable_collection = collection;
@@ -151,7 +168,7 @@ impl Workbench {
         let binding = &self.proxy_inputs[index].binding;
         let proxy = binding
             .as_ref()
-            .and_then(|id| self.proxies.iter().find(|p| &p.id == id))
+            .and_then(|id| self.workspace.proxies.iter().find(|p| &p.id == id))
             .map(|p| p.settings.clone())
             .unwrap_or_default();
         serde_json::json!({"variables":rows,"proxy_id":binding,"proxy":proxy})
@@ -214,15 +231,15 @@ impl Workbench {
         }
     }
     pub(super) fn reset_variable_rows(&mut self, cx: &mut Context<Self>) {
-        while self.proxy_inputs.len() < self.environment_inputs.len() {
+        while self.proxy_inputs.len() < self.workspace.environment_inputs.len() {
             self.add_proxy_input(cx);
         }
-        for index in 0..self.environment_inputs.len() {
+        for index in 0..self.workspace.environment_inputs.len() {
             self.reset_environment_rows(index, cx);
         }
     }
     pub(super) fn add_proxy_input(&mut self, cx: &mut Context<Self>) {
-        let binding = self.environment_inputs[self.proxy_inputs.len()]
+        let binding = self.workspace.environment_inputs[self.proxy_inputs.len()]
             .proxy_id
             .clone();
         let options = self.proxy_binding_options();
@@ -235,7 +252,13 @@ impl Workbench {
         });
         let subscription = cx.subscribe(&select, |this, select, event: &SelectEvent, cx| {
             let SelectEvent::Changed(value) = event;
-            if !value.is_empty() && !this.proxies.iter().any(|p| p.id == value.as_ref()) {
+            if !value.is_empty()
+                && !this
+                    .workspace
+                    .proxies
+                    .iter()
+                    .any(|p| p.id == value.as_ref())
+            {
                 return;
             }
             if let Some(input) = this
@@ -283,7 +306,8 @@ impl Workbench {
         self.sync_variable_table(cx);
     }
     pub(super) fn reset_environment_rows(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.proxy_inputs[index].binding = self.environment_inputs[index].proxy_id.clone();
+        self.proxy_inputs[index].binding =
+            self.workspace.environment_inputs[index].proxy_id.clone();
         let binding = self.proxy_inputs[index].binding.clone().unwrap_or_default();
         self.proxy_inputs[index].select.update(cx, |select, cx| {
             select.set_selected(Some(binding.into()), cx);
@@ -323,10 +347,11 @@ impl Workbench {
             .collect();
         self.variable_draft(cx) != saved
             || self.proxy_inputs[self.editing_environment].binding
-                != self.environment_inputs[self.editing_environment].proxy_id
+                != self.workspace.environment_inputs[self.editing_environment].proxy_id
     }
     pub(super) fn has_unsaved_environment(&self, cx: &App) -> bool {
-        self.environment_inputs
+        self.workspace
+            .environment_inputs
             .iter()
             .enumerate()
             .any(|(index, saved)| {
@@ -374,7 +399,7 @@ impl Workbench {
         let scope = self.editing_variable_collection.clone();
         let drafts = (|| {
             let mut drafts = Vec::new();
-            for index in 0..self.environment_inputs.len() {
+            for index in 0..self.workspace.environment_inputs.len() {
                 self.editing_environment = index;
                 let mut environment = self.editor_environment(index);
                 let result = environment.replace(&self.variable_draft(cx)).and_then(|_| {
@@ -395,7 +420,7 @@ impl Workbench {
         for (index, environment) in drafts?.into_iter().enumerate() {
             *self.scoped_environment_mut(index, scope.as_deref())? = environment;
         }
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.variable_error = None;
         self.reset_variable_rows(cx);
         self.sync_reference_inputs(cx);
@@ -411,10 +436,10 @@ impl Workbench {
         }) {
             Ok(()) => {
                 if scope.is_none() {
-                    self.environment_inputs[index].proxy_id =
+                    self.workspace.environment_inputs[index].proxy_id =
                         self.proxy_inputs[index].binding.clone();
                 }
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
                 self.reset_environment_rows(index, cx);
                 self.sync_reference_inputs(cx);
                 self.ws_invalidate_titles();
@@ -661,7 +686,8 @@ impl Workbench {
     fn variable_scope_tabs(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut tabs = div().flex().items_center().gap_2();
         let collection = self.editing_variable_collection.clone().or_else(|| {
-            self.collections
+            self.workspace
+                .collections
                 .get(self.current_collection)
                 .map(|c| c.collection.clone())
         });
@@ -676,7 +702,7 @@ impl Workbench {
                 ),
             ),
         ] {
-            if local && scope.is_none() || !local && self.environment_names.len() <= 1 {
+            if local && scope.is_none() || !local && self.workspace.environment_names.len() <= 1 {
                 continue;
             }
             let active = self.editing_variable_collection == scope;
@@ -709,7 +735,7 @@ impl Workbench {
             );
         }
         tabs.when(
-            self.environment_names.len() > 1 && collection.is_some(),
+            self.workspace.environment_names.len() > 1 && collection.is_some(),
             |tabs| {
                 tabs.child(
                     div()
@@ -733,7 +759,7 @@ impl Workbench {
 
     pub(super) fn environment_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        if self.environment_names.len() <= 1 && self.collections.is_empty() {
+        if self.workspace.environment_names.len() <= 1 && self.workspace.collections.is_empty() {
             return div()
                 .size_full()
                 .flex()
@@ -768,7 +794,7 @@ impl Workbench {
                         .items_center()
                         .justify_center()
                         .text_color(rgb(p.text_muted))
-                        .child(if self.environment_names.len() <= 1 {
+                        .child(if self.workspace.environment_names.len() <= 1 {
                             "选择集合变量来管理当前集合的变量，或创建请求环境。"
                         } else {
                             "请选择环境来管理全局变量；集合变量可单独设置。"
@@ -956,7 +982,9 @@ impl Workbench {
                             .theme(self.theme)
                             .render()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_environments = false;
+                                if this.page == crate::Page::Environments {
+                                    this.page = crate::Page::Requests;
+                                }
                                 this.revealed_variables.clear();
                                 this.variable_delete = None;
                                 cx.notify();
@@ -986,7 +1014,8 @@ impl Workbench {
 
 impl Workbench {
     pub(super) fn environment_name(&self, index: usize) -> &str {
-        self.environment_names
+        self.workspace
+            .environment_names
             .get(index)
             .map(String::as_str)
             .unwrap_or("不使用环境")
@@ -995,7 +1024,8 @@ impl Workbench {
     pub(super) fn reference_resolver(&self, cx: &App) -> TextReferenceResolver {
         self.request_reference_resolver(
             &self.snapshot(cx),
-            self.requests
+            self.workspace
+                .requests
                 .get(self.active)
                 .map(|request| request.collection.as_str()),
             cx,
@@ -1071,6 +1101,7 @@ impl Workbench {
         });
         if let Some(editor) = &self.directory_settings {
             let collection = self
+                .workspace
                 .collections
                 .get(editor.read(cx).collection)
                 .map(|c| c.collection.as_str());
@@ -1093,7 +1124,7 @@ impl Workbench {
         let p = self.theme.palette();
         let applied = self.selected_environment(cx);
         let mut list = div().flex().flex_col().gap_2().px_2().py_3();
-        for (index, name) in self.environment_names.iter().enumerate().skip(1) {
+        for (index, name) in self.workspace.environment_names.iter().enumerate().skip(1) {
             let selected = self.editing_environment == index;
             let scoped = self.editor_environment(index);
             let base = scoped
@@ -1188,7 +1219,10 @@ impl Workbench {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(p.text_muted))
-                            .child(format!("{} 个环境", self.environment_names.len() - 1)),
+                            .child(format!(
+                                "{} 个环境",
+                                self.workspace.environment_names.len() - 1
+                            )),
                     ),
             )
             .child(
@@ -1199,7 +1233,8 @@ impl Workbench {
                     .overflow_y_scroll()
                     .child(list)
                     .when(
-                        self.environment_names.len() > 1 || !self.collections.is_empty(),
+                        self.workspace.environment_names.len() > 1
+                            || !self.workspace.collections.is_empty(),
                         |list| {
                             list.child(
                                 Button::new("创建环境")
@@ -1251,19 +1286,20 @@ mod scope_tests {
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
             for name in ["A", "B"] {
-                host.collections
-                    .push(RequestGroups::create_collection(name, &host.collections).unwrap());
+                host.workspace.collections.push(
+                    RequestGroups::create_collection(name, &host.workspace.collections).unwrap(),
+                );
             }
             host.current_collection = 0;
             host.add_request(cx);
-            host.environment_names.push("Dev".into());
-            host.environment_inputs.push(Default::default());
+            host.workspace.environment_names.push("Dev".into());
+            host.workspace.environment_inputs.push(Default::default());
             host.variable_rows.push(vec![]);
             host.add_proxy_input(cx);
-            host.environment_inputs[1]
+            host.workspace.environment_inputs[1]
                 .save(None, "host", "https://global.test", false)
                 .unwrap();
-            host.environment_inputs[1]
+            host.workspace.environment_inputs[1]
                 .save(None, "token", "global-secret", true)
                 .unwrap();
             host.scoped_environment_mut(1, Some("A"))
@@ -1275,7 +1311,7 @@ mod scope_tests {
                 .save(None, "only_a", "A", false)
                 .unwrap();
             host.reset_variable_rows(cx);
-            host.show_environments = true;
+            host.page = crate::Page::Environments;
             host.editing_environment = 1;
             host
         });
@@ -1333,16 +1369,16 @@ mod scope_tests {
                 "global-secret"
             );
             assert_eq!(
-                host.environment_inputs[1].values().0["token"],
+                host.workspace.environment_inputs[1].values().0["token"],
                 "global-secret"
             );
-            let token = host.collections[0].environments["Dev"]
+            let token = host.workspace.collections[0].environments["Dev"]
                 .variables
                 .iter()
                 .find(|v| v.name == "token")
                 .unwrap();
             assert!(token.secret);
-            assert!(host.collections[1].environments.is_empty());
+            assert!(host.workspace.collections[1].environments.is_empty());
             let bad = Draft {
                 extractors: vec![
                     Pair::new("token", "$.token", ""),
@@ -1357,7 +1393,7 @@ mod scope_tests {
             );
             host.apply_extractors(&draft, 0, "A", &response, cx)
                 .unwrap();
-            assert!(host.environment_inputs[0].variables.is_empty());
+            assert!(host.workspace.environment_inputs[0].variables.is_empty());
             assert!(
                 !host
                     .environment_values(0, Some("B"))
@@ -1367,17 +1403,18 @@ mod scope_tests {
             RequestGroups::rename_collection(
                 0,
                 "Renamed",
-                &mut host.collections,
-                &mut host.requests,
+                &mut host.workspace.collections,
+                &mut host.workspace.requests,
             )
             .unwrap();
             assert_eq!(host.environment_values(1, Some("Renamed")).0["only_a"], "A");
-            let origin_id = host.collections[0].id.clone();
-            host.collections
-                .push(RequestGroups::create_collection("A", &host.collections).unwrap());
+            let origin_id = host.workspace.collections[0].id.clone();
+            host.workspace
+                .collections
+                .push(RequestGroups::create_collection("A", &host.workspace.collections).unwrap());
             host.apply_extractors_for_id(&draft, 1, &origin_id, &response, cx)
                 .unwrap();
-            assert!(host.collections[2].environments.is_empty());
+            assert!(host.workspace.collections[2].environments.is_empty());
             assert_eq!(
                 host.environment_values(1, Some("Renamed")).0["token"],
                 "local-secret"

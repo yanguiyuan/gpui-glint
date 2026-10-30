@@ -5,7 +5,7 @@ use super::*;
 impl Workbench {
     pub(super) fn activity_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        let Some(request) = self.requests.get(self.active) else {
+        let Some(request) = self.workspace.requests.get(self.active) else {
             return div();
         };
         let records = if self.activity == 0 {
@@ -174,17 +174,18 @@ impl Workbench {
                             this.selected_history = Some((this.active, i));
                             this.load(&record.draft, cx);
                             let exchange = record.exchange.as_ref();
-                            this.sent_curls[this.active] = exchange.and_then(|e| e.curl.clone());
+                            this.workspace.sent_curls[this.active] =
+                                exchange.and_then(|e| e.curl.clone());
                             this.response_data = exchange.and_then(|e| e.response.clone());
                             this.response_json =
                                 this.response_data.as_ref().and_then(|r| r.json.clone());
                             this.status = this.response_data.as_ref().map(|r| r.status);
                             this.error = exchange.and_then(|e| e.error.clone());
-                            this.sent_requests[this.active] =
+                            this.workspace.sent_requests[this.active] =
                                 exchange.and_then(|e| e.preview.clone());
-                            this.traces[this.active] =
+                            this.workspace.traces[this.active] =
                                 exchange.map(|e| e.traces.clone()).unwrap_or_default();
-                            this.responses[this.active] = this.response_data.clone();
+                            this.workspace.responses[this.active] = this.response_data.clone();
                             this.sync_request_preview(cx);
                             this.update_response(cx);
                             if record.draft.method == "WS" {
@@ -443,6 +444,7 @@ impl Workbench {
                             self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = crate::Page::Requests;
                             this.activity = 0;
                             cx.notify();
                         })),
@@ -454,6 +456,7 @@ impl Workbench {
                             self.theme,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = crate::Page::History;
                             this.activity = 1;
                             cx.notify();
                         })),
@@ -464,6 +467,7 @@ impl Workbench {
                             .theme(self.theme)
                             .render()
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.page = crate::Page::Requests;
                                 this.show_activity = false;
                                 cx.notify();
                             })),

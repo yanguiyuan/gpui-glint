@@ -91,11 +91,21 @@ impl RenderOnce for WindowControls {
     }
 }
 
+/// Module-owned regions; the application host owns the outer window shell.
+pub struct WorkspaceSlots {
+    pub topbar: AnyElement,
+    pub sidebar: AnyElement,
+    pub content: AnyElement,
+    pub sidebar_width: f32,
+    pub sidebar_visible: bool,
+    pub sidebar_resize_handle: Option<AnyElement>,
+    pub theme: ThemePreset,
+}
+
+pub type ShellRenderer = std::rc::Rc<dyn Fn(WorkspaceSlots) -> AnyElement>;
+
 /// A full-window shell with a topbar, outer navigation rail, and workspace.
-///
-/// The sidebar and content share a rounded glass panel, separated by a subtle
-/// divider. The panel is raised from the topbar and navigation rail with a
-/// light edge and soft shadow.
+/// The sidebar and content share a rounded panel and a resizable divider.
 pub struct AppLayout {
     topbar: AnyElement,
     navigation_rail: Option<AnyElement>,
@@ -110,6 +120,14 @@ pub struct AppLayout {
 }
 
 impl AppLayout {
+    pub fn from_slots(slots: WorkspaceSlots) -> Self {
+        let mut layout = Self::new(slots.topbar, slots.sidebar, slots.content)
+            .sidebar_width(slots.sidebar_width)
+            .sidebar_visible(slots.sidebar_visible)
+            .theme(slots.theme);
+        layout.sidebar_resize_handle = slots.sidebar_resize_handle;
+        layout
+    }
     /// Creates the shell from its three content regions.
     pub fn new(
         topbar: impl IntoElement,

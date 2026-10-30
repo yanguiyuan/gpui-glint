@@ -177,14 +177,15 @@ impl Workbench {
                     };
                     let target_select = if kind == 5 {
                         let collection = self
+                            .workspace
                             .requests
                             .get(self.active)
                             .map(|r| r.collection.as_str());
-                        let active_id = self.requests.get(self.active).map(|r| &r.id);
+                        let active_id = self.workspace.requests.get(self.active).map(|r| &r.id);
                         let options: Vec<_> = self
                             .trigger_requests
                             .as_deref()
-                            .unwrap_or(&self.requests)
+                            .unwrap_or(&self.workspace.requests)
                             .iter()
                             .filter(|r| {
                                 Some(&r.id) != active_id
@@ -361,7 +362,8 @@ mod tests {
                 storage::Store::open(&dir.path().join("test.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("API", &[]).unwrap());
             host.add_request(cx);
             host
@@ -436,7 +438,7 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].key.entity_id(), second);
                 host.persist(cx);
-                assert!(host.storage_error.is_none());
+                assert!(host.workspace.storage_error.is_none());
             });
         }
     }

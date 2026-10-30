@@ -27,7 +27,8 @@ pub(super) fn certificate_status(store: &storage::Store) -> String {
 }
 impl Workbench {
     fn proxy_directory(&self) -> PathBuf {
-        self.storage
+        self.workspace
+            .storage
             .connection
             .path()
             .map(PathBuf::from)
@@ -43,7 +44,7 @@ impl Workbench {
             return Err("请等待证书操作完成".into());
         }
         let index = self.editing_proxy;
-        let id = self.proxies[index].id.clone();
+        let id = self.workspace.proxies[index].id.clone();
         if self.proxy_services.contains_key(&id) {
             return Ok(());
         }
@@ -73,7 +74,7 @@ impl Workbench {
     ) {
         self.proxy_app_menu = false;
         let result = self.start_proxy_service(cx).and_then(|_| {
-            let service = &self.proxy_services[&self.proxies[self.editing_proxy].id];
+            let service = &self.proxy_services[&self.workspace.proxies[self.editing_proxy].id];
             proxy_service::browser::launch(
                 &browser,
                 &self.proxy_directory(),
@@ -136,10 +137,10 @@ impl Workbench {
         .render()
     }
     pub(super) fn proxy_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
-        if self.proxies.is_empty() {
+        if self.workspace.proxies.is_empty() {
             return self.proxy_settings_workspace(cx);
         }
-        let profile = &self.proxies[self.editing_proxy];
+        let profile = &self.workspace.proxies[self.editing_proxy];
         self.proxy_capture_panel.update(cx, |panel, cx| {
             panel.bind_profile(
                 &profile.id,
@@ -223,7 +224,7 @@ impl Workbench {
     pub(super) fn proxy_listener_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
         let index = self.editing_proxy;
         let input = &self.profile_inputs[index];
-        let id = self.proxies[index].id.clone();
+        let id = self.workspace.proxies[index].id.clone();
         let running = self.proxy_services.get(&id);
         let owner = cx.entity().downgrade();
         let mut actions = div()
@@ -454,7 +455,7 @@ mod tests {
                 storage::Store::open(&directory.path().join("listener.sqlite3")).unwrap(),
                 cx,
             );
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "端口测试".into(),
                 settings: environment::ProxySettings {
@@ -467,7 +468,7 @@ mod tests {
                 },
             });
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         let endpoint = host.update(window, |host, cx| {
@@ -481,7 +482,7 @@ mod tests {
                 .update(cx, |entry, cx| entry.set_value(port.to_string(), cx));
             host.start_proxy_service(cx).unwrap();
             assert!(host.proxy_certificate_status.contains("SHA-256"));
-            let service = &host.proxy_services[&host.proxies[0].id];
+            let service = &host.proxy_services[&host.workspace.proxies[0].id];
             assert_eq!(service.address.port(), port);
             assert!(service.address.ip().is_loopback());
             service.endpoint()
@@ -506,11 +507,14 @@ mod tests {
         assert!(window.debug_bounds("proxy-capture-page").is_some());
         assert!(window.debug_bounds("table-empty-state").is_none());
         let captures = host.read_with(window, |host, _| {
-            host.proxy_captures[&host.proxies[0].id].clone()
+            host.proxy_captures[&host.workspace.proxies[0].id].clone()
         });
         assert_eq!(captures.summaries().len(), 1);
         let other = host.update(window, |host, _| {
-            host.storage.create_workspace("另一工作区").unwrap()
+            host.workspace
+                .storage
+                .create_workspace("另一工作区")
+                .unwrap()
         });
         window.update(|window, cx| {
             host.update(cx, |host, cx| {

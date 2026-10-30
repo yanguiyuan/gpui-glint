@@ -13,7 +13,8 @@ mod title_hit_tests {
                 storage::Store::open(&dir.path().join("title.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("API", &[]).unwrap());
             host.add_request(cx);
             host
@@ -31,7 +32,7 @@ mod title_hit_tests {
 
 impl Workbench {
     pub(super) fn edit_request_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(request) = self.requests.get(self.active) else {
+        let Some(request) = self.workspace.requests.get(self.active) else {
             return;
         };
         let name = request.name.clone();
@@ -59,10 +60,10 @@ impl Workbench {
             cx.notify();
             return;
         }
-        if let Some(request) = self.requests.get_mut(self.active) {
+        if let Some(request) = self.workspace.requests.get_mut(self.active) {
             if request.name != name {
                 request.name = name;
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
             }
         }
         self.cancel_request_name(cx);
@@ -164,7 +165,7 @@ impl Workbench {
                             .truncate()
                             .text_size(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.requests[self.active].name.clone()),
+                            .child(self.workspace.requests[self.active].name.clone()),
                     )
                     .child(
                         Icon::Pencil
@@ -181,11 +182,11 @@ impl Workbench {
     }
 
     pub(super) fn capture_draft(&mut self, cx: &App) {
-        if !self.requests.is_empty() {
+        if !self.workspace.requests.is_empty() {
             let draft = self.snapshot(cx);
-            if self.requests[self.active].draft != draft {
-                self.requests[self.active].draft = draft;
-                self.storage_dirty = true;
+            if self.workspace.requests[self.active].draft != draft {
+                self.workspace.requests[self.active].draft = draft;
+                self.workspace.storage_dirty = true;
             }
         }
     }
@@ -214,36 +215,23 @@ impl Workbench {
         self.flush_request_editors(cx);
         self.refresh_request_editors(cx);
         self.capture_draft(cx);
-        self.storage_dirty |= self.selected_environment(cx) != self.saved_environment;
-        if !self.storage_dirty {
+        self.workspace.storage_dirty |= self.selected_environment(cx) != self.saved_environment;
+        if !self.workspace.storage_dirty {
             return;
         }
-        let workspace = storage::Workspace {
-            update_source: self.update_source.clone(),
-            selected_environment: self.selected_environment(cx),
-            requests: self.requests.clone(),
-            collections: self.collections.clone(),
-            environments: self.environment_names.clone(),
-            variables: self.environment_inputs.clone(),
-            proxies: self.proxies.clone(),
-            traces: self.traces.clone(),
-            responses: self.responses.clone(),
-            previews: self.sent_requests.clone(),
-            curls: self.sent_curls.clone(),
-        };
-        let error = self.storage.save(&workspace).err();
-        if error.is_none() {
-            self.storage_dirty = false;
-            self.saved_environment = workspace.selected_environment;
+        let previous_error = self.workspace.storage_error.clone();
+        let selected = self.selected_environment(cx);
+        self.workspace.save(selected);
+        if self.workspace.storage_error.is_none() {
+            self.saved_environment = selected;
         }
-        if error != self.storage_error {
-            self.storage_error = error;
+        if previous_error != self.workspace.storage_error {
             cx.notify();
         }
     }
 
     pub(super) fn restore_response(&mut self, cx: &mut Context<Self>) {
-        self.response_data = self.responses.get(self.active).cloned().flatten();
+        self.response_data = self.workspace.responses.get(self.active).cloned().flatten();
         self.status = self.response_data.as_ref().map(|r| r.status);
         self.response_json = self.response_data.as_ref().and_then(|r| r.json.clone());
         self.sync_request_preview(cx);
@@ -269,10 +257,12 @@ impl Workbench {
             websocket_follow_latest: self.ws_follow_latest,
             websocket_raw: self.ws_raw,
             event_decoder: self
+                .workspace
                 .requests
                 .get(self.active)
                 .and_then(|r| r.draft.event_decoder.clone()),
             plugins: self
+                .workspace
                 .requests
                 .get(self.active)
                 .map(|r| r.draft.plugins.clone())
@@ -332,7 +322,7 @@ impl Workbench {
             select.close(cx);
             select.set_selected(Some(if self.ws_raw { "raw" } else { "pretty" }.into()), cx);
         });
-        if let Some(request) = self.requests.get_mut(self.active) {
+        if let Some(request) = self.workspace.requests.get_mut(self.active) {
             request.draft.plugins = draft.plugins.clone();
             request.draft.event_decoder = draft.event_decoder.clone();
         }
@@ -397,14 +387,19 @@ impl Workbench {
         self.tab_menu = None;
         self.directory_settings = None;
         self.tree_delete = None;
-        self.show_proxies = false;
-        self.show_mcp = false;
-        self.show_plugins = false;
-        self.show_environments = false;
-        if index >= self.requests.len() {
+        if matches!(
+            self.page,
+            crate::Page::Proxies
+                | crate::Page::Plugins
+                | crate::Page::Environments
+                | crate::Page::Mcp
+        ) {
+            self.page = crate::Page::Requests;
+        }
+        if index >= self.workspace.requests.len() {
             return;
         }
-        if !self.requests.is_empty() {
+        if !self.workspace.requests.is_empty() {
             self.capture_draft(cx);
         }
         self.park_websocket(cx);
@@ -415,17 +410,15 @@ impl Workbench {
         self.tree_menu = None;
         self.cancel_request_name(cx);
         self.active = index;
-        if let Some(collection) = self
-            .collections
-            .iter()
-            .position(|collection| collection.collection == self.requests[index].collection)
-        {
+        if let Some(collection) = self.workspace.collections.iter().position(|collection| {
+            collection.collection == self.workspace.requests[index].collection
+        }) {
             if self.current_collection != collection {
                 self.group_edit = None;
                 self.group_error = None;
             }
             self.current_collection = collection;
-            self.current_directory = self.requests[index].group.clone();
+            self.current_directory = self.workspace.requests[index].group.clone();
             let mut path = self.current_directory.as_str();
             loop {
                 self.collapsed_directories
@@ -441,7 +434,7 @@ impl Workbench {
         if !self.tabs.contains(&index) {
             self.tabs.push(index);
         }
-        let draft = self.requests[index].draft.clone();
+        let draft = self.workspace.requests[index].draft.clone();
         self.config = if matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH" | "WS") {
             3
         } else {
@@ -469,12 +462,12 @@ impl Workbench {
             editor.update(cx, |editor, cx| editor.save(cx));
             return;
         }
-        if self.requests.is_empty() {
+        if self.workspace.requests.is_empty() {
             return;
         }
         let draft = self.snapshot(cx);
         self.duplicate_version = None;
-        let request = &self.requests[self.active];
+        let request = &self.workspace.requests[self.active];
         if let Some(index) = self.matching_version(self.active, &draft) {
             let record = &request.versions[index];
             self.duplicate_version = Some(version_history::DuplicateVersion {
@@ -498,64 +491,37 @@ impl Workbench {
     }
 
     pub(super) fn add_request_to(&mut self, group: String, cx: &mut Context<Self>) {
-        if self.collections.is_empty() {
+        if self.workspace.collections.is_empty() {
             self.group_edit = Some(GroupEdit::CreateCollection);
             self.group_error = None;
             cx.notify();
             return;
         }
-        let draft = self.collections[self.current_collection].request_defaults(&group);
-        if !self.collections[self.current_collection].contains(&group) {
+        let draft = self.workspace.collections[self.current_collection].request_defaults(&group);
+        if !self.workspace.collections[self.current_collection].contains(&group) {
             return;
         }
-        let i = self.requests.len();
-        self.storage_dirty = true;
-        self.requests.push(Request {
-            id: crate::model::new_id(),
-            tree_order: 0,
-            name: format!("新建请求 {}", i + 1),
-            collection: self.collections[self.current_collection].collection.clone(),
-            group,
-            draft: draft.clone(),
-            versions: vec![Record {
-                id: crate::model::new_id(),
-                tag: String::new(),
-                source: Default::default(),
-                environment_name: None,
+        let title = format!("新建请求 {}", self.workspace.requests.len() + 1);
+        let i = self
+            .workspace
+            .create_request(
+                self.current_collection,
+                &group,
+                &title,
                 draft,
-                label: "v1".into(),
-                time: record_time(),
-                detail: "初始版本".into(),
-                elapsed_ms: None,
-                exchange: None,
-            }],
-            history: vec![],
-        });
-        let target = model::TreeNode::Directory {
-            collection: self.current_collection,
-            path: self.requests[i].group.clone(),
-        };
-        let _ = model::move_node(
-            &mut self.collections,
-            &mut self.requests,
-            &model::TreeNode::Request(i),
-            &target,
-            model::Placement::Inside,
-        );
-        self.responses.push(None);
-        self.traces.push(vec![]);
-        self.sent_requests.push(None);
-        self.sent_curls.push(None);
+                Default::default(),
+            )
+            .expect("validated collection and directory");
         self.current_versions.push(0);
         if i == 0 {
-            self.load(&self.requests[0].draft.clone(), cx);
+            self.load(&self.workspace.requests[0].draft.clone(), cx);
         }
         self.choose(i, cx);
     }
 
     pub(super) fn delete_request(&mut self, index: usize, cx: &mut Context<Self>) {
         self.request_menu = None;
-        if let Some(request) = self.requests.get(index) {
+        if let Some(request) = self.workspace.requests.get(index) {
             if let Some(shared) = self.request_editors.remove(&request.id) {
                 shared
                     .editor
@@ -566,7 +532,7 @@ impl Workbench {
         self.history_delete = None;
         self.version_tag_edit = None;
         self.tree_delete = None;
-        if index >= self.requests.len() {
+        if index >= self.workspace.requests.len() {
             return;
         }
         self.cancel_request_name(cx);
@@ -574,7 +540,7 @@ impl Workbench {
         if index != self.active {
             self.park_websocket(cx);
         }
-        let deleted_id = self.requests[index].id.clone();
+        let deleted_id = self.workspace.requests[index].id.clone();
         self.ws_background.remove(&deleted_id);
         // Any removal changes captured indices in a pending response task.
         if self.sending.take().is_some() {
@@ -582,12 +548,12 @@ impl Workbench {
         }
         self.trace_started = None;
         let removed_active = index == self.active;
-        self.storage_dirty = true;
-        let name = self.requests.remove(index).name;
-        self.responses.remove(index);
-        self.traces.remove(index);
-        self.sent_requests.remove(index);
-        self.sent_curls.remove(index);
+        self.workspace.storage_dirty = true;
+        let name = self
+            .workspace
+            .delete_request(index)
+            .expect("validated request index")
+            .name;
         self.current_versions.remove(index);
         self.tabs = self
             .tabs
@@ -603,18 +569,18 @@ impl Workbench {
         self.selected_history = self
             .selected_history
             .and_then(|(i, record)| (i != index).then(|| (i - usize::from(i > index), record)));
-        if self.requests.is_empty() {
+        if self.workspace.requests.is_empty() {
             self.active = 0;
         } else if removed_active {
             self.active = self
                 .tabs
                 .first()
                 .copied()
-                .unwrap_or(index.min(self.requests.len() - 1));
+                .unwrap_or(index.min(self.workspace.requests.len() - 1));
             if !self.tabs.contains(&self.active) {
                 self.tabs.push(self.active);
             }
-            self.load(&self.requests[self.active].draft.clone(), cx);
+            self.load(&self.workspace.requests[self.active].draft.clone(), cx);
             self.config = 0;
         } else if self.active > index {
             self.active -= 1;

@@ -66,13 +66,14 @@ impl Workbench {
     fn duplicate_request(&mut self, index: usize, cx: &mut Context<Self>) {
         self.flush_request_editors(cx);
         self.capture_draft(cx);
-        let Some(source) = self.requests.get(index).cloned() else {
+        let Some(source) = self.workspace.requests.get(index).cloned() else {
             return;
         };
         let base = format!("{} 副本", source.name);
         let mut name = base.clone();
         let mut suffix = 2;
         while self
+            .workspace
             .requests
             .iter()
             .any(|r| r.collection == source.collection && r.group == source.group && r.name == name)
@@ -80,8 +81,8 @@ impl Workbench {
             name = format!("{base} {suffix}");
             suffix += 1;
         }
-        let i = self.requests.len();
-        self.requests.push(Request {
+        let i = self.workspace.requests.len();
+        self.workspace.requests.push(Request {
             id: model::new_id(),
             tree_order: 0,
             name: name.clone(),
@@ -103,18 +104,18 @@ impl Workbench {
             history: vec![],
         });
         let _ = model::move_node(
-            &mut self.collections,
-            &mut self.requests,
+            &mut self.workspace.collections,
+            &mut self.workspace.requests,
             &model::TreeNode::Request(i),
             &model::TreeNode::Request(index),
             model::Placement::After,
         );
-        self.responses.push(None);
-        self.traces.push(vec![]);
-        self.sent_requests.push(None);
-        self.sent_curls.push(None);
+        self.workspace.responses.push(None);
+        self.workspace.traces.push(vec![]);
+        self.workspace.sent_requests.push(None);
+        self.workspace.sent_curls.push(None);
         self.current_versions.push(0);
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.choose(i, cx);
         self.notice = format!("已复制请求 {name}");
         self.sync_groups(cx);
@@ -129,7 +130,7 @@ impl Workbench {
     ) -> gpui::AnyElement {
         let (title, description) = match &target {
             model::TreeNode::Request(index) => (
-                format!("删除请求「{}」？", self.requests[*index].name),
+                format!("删除请求「{}」？", self.workspace.requests[*index].name),
                 "该请求及其版本、请求历史将一并删除。".to_owned(),
             ),
             model::TreeNode::Directory { path, .. } => (
@@ -185,8 +186,10 @@ impl Workbench {
                                     }
                                     model::TreeNode::Directory { collection, path } => {
                                         this.directory_settings = None;
-                                        if let Some(group) = this.collections.get_mut(*collection) {
-                                            group.remove(path, &mut this.requests);
+                                        if let Some(group) =
+                                            this.workspace.collections.get_mut(*collection)
+                                        {
+                                            group.remove(path, &mut this.workspace.requests);
                                             this.collapsed_directories.retain(|(c, folder)| {
                                                 *c != *collection
                                                     || (folder != path
@@ -196,7 +199,7 @@ impl Workbench {
                                             this.current_directory =
                                                 RequestGroups::parent(path).to_owned();
                                             this.group_edit = None;
-                                            this.storage_dirty = true;
+                                            this.workspace.storage_dirty = true;
                                             this.notice = "已删除目录，请求保留在上级目录中".into();
                                             this.sync_groups(cx);
                                         }
@@ -260,7 +263,7 @@ mod tests {
             let trigger = window.debug_bounds("delete-request:0").unwrap();
             window.simulate_click(trigger.center(), gpui::Modifiers::default());
             host.update(window, |host, _| {
-                assert_eq!(host.requests.len(), 1);
+                assert_eq!(host.workspace.requests.len(), 1);
                 assert_eq!(host.tree_delete, Some(model::TreeNode::Request(0)));
             });
             assert!(window.debug_bounds("tree-delete-confirmation").is_some());
@@ -274,7 +277,7 @@ mod tests {
             }
             host.update(window, |host, _| {
                 assert!(host.tree_delete.is_none());
-                assert_eq!(host.requests.len(), 1);
+                assert_eq!(host.workspace.requests.len(), 1);
             });
         }
         hover(window, "request-leaf:0");
@@ -290,7 +293,7 @@ mod tests {
         });
         window.simulate_click(confirm.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
-            assert!(host.requests.is_empty());
+            assert!(host.workspace.requests.is_empty());
             assert!(host.tree_delete.is_none());
             host.persist(cx);
         });
@@ -317,13 +320,13 @@ mod tests {
             host
         });
         let original = host.update(window, |host, cx| {
-            let mut draft = host.requests[0].draft.clone();
+            let mut draft = host.workspace.requests[0].draft.clone();
             draft.method = "POST".into();
             draft.url = "https://example.test/copied".into();
             draft.body = r#"{"message":"copy me"}"#.into();
             host.load(&draft, cx);
             host.capture_draft(cx);
-            host.requests[0].clone()
+            host.workspace.requests[0].clone()
         });
         hover(window, "request-leaf:0");
         let more = window.debug_bounds("request-more:0").unwrap();
@@ -341,11 +344,11 @@ mod tests {
         });
         window.simulate_click(copy.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
-            assert_eq!(host.requests.len(), 2);
+            assert_eq!(host.workspace.requests.len(), 2);
             assert_eq!(host.active, 1);
             assert!(host.request_menu.is_none());
             assert!(host.tree_delete.is_none());
-            let copy = &host.requests[1];
+            let copy = &host.workspace.requests[1];
             assert_ne!(copy.id, original.id);
             assert_eq!(copy.draft, original.draft);
             assert_eq!(copy.collection, original.collection);
@@ -355,7 +358,10 @@ mod tests {
             assert_eq!(copy.versions.len(), 1);
             assert_ne!(copy.versions[0].id, original.versions[0].id);
             host.duplicate_request(0, cx);
-            assert_eq!(host.requests[2].name, format!("{} 副本 2", original.name));
+            assert_eq!(
+                host.workspace.requests[2].name,
+                format!("{} 副本 2", original.name)
+            );
             host.persist(cx);
         });
         let saved = storage::Store::open(&path).unwrap().load().unwrap();
@@ -372,8 +378,12 @@ mod tests {
             host.group_edit = Some(GroupEdit::CreateCollection);
             host.group_name.update(cx, |e, cx| e.set_value("API", cx));
             host.save_group(cx);
-            host.collections[0].add_child("", "folder").unwrap();
-            host.collections[0].add_child("folder", "child").unwrap();
+            host.workspace.collections[0]
+                .add_child("", "folder")
+                .unwrap();
+            host.workspace.collections[0]
+                .add_child("folder", "child")
+                .unwrap();
             host.add_request_to("folder/child".into(), cx);
             host
         });
@@ -386,8 +396,8 @@ mod tests {
                 .unwrap();
             window.simulate_click(delete.center(), gpui::Modifiers::default());
             host.update(window, |host, _| {
-                assert!(host.collections[0].contains("folder/child"));
-                assert_eq!(host.requests[0].group, "folder/child");
+                assert!(host.workspace.collections[0].contains("folder/child"));
+                assert_eq!(host.workspace.requests[0].group, "folder/child");
                 assert!(host.tree_menu.is_none());
                 assert!(host.tree_delete.is_some());
             });
@@ -405,9 +415,9 @@ mod tests {
             window.simulate_click(action.center(), gpui::Modifiers::default());
         }
         host.update(window, |host, cx| {
-            assert!(host.collections[0].names.is_empty());
-            assert_eq!(host.requests.len(), 1);
-            assert!(host.requests[0].group.is_empty());
+            assert!(host.workspace.collections[0].names.is_empty());
+            assert_eq!(host.workspace.requests.len(), 1);
+            assert!(host.workspace.requests[0].group.is_empty());
             assert!(host.tree_delete.is_none());
             host.persist(cx);
         });

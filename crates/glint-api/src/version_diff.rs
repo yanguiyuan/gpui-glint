@@ -27,7 +27,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(request) = self.requests.get(self.active) else {
+        let Some(request) = self.workspace.requests.get(self.active) else {
             return;
         };
         if index >= request.versions.len() {
@@ -299,7 +299,7 @@ mod tests {
             assert_eq!(h.snapshot(cx).url, "https://example.test/unsaved");
             h.endpoint
                 .update(cx, |e, cx| e.set_text("https://example.test/later", cx));
-            h.requests[0].versions.clear();
+            h.workspace.requests[0].versions.clear();
         });
         child
             .update(window, |diff, _, cx| {

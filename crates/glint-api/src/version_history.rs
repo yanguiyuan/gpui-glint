@@ -32,12 +32,14 @@ mod tests {
             host.save(cx);
             host
         });
-        let original = host.read_with(window, |h, _| h.requests[0].versions[1].draft.clone());
+        let original = host.read_with(window, |h, _| {
+            h.workspace.requests[0].versions[1].draft.clone()
+        });
         for dismissal in ["cancel", "escape", "outside"] {
             host.update(window, |h, cx| {
                 h.load(&original, cx);
                 h.save(cx);
-                assert_eq!(h.requests[0].versions.len(), 2);
+                assert_eq!(h.workspace.requests[0].versions.len(), 2);
                 assert_eq!(h.current_versions[0], 0);
             });
             assert!(window.debug_bounds("duplicate-version-dialog").is_some());
@@ -58,7 +60,7 @@ mod tests {
             assert!(h.duplicate_version.is_none());
             assert_eq!(h.current_versions[0], 1);
             assert_eq!(h.snapshot(cx), original);
-            assert_eq!(h.requests[0].versions.len(), 2);
+            assert_eq!(h.workspace.requests[0].versions.len(), 2);
         });
         let reopened = window.update(|_, cx| {
             cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx))
@@ -66,7 +68,7 @@ mod tests {
         reopened.update(window, |h, cx| {
             assert_eq!(h.current_versions[0], 1);
             assert_eq!(h.snapshot(cx), original);
-            assert_eq!(h.requests[0].versions.len(), 2);
+            assert_eq!(h.workspace.requests[0].versions.len(), 2);
         });
     }
 
@@ -92,34 +94,34 @@ mod tests {
                 .update(cx, |e, cx| e.set_text("https://example.test/edited", cx));
             h.confirm_duplicate_version(cx);
             assert_eq!(h.snapshot(cx).url, "https://example.test/edited");
-            assert_eq!(h.requests[0].versions.len(), 1);
+            assert_eq!(h.workspace.requests[0].versions.len(), 1);
             h.save(cx);
-            let original = h.requests[0].versions[1].draft.clone();
+            let original = h.workspace.requests[0].versions[1].draft.clone();
             h.load(&original, cx);
             h.save(cx);
             // Legacy/imported histories can contain duplicates; a selected match wins.
-            let mut duplicate = h.requests[0].versions[1].clone();
+            let mut duplicate = h.workspace.requests[0].versions[1].clone();
             duplicate.id = model::new_id();
-            h.requests[0].versions.insert(0, duplicate);
+            h.workspace.requests[0].versions.insert(0, duplicate);
             h.confirm_duplicate_version(cx);
             assert_eq!(h.current_versions[0], 2);
             h.save(cx);
             assert_eq!(
                 h.duplicate_version.as_ref().unwrap().version_id,
-                h.requests[0].versions[2].id
+                h.workspace.requests[0].versions[2].id
             );
             let result = h
                 .mcp_call(
                     "glint_version_save",
-                    serde_json::json!({"request_id":h.requests[0].id,"tag":"must not overwrite"}),
+                    serde_json::json!({"request_id":h.workspace.requests[0].id,"tag":"must not overwrite"}),
                     cx,
                 )
                 .unwrap();
             assert_eq!(result["duplicate"], true);
             assert_eq!(result["confirmation_required"], false);
             assert!(h.duplicate_version.is_none());
-            assert_eq!(result["id"], h.requests[0].versions[2].id);
-            assert!(h.requests[0].versions.iter().all(|r| r.tag.is_empty()));
+            assert_eq!(result["id"], h.workspace.requests[0].versions[2].id);
+            assert!(h.workspace.requests[0].versions.iter().all(|r| r.tag.is_empty()));
         });
     }
 }
@@ -127,7 +129,7 @@ mod tests {
 impl Workbench {
     pub(super) fn matching_version(&self, request: usize, draft: &Draft) -> Option<usize> {
         let fingerprint = Fingerprint::new(draft);
-        let versions = &self.requests[request].versions;
+        let versions = &self.workspace.requests[request].versions;
         let selected = self.current_versions[request];
         if versions
             .get(selected)
@@ -142,7 +144,7 @@ impl Workbench {
     }
 
     pub(super) fn version_modified(&self, request: usize, draft: &Draft) -> bool {
-        self.requests[request]
+        self.workspace.requests[request]
             .versions
             .get(self.current_versions[request])
             .is_none_or(|r| Fingerprint::new(&r.draft) != Fingerprint::new(draft))
@@ -154,30 +156,9 @@ impl Workbench {
         draft: Draft,
         source: model::VersionSource,
     ) {
-        let request_data = &mut self.requests[request];
-        request_data.draft = draft.clone();
-        request_data.versions.insert(
-            0,
-            Record {
-                id: model::new_id(),
-                tag: String::new(),
-                source,
-                environment_name: None,
-                draft,
-                label: format!("v{}", request_data.versions.len() + 1),
-                time: record_time(),
-                detail: if source == model::VersionSource::Mcp {
-                    "MCP 保存请求时生成的快照"
-                } else {
-                    "保存请求时生成的快照"
-                }
-                .into(),
-                elapsed_ms: None,
-                exchange: None,
-            },
-        );
+        self.workspace.append_version(request, draft, source);
         self.current_versions[request] = 0;
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
     }
 
     /// MCP writes are saved without opening a GUI confirmation or interrupting
@@ -186,11 +167,11 @@ impl Workbench {
         if self
             .duplicate_version
             .as_ref()
-            .is_some_and(|pending| pending.request_id == self.requests[request].id)
+            .is_some_and(|pending| pending.request_id == self.workspace.requests[request].id)
         {
             self.duplicate_version = None;
         }
-        let draft = self.requests[request].draft.clone();
+        let draft = self.workspace.requests[request].draft.clone();
         if let Some(version) = self.matching_version(request, &draft) {
             self.current_versions[request] = version;
             (version, false)
@@ -206,6 +187,7 @@ impl Workbench {
             return;
         }
         let Some(record) = self
+            .workspace
             .requests
             .get(self.active)
             .and_then(|r| r.versions.get(index))
@@ -227,9 +209,9 @@ impl Workbench {
         self.response_data = None;
         self.status = None;
         self.error = None;
-        self.responses[self.active] = None;
+        self.workspace.responses[self.active] = None;
         self.update_response(cx);
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.persist(cx);
         cx.notify();
     }
@@ -239,6 +221,7 @@ impl Workbench {
             return;
         };
         let index = self
+            .workspace
             .requests
             .get(self.active)
             .filter(|request| request.id == pending.request_id)
@@ -250,7 +233,7 @@ impl Workbench {
             });
         if let Some(index) = index.filter(|&index| {
             Fingerprint::new(&self.snapshot(cx)) == pending.fingerprint
-                && Fingerprint::new(&self.requests[self.active].versions[index].draft)
+                && Fingerprint::new(&self.workspace.requests[self.active].versions[index].draft)
                     == pending.fingerprint
         }) {
             self.restore_version(index, cx);
@@ -268,6 +251,7 @@ impl Workbench {
     ) -> Option<gpui::AnyElement> {
         let pending = self.duplicate_version.as_ref()?;
         let request = self
+            .workspace
             .requests
             .get(self.active)
             .filter(|r| r.id == pending.request_id)?;

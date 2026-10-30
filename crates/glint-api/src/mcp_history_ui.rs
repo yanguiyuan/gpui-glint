@@ -2,11 +2,7 @@ use super::*;
 
 impl Workbench {
     pub(super) fn open_mcp_history(&mut self, cx: &mut Context<Self>) {
-        self.show_vault = false;
-        self.show_proxies = false;
-        self.show_mcp = true;
-        self.show_plugins = false;
-        self.show_environments = false;
+        self.page = crate::Page::Mcp;
         self.show_collection_menu = false;
         self.tree_menu = None;
         self.directory_settings = None;
@@ -18,7 +14,7 @@ impl Workbench {
             2 => Some(false),
             _ => None,
         };
-        match self.storage.mcp_call_page(
+        match self.workspace.storage.mcp_call_page(
             self.mcp_history_search.read(cx).value(),
             success,
             self.mcp_history_before,
@@ -46,7 +42,7 @@ impl Workbench {
         cx.notify();
     }
     fn select_mcp_history(&mut self, id: i64, cx: &mut Context<Self>) {
-        match self.storage.mcp_call_record(id) {
+        match self.workspace.storage.mcp_call_record(id) {
             Ok(record) => {
                 self.mcp_history_selected = Some(record);
                 self.sync_mcp_history_detail(cx);
@@ -510,130 +506,17 @@ impl Workbench {
 
 impl Workbench {
     pub(super) fn execute_mcp_call(&mut self, call: mcp::Call, cx: &mut Context<Self>) {
-        let mut secrets = self.mcp_log_secrets();
-        let arguments = call.arguments.clone();
-        let result = if Instant::now() >= call.deadline {
-            Err("MCP 操作已过期，未执行".into())
-        } else if let Some(error) = call.rejection {
-            Err(error)
-        } else {
-            self.mcp_call(&call.name, call.arguments, cx)
-        };
-        secrets.extend(self.mcp_log_secrets());
-        let mut arguments = arguments;
-        if call.name == "glint_environment_variable_set" {
-            if let Some(fields) = arguments.as_object_mut() {
-                fields.insert("value".into(), serde_json::json!("[REDACTED]"));
-            }
-        }
-        let mut output = match &result {
-            Ok(value) => serde_json::json!({"result":value}),
-            Err(error) => serde_json::json!({"error":error}),
-        };
-        super::mcp_ui::redact(&mut arguments);
-        super::mcp_ui::redact(&mut output);
-        scrub_values(&mut arguments, &secrets);
-        scrub_values(&mut output, &secrets);
-        let record = mcp_history::Record {
-            summary: mcp_history::Summary {
-                id: 0,
-                started_at_ms: call.metadata.started_at_ms,
-                client: call.metadata.client,
-                rpc_id: call.metadata.rpc_id,
-                tool: mcp_history::clip(&call.name, 256),
-                duration_ms: call
-                    .metadata
-                    .started
-                    .elapsed()
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64,
-                success: result.is_ok(),
+        let result = self.execute_workspace_tool(
+            crate::workspace_service::Invocation {
+                metadata: call.metadata,
+                name: call.name,
+                arguments: call.arguments,
+                deadline: call.deadline,
+                rejection: call.rejection,
             },
-            arguments: mcp_history::bounded(arguments),
-            result: mcp_history::bounded(output),
-        };
-        match self.storage.append_mcp_call(&record) {
-            Ok(_) => {
-                self.mcp_history_error = None;
-                if self.show_mcp {
-                    self.reload_mcp_history(cx);
-                }
-            }
-            Err(error) => {
-                self.mcp_history_error = Some(format!("调用记录保存失败：{error}"));
-                cx.notify();
-            }
-        }
+            cx,
+        );
         let _ = call.reply.send(result);
-    }
-    fn mcp_log_secrets(&self) -> Vec<String> {
-        let mut values = self
-            .environment_inputs
-            .iter()
-            .chain(
-                self.collections
-                    .iter()
-                    .flat_map(|c| c.environments.values()),
-            )
-            .flat_map(|env| {
-                env.variables
-                    .iter()
-                    .filter(|v| v.secret)
-                    .map(|v| v.value.clone())
-            })
-            .collect::<Vec<_>>();
-        for request in &self.requests {
-            values.push(request.draft.token.clone());
-            values.extend(
-                request
-                    .draft
-                    .cookies
-                    .iter()
-                    .map(|cookie| cookie.value.clone()),
-            );
-            values.extend(
-                request
-                    .draft
-                    .headers
-                    .iter()
-                    .filter(|h| {
-                        matches!(
-                            h.key.to_ascii_lowercase().as_str(),
-                            "authorization"
-                                | "cookie"
-                                | "x-kso-authorization"
-                                | "proxy-authorization"
-                        )
-                    })
-                    .map(|h| h.value.clone()),
-            );
-        }
-        values.retain(|value| value.len() >= 4);
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values.dedup();
-        values
-    }
-}
-fn scrub_values(value: &mut serde_json::Value, secrets: &[String]) {
-    match value {
-        serde_json::Value::String(text) => {
-            for secret in secrets {
-                if text.contains(secret) {
-                    *text = text.replace(secret, "[REDACTED]");
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                scrub_values(item, secrets);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            for item in fields.values_mut() {
-                scrub_values(item, secrets);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -680,10 +563,10 @@ mod tests {
             let revealed=dispatch(host,"glint_environment_get",json!({"environment":"Dev","include_secrets":true}),"Agent",cx).unwrap();
             assert_eq!(revealed["variables"][0]["value"],"long-secret-value");
             assert!(dispatch(host,"glint_request_get",json!({"request_id":"missing"}),"Agent",cx).is_err());
-            let page=host.storage.mcp_call_page("",None,None,100).unwrap();assert_eq!(page.total,4);
+            let page=host.workspace.storage.mcp_call_page("",None,None,100).unwrap();assert_eq!(page.total,4);
             assert!(!page.rows[0].success);assert_eq!(page.rows[0].client,"Agent");
             for row in page.rows{
-                let record=host.storage.mcp_call_record(row.id).unwrap();
+                let record=host.workspace.storage.mcp_call_record(row.id).unwrap();
                 assert!(!record.arguments.to_string().contains("long-secret-value"));
                 assert!(!record.result.to_string().contains("long-secret-value"));
             }
@@ -710,7 +593,8 @@ mod tests {
                 let time = chrono::DateTime::parse_from_rfc3339(stamp)
                     .unwrap()
                     .timestamp_millis();
-                host.storage
+                host.workspace
+                    .storage
                     .append_mcp_call(&mcp_history::Record {
                         summary: mcp_history::Summary {
                             id: 0,
@@ -734,7 +618,7 @@ mod tests {
         assert!(window.debug_bounds("mcp-history-day-2026-10-17").is_some());
         assert!(window.debug_bounds("mcp-history-day-2026-10-16").is_some());
         host.update(window, |host, cx| {
-            assert!(host.show_mcp);
+            assert_eq!(host.page, crate::Page::Mcp);
             assert_eq!(host.mcp_history_rows.len(), 2);
             assert!(host.mcp_history_detail.read(cx).content().contains("hello"));
         });
@@ -764,12 +648,12 @@ mod tests {
         assert_eq!(config["mcpServers"]["glint-api"]["args"][0], "--mcp");
         host.update(window, |host, cx| {
             host.open_plugin_manager(cx);
-            assert!(!host.show_mcp);
+            assert!(host.page != crate::Page::Mcp);
             host.open_mcp_history(cx);
-            assert!(host.show_mcp);
+            assert_eq!(host.page, crate::Page::Mcp);
             host.mcp_call("glint_ui_set", json!({"section":"requests"}), cx)
                 .unwrap();
-            assert!(!host.show_mcp);
+            assert!(host.page != crate::Page::Mcp);
         });
     }
 }

@@ -4,13 +4,13 @@ use super::*;
 
 impl Workbench {
     pub(super) fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        if self.show_proxies {
+        if self.page == crate::Page::Proxies {
             return self.proxy_sidebar(cx);
         }
-        if self.show_mcp {
+        if self.page == crate::Page::Mcp {
             return self.mcp_history_sidebar(cx);
         }
-        if self.show_plugins {
+        if self.page == crate::Page::Plugins {
             return self.plugin_sidebar(cx);
         }
         let p = self.theme.palette();
@@ -21,12 +21,12 @@ impl Workbench {
             .overflow_scroll()
             .px_2()
             .pb_3();
-        if self.show_environments {
+        if self.page == crate::Page::Environments {
             return self.environment_sidebar(cx);
         }
         let list = model::tree_list(
-            &self.collections,
-            &self.requests,
+            &self.workspace.collections,
+            &self.workspace.requests,
             &self.collapsed_directories,
             self.filter.read(cx).value(),
         );
@@ -36,7 +36,7 @@ impl Workbench {
                     .p_3()
                     .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child(if self.collections.is_empty() {
+                    .child(if self.workspace.collections.is_empty() {
                         "先创建一个集合，再添加请求或目录"
                     } else {
                         "没有匹配的集合、目录或请求"
@@ -57,7 +57,7 @@ impl Workbench {
                     .h(px(44.))
                     .gap_1()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                        if self.show_environments {
+                        if self.page == crate::Page::Environments {
                             "环境变量"
                         } else {
                             "请求"
@@ -70,7 +70,7 @@ impl Workbench {
                             .render()
                             .on_click(cx.listener(|this, _, _, cx| this.add_request(cx))),
                     )
-                    .when(!self.show_environments, |header| {
+                    .when(self.page != crate::Page::Environments, |header| {
                         header.child(self.collection_menu(cx))
                     }),
             )
@@ -142,12 +142,14 @@ impl Workbench {
     }
 
     pub(super) fn edit_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_proxies = false;
-        self.show_mcp = false;
+        if matches!(self.page, crate::Page::Proxies | crate::Page::Mcp) {
+            self.page = crate::Page::Requests;
+        }
         self.show_collection_menu = false;
         self.tree_menu = None;
-        self.show_environments = false;
-        self.show_plugins = false;
+        if matches!(self.page, crate::Page::Plugins | crate::Page::Environments) {
+            self.page = crate::Page::Requests;
+        }
         self.group_name
             .update(cx, |entry, cx| entry.set_value("", cx));
         self.group_edit = Some(GroupEdit::CreateCollection);
@@ -162,7 +164,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.collections.get(collection) else {
+        let Some(target) = self.workspace.collections.get(collection) else {
             return;
         };
         let old = target.collection.clone();
@@ -170,10 +172,15 @@ impl Workbench {
             self.current_directory.clear();
         }
         self.current_collection = collection;
-        self.show_proxies = false;
-        self.show_mcp = false;
-        self.show_environments = false;
-        self.show_plugins = false;
+        if matches!(
+            self.page,
+            crate::Page::Proxies
+                | crate::Page::Plugins
+                | crate::Page::Environments
+                | crate::Page::Mcp
+        ) {
+            self.page = crate::Page::Requests;
+        }
         self.tree_menu = None;
         self.show_collection_menu = false;
         self.group_name
@@ -187,6 +194,7 @@ impl Workbench {
     pub(super) fn sync_groups(&mut self, cx: &mut Context<Self>) {
         // Tree rows are derived directly from collections and requests at render time.
         if !self
+            .workspace
             .collections
             .get(self.current_collection)
             .is_some_and(|c| c.contains(&self.current_directory))
@@ -231,18 +239,20 @@ impl Workbench {
                 let name = name.trim();
                 if name.is_empty() {
                     Err("请输入环境名称".into())
-                } else if self.environment_names.iter().any(|n| n == name) {
+                } else if self.workspace.environment_names.iter().any(|n| n == name) {
                     Err("环境名称已存在".into())
                 } else {
-                    self.environment_names.push(name.to_owned());
-                    self.environment_inputs
+                    self.workspace.environment_names.push(name.to_owned());
+                    self.workspace
+                        .environment_inputs
                         .push(EnvironmentVariables::default());
                     self.variable_rows.push(vec![]);
                     self.add_proxy_input(cx);
-                    self.editing_environment = self.environment_names.len() - 1;
+                    self.editing_environment = self.workspace.environment_names.len() - 1;
                     self.environment.update(cx, |select, cx| {
                         select.set_options(
-                            self.environment_names
+                            self.workspace
+                                .environment_names
                                 .iter()
                                 .enumerate()
                                 .map(|(i, n)| SelectOption::new(i.to_string(), n.clone())),
@@ -254,34 +264,28 @@ impl Workbench {
                 }
             }
             Some(GroupEdit::CreateCollection) => {
-                RequestGroups::create_collection(&name, &self.collections).map(|collection| {
-                    self.collections.push(collection);
-                    self.current_collection = self.collections.len() - 1;
+                self.workspace.create_collection(&name).map(|index| {
+                    self.current_collection = index;
                     self.current_directory.clear();
                     self.notice = format!("已创建集合 {}", name.trim());
                 })
             }
             Some(GroupEdit::RenameCollection(old)) => self
+                .workspace
                 .collections
                 .iter()
                 .position(|collection| collection.collection == *old)
                 .ok_or("集合不存在或已重命名，请重新选择".to_owned())
-                .and_then(|index| {
-                    RequestGroups::rename_collection(
-                        index,
-                        &name,
-                        &mut self.collections,
-                        &mut self.requests,
-                    )
-                })
+                .and_then(|index| self.workspace.rename_collection(index, &name))
                 .map(|_| {
                     if self.editing_variable_collection.as_deref() == Some(old) {
                         self.editing_variable_collection = Some(name.trim().into());
                     }
                     self.notice = format!("已重命名集合为 {}", name.trim());
                 }),
-            Some(GroupEdit::Create(parent)) => self.collections[self.current_collection]
-                .add_child(parent, &name)
+            Some(GroupEdit::Create(parent)) => self
+                .workspace
+                .create_directory(self.current_collection, parent, &name)
                 .map(|path| {
                     let node = model::TreeNode::Directory {
                         collection: self.current_collection,
@@ -292,8 +296,8 @@ impl Workbench {
                         path: parent.clone(),
                     };
                     let _ = model::move_node(
-                        &mut self.collections,
-                        &mut self.requests,
+                        &mut self.workspace.collections,
+                        &mut self.workspace.requests,
                         &node,
                         &target,
                         model::Placement::Inside,
@@ -318,8 +322,8 @@ impl Workbench {
                 } else {
                     format!("{parent}/{}", name.trim())
                 };
-                self.collections[self.current_collection]
-                    .rename(old, &name, &mut self.requests)
+                self.workspace
+                    .rename_directory(self.current_collection, old, &name)
                     .map(|_| {
                         let prefix = format!("{old}/");
                         self.collapsed_directories = self
@@ -342,7 +346,7 @@ impl Workbench {
         };
         match result {
             Ok(()) => {
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
                 self.sync_groups(cx);
                 self.sync_commands(cx);
                 self.group_edit = None;

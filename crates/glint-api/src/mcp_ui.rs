@@ -15,69 +15,7 @@ fn flag(args: &Value, key: &str) -> bool {
 fn encode(value: impl serde::Serialize) -> Value {
     serde_json::to_value(value).expect("serializable workbench data")
 }
-fn sensitive(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "token"
-            | "authorization"
-            | "proxy-authorization"
-            | "cookie"
-            | "set-cookie"
-            | "x-kso-authorization"
-    )
-}
-pub(super) fn redact(value: &mut Value) {
-    match value {
-        Value::Object(fields) => {
-            let secret = fields.get("secret").and_then(Value::as_bool) == Some(true)
-                || ["key", "name"].iter().any(|key| {
-                    fields
-                        .get(*key)
-                        .and_then(Value::as_str)
-                        .is_some_and(sensitive)
-                });
-            for (key, value) in fields {
-                if sensitive(key)
-                    || secret && key == "value"
-                    || matches!(key.as_str(), "curl" | "preview") && value.is_string()
-                {
-                    if !value.is_null() {
-                        *value = json!("[REDACTED]");
-                    }
-                } else {
-                    redact(value);
-                }
-            }
-        }
-        Value::Array(items) => {
-            if items.len() == 2 && items[0].as_str().is_some_and(sensitive) {
-                items[1] = json!("[REDACTED]");
-            } else {
-                for item in items {
-                    redact(item);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-fn patch_draft(base: &Draft, patch: &Value) -> Result<Draft, String> {
-    mcp_tools::validate(&mcp_tools::draft_schema(), patch)?;
-    let mut value = encode(base);
-    for (key, item) in patch.as_object().ok_or("draft 必须是对象")? {
-        value[key] = item.clone();
-    }
-    let mut draft: Draft =
-        serde_json::from_value(value).map_err(|e| format!("请求配置无效：{e}"))?;
-    if patch.get("oauth").is_none() && patch.get("auth").is_some() {
-        draft.oauth = None;
-    }
-    if draft.oauth.is_some() {
-        draft.auth = false;
-        draft.token.clear();
-    }
-    Ok(draft)
-}
+use crate::workspace_service::{patch_draft, redact};
 fn name(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -110,37 +48,28 @@ impl Workbench {
     }
     fn mcp_workspace(&mut self, cx: &App) -> storage::Workspace {
         self.capture_draft(cx);
-        storage::Workspace {
-            update_source: self.update_source.clone(),
-            selected_environment: self.selected_environment(cx),
-            requests: self.requests.clone(),
-            collections: self.collections.clone(),
-            environments: self.environment_names.clone(),
-            variables: self.environment_inputs.clone(),
-            proxies: self.proxies.clone(),
-            traces: self.traces.clone(),
-            responses: self.responses.clone(),
-            previews: self.sent_requests.clone(),
-            curls: self.sent_curls.clone(),
-        }
+        self.workspace.snapshot(self.selected_environment(cx))
     }
     fn mcp_request_index(&self, args: &Value) -> Result<usize, String> {
         let id = text(args, "request_id")?;
-        self.requests
+        self.workspace
+            .requests
             .iter()
             .position(|r| r.id == id)
             .ok_or_else(|| "请求 ID 不存在，请刷新 workspace_get".into())
     }
     fn mcp_collection(&self, args: &Value) -> Result<usize, String> {
         let collection = text(args, "collection")?;
-        self.collections
+        self.workspace
+            .collections
             .iter()
             .position(|c| c.collection == collection)
             .ok_or_else(|| "集合不存在".into())
     }
     fn mcp_environment(&self, args: &Value) -> Result<usize, String> {
         let environment = text(args, "environment")?;
-        self.environment_names
+        self.workspace
+            .environment_names
             .iter()
             .position(|e| e == environment)
             .ok_or_else(|| "环境不存在".into())
@@ -166,7 +95,8 @@ impl Workbench {
         self.oauth.ready = None;
         self.environment.update(cx, |select, cx| {
             select.set_options(
-                self.environment_names
+                self.workspace
+                    .environment_names
                     .iter()
                     .enumerate()
                     .map(|(i, n)| SelectOption::new(i.to_string(), n.clone())),
@@ -185,7 +115,7 @@ impl Workbench {
         }
         let collection = self.mcp_collection(value)?;
         let path = optional_text(value, "path");
-        if !self.collections[collection].contains(path) {
+        if !self.workspace.collections[collection].contains(path) {
             return Err("目录不存在".into());
         }
         Ok(model::TreeNode::Directory {
@@ -195,9 +125,9 @@ impl Workbench {
     }
     fn mcp_status(&self, index: usize) -> Value {
         let active = index == self.active;
-        let response = self.responses[index].as_ref();
-        let background = self.ws_background.get(&self.requests[index].id);
-        json!({"request_id":self.requests[index].id,"active":active,"running":if active { self.sending.is_some() || self.ws_active } else { background.is_some_and(|state| state.active) },
+        let response = self.workspace.responses[index].as_ref();
+        let background = self.ws_background.get(&self.workspace.requests[index].id);
+        json!({"request_id":self.workspace.requests[index].id,"active":active,"running":if active { self.sending.is_some() || self.ws_active } else { background.is_some_and(|state| state.active) },
             "websocket_connected":if active { self.ws_connected } else { background.is_some_and(|state| state.connected) },"sse":response.is_some_and(HttpResponse::is_event_stream),
             "status":response.map(|r| r.status),"bytes":response.map(|r| r.bytes),
             "notice":if active {Some(&self.notice)} else {None},"error":if active {self.error.as_ref()} else {None}})
@@ -208,14 +138,10 @@ impl Workbench {
         args: Value,
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
-        let catalog = mcp_tools::catalog();
-        let spec = catalog
-            .iter()
-            .find(|item| item["name"] == tool)
-            .ok_or("未知 MCP 工具")?;
-        mcp_tools::validate(&spec["inputSchema"], &args)?;
-        let read_only = spec["annotations"]["readOnlyHint"] == true;
-        let operation = tool.strip_prefix("glint_").ok_or("未知工具前缀")?;
+        let command = crate::workspace_service::ToolCommand::parse(tool, args)?;
+        let read_only = command.read_only;
+        let args = command.arguments;
+        let operation = command.operation.as_str();
         if !matches!(operation, "request_select" | "request_delete" | "tree_move") {
             if let Some(shared) = args["request_id"]
                 .as_str()
@@ -227,7 +153,7 @@ impl Workbench {
                 if let Ok(value) = &mut result {
                     if value.get("active").is_some() {
                         value["active"] = json!(
-                                self.requests.get(self.active).is_some_and(
+                                self.workspace.requests.get(self.active).is_some_and(
                                     |r| Some(r.id.as_str()) == args["request_id"].as_str()
                                 )
                             );
@@ -236,7 +162,7 @@ impl Workbench {
                 self.flush_request_editors(cx);
                 self.persist(cx);
                 cx.notify();
-                if let Some(error) = &self.storage_error {
+                if let Some(error) = &self.workspace.storage_error {
                     return Err(format!("操作已应用但持久化失败：{error}"));
                 }
                 return result;
@@ -251,7 +177,7 @@ impl Workbench {
                     Some("error") => Some(false),
                     _ => None,
                 };
-                let page = self.storage.mcp_call_page(
+                let page = self.workspace.storage.mcp_call_page(
                     optional_text(&args, "query"),
                     success,
                     args["before_id"].as_i64(),
@@ -260,16 +186,17 @@ impl Workbench {
                 json!({"total":page.total,"has_more":page.has_more,"next_before_id":page.rows.last().map(|r|r.id),"calls":page.rows.iter().map(|r|json!({"id":r.id,"date":r.date(),"time":r.time(),"started_at_ms":r.started_at_ms,"client":r.client,"rpc_id":r.rpc_id,"tool":r.tool,"success":r.success,"duration_ms":r.duration_ms})).collect::<Vec<_>>()})
             }
             "mcp_history_get" => serde_json::to_value(
-                self.storage
+                self.workspace
+                    .storage
                     .mcp_call_record(args["id"].as_i64().ok_or("调用 ID 无效")?)?,
             )
             .map_err(|e| e.to_string())?,
             "workspace_get" => {
-                json!({"version":updater::VERSION,"workspace_id":self.storage.workspace_id,"workspace_name":self.workspace_label(),"active_request_id":self.requests.get(self.active).map(|r| &r.id),
-                "selected_environment":self.environment_name(self.selected_environment(cx)),"environments":self.environment_names,
-                "collections":self.collections.iter().map(|c| json!({"name":c.collection,"directories":c.names})).collect::<Vec<_>>(),
-                "requests":self.requests.iter().map(|r| json!({"id":r.id,"name":r.name,"collection":r.collection,"path":r.group,"method":r.draft.method,"url":r.draft.url})).collect::<Vec<_>>(),
-                "running":!self.running_request_tasks().is_empty(),"background_tasks":self.running_request_tasks().into_iter().map(|(request_id,label)|json!({"request_id":request_id,"label":label})).collect::<Vec<_>>(),"notice":self.notice,"error":self.error,"storage_error":self.storage_error,"mcp_error":self.mcp_error,
+                json!({"version":updater::VERSION,"workspace_id":self.workspace.storage.workspace_id,"workspace_name":self.workspace_label(),"active_request_id":self.workspace.requests.get(self.active).map(|r| &r.id),
+                "selected_environment":self.environment_name(self.selected_environment(cx)),"environments":self.workspace.environment_names,
+                "collections":self.workspace.collections.iter().map(|c| json!({"name":c.collection,"directories":c.names})).collect::<Vec<_>>(),
+                "requests":self.workspace.requests.iter().map(|r| json!({"id":r.id,"name":r.name,"collection":r.collection,"path":r.group,"method":r.draft.method,"url":r.draft.url})).collect::<Vec<_>>(),
+                "running":!self.running_request_tasks().is_empty(),"background_tasks":self.running_request_tasks().into_iter().map(|(request_id,label)|json!({"request_id":request_id,"label":label})).collect::<Vec<_>>(),"notice":self.notice,"error":self.error,"storage_error":self.workspace.storage_error,"mcp_error":self.mcp_error,
                 "registry_running":self.registry_task.is_some()})
             }
             "workspace_export" => {
@@ -293,27 +220,29 @@ impl Workbench {
                 self.ws_commands = None;
                 self.ws_active = false;
                 self.ws_connected = false;
-                self.requests = workspace.requests;
-                self.collections = workspace.collections;
-                self.environment_names = workspace.environments;
+                self.workspace.requests = workspace.requests;
+                self.workspace.collections = workspace.collections;
+                self.workspace.environment_names = workspace.environments;
                 self.editing_variable_collection = None;
-                self.environment_inputs = workspace.variables;
-                self.proxies = workspace.proxies;
+                self.workspace.environment_inputs = workspace.variables;
+                self.workspace.proxies = workspace.proxies;
                 self.reset_proxy_profiles(cx);
-                self.traces = workspace.traces;
-                self.responses = workspace.responses;
-                self.sent_requests = workspace.previews;
-                self.sent_curls = workspace.curls;
-                self.sent_curls.resize(self.requests.len(), None);
+                self.workspace.traces = workspace.traces;
+                self.workspace.responses = workspace.responses;
+                self.workspace.sent_requests = workspace.previews;
+                self.workspace.sent_curls = workspace.curls;
+                self.workspace
+                    .sent_curls
+                    .resize(self.workspace.requests.len(), None);
                 self.active = 0;
                 self.current_collection = 0;
                 self.current_directory.clear();
-                self.tabs = if self.requests.is_empty() {
+                self.tabs = if self.workspace.requests.is_empty() {
                     vec![]
                 } else {
                     vec![0]
                 };
-                self.current_versions = vec![0; self.requests.len()];
+                self.current_versions = vec![0; self.workspace.requests.len()];
                 self.selected_history = None;
                 self.directory_settings = None;
                 self.group_edit = None;
@@ -322,12 +251,15 @@ impl Workbench {
                 self.version_tag_edit = None;
                 self.history_delete = None;
                 self.collapsed_directories.clear();
-                self.variable_rows = (0..self.environment_inputs.len()).map(|_| vec![]).collect();
+                self.variable_rows = (0..self.workspace.environment_inputs.len())
+                    .map(|_| vec![])
+                    .collect();
                 self.proxy_inputs.clear();
                 self.editing_environment = 0;
                 self.reset_variable_rows(cx);
                 self.mcp_environment_options(workspace.selected_environment, cx);
                 let draft = self
+                    .workspace
                     .requests
                     .first()
                     .map(|r| r.draft.clone())
@@ -340,26 +272,18 @@ impl Workbench {
                 self.cancel_request_name(cx);
                 self.sync_commands(cx);
                 self.sync_groups(cx);
-                json!({"imported_requests":self.requests.len(),"imported_collections":self.collections.len()})
+                json!({"imported_requests":self.workspace.requests.len(),"imported_collections":self.workspace.collections.len()})
             }
             "collection_create" => {
-                let collection =
-                    RequestGroups::create_collection(text(&args, "name")?, &self.collections)?;
-                self.collections.push(collection);
-                self.current_collection = self.collections.len() - 1;
+                self.current_collection = self.workspace.create_collection(text(&args, "name")?)?;
                 self.current_directory.clear();
-                json!({"collection":self.collections[self.current_collection].collection})
+                json!({"collection":self.workspace.collections[self.current_collection].collection})
             }
             "collection_rename" => {
                 let index = self.mcp_collection(&args)?;
-                let old = self.collections[index].collection.clone();
+                let old = self.workspace.collections[index].collection.clone();
                 let next = text(&args, "name")?.trim().to_owned();
-                RequestGroups::rename_collection(
-                    index,
-                    &next,
-                    &mut self.collections,
-                    &mut self.requests,
-                )?;
+                self.workspace.rename_collection(index, &next)?;
                 if self.editing_variable_collection.as_deref() == Some(&old) {
                     self.editing_variable_collection = Some(next.clone());
                 }
@@ -370,8 +294,9 @@ impl Workbench {
             "collection_delete" => {
                 self.mcp_idle()?;
                 let index = self.mcp_collection(&args)?;
-                let old = self.collections[index].collection.clone();
+                let old = self.workspace.collections[index].collection.clone();
                 let indices = self
+                    .workspace
                     .requests
                     .iter()
                     .enumerate()
@@ -383,7 +308,7 @@ impl Workbench {
                 for i in indices.into_iter().rev() {
                     self.delete_request(i, cx);
                 }
-                self.collections.remove(index);
+                self.workspace.collections.remove(index);
                 if self.editing_variable_collection.as_deref() == Some(&old) {
                     self.editing_variable_collection = None;
                     self.reset_variable_rows(cx);
@@ -399,27 +324,24 @@ impl Workbench {
                 self.directory_settings = None;
                 match operation {
                     "directory_create" => {
-                        let path = self.collections[c]
-                            .add_child(optional_text(&args, "parent"), text(&args, "name")?)?;
+                        let path = self.workspace.create_directory(
+                            c,
+                            optional_text(&args, "parent"),
+                            text(&args, "name")?,
+                        )?;
                         json!({"path":path})
                     }
                     "directory_rename" => {
                         let old = text(&args, "path")?;
-                        self.collections[c].rename(
-                            old,
-                            text(&args, "name")?,
-                            &mut self.requests,
-                        )?;
+                        self.workspace
+                            .rename_directory(c, old, text(&args, "name")?)?;
                         self.current_directory.clear();
                         self.collapsed_directories.clear();
                         json!({"renamed":true})
                     }
                     _ => {
                         let path = text(&args, "path")?;
-                        if path.is_empty() || !self.collections[c].contains(path) {
-                            return Err("目录不存在；删除集合请使用 collection_delete".into());
-                        }
-                        self.collections[c].remove(path, &mut self.requests);
+                        self.workspace.delete_directory(c, path)?;
                         self.current_directory.clear();
                         self.collapsed_directories.clear();
                         json!({"deleted":path,"requests_preserved":true})
@@ -429,7 +351,7 @@ impl Workbench {
             "directory_defaults_get" | "directory_defaults_set" => {
                 let c = self.mcp_collection(&args)?;
                 let path = optional_text(&args, "path");
-                if !self.collections[c].contains(path) {
+                if !self.workspace.collections[c].contains(path) {
                     return Err("目录不存在".into());
                 }
                 if operation.ends_with("set") {
@@ -465,12 +387,12 @@ impl Workbench {
                             })
                             .collect::<Result<Vec<_>, String>>()?;
                     }
-                    self.collections[c]
+                    self.workspace.collections[c]
                         .defaults
                         .insert(path.into(), model::DirectoryDefaults { sections, draft });
                     self.directory_settings = None;
                 }
-                json!({"explicit":self.collections[c].defaults.get(path),"resolved":self.collections[c].request_defaults(path)})
+                json!({"explicit":self.workspace.collections[c].defaults.get(path),"resolved":self.workspace.collections[c].request_defaults(path)})
             }
             "tree_move" => {
                 let source = self.mcp_node(&args["source"])?;
@@ -483,8 +405,8 @@ impl Workbench {
                 if !matches!((&source,&target), (model::TreeNode::Directory{path:a,..},model::TreeNode::Directory{path:b,..}) if a.is_empty()&&b.is_empty()&&placement!=model::Placement::Inside)
                 {
                     model::move_node(
-                        &mut self.collections.clone(),
-                        &mut self.requests.clone(),
+                        &mut self.workspace.collections.clone(),
+                        &mut self.workspace.requests.clone(),
                         &source,
                         &target,
                         placement,
@@ -498,32 +420,36 @@ impl Workbench {
                 let c = self.mcp_collection(&args)?;
                 let path = optional_text(&args, "path");
                 let title = name(text(&args, "name")?)?;
-                if !self.collections[c].contains(path) {
+                if !self.workspace.collections[c].contains(path) {
                     return Err("目录不存在".into());
                 }
                 let draft = if operation == "curl_import" {
                     curl::parse(text(&args, "curl")?)?
                 } else {
                     patch_draft(
-                        &self.collections[c].request_defaults(path),
+                        &self.workspace.collections[c].request_defaults(path),
                         args.get("draft").unwrap_or(&json!({})),
                     )?
                 };
                 self.current_collection = c;
-                self.add_request_to(path.into(), cx);
-                self.requests[self.active].name = title;
-                self.load(&draft, cx);
-                self.capture_draft(cx);
-                self.requests[self.active].versions[0].draft = draft;
-                self.requests[self.active].versions[0].source = model::VersionSource::Mcp;
-                self.requests[self.active].versions[0].detail = "MCP 创建的初始版本".into();
-                json!({"request_id":self.requests[self.active].id,"saved":true,"version_created":true,"version":record_summary(&self.requests[self.active].versions[0])})
+                let index = self.workspace.create_request(
+                    c,
+                    path,
+                    &title,
+                    draft.clone(),
+                    model::VersionSource::Mcp,
+                )?;
+                self.current_versions.push(0);
+                if index == 0 {
+                    self.load(&draft, cx);
+                }
+                self.choose(index, cx);
+                self.workspace.requests[index].versions[0].detail = "MCP 创建的初始版本".into();
+                json!({"request_id":self.workspace.requests[self.active].id,"saved":true,"version_created":true,"version":record_summary(&self.workspace.requests[self.active].versions[0])})
             }
             "request_get" => {
                 let i = self.mcp_request_index(&args)?;
-                let r = &self.requests[i];
-                json!({"id":r.id,"name":r.name,"collection":r.collection,"path":r.group,"draft":r.draft,
-                    "versions":r.versions.iter().map(record_summary).collect::<Vec<_>>(),"history":r.history.iter().map(record_summary).collect::<Vec<_>>()})
+                self.workspace.request_summary(i)?
             }
             "request_update" => {
                 let i = self.mcp_request_index(&args)?;
@@ -536,23 +462,20 @@ impl Workbench {
                     .transpose()?;
                 let draft = args
                     .get("draft")
-                    .map(|patch| patch_draft(&self.requests[i].draft, patch))
+                    .map(|patch| patch_draft(&self.workspace.requests[i].draft, patch))
                     .transpose()?;
-                if let Some(title) = title {
-                    self.requests[i].name = title;
-                }
+                self.workspace.patch_request(i, title, draft.clone())?;
                 if let Some(draft) = draft {
-                    self.requests[i].draft = draft.clone();
                     if i == self.active {
                         self.load(&draft, cx);
                     }
                 }
-                json!({"request_id":self.requests[i].id})
+                json!({"request_id":self.workspace.requests[i].id})
             }
             "request_select" => {
                 let i = self.mcp_request_index(&args)?;
                 self.mcp_select(i, cx)?;
-                json!({"request_id":self.requests[i].id})
+                json!({"request_id":self.workspace.requests[i].id})
             }
             "request_delete" => {
                 self.mcp_idle()?;
@@ -567,7 +490,7 @@ impl Workbench {
                 }
                 if self
                     .ws_background
-                    .get(&self.requests[i].id)
+                    .get(&self.workspace.requests[i].id)
                     .is_some_and(|state| state.active)
                 {
                     return Err("该请求的 WebSocket 已在后台运行".into());
@@ -591,7 +514,7 @@ impl Workbench {
             "request_cancel" => {
                 let i = self.mcp_request_index(&args)?;
                 if i != self.active {
-                    let id = self.requests[i].id.clone();
+                    let id = self.workspace.requests[i].id.clone();
                     self.with_ws_request(&id, cx, |this, cx| this.disconnect_websocket(cx))
                         .ok_or("该请求没有正在执行的操作")?;
                     return Ok(self.mcp_status(i));
@@ -616,32 +539,32 @@ impl Workbench {
                 let i = self.mcp_request_index(&args)?;
                 let proxy = self.effective_proxy(self.selected_environment(cx));
                 let mut request = PreparedRequest::new(
-                    &self.requests[i].draft,
+                    &self.workspace.requests[i].draft,
                     &self.environment_values(
                         self.selected_environment(cx),
-                        Some(&self.requests[i].collection),
+                        Some(&self.workspace.requests[i].collection),
                     ),
                 )?
                 .with_proxy(&proxy)?;
-                if self.requests[i].draft.oauth.is_some() {
+                if self.workspace.requests[i].draft.oauth.is_some() {
                     request = request.with_oauth_token("[已隐藏]")?;
                 }
-                json!({"preview":request.preview,"curl":if self.requests[i].draft.method!="WS" {request.to_curl().ok()} else {None},"plugins_applied":false})
+                json!({"preview":request.preview,"curl":if self.workspace.requests[i].draft.method!="WS" {request.to_curl().ok()} else {None},"plugins_applied":false})
             }
             "response_read" => {
                 let i = self.mcp_request_index(&args)?;
                 let response = if let Some(id) = args["record_id"].as_str() {
-                    self.requests[i]
+                    self.workspace.requests[i]
                         .history
                         .iter()
-                        .chain(&self.requests[i].versions)
+                        .chain(&self.workspace.requests[i].versions)
                         .find(|r| r.id == id)
                         .ok_or("记录不存在")?
                         .exchange
                         .as_ref()
                         .and_then(|e| e.response.as_ref())
                 } else {
-                    self.responses[i].as_ref()
+                    self.workspace.responses[i].as_ref()
                 }
                 .ok_or("尚无响应")?;
                 let mut offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -665,21 +588,21 @@ impl Workbench {
             }
             "curl_export" => {
                 let i = self.mcp_request_index(&args)?;
-                json!({"curl":self.sent_curls[i].as_ref().ok_or("尚无已发送的 HTTP 请求快照")?})
+                json!({"curl":self.workspace.sent_curls[i].as_ref().ok_or("尚无已发送的 HTTP 请求快照")?})
             }
             "traces_read" => {
                 let i = self.mcp_request_index(&args)?;
-                json!({"traces":self.traces[i],"preview":self.sent_requests[i]})
+                json!({"traces":self.workspace.traces[i],"preview":self.workspace.sent_requests[i]})
             }
             "response_clear" => {
                 let i = self.mcp_request_index(&args)?;
                 if i == self.active {
                     self.mcp_idle()?;
                 }
-                self.responses[i] = None;
-                self.traces[i].clear();
-                self.sent_requests[i] = None;
-                self.sent_curls[i] = None;
+                self.workspace.responses[i] = None;
+                self.workspace.traces[i].clear();
+                self.workspace.sent_requests[i] = None;
+                self.workspace.sent_curls[i] = None;
                 if i == self.active {
                     self.restore_response(cx);
                     self.sync_request_preview(cx);
@@ -694,10 +617,10 @@ impl Workbench {
                 let (version, created) = self.save_mcp_version(i);
                 if created {
                     if let Some(tag) = args["tag"].as_str() {
-                        self.requests[i].versions[version].tag = tag.trim().into();
+                        self.workspace.requests[i].versions[version].tag = tag.trim().into();
                     }
                 }
-                let mut summary = record_summary(&self.requests[i].versions[version]);
+                let mut summary = record_summary(&self.workspace.requests[i].versions[version]);
                 summary["duplicate"] = json!(!created);
                 summary["confirmation_required"] = json!(false);
                 summary["saved"] = json!(true);
@@ -707,11 +630,17 @@ impl Workbench {
             "record_get" | "record_restore" | "record_tag" | "record_delete" => {
                 let i = self.mcp_request_index(&args)?;
                 let id = text(&args, "record_id")?;
-                let version = self.requests[i].versions.iter().position(|r| r.id == id);
-                let history = self.requests[i].history.iter().position(|r| r.id == id);
+                let version = self.workspace.requests[i]
+                    .versions
+                    .iter()
+                    .position(|r| r.id == id);
+                let history = self.workspace.requests[i]
+                    .history
+                    .iter()
+                    .position(|r| r.id == id);
                 let record = version
-                    .map(|v| self.requests[i].versions[v].clone())
-                    .or_else(|| history.map(|h| self.requests[i].history[h].clone()))
+                    .map(|v| self.workspace.requests[i].versions[v].clone())
+                    .or_else(|| history.map(|h| self.workspace.requests[i].history[h].clone()))
                     .ok_or("版本或历史 ID 不存在")?;
                 match operation {
                     "record_get" => {
@@ -730,19 +659,19 @@ impl Workbench {
                         if let Some(v) = version {
                             self.current_versions[i] = v;
                             self.selected_history = None;
-                            self.responses[i] = None;
+                            self.workspace.responses[i] = None;
                             self.error = None;
                             self.restore_response(cx);
                         }
                         if let Some(h) = history {
                             self.selected_history = Some((i, h));
-                            self.responses[i] =
+                            self.workspace.responses[i] =
                                 record.exchange.as_ref().and_then(|e| e.response.clone());
-                            self.sent_requests[i] =
+                            self.workspace.sent_requests[i] =
                                 record.exchange.as_ref().and_then(|e| e.preview.clone());
-                            self.sent_curls[i] =
+                            self.workspace.sent_curls[i] =
                                 record.exchange.as_ref().and_then(|e| e.curl.clone());
-                            self.traces[i] = record
+                            self.workspace.traces[i] = record
                                 .exchange
                                 .as_ref()
                                 .map(|e| e.traces.clone())
@@ -755,14 +684,14 @@ impl Workbench {
                     }
                     "record_tag" => {
                         let v = version.ok_or("仅版本支持标签")?;
-                        self.requests[i].versions[v].tag =
+                        self.workspace.requests[i].versions[v].tag =
                             optional_text(&args, "tag").trim().into();
-                        record_summary(&self.requests[i].versions[v])
+                        record_summary(&self.workspace.requests[i].versions[v])
                     }
                     _ => {
                         self.duplicate_version = None;
                         if let Some(v) = version {
-                            self.requests[i].versions.remove(v);
+                            self.workspace.requests[i].versions.remove(v);
                             self.current_versions[i] = 0;
                         } else {
                             self.delete_history_record(i, history.unwrap(), cx);
@@ -773,13 +702,8 @@ impl Workbench {
             }
             "environment_create" => {
                 let title = name(text(&args, "name")?)?;
-                if self.environment_names.contains(&title) {
-                    return Err("环境名称已存在".into());
-                }
                 let selected = self.selected_environment(cx);
-                self.environment_names.push(title.clone());
-                self.environment_inputs
-                    .push(EnvironmentVariables::default());
+                self.workspace.create_environment(&title)?;
                 self.variable_rows.push(vec![]);
                 self.add_proxy_input(cx);
                 self.mcp_environment_options(selected, cx);
@@ -790,6 +714,7 @@ impl Workbench {
                 let scope = args["collection"].as_str();
                 let variables = if let Some(name) = scope {
                     let collection = self
+                        .workspace
                         .collections
                         .iter()
                         .find(|c| c.collection == name)
@@ -800,14 +725,14 @@ impl Workbench {
                         .cloned()
                         .unwrap_or_default()
                 } else {
-                    self.environment_inputs[i].clone()
+                    self.workspace.environment_inputs[i].clone()
                 };
-                json!({"name":self.environment_names[i],"collection":scope,"variables":variables.variables,"proxy_id":self.environment_inputs[i].proxy_id,"proxy":self.effective_proxy(i),"available_proxies":self.proxies,"editor":if self.editing_variable_collection.as_deref()==scope { self.mcp_environment_editor(i,cx) } else { Value::Null }})
+                json!({"name":self.workspace.environment_names[i],"collection":scope,"variables":variables.variables,"proxy_id":self.workspace.environment_inputs[i].proxy_id,"proxy":self.effective_proxy(i),"available_proxies":self.workspace.proxies,"editor":if self.editing_variable_collection.as_deref()==scope { self.mcp_environment_editor(i,cx) } else { Value::Null }})
             }
             "environment_select" => {
                 let i = self.mcp_environment(&args)?;
                 self.mcp_environment_options(i, cx);
-                json!({"environment":self.environment_names[i]})
+                json!({"environment":self.workspace.environment_names[i]})
             }
             "environment_rename" | "environment_delete" => {
                 let i = self.mcp_environment(&args)?;
@@ -820,30 +745,12 @@ impl Workbench {
                 let selected = self.selected_environment(cx);
                 if operation.ends_with("rename") {
                     let title = name(text(&args, "name")?)?;
-                    if self
-                        .environment_names
-                        .iter()
-                        .enumerate()
-                        .any(|(j, n)| j != i && *n == title)
-                    {
-                        return Err("环境名称已存在".into());
-                    }
-                    let old = self.environment_names[i].clone();
-                    for collection in &mut self.collections {
-                        if let Some(variables) = collection.environments.remove(&old) {
-                            collection.environments.insert(title.clone(), variables);
-                        }
-                    }
-                    self.environment_names[i] = title;
+                    self.workspace.rename_environment(i, &title)?;
                     self.mcp_environment_options(selected, cx);
                 } else {
                     // Running HTTP post-actions capture environment indices.
                     self.mcp_idle()?;
-                    let removed = self.environment_names.remove(i);
-                    for collection in &mut self.collections {
-                        collection.environments.remove(&removed);
-                    }
-                    self.environment_inputs.remove(i);
+                    self.workspace.delete_environment(i)?;
                     self.variable_rows.remove(i);
                     self.proxy_inputs.remove(i);
                     self.editing_environment = 0;
@@ -866,10 +773,13 @@ impl Workbench {
             | "environment_draft" => {
                 let i = self.mcp_environment(&args)?;
                 let scope = args["collection"].as_str().map(str::to_owned);
-                if scope
-                    .as_ref()
-                    .is_some_and(|name| !self.collections.iter().any(|c| &c.collection == name))
-                {
+                if scope.as_ref().is_some_and(|name| {
+                    !self
+                        .workspace
+                        .collections
+                        .iter()
+                        .any(|c| &c.collection == name)
+                }) {
                     return Err("集合不存在".into());
                 }
                 if i == 0 && scope.is_none() {
@@ -956,14 +866,13 @@ impl Workbench {
                                             .to_owned(),
                                     )
                                 };
-                                if id
-                                    .as_ref()
-                                    .is_some_and(|id| !self.proxies.iter().any(|p| &p.id == id))
-                                {
+                                if id.as_ref().is_some_and(|id| {
+                                    !self.workspace.proxies.iter().any(|p| &p.id == id)
+                                }) {
                                     return Err("代理不存在".into());
                                 }
-                                self.environment_inputs[i].proxy_id = id;
-                                self.environment_inputs[i].proxy = Default::default();
+                                self.workspace.environment_inputs[i].proxy_id = id;
+                                self.workspace.environment_inputs[i].proxy = Default::default();
                             } else {
                                 let proxy = environment::ProxySettings {
                                     enabled: flag(&args, "enabled"),
@@ -984,26 +893,27 @@ impl Workbench {
                                 if self.has_unsaved_proxies(cx) {
                                     return Err("代理管理中有未保存修改，请先保存或丢弃".into());
                                 }
-                                let id = self.environment_inputs[i]
+                                let id = self.workspace.environment_inputs[i]
                                     .proxy_id
                                     .clone()
                                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                                if let Some(profile) = self.proxies.iter_mut().find(|p| p.id == id)
+                                if let Some(profile) =
+                                    self.workspace.proxies.iter_mut().find(|p| p.id == id)
                                 {
                                     profile.settings = proxy;
                                 } else {
-                                    self.proxies.push(environment::ProxyProfile {
+                                    self.workspace.proxies.push(environment::ProxyProfile {
                                         id: id.clone(),
                                         name: format!(
                                             "{} 代理 {}",
-                                            self.environment_names[i],
+                                            self.workspace.environment_names[i],
                                             &id[..8]
                                         ),
                                         settings: proxy,
                                     });
                                 }
-                                self.environment_inputs[i].proxy_id = Some(id);
-                                self.environment_inputs[i].proxy = Default::default();
+                                self.workspace.environment_inputs[i].proxy_id = Some(id);
+                                self.workspace.environment_inputs[i].proxy = Default::default();
                                 self.reset_proxy_profiles(cx);
                             }
                         }
@@ -1017,7 +927,7 @@ impl Workbench {
             }
             "websocket_send" | "websocket_read" | "websocket_clear" => {
                 let i = self.mcp_request_index(&args)?;
-                let request_id = self.requests[i].id.clone();
+                let request_id = self.workspace.requests[i].id.clone();
                 self.with_ws_request(&request_id, cx, |this, cx| -> Result<Value, String> {
                 Ok(match operation {
                     "websocket_send" => {
@@ -1028,7 +938,7 @@ impl Workbench {
                         let message = if args["resolve_templates"] != false {
                             template::TemplateResolver::for_request(
                                 &this.websocket_variables(cx),
-                                &if this.ws_background_update { this.requests[this.active].draft.clone() } else { this.snapshot(cx) },
+                                &if this.ws_background_update { this.workspace.requests[this.active].draft.clone() } else { this.snapshot(cx) },
                             )?
                             .resolve(message)?
                         } else {
@@ -1066,7 +976,7 @@ impl Workbench {
                 if operation == "plugin_bind" {
                     let identity = text(&args, "identity")?;
                     let action = optional_text(&args, "action_id");
-                    let bindings = &mut self.requests[i].draft.plugins;
+                    let bindings = &mut self.workspace.requests[i].draft.plugins;
                     let existing = bindings
                         .iter()
                         .position(|b| b.id == identity && b.action_id == action);
@@ -1112,15 +1022,17 @@ impl Workbench {
                         .collect::<Vec<_>>();
                     let mut sorted = order.clone();
                     sorted.sort_unstable();
-                    if sorted != (0..self.requests[i].draft.plugins.len()).collect::<Vec<_>>() {
+                    if sorted
+                        != (0..self.workspace.requests[i].draft.plugins.len()).collect::<Vec<_>>()
+                    {
                         return Err("order 必须包含所有现有索引且不重复".into());
                     }
-                    self.requests[i].draft.plugins = order
+                    self.workspace.requests[i].draft.plugins = order
                         .iter()
-                        .map(|&j| self.requests[i].draft.plugins[j].clone())
+                        .map(|&j| self.workspace.requests[i].draft.plugins[j].clone())
                         .collect();
                 }
-                json!({"bindings":self.requests[i].draft.plugins})
+                json!({"bindings":self.workspace.requests[i].draft.plugins})
             }
             "registry_source_add" | "registry_source_remove" => {
                 if self.registry_task.is_some() {
@@ -1196,12 +1108,15 @@ impl Workbench {
                     );
                 }
                 if let Some(section) = args["section"].as_str() {
-                    self.show_proxies = section == "proxies";
-                    self.show_mcp = section == "mcp";
-                    self.show_plugins = section == "plugins";
-                    self.show_environments = section == "environments";
+                    self.page = match section {
+                        "proxies" => crate::Page::Proxies,
+                        "mcp" => crate::Page::Mcp,
+                        "plugins" => crate::Page::Plugins,
+                        "environments" => crate::Page::Environments,
+                        _ => crate::Page::Requests,
+                    };
                     self.directory_settings = None;
-                    if self.show_mcp {
+                    if self.page == crate::Page::Mcp {
                         self.reload_mcp_history(cx);
                     }
                 }
@@ -1263,7 +1178,7 @@ impl Workbench {
             let (version, created) = self.save_mcp_version(i);
             result["saved"] = json!(true);
             result["version_created"] = json!(created);
-            result["version"] = record_summary(&self.requests[i].versions[version]);
+            result["version"] = record_summary(&self.workspace.requests[i].versions[version]);
         }
         if !read_only {
             if !matches!(
@@ -1276,13 +1191,13 @@ impl Workbench {
                     | "request_status"
                     | "update_status"
             ) {
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
             }
             self.sync_commands(cx);
             self.sync_groups(cx);
             self.persist(cx);
             cx.notify();
-            if let Some(error) = &self.storage_error {
+            if let Some(error) = &self.workspace.storage_error {
                 return Err(format!("操作已应用但持久化失败，请重试保存：{error}"));
             }
         }
@@ -1349,14 +1264,14 @@ mod tests {
                 assert!(preview["preview"].as_str().unwrap().contains(url));
             }
             call(host,"environment_rename",json!({"environment":"Dev","name":"Development"}),cx);
-            assert!(host.collections[0].environments.contains_key("Development"));
-            assert!(!host.collections[0].environments.contains_key("Dev"));
+            assert!(host.workspace.collections[0].environments.contains_key("Development"));
+            assert!(!host.workspace.collections[0].environments.contains_key("Dev"));
             call(host,"collection_rename",json!({"collection":"A","name":"Renamed"}),cx);
             assert_eq!(host.environment_values(1,Some("Renamed")).0["host"],"https://a.test");
             call(host,"environment_variable_delete",json!({"environment":"Development","collection":"Renamed","name":"host"}),cx);
             assert_eq!(host.environment_values(1,Some("Renamed")).0["host"],"https://global.test");
             call(host,"environment_delete",json!({"environment":"Development"}),cx);
-            assert!(host.collections.iter().all(|c| c.environments.is_empty()));
+            assert!(host.workspace.collections.iter().all(|c| c.environments.is_empty()));
         });
     }
     #[gpui::test]
@@ -1396,7 +1311,7 @@ mod tests {
             call(host,"tree_move",json!({"source":{"request_id":id},"target":{"collection":"API","path":"A/B"},"placement":"inside"}),cx);
             call(host,"directory_rename",json!({"collection":"API","path":"A","name":"Renamed"}),cx);
             call(host,"request_delete",json!({"request_id":other}),cx);
-            assert_eq!(host.requests.len(),1);
+            assert_eq!(host.workspace.requests.len(),1);
             let read=call(host,"request_get",json!({"request_id":id}),cx);
             assert_eq!(read["path"],"Renamed/B");
             assert_eq!(read["id"],id);
@@ -1407,7 +1322,7 @@ mod tests {
         });
         let reopened = cx.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(cx, |host, cx| {
-            assert_eq!(host.requests[0].id, request_id);
+            assert_eq!(host.workspace.requests[0].id, request_id);
             let record = call(
                 host,
                 "record_get",
@@ -1415,7 +1330,10 @@ mod tests {
                 cx,
             );
             assert_eq!(record["tag"], "baseline");
-            assert_eq!(host.environment_inputs[1].variables[0].value, "new-secret");
+            assert_eq!(
+                host.workspace.environment_inputs[1].variables[0].value,
+                "new-secret"
+            );
         });
     }
     #[gpui::test]
@@ -1471,7 +1389,7 @@ mod tests {
             assert!(host.sending.is_some());
             call(host, "request_get", json!({"request_id":id}), cx);
             assert_eq!(
-                host.requests[host.active].id, second,
+                host.workspace.requests[host.active].id, second,
                 "reading another request must not change the active execution"
             );
             call(host, "request_cancel", json!({"request_id":second}), cx);
@@ -1493,10 +1411,10 @@ mod tests {
             assert_eq!(result["version_created"],true);
             assert_eq!(result["version"]["source"],"mcp");
             assert!(!host.version_modified(host.active,&host.snapshot(cx)));
-            assert!(host.requests[0].draft.plugins[0].approval.matches(host.plugin_catalog.iter().find(|p|p.identity()==identity).unwrap()));
+            assert!(host.workspace.requests[0].draft.plugins[0].approval.matches(host.plugin_catalog.iter().find(|p|p.identity()==identity).unwrap()));
             call(host,"plugin_bind",json!({"request_id":id,"identity":identity,"action_id":action,"remove":true}),cx);
-            assert!(host.requests[0].draft.plugins.is_empty());
-            assert_eq!(host.requests[0].versions.len(),2);
+            assert!(host.workspace.requests[0].draft.plugins.is_empty());
+            assert_eq!(host.workspace.requests[0].versions.len(),2);
             assert_eq!(host.current_versions[0],1);
             assert!(!host.version_modified(host.active,&host.snapshot(cx)));
             let (sender,receiver)=async_channel::bounded(16);host.ws_commands=Some(sender);host.ws_connected=true;host.ws_active=true;
@@ -1509,7 +1427,7 @@ mod tests {
             call(host,"websocket_clear",json!({"request_id":id}),cx);
             assert_eq!(host.ws_sequence,8);
             host.ws_active=false;host.ws_connected=false;host.ws_commands=None;
-            host.responses[0]=Some(HttpResponse{status:200,headers:vec![("Set-Cookie".into(),"secret-session".into())],text:"你好world".into(),bytes:11,json:None});
+            host.workspace.responses[0]=Some(HttpResponse{status:200,headers:vec![("Set-Cookie".into(),"secret-session".into())],text:"你好world".into(),bytes:11,json:None});
             let response=call(host,"response_read",json!({"request_id":id,"offset":1,"limit":4}),cx);
             assert_eq!(response["text"],"好w");assert_eq!(response["offset"],3);
             assert_eq!(response["headers"][0][1],"[REDACTED]");
@@ -1526,9 +1444,9 @@ mod tests {
         host.update(cx, |h, cx| {
             call(h, "collection_create", json!({"name":"API"}), cx);
             h.add_request(cx);
-            let id = h.requests[0].id.clone();
-            h.requests[0].versions[0].tag = "人工基线".into();
-            let baseline_id = h.requests[0].versions[0].id.clone();
+            let id = h.workspace.requests[0].id.clone();
+            h.workspace.requests[0].versions[0].tag = "人工基线".into();
+            let baseline_id = h.workspace.requests[0].versions[0].id.clone();
             let result = call(
                 h,
                 "request_update",
@@ -1538,7 +1456,7 @@ mod tests {
             assert_eq!(result["saved"], true);
             assert_eq!(result["version_created"], true);
             assert_eq!(result["version"]["source"], "mcp");
-            assert_eq!(h.requests[0].versions.len(), 2);
+            assert_eq!(h.workspace.requests[0].versions.len(), 2);
             assert!(!h.version_modified(0, &h.snapshot(cx)));
             let version_id = result["version"]["id"].clone();
             call(
@@ -1583,7 +1501,7 @@ mod tests {
                 json!({"request_id":id,"name":"renamed"}),
                 cx,
             );
-            assert_eq!(h.requests[0].versions.len(), 2);
+            assert_eq!(h.workspace.requests[0].versions.len(), 2);
             let stored = storage::Store::open(&path).unwrap().load().unwrap();
             assert_eq!(
                 stored.requests[0].versions[0].source,
@@ -1630,7 +1548,7 @@ mod tests {
             assert_eq!(updated["version_created"], true);
             assert_eq!(h.active, 1);
             assert_eq!(h.snapshot(cx), active_draft);
-            assert_eq!(h.requests[0].versions[0].draft.body, "inactive draft");
+            assert_eq!(h.workspace.requests[0].versions[0].draft.body, "inactive draft");
             h.show_curl_import = true;
             h.version_tag_edit = Some((1,"v1".into()));
             let saved = call(h, "version_save", json!({"request_id":first["request_id"]}), cx);
@@ -1642,13 +1560,13 @@ mod tests {
             assert!(h.duplicate_version.is_none());
             h.show_curl_import = false;
             h.version_tag_edit = None;
-            let saved = call(h, "version_save", json!({"request_id":h.requests[1].id,"tag":"explicit save"}), cx);
+            let saved = call(h, "version_save", json!({"request_id":h.workspace.requests[1].id,"tag":"explicit save"}), cx);
             assert_eq!(saved["source"], "mcp");
             assert_eq!(saved["version_created"], true);
             assert_eq!(saved["tag"], "explicit save");
             let imported = call(h, "curl_import", json!({"collection":"API","name":"imported","curl":"curl https://example.test/import"}), cx);
             assert_eq!(imported["version"]["source"], "mcp");
-            assert_eq!(h.requests[2].versions.len(), 1);
+            assert_eq!(h.workspace.requests[2].versions.len(), 1);
         });
     }
 
@@ -1662,14 +1580,14 @@ mod tests {
             );
             call(&mut h, "collection_create", json!({"name":"API"}), cx);
             h.add_request(cx);
-            let id = h.requests[0].id.clone();
+            let id = h.workspace.requests[0].id.clone();
             call(
                 &mut h,
                 "request_update",
                 json!({"request_id":id,"draft":{"body":"MCP body"}}),
                 cx,
             );
-            let record = h.requests[0].versions[0].id.clone();
+            let record = h.workspace.requests[0].versions[0].id.clone();
             call(
                 &mut h,
                 "record_tag",
@@ -1683,8 +1601,11 @@ mod tests {
         assert!(window.debug_bounds("version-source-0").is_some());
         assert!(window.debug_bounds("version-source-1").is_none());
         host.update(window, |h, cx| {
-            assert_eq!(h.requests[0].versions[0].tag, "自定义标签");
-            assert_eq!(h.requests[0].versions[0].source, model::VersionSource::Mcp);
+            assert_eq!(h.workspace.requests[0].versions[0].tag, "自定义标签");
+            assert_eq!(
+                h.workspace.requests[0].versions[0].source,
+                model::VersionSource::Mcp
+            );
             assert!(!h.version_modified(0, &h.snapshot(cx)));
             h.endpoint.update(cx, |e, cx| {
                 e.set_text("https://example.test/manual-edit", cx)

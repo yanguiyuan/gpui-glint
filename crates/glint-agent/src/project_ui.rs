@@ -32,8 +32,9 @@ impl AgentWorkspace {
         self.restore_draft(cx);
         images::release_previews(self.image_views.borrow_mut().clear(), cx);
         self.project_picker_open = false;
-        self.show_settings = false;
-        self.show_calendar = false;
+        if matches!(self.page, crate::Page::Settings | crate::Page::Calendar) {
+            self.page = crate::Page::Chat;
+        }
         self.save(cx);
         cx.notify();
     }

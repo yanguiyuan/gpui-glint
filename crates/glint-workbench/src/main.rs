@@ -10,7 +10,10 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, Subscription, TitlebarOptions, Window, WindowBounds,
     WindowOptions, div, point, prelude::*, px, size,
 };
-use gpui_glint::{components::GlintAssets, theme::ThemePreset};
+use gpui_glint::{
+    components::{AppLayout, GlintAssets, ShellRenderer},
+    theme::ThemePreset,
+};
 use navigation::{Action, Navigation, Route};
 
 struct Workbench {
@@ -18,7 +21,7 @@ struct Workbench {
     api: Entity<glint_api::Workbench>,
     agent: Entity<glint_agent::AgentWorkspace>,
     navigation: Entity<Navigation>,
-    agent_active: bool,
+    route: Route,
     theme: ThemePreset,
     _subscriptions: Vec<Subscription>,
 }
@@ -26,10 +29,32 @@ struct Workbench {
 impl Workbench {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let navigation = cx.new(|_| Navigation::default());
-        let api = cx.new(|cx| glint_api::Workbench::hosted(navigation.clone().into(), cx));
+        let rail = navigation.clone();
+        let shell: ShellRenderer = std::rc::Rc::new(move |mut slots| {
+            slots.topbar = div()
+                .size_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .pl(px(if cfg!(target_os = "macos") { 80. } else { 16. }))
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Glint Workbench"),
+                )
+                .child(div().flex_1().min_w_0().h_full().child(slots.topbar))
+                .into_any_element();
+            AppLayout::from_slots(slots)
+                .navigation_rail(rail.clone())
+                .navigation_rail_width(46.)
+                .into_any_element()
+        });
+        let api = cx.new(|cx| glint_api::Workbench::hosted(shell.clone(), cx));
         let (tools, api_tools_task) = api_tools::ApiTools::connect(&api, cx);
         let agent = cx.new(|cx| {
-            let mut agent = glint_agent::AgentWorkspace::hosted(navigation.clone().into(), cx);
+            let mut agent = glint_agent::AgentWorkspace::hosted(shell.clone(), cx);
             agent.set_host_tools(tools);
             agent
         });
@@ -41,15 +66,29 @@ impl Workbench {
                     this.dispatch(*action, window, cx);
                 },
             ),
-            cx.observe(&api, |_, _, cx| cx.notify()),
-            cx.observe(&agent, |_, _, cx| cx.notify()),
+            cx.observe(&api, |this, _, cx| {
+                if matches!(this.route, Route::Api(_)) {
+                    this.route = Route::Api(this.api.read(cx).page());
+                }
+                this.sync_theme(this.api.read(cx).host_theme(), cx);
+                this.sync_navigation(cx);
+                cx.notify();
+            }),
+            cx.observe(&agent, |this, _, cx| {
+                if matches!(this.route, Route::Agent(_)) {
+                    this.route = Route::Agent(this.agent.read(cx).page());
+                }
+                this.sync_theme(this.agent.read(cx).host_theme(), cx);
+                this.sync_navigation(cx);
+                cx.notify();
+            }),
         ];
         Self {
             _api_tools_task: api_tools_task,
             api,
             agent,
             navigation,
-            agent_active: false,
+            route: Route::Api(glint_api::Page::Requests),
             theme: ThemePreset::Moonstone,
             _subscriptions: subscriptions,
         }
@@ -58,15 +97,15 @@ impl Workbench {
     fn dispatch(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             Action::Navigate(Route::Api(page)) => {
-                self.agent_active = false;
+                self.route = Route::Api(page);
                 self.api
                     .update(cx, |api, cx| api.navigate(page, window, cx));
             }
             Action::Navigate(Route::Agent(page)) => {
-                if !self.agent_active {
+                if matches!(self.route, Route::Api(_)) {
                     self.api.update(cx, |api, cx| api.deactivate(window, cx));
                 }
-                self.agent_active = true;
+                self.route = Route::Agent(page);
                 self.agent
                     .update(cx, |agent, cx| agent.navigate(page, window, cx));
             }
@@ -91,40 +130,43 @@ impl Workbench {
                     .update(cx, |agent, cx| agent.set_host_theme(self.theme, cx));
             }
         }
+        self.sync_navigation(cx);
         cx.notify();
+    }
+
+    fn sync_navigation(&self, cx: &mut Context<Self>) {
+        self.navigation.update(cx, |navigation, cx| {
+            navigation.set_state(self.route, self.theme, cx)
+        });
+    }
+
+    fn sync_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        if theme == self.theme {
+            return;
+        }
+        self.theme = theme;
+        self.api.update(cx, |api, cx| {
+            if api.host_theme() != theme {
+                api.set_host_theme(theme, cx);
+            }
+        });
+        self.agent.update(cx, |agent, cx| {
+            if agent.host_theme() != theme {
+                agent.set_host_theme(theme, cx);
+            }
+        });
     }
 }
 
 impl Render for Workbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Module commands can also change the theme; keep the host and inactive module in sync.
-        let theme = if self.agent_active {
-            self.agent.read(cx).host_theme()
-        } else {
-            self.api.read(cx).host_theme()
-        };
-        if theme != self.theme {
-            self.theme = theme;
-            if self.agent_active {
-                self.api.update(cx, |api, cx| api.set_host_theme(theme, cx));
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(if matches!(self.route, Route::Agent(_)) {
+                self.agent.clone().into_any_element()
             } else {
-                self.agent
-                    .update(cx, |agent, cx| agent.set_host_theme(theme, cx));
-            }
-        }
-        let route = if self.agent_active {
-            Route::Agent(self.agent.read(cx).page())
-        } else {
-            Route::Api(self.api.read(cx).page())
-        };
-        self.navigation.update(cx, |navigation, cx| {
-            navigation.set_state(route, self.theme, cx)
-        });
-        div().size_full().child(if self.agent_active {
-            self.agent.clone().into_any_element()
-        } else {
-            self.api.clone().into_any_element()
-        })
+                self.api.clone().into_any_element()
+            })
     }
 }
 

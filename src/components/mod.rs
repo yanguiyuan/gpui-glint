@@ -41,7 +41,7 @@ pub use inputs::{
     Checkbox, InputField, RadioOption, SearchInput, SegmentOption, SegmentedControl, Slider,
     Stepper, Switch, TokenInput, checkbox_control, checkbox_control_themed,
 };
-pub use layout::{AppLayout, window_drag_region};
+pub use layout::{AppLayout, ShellRenderer, WorkspaceSlots, window_drag_region};
 pub use mermaid::{MermaidDiagram, MermaidEvent, MermaidSvg, render_mermaid};
 pub use popover::Popover;
 pub use select::{Select, SelectEvent, SelectOption};

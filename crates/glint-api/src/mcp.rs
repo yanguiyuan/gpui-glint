@@ -14,13 +14,7 @@ use std::{
 };
 const MAX_LINE: u64 = 64 * 1024 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-#[derive(Clone)]
-pub struct CallMetadata {
-    pub client: String,
-    pub rpc_id: String,
-    pub started_at_ms: i64,
-    pub started: Instant,
-}
+pub use crate::workspace_service::CallMetadata;
 pub struct Call {
     pub metadata: CallMetadata,
     pub rejection: Option<String>,

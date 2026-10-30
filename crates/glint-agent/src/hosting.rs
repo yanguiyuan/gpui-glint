@@ -6,6 +6,7 @@ pub enum Page {
     Chat,
     Calendar,
     Settings,
+    Vault,
 }
 
 impl AgentWorkspace {
@@ -13,30 +14,25 @@ impl AgentWorkspace {
     pub fn set_host_tools(&mut self, tools: std::sync::Arc<dyn crate::host_tools::HostTools>) {
         self.host_tools = Some(tools);
     }
-    pub fn hosted(navigation: gpui::AnyView, cx: &mut Context<Self>) -> Self {
+    pub fn hosted(shell: gpui_glint::components::ShellRenderer, cx: &mut Context<Self>) -> Self {
         let mut this = Self::new(cx);
-        this.host_navigation = Some(navigation);
+        this.host_shell = Some(shell);
         this
     }
 
     pub fn page(&self) -> Page {
-        if self.show_settings {
-            Page::Settings
-        } else if self.show_calendar {
-            Page::Calendar
-        } else {
-            Page::Chat
-        }
+        self.page
     }
 
     pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_vault = false;
-        self.show_settings = page == Page::Settings;
-        self.show_calendar = page == Page::Calendar;
+        self.page = page;
         self.project_picker_open = false;
         match page {
             Page::Chat => window.focus(&self.composer.focus_handle(cx), cx),
             Page::Settings => self.open_settings(window, cx),
+            Page::Vault => {
+                window.focus(&self.focus, cx);
+            }
             Page::Calendar => {
                 self.show_auxiliary_sidebar = true;
                 self.refresh_calendar(cx);
@@ -72,15 +68,6 @@ impl AgentWorkspace {
 mod tests {
     use super::*;
 
-    struct HostRail;
-    impl Render for HostRail {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .debug_selector(|| "host-navigation".into())
-                .size_full()
-        }
-    }
-
     #[gpui::test]
     fn hosted_pages_keep_session_draft_and_change_topbar(cx: &mut gpui::TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
@@ -92,7 +79,11 @@ mod tests {
         .unwrap();
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
-            host.host_navigation = Some(cx.new(|_| HostRail).into());
+            host.host_shell = Some(std::rc::Rc::new(|slots| {
+                gpui_glint::components::AppLayout::from_slots(slots)
+                    .navigation_rail(div().debug_selector(|| "host-navigation".into()))
+                    .into_any_element()
+            }));
             host
         });
         let (session, composer) = host.update(window, |host, cx| {

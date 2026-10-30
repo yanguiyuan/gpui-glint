@@ -30,7 +30,7 @@ impl Workbench {
             if index == 0 {
                 return Err("不使用环境时不能绑定代理".into());
             }
-            if !self.proxies.iter().any(|p| &p.id == id) {
+            if !self.workspace.proxies.iter().any(|p| &p.id == id) {
                 return Err("绑定的代理不存在".into());
             }
         }
@@ -317,25 +317,32 @@ impl Workbench {
         input.table.update(cx, |table, cx| table.set_rows(rows, cx));
     }
     pub(super) fn effective_proxy(&self, index: usize) -> environment::ProxySettings {
-        let variables = &self.environment_inputs[index];
+        let variables = &self.workspace.environment_inputs[index];
         variables
             .proxy_id
             .as_ref()
-            .and_then(|id| self.proxies.iter().find(|profile| &profile.id == id))
+            .and_then(|id| {
+                self.workspace
+                    .proxies
+                    .iter()
+                    .find(|profile| &profile.id == id)
+            })
             .map(|profile| profile.settings.clone())
             .unwrap_or_else(|| variables.proxy.clone())
     }
     pub(super) fn reset_proxy_profiles(&mut self, cx: &mut Context<Self>) {
         self.profile_inputs.clear();
         self.profile_names.clear();
-        for profile in self.proxies.clone() {
+        for profile in self.workspace.proxies.clone() {
             let input = self.new_proxy_input(&profile.settings, cx);
             self.profile_inputs.push(input);
             let name = Self::entry(&profile.name, "代理名称", cx);
             name.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
             self.profile_names.push(name);
         }
-        self.editing_proxy = self.editing_proxy.min(self.proxies.len().saturating_sub(1));
+        self.editing_proxy = self
+            .editing_proxy
+            .min(self.workspace.proxies.len().saturating_sub(1));
         self.sync_proxy_binding_options(cx);
     }
     pub(super) fn profile_draft(&self, index: usize, cx: &App) -> environment::ProxySettings {
@@ -367,7 +374,8 @@ impl Workbench {
     }
     pub(super) fn proxy_drafts(&self, cx: &App) -> Result<Vec<environment::ProxyProfile>, String> {
         let mut names = HashSet::new();
-        self.proxies
+        self.workspace
+            .proxies
             .iter()
             .enumerate()
             .map(|(index, saved)| {
@@ -387,7 +395,7 @@ impl Workbench {
             .collect()
     }
     pub(super) fn has_unsaved_proxies(&self, cx: &App) -> bool {
-        self.proxies.iter().enumerate().any(|(i, p)| {
+        self.workspace.proxies.iter().enumerate().any(|(i, p)| {
             self.profile_names[i].read(cx).value().trim() != p.name
                 || self.profile_draft(i, cx) != p.settings
         })
@@ -403,6 +411,7 @@ impl Workbench {
             .and_then(|_| {
                 if name.is_empty()
                     || self
+                        .workspace
                         .proxies
                         .iter()
                         .enumerate()
@@ -414,11 +423,11 @@ impl Workbench {
             });
         match result {
             Ok(()) => {
-                self.proxies[index].name = name;
-                self.proxies[index].settings = settings;
+                self.workspace.proxies[index].name = name;
+                self.workspace.proxies[index].settings = settings;
                 self.sync_proxy_binding_options(cx);
                 self.variable_error = None;
-                self.storage_dirty = true;
+                self.workspace.storage_dirty = true;
                 self.persist(cx);
                 self.notice = "代理已保存，所有绑定环境立即生效".into();
             }
@@ -428,12 +437,12 @@ impl Workbench {
     }
     fn delete_proxy_profile(&mut self, cx: &mut Context<Self>) {
         let index = self.editing_proxy;
-        let id = self.proxies.remove(index).id;
+        let id = self.workspace.proxies.remove(index).id;
         self.proxy_services.remove(&id);
         self.proxy_captures.remove(&id);
         self.profile_inputs.remove(index);
         self.profile_names.remove(index);
-        for environment in &mut self.environment_inputs {
+        for environment in &mut self.workspace.environment_inputs {
             if environment.proxy_id.as_ref() == Some(&id) {
                 environment.proxy_id = None;
             }
@@ -443,16 +452,16 @@ impl Workbench {
                 input.binding = None;
             }
         }
-        self.editing_proxy = index.min(self.proxies.len().saturating_sub(1));
+        self.editing_proxy = index.min(self.workspace.proxies.len().saturating_sub(1));
         self.sync_proxy_binding_options(cx);
         self.variable_error = None;
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.persist(cx);
         cx.notify();
     }
     fn proxy_delete_popover(&self, cx: &mut Context<Self>) -> Popover {
         let index = self.editing_proxy;
-        let id = self.proxies[index].id.clone();
+        let id = self.workspace.proxies[index].id.clone();
         let confirm_id = id.clone();
         let cancel_id = id.clone();
         let theme = self.theme;
@@ -469,11 +478,10 @@ impl Workbench {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("删除代理“{}”？", self.proxies[index].name)),
-                )
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
+                    "删除代理“{}”？",
+                    self.workspace.proxies[index].name
+                )))
                 .child(
                     div()
                         .text_size(px(11.))
@@ -493,8 +501,11 @@ impl Workbench {
                                 .render()
                                 .debug_selector(|| "proxy-delete-cancel".into())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(index) =
-                                        this.proxies.iter().position(|p| p.id == cancel_id)
+                                    if let Some(index) = this
+                                        .workspace
+                                        .proxies
+                                        .iter()
+                                        .position(|p| p.id == cancel_id)
                                     {
                                         this.profile_inputs[index].delete_profile = false;
                                         cx.notify();
@@ -509,8 +520,11 @@ impl Workbench {
                                 .render()
                                 .debug_selector(|| "proxy-delete-confirm".into())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(index) =
-                                        this.proxies.iter().position(|p| p.id == confirm_id)
+                                    if let Some(index) = this
+                                        .workspace
+                                        .proxies
+                                        .iter()
+                                        .position(|p| p.id == confirm_id)
                                     {
                                         if this.profile_inputs[index].delete_profile {
                                             this.editing_proxy = index;
@@ -528,7 +542,7 @@ impl Workbench {
         .open(self.profile_inputs[index].delete_profile)
         .on_open_change(move |open, _, cx| {
             let _ = owner.update(cx, |this, cx| {
-                if let Some(index) = this.proxies.iter().position(|p| p.id == id) {
+                if let Some(index) = this.workspace.proxies.iter().position(|p| p.id == id) {
                     this.profile_inputs[index].delete_profile = open;
                     cx.notify();
                 }
@@ -537,8 +551,9 @@ impl Workbench {
     }
     pub(super) fn proxy_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut list = div().flex().flex_col().gap_2().p_3().child("代理管理");
-        for (index, profile) in self.proxies.iter().enumerate() {
+        for (index, profile) in self.workspace.proxies.iter().enumerate() {
             let count = self
+                .workspace
                 .environment_inputs
                 .iter()
                 .filter(|v| v.proxy_id.as_ref() == Some(&profile.id))
@@ -566,8 +581,13 @@ impl Workbench {
                 .render()
                 .debug_selector(|| "proxy-create".into())
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let mut n = this.proxies.len() + 1;
-                    while this.proxies.iter().any(|p| p.name == format!("代理 {n}")) {
+                    let mut n = this.workspace.proxies.len() + 1;
+                    while this
+                        .workspace
+                        .proxies
+                        .iter()
+                        .any(|p| p.name == format!("代理 {n}"))
+                    {
                         n += 1;
                     }
                     let settings = environment::ProxySettings {
@@ -580,36 +600,37 @@ impl Workbench {
                     let entry = Self::entry(&name, "代理名称", cx);
                     entry.update(cx, |entry, cx| entry.set_theme(this.theme, cx));
                     this.profile_names.push(entry);
-                    this.editing_proxy = this.proxies.len();
-                    this.proxies.push(environment::ProxyProfile {
+                    this.editing_proxy = this.workspace.proxies.len();
+                    this.workspace.proxies.push(environment::ProxyProfile {
                         id: uuid::Uuid::new_v4().to_string(),
                         name,
                         settings,
                     });
                     this.sync_proxy_binding_options(cx);
                     this.variable_error = None;
-                    this.storage_dirty = true;
+                    this.workspace.storage_dirty = true;
                     this.persist(cx);
                     cx.notify();
                 })),
         )
     }
     pub(super) fn proxy_settings_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
-        if self.proxies.is_empty() {
+        if self.workspace.proxies.is_empty() {
             return div()
                 .p_6()
                 .child("新建代理后，可在环境设置中绑定；多个环境可以共用同一代理。");
         }
         let index = self.editing_proxy;
-        let profile = &self.proxies[index];
+        let profile = &self.workspace.proxies[index];
         let input = &self.profile_inputs[index];
         let p = self.theme.palette();
         let bound = self
+            .workspace
             .environment_inputs
             .iter()
             .enumerate()
             .filter(|(_, v)| v.proxy_id.as_ref() == Some(&profile.id))
-            .map(|(i, _)| self.environment_names[i].clone())
+            .map(|(i, _)| self.workspace.environment_names[i].clone())
             .collect::<Vec<_>>();
         let owner = cx.entity().downgrade();
         div().flex_1().min_w_0().min_h_0().flex().flex_col().child(
@@ -747,7 +768,7 @@ impl Workbench {
                                         .theme(self.theme)
                                         .render()
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            let profile = this.proxies[index].clone();
+                                            let profile = this.workspace.proxies[index].clone();
                                             this.profile_inputs[index] =
                                                 this.new_proxy_input(&profile.settings, cx);
                                             this.profile_names[index].update(cx, |entry, cx| {
@@ -766,7 +787,8 @@ impl Workbench {
     pub(super) fn proxy_binding_options(&self) -> Vec<SelectOption> {
         std::iter::once(SelectOption::new("", "不使用代理"))
             .chain(
-                self.proxies
+                self.workspace
+                    .proxies
                     .iter()
                     .map(|p| SelectOption::new(p.id.clone(), p.name.clone())),
             )
@@ -983,7 +1005,7 @@ mod tests {
                 storage::Store::open(&dir.path().join("scroll.sqlite3")).unwrap(),
                 cx,
             );
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "滚动测试".into(),
                 settings: environment::ProxySettings {
@@ -998,7 +1020,7 @@ mod tests {
                 },
             });
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         window.simulate_resize(gpui::size(px(1000.), px(650.)));
@@ -1036,7 +1058,7 @@ mod tests {
                 cx,
             );
             for name in ["A", "B"] {
-                host.proxies.push(environment::ProxyProfile {
+                host.workspace.proxies.push(environment::ProxyProfile {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: name.into(),
                     settings: environment::ProxySettings {
@@ -1046,28 +1068,30 @@ mod tests {
                 });
             }
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
-            host.storage_dirty = true;
+            host.page = crate::Page::Proxies;
+            host.workspace.storage_dirty = true;
             host.persist(cx);
             host
         });
         click(window, "proxy-delete");
         host.update(window, |host, _| {
-            assert_eq!(host.proxies.len(), 2);
-            assert_eq!(host.storage.load().unwrap().proxies.len(), 2);
+            assert_eq!(host.workspace.proxies.len(), 2);
+            assert_eq!(host.workspace.storage.load().unwrap().proxies.len(), 2);
         });
         click(window, "proxy-delete-cancel");
         assert!(window.debug_bounds("proxy-delete-confirm").is_none());
-        host.read_with(window, |host, _| assert_eq!(host.proxies.len(), 2));
+        host.read_with(window, |host, _| {
+            assert_eq!(host.workspace.proxies.len(), 2)
+        });
         click(window, "proxy-delete");
         window.simulate_keystrokes("escape");
         assert!(window.debug_bounds("proxy-delete-confirm").is_none());
         click(window, "proxy-delete");
         click(window, "proxy-delete-confirm");
         host.update(window, |host, _| {
-            assert_eq!(host.proxies.len(), 1);
-            assert_eq!(host.proxies[0].name, "B");
-            assert_eq!(host.storage.load().unwrap().proxies[0].name, "B");
+            assert_eq!(host.workspace.proxies.len(), 1);
+            assert_eq!(host.workspace.proxies[0].name, "B");
+            assert_eq!(host.workspace.storage.load().unwrap().proxies[0].name, "B");
         });
     }
 
@@ -1081,7 +1105,7 @@ mod tests {
                 storage::Store::open(&dir.path().join("search.sqlite3")).unwrap(),
                 cx,
             );
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "搜索".into(),
                 settings: environment::ProxySettings {
@@ -1101,7 +1125,7 @@ mod tests {
                 },
             });
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         let (search, table, id) = host.read_with(window, |host, _| {
@@ -1144,7 +1168,7 @@ mod tests {
         table.read_with(window, |table, _| assert_eq!(table.matching_row_count(), 0));
         host.read_with(window, |host, _| {
             assert_eq!(host.profile_inputs[0].mappings.len(), 441);
-            assert_eq!(host.proxies[0].settings.mappings.len(), 442);
+            assert_eq!(host.workspace.proxies[0].settings.mappings.len(), 442);
         });
         assert!(window.debug_bounds("table-empty-state").is_some());
         search.update(window, |entry, cx| entry.set_value("host-0.test", cx));
@@ -1176,8 +1200,7 @@ mod tests {
                 host.group_name.update(cx, |e, cx| e.set_value(name, cx));
                 host.save_group(cx);
             }
-            host.show_proxies = true;
-            host.show_environments = false;
+            host.page = crate::Page::Proxies;
             host
         });
         let bounds = window.debug_bounds("proxy-create").unwrap();
@@ -1189,13 +1212,13 @@ mod tests {
             host.profile_inputs[0].enabled = true;
             host.save_proxy_profile(cx);
             assert!(host.variable_error.is_some());
-            assert!(host.proxies[0].settings.mappings.is_empty());
+            assert!(host.workspace.proxies[0].settings.mappings.is_empty());
             let row = &host.profile_inputs[0].mappings[0];
             row.name.update(cx, |e, cx| e.set_value("api.test", cx));
             row.value.update(cx, |e, cx| e.set_value("127.0.0.1", cx));
             host.save_proxy_profile(cx);
             assert!(host.variable_error.is_none());
-            let id = host.proxies[0].id.clone();
+            let id = host.workspace.proxies[0].id.clone();
             for index in [1, 2] {
                 host.editing_environment = index;
                 host.proxy_inputs[index].binding = Some(id.clone());
@@ -1207,8 +1230,8 @@ mod tests {
             host.profile_names[0].update(cx, |e, cx| e.set_value("共享代理", cx));
             host.save_proxy_profile(cx);
             assert_eq!(
-                host.environment_inputs[1].proxy_id,
-                host.environment_inputs[2].proxy_id
+                host.workspace.environment_inputs[1].proxy_id,
+                host.workspace.environment_inputs[2].proxy_id
             );
             host.proxy_inputs[2].binding = None;
             host.reset_environment_rows(2, cx);
@@ -1216,8 +1239,7 @@ mod tests {
             host.persist(cx);
         });
         host.update(window, |host, cx| {
-            host.show_proxies = false;
-            host.show_environments = true;
+            host.page = crate::Page::Environments;
             host.editing_environment = 2;
             cx.notify();
         });
@@ -1227,20 +1249,25 @@ mod tests {
         window.simulate_keystrokes("enter");
         host.update(window, |host, cx| {
             assert!(host.proxy_inputs[2].binding.is_none());
-            assert!(host.environment_inputs[2].proxy_id.is_some());
+            assert!(host.workspace.environment_inputs[2].proxy_id.is_some());
             host.reset_environment_rows(2, cx);
         });
         let reopened =
             window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.update(window, |host, cx| {
-            assert_eq!(host.proxies[0].name, "共享代理");
+            assert_eq!(host.workspace.proxies[0].name, "共享代理");
             assert_eq!(host.effective_proxy(1), host.effective_proxy(2));
             assert_eq!(host.effective_proxy(1).mappings[0].domain, "api.test");
             host.delete_proxy_profile(cx);
-            assert!(host.proxies.is_empty());
-            assert!(host.environment_inputs.iter().all(|e| e.proxy_id.is_none()));
+            assert!(host.workspace.proxies.is_empty());
+            assert!(
+                host.workspace
+                    .environment_inputs
+                    .iter()
+                    .all(|e| e.proxy_id.is_none())
+            );
             assert!(!host.effective_proxy(1).enabled);
-            let saved = host.storage.load().unwrap();
+            let saved = host.workspace.storage.load().unwrap();
             assert!(saved.proxies.is_empty());
         });
     }
@@ -1252,7 +1279,7 @@ mod tests {
         let path = dir.path().join("import.sqlite3");
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "Hosts".into(),
                 settings: environment::ProxySettings {
@@ -1274,7 +1301,7 @@ mod tests {
             host.reset_proxy_profiles(cx);
             let empty = host.mapping_input("", "", cx);
             host.profile_inputs[0].mappings.push(empty);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         host.update(window, |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1287,7 +1314,7 @@ mod tests {
             assert_eq!(draft.mappings[0].domain, "api.test");
             assert_eq!(draft.mappings[0].ip, "10.0.0.3");
             assert_eq!(draft.mappings[1].domain, "keep.test");
-            assert_eq!(host.proxies[0].settings.mappings.len(), 2);
+            assert_eq!(host.workspace.proxies[0].settings.mappings.len(), 2);
             assert!(host.notice.contains("新增 2 条，更新 1 条"));
             cx.write_to_clipboard(ClipboardItem::new_string(
                 "127.0.0.1 new.test\nbad-ip broken.test".into(),
@@ -1317,7 +1344,10 @@ mod tests {
             assert_eq!(host.profile_draft(0, cx), draft);
             host.save_proxy_profile(cx);
             assert!(host.variable_error.is_none());
-            assert_eq!(host.storage.load().unwrap().proxies[0].settings, draft);
+            assert_eq!(
+                host.workspace.storage.load().unwrap().proxies[0].settings,
+                draft
+            );
         });
     }
     #[gpui::test]
@@ -1328,7 +1358,7 @@ mod tests {
                 storage::Store::open(&dir.path().join("layout.sqlite3")).unwrap(),
                 cx,
             );
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "布局".into(),
                 settings: environment::ProxySettings {
@@ -1341,7 +1371,7 @@ mod tests {
                 },
             });
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         let row_id = host.read_with(window, |host, _| host.profile_inputs[0].mappings[0].id);
@@ -1436,7 +1466,7 @@ mod tests {
                 storage::Store::open(&dir.path().join("add-row.sqlite3")).unwrap(),
                 cx,
             );
-            host.proxies.push(environment::ProxyProfile {
+            host.workspace.proxies.push(environment::ProxyProfile {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "大量映射".into(),
                 settings: environment::ProxySettings {
@@ -1451,7 +1481,7 @@ mod tests {
                 },
             });
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         reveal(window, "proxy-mapping-table");
@@ -1491,7 +1521,7 @@ mod tests {
                 cx,
             );
             for name in ["A", "B"] {
-                host.proxies.push(environment::ProxyProfile {
+                host.workspace.proxies.push(environment::ProxyProfile {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: name.into(),
                     settings: environment::ProxySettings {
@@ -1505,7 +1535,7 @@ mod tests {
                 });
             }
             host.reset_proxy_profiles(cx);
-            host.show_proxies = true;
+            host.page = crate::Page::Proxies;
             host
         });
         let (table, row_id) = host.read_with(window, |host, _| {

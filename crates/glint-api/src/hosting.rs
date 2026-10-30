@@ -39,11 +39,11 @@ mod tests {
             assert!(request.to_string().contains("https://example.test/new"));
             assert!(call("glint_collection_create", serde_json::json!({"name":42})).is_err());
             assert!(call("glint_missing_tool", serde_json::json!({})).is_err());
-            assert_eq!(host.requests[0].id, id);
-            assert_eq!(host.requests[0].name, "Updated by Agent");
+            assert_eq!(host.workspace.requests[0].id, id);
+            assert_eq!(host.workspace.requests[0].name, "Updated by Agent");
             assert!(host.execute_host_tool("expired".into(), "glint_collection_create".into(), serde_json::json!({"name":"Must not exist"}), Instant::now() - std::time::Duration::from_secs(1), cx).is_err());
-            assert!(!host.collections.iter().any(|c| c.collection == "Must not exist"));
-            let history = host.storage.mcp_call_page("Glint Workbench Agent", None, None, 100).unwrap();
+            assert!(!host.workspace.collections.iter().any(|c| c.collection == "Must not exist"));
+            let history = host.workspace.storage.mcp_call_page("Glint Workbench Agent", None, None, 100).unwrap();
             assert_eq!(history.total, 7);
             assert_eq!(history.rows.iter().filter(|row| !row.success).count(), 3);
             host.persist(cx);
@@ -53,15 +53,6 @@ mod tests {
             .load()
             .unwrap();
         assert_eq!(saved.requests[0].name, "Updated by Agent");
-    }
-
-    struct HostRail;
-    impl Render for HostRail {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .debug_selector(|| "host-navigation".into())
-                .size_full()
-        }
     }
 
     #[gpui::test]
@@ -74,7 +65,11 @@ mod tests {
                 storage::Store::open(&directory.path().join("api.sqlite3")).unwrap(),
                 cx,
             );
-            host.host_navigation = Some(cx.new(|_| HostRail).into());
+            host.host_shell = Some(std::rc::Rc::new(|slots| {
+                gpui_glint::components::AppLayout::from_slots(slots)
+                    .navigation_rail(div().debug_selector(|| "host-navigation".into()))
+                    .into_any_element()
+            }));
             host.group_edit = Some(GroupEdit::CreateCollection);
             host.group_name
                 .update(cx, |entry, cx| entry.set_value("Test", cx));
@@ -98,13 +93,43 @@ mod tests {
             host.read_with(window, |host, _| {
                 assert_eq!(host.page(), page);
                 assert_eq!(host.endpoint.entity_id(), endpoint);
-                assert_eq!(host.requests.len(), 1);
+                assert_eq!(host.workspace.requests.len(), 1);
             });
             assert_eq!(
                 window.debug_bounds("global-environment-selector").is_some(),
                 matches!(page, Page::Requests | Page::History)
             );
         }
+        let shell = host.read_with(window, |host, _| host.host_shell.clone().unwrap());
+        let workspace_id = host.update(window, |host, _| {
+            host.workspace.storage.create_workspace("Second").unwrap()
+        });
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.switch_workspace(&workspace_id, window, cx).unwrap()
+            })
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("host-navigation").is_some());
+        host.read_with(window, |host, _| {
+            assert!(std::rc::Rc::ptr_eq(
+                host.host_shell.as_ref().unwrap(),
+                &shell
+            ))
+        });
+        host.update(window, |host, cx| {
+            for (section, expected) in [
+                ("proxies", Page::Proxies),
+                ("mcp", Page::Mcp),
+                ("plugins", Page::Plugins),
+                ("environments", Page::Environments),
+                ("requests", Page::Requests),
+            ] {
+                host.mcp_call("glint_ui_set", serde_json::json!({"section":section}), cx)
+                    .unwrap();
+                assert_eq!(host.page(), expected);
+            }
+        });
     }
 }
 
@@ -123,62 +148,39 @@ impl Workbench {
         deadline: Instant,
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
-        let (reply, result) = std::sync::mpsc::channel();
-        self.execute_mcp_call(
-            mcp::Call {
+        self.execute_workspace_tool(
+            crate::workspace_service::Invocation {
                 metadata: mcp::CallMetadata {
                     client: "Glint Workbench Agent".into(),
                     rpc_id: mcp_history::clip(&id, 256),
                     started_at_ms: chrono::Utc::now().timestamp_millis(),
                     started: Instant::now(),
                 },
-                rejection: None,
                 name,
                 arguments,
                 deadline,
-                reply,
+                rejection: None,
             },
             cx,
-        );
-        result
-            .try_recv()
-            .map_err(|_| "API 工具未返回结果".to_owned())?
+        )
     }
     /// Uses the existing API store and services, with navigation owned by the host.
     /// API-specific application updates are intentionally only started by `run`.
-    pub fn hosted(navigation: gpui::AnyView, cx: &mut Context<Self>) -> Self {
+    pub fn hosted(shell: gpui_glint::components::ShellRenderer, cx: &mut Context<Self>) -> Self {
         let path = storage::Store::default_path().expect("无法确定 SQLite 数据目录");
         let storage = storage::Store::open(&path).expect("无法打开 SQLite 数据库");
         let mut this = Self::with_store(storage, cx);
-        this.host_navigation = Some(navigation);
+        this.host_shell = Some(shell);
         this.start_mcp(cx);
         this
     }
 
     pub fn page(&self) -> Page {
-        if self.show_vault {
-            Page::Vault
-        } else if self.show_proxies {
-            Page::Proxies
-        } else if self.show_plugins {
-            Page::Plugins
-        } else if self.show_mcp {
-            Page::Mcp
-        } else if self.show_environments {
-            Page::Environments
-        } else if self.activity == 1 && self.show_activity {
-            Page::History
-        } else {
-            Page::Requests
-        }
+        self.page
     }
 
     pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_vault = page == Page::Vault;
-        self.show_proxies = page == Page::Proxies;
-        self.show_plugins = page == Page::Plugins;
-        self.show_mcp = page == Page::Mcp;
-        self.show_environments = page == Page::Environments;
+        self.page = page;
         self.show_collection_menu = false;
         self.tree_menu = None;
         self.tab_menu = None;

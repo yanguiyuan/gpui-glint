@@ -4,7 +4,7 @@ impl Workbench {
     pub(super) fn workspace_label(&self) -> String {
         self.workspace_list
             .iter()
-            .find(|w| w.id == self.storage.workspace_id)
+            .find(|w| w.id == self.workspace.storage.workspace_id)
             .map(|w| w.name.clone())
             .unwrap_or_else(|| "工作区".into())
     }
@@ -26,7 +26,7 @@ impl Workbench {
             .child(div().min_w_0().truncate().child(self.workspace_label()))
             .child(Icon::ChevronDown.render(12.).flex_shrink_0())
             .on_click(cx.listener(|this, _, window, cx| {
-                match this.storage.workspaces() {
+                match this.workspace.storage.workspaces() {
                     Ok(list) => {
                         this.workspace_list = list;
                         this.workspace_error = None;
@@ -77,12 +77,12 @@ impl Workbench {
         if self.has_unsaved_environment(cx) {
             self.save_workspace_environment_drafts(cx)?;
         }
-        if self.proxies != proxies {
-            self.proxies = proxies;
-            self.storage_dirty = true;
+        if self.workspace.proxies != proxies {
+            self.workspace.proxies = proxies;
+            self.workspace.storage_dirty = true;
         }
         self.persist(cx);
-        if let Some(error) = &self.storage_error {
+        if let Some(error) = &self.workspace.storage_error {
             return Err(format!("当前工作区保存失败：{error}"));
         }
         Ok(())
@@ -102,17 +102,18 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if id == self.storage.workspace_id {
+        if id == self.workspace.storage.workspace_id {
             self.show_workspaces = false;
             window.focus(&self.focus, cx);
             cx.notify();
             return Ok(());
         }
         self.workspace_switch_ready(cx)?;
-        let (store, data) = self.storage.prepare_workspace(id)?;
+        let (store, data) = self.workspace.storage.prepare_workspace(id)?;
         store.select_workspace()?;
         let mut next = Self::with_workspace(store, data, cx);
         // Keep application-level services alive; request/editor entities belong to the workspace.
+        next.host_shell = self.host_shell.clone();
         next.mcp_server = self.mcp_server.take();
         next.mcp_task = self.mcp_task.take();
         next.mcp_error = self.mcp_error.take();
@@ -124,7 +125,7 @@ impl Workbench {
             next.update_state = update_ui::UpdateState::Idle;
             next.update_error = None;
         } else {
-            next.update_source = self.update_source.clone();
+            next.workspace.update_source = self.workspace.update_source.clone();
             next.update_source_url.update(cx, |e, cx| {
                 e.set_value(self.update_source_url.read(cx).value().to_owned(), cx)
             });
@@ -135,7 +136,7 @@ impl Workbench {
         next.sidebar_width = self.sidebar_width;
         next.show_activity = self.show_activity;
         next.set_theme(self.theme, cx);
-        next.storage_dirty = true;
+        next.workspace.storage_dirty = true;
         *self = next;
         self.persist(cx);
         window.focus(&self.focus, cx);
@@ -145,16 +146,19 @@ impl Workbench {
     pub(super) fn submit_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.workspace_name_input.read(cx).value().to_owned();
         let result = if let Some(id) = self.workspace_edit.clone() {
-            self.storage.rename_workspace(&id, &name).and_then(|_| {
-                self.workspace_list = self.storage.workspaces()?;
-                self.workspace_edit = None;
-                self.workspace_name_input
-                    .update(cx, |e, cx| e.set_value("", cx));
-                Ok(())
-            })
+            self.workspace
+                .storage
+                .rename_workspace(&id, &name)
+                .and_then(|_| {
+                    self.workspace_list = self.workspace.storage.workspaces()?;
+                    self.workspace_edit = None;
+                    self.workspace_name_input
+                        .update(cx, |e, cx| e.set_value("", cx));
+                    Ok(())
+                })
         } else {
             self.workspace_switch_ready(cx)
-                .and_then(|_| self.storage.create_workspace(&name))
+                .and_then(|_| self.workspace.storage.create_workspace(&name))
                 .and_then(|id| self.switch_workspace(&id, window, cx))
         };
         self.workspace_error = result.err();
@@ -166,20 +170,20 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let list = self.storage.workspaces()?;
+        let list = self.workspace.storage.workspaces()?;
         if list.len() <= 1 {
             return Err("至少保留一个工作区，无法删除最后一个工作区".into());
         }
         if !list.iter().any(|w| w.id == id) {
             return Err("工作区不存在".into());
         }
-        if id == self.storage.workspace_id {
+        if id == self.workspace.storage.workspace_id {
             let next = list.iter().find(|w| w.id != id).unwrap();
             self.switch_workspace(&next.id, window, cx)?;
             self.show_workspaces = true;
         }
-        self.storage.delete_workspace(id)?;
-        self.workspace_list = self.storage.workspaces()?;
+        self.workspace.storage.delete_workspace(id)?;
+        self.workspace_list = self.workspace.storage.workspaces()?;
         self.workspace_delete = None;
         if self.workspace_edit.as_deref() == Some(id) {
             self.workspace_edit = None;
@@ -207,7 +211,7 @@ impl Workbench {
             let edit_id = id.clone();
             let delete_id = id.clone();
             let name = workspace.name.clone();
-            let selected = id == self.storage.workspace_id;
+            let selected = id == self.workspace.storage.workspace_id;
             let mut row = div()
                 .id(format!("workspace-row-{id}"))
                 .flex()
@@ -513,9 +517,9 @@ mod tests {
         window.simulate_click(submit.center(), gpui::Modifiers::default());
         assert!(window.debug_bounds("workspace-dialog").is_none());
         let (second_id, second_namespace) = host.update(window, |host, cx| {
-            assert!(host.requests.is_empty());
-            assert!(host.collections.is_empty());
-            assert_eq!(host.environment_names, ["不使用环境"]);
+            assert!(host.workspace.requests.is_empty());
+            assert!(host.workspace.collections.is_empty());
+            assert_eq!(host.workspace.environment_names, ["不使用环境"]);
             assert_eq!(host.workspace_label(), "项目 B");
             host.group_edit = Some(GroupEdit::CreateCollection);
             host.group_name
@@ -524,7 +528,7 @@ mod tests {
             host.add_request(cx);
             host.body.update(cx, |e, cx| e.set_content("B body", cx));
             (
-                host.storage.workspace_id.clone(),
+                host.workspace.storage.workspace_id.clone(),
                 host.oauth_namespace.clone(),
             )
         });
@@ -533,8 +537,8 @@ mod tests {
         let original = window.debug_bounds("switch-default").unwrap();
         window.simulate_click(original.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
-            assert_eq!(host.storage.workspace_id, "default");
-            assert_eq!(host.collections[0].collection, "原项目");
+            assert_eq!(host.workspace.storage.workspace_id, "default");
+            assert_eq!(host.workspace.collections[0].collection, "原项目");
             assert_eq!(host.snapshot(cx).body, "unsaved body");
             assert_ne!(host.oauth_namespace, second_namespace);
             // A live transport must prevent replacement of its workspace/editor state.
@@ -547,7 +551,7 @@ mod tests {
             .unwrap();
         window.simulate_click(second.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspace_id, "default");
+            assert_eq!(host.workspace.storage.workspace_id, "default");
             assert!(host.workspace_error.as_ref().unwrap().contains("先结束"));
             assert!(host.show_workspaces);
             host.ws_active = false;
@@ -557,9 +561,9 @@ mod tests {
             .unwrap();
         window.simulate_click(second.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
-            assert_eq!(host.storage.workspace_id, second_id);
+            assert_eq!(host.workspace.storage.workspace_id, second_id);
             assert_eq!(host.snapshot(cx).body, "B body");
-            assert_eq!(host.collections[0].collection, "另一个项目");
+            assert_eq!(host.workspace.collections[0].collection, "另一个项目");
         });
         let mut reopened = storage::Store::open(&path).unwrap();
         assert_eq!(reopened.workspace_id, second_id);
@@ -577,8 +581,8 @@ mod tests {
             for name in ["A", "B"] {
                 let mut variables = EnvironmentVariables::default();
                 variables.save(None, "host", "original", false).unwrap();
-                host.environment_names.push(name.into());
-                host.environment_inputs.push(variables);
+                host.workspace.environment_names.push(name.into());
+                host.workspace.environment_inputs.push(variables);
                 host.variable_rows.push(vec![]);
                 host.add_proxy_input(cx);
             }
@@ -592,19 +596,28 @@ mod tests {
             host.variable_rows[2][0]
                 .value
                 .update(cx, |e, cx| e.set_value("edited B", cx));
-            assert!(!host.show_environments);
+            assert!(host.page != crate::Page::Environments);
             assert!(host.save_workspace_environment_drafts(cx).is_err());
             assert_eq!(host.editing_environment, 0);
-            assert_eq!(host.environment_inputs[1].variables[0].value, "original");
+            assert_eq!(
+                host.workspace.environment_inputs[1].variables[0].value,
+                "original"
+            );
             host.variable_rows[2][0]
                 .name
                 .update(cx, |e, cx| e.set_value("host", cx));
             host.save_workspace_environment_drafts(cx).unwrap();
             assert!(!host.has_unsaved_environment(cx));
-            assert_eq!(host.environment_inputs[1].variables[0].value, "edited A");
-            assert_eq!(host.environment_inputs[2].variables[0].value, "edited B");
+            assert_eq!(
+                host.workspace.environment_inputs[1].variables[0].value,
+                "edited A"
+            );
+            assert_eq!(
+                host.workspace.environment_inputs[2].variables[0].value,
+                "edited B"
+            );
             host.persist(cx);
-            assert!(host.storage_error.is_none());
+            assert!(host.workspace.storage_error.is_none());
         });
         let data = storage::Store::open(&path).unwrap().load().unwrap();
         assert_eq!(data.variables[1].variables[0].value, "edited A");
@@ -623,15 +636,15 @@ mod tests {
             )
         });
         host.update(window,|host,cx| {
-            host.storage_dirty=true;
+            host.workspace.storage_dirty=true;
             host.persist(cx);
-            host.storage.connection.execute_batch("CREATE TRIGGER reject_workspace_save BEFORE UPDATE ON workspace BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
-            host.environment_names.push("unsaved".into());
-            host.environment_inputs.push(EnvironmentVariables::default());
+            host.workspace.storage.connection.execute_batch("CREATE TRIGGER reject_workspace_save BEFORE UPDATE ON workspace BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+            host.workspace.environment_names.push("unsaved".into());
+            host.workspace.environment_inputs.push(EnvironmentVariables::default());
             host.variable_rows.push(vec![]);
             host.add_proxy_input(cx);
             host.reset_variable_rows(cx);
-            host.storage_dirty=true;
+            host.workspace.storage_dirty=true;
         });
         let trigger = window.debug_bounds("workspace-switcher").unwrap();
         window.simulate_click(trigger.center(), gpui::Modifiers::default());
@@ -642,10 +655,10 @@ mod tests {
         let submit = window.debug_bounds("submit-workspace").unwrap();
         window.simulate_click(submit.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspace_id, "default");
-            assert_eq!(host.storage.workspaces().unwrap().len(), 1);
+            assert_eq!(host.workspace.storage.workspace_id, "default");
+            assert_eq!(host.workspace.storage.workspaces().unwrap().len(), 1);
             assert!(host.workspace_error.as_ref().unwrap().contains("保存失败"));
-            assert!(host.storage_dirty);
+            assert!(host.workspace.storage_dirty);
         });
     }
 
@@ -682,13 +695,13 @@ mod tests {
             .unwrap();
         window.simulate_click(delete.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspaces().unwrap().len(), 2);
+            assert_eq!(host.workspace.storage.workspaces().unwrap().len(), 2);
             assert_eq!(host.workspace_delete.as_deref(), Some(other_id.as_str()));
         });
         let confirm = window.debug_bounds("confirm-delete-workspace").unwrap();
         window.simulate_click(confirm.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspaces().unwrap().len(), 1);
+            assert_eq!(host.workspace.storage.workspaces().unwrap().len(), 1);
             assert!(host.workspace_edit.is_none());
             assert!(host.workspace_delete.is_none());
             assert!(host.workspace_error.is_none());
@@ -710,8 +723,8 @@ mod tests {
             let delete = window.debug_bounds("delete-workspace-default").unwrap();
             window.simulate_click(delete.center(), gpui::Modifiers::default());
             host.update(window, |h, _| {
-                assert_eq!(h.storage.workspace_id, "default");
-                assert_eq!(h.storage.workspaces().unwrap().len(), 2);
+                assert_eq!(h.workspace.storage.workspace_id, "default");
+                assert_eq!(h.workspace.storage.workspaces().unwrap().len(), 2);
             });
             let action = window
                 .debug_bounds(if confirm {
@@ -723,7 +736,7 @@ mod tests {
             window.simulate_click(action.center(), gpui::Modifiers::default());
         }
         host.update(window, |h, _| {
-            assert_eq!(h.storage.workspace_id, other_id);
+            assert_eq!(h.workspace.storage.workspace_id, other_id);
             assert_eq!(h.workspace_list.len(), 1);
             assert!(h.workspace_error.is_none());
             assert!(h.workspace_delete.is_none());
@@ -735,7 +748,7 @@ mod tests {
         host.update(window, |h, cx| {
             assert!(h.workspace_delete.is_none());
             // Also reject a stale confirmation and a direct storage call.
-            assert!(h.storage.delete_workspace(&other_id).is_err());
+            assert!(h.workspace.storage.delete_workspace(&other_id).is_err());
             h.workspace_delete = Some(other_id.clone());
             cx.notify();
         });
@@ -748,7 +761,7 @@ mod tests {
                     .unwrap()
                     .contains("至少保留一个工作区")
             );
-            assert_eq!(h.storage.workspaces().unwrap().len(), 1);
+            assert_eq!(h.workspace.storage.workspaces().unwrap().len(), 1);
         });
         let reopened = storage::Store::open(&path).unwrap();
         assert_eq!(reopened.workspace_id, other_id);
@@ -776,7 +789,7 @@ mod tests {
         let submit = window.debug_bounds("submit-workspace").unwrap();
         window.simulate_click(submit.center(), gpui::Modifiers::default());
         host.update(window, |host, _| {
-            assert_eq!(host.storage.workspace_id, "default");
+            assert_eq!(host.workspace.storage.workspace_id, "default");
             assert!(host.workspace_error.is_some());
             assert_eq!(host.workspace_list.len(), 1);
         });

@@ -485,7 +485,7 @@ mod tests {
                 storage::Store::open(&dir.path().join("workspace.sqlite3")).unwrap(),
                 cx,
             );
-            host.show_plugins = true;
+            host.page = crate::Page::Plugins;
             host.plugin_manager_tab = 1;
             host
         });

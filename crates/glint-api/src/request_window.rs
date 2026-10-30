@@ -80,7 +80,7 @@ mod tests {
                 .update(cx, |entry, cx| entry.set_text("https://example.test/", cx));
             host.persist(cx);
         });
-        let writes = host.read_with(window, |host, _| host.storage.serializations);
+        let writes = host.read_with(window, |host, _| host.workspace.storage.serializations);
         let endpoint = window.debug_bounds("request-endpoint").unwrap();
         window.simulate_click(endpoint.center(), gpui::Modifiers::default());
         window.simulate_keystrokes("end");
@@ -94,7 +94,7 @@ mod tests {
                     expected.as_str()
                 );
                 assert_eq!(
-                    host.storage.serializations, writes,
+                    host.workspace.storage.serializations, writes,
                     "typing must not write SQLite"
                 );
             });
@@ -108,7 +108,7 @@ mod tests {
                     expected.as_str()
                 );
                 assert_eq!(
-                    host.storage.serializations, writes,
+                    host.workspace.storage.serializations, writes,
                     "backspace must not write SQLite"
                 );
             });
@@ -116,7 +116,7 @@ mod tests {
         window.executor().advance_clock(Duration::from_millis(200));
         window.run_until_parked();
         host.read_with(window, |host, _| {
-            assert_eq!(host.storage.serializations, writes + 1)
+            assert_eq!(host.workspace.storage.serializations, writes + 1)
         });
         let saved = storage::Store::open(&path).unwrap().load().unwrap();
         assert_eq!(saved.requests[0].draft.url, expected);
@@ -170,7 +170,7 @@ mod tests {
         let path = directory.path().join("triggers.sqlite3");
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = setup(&path, cx);
-            host.requests[0].id = "f29d4365-00db-4a66-b159-f8ae2d5eae64".into();
+            host.workspace.requests[0].id = "f29d4365-00db-4a66-b159-f8ae2d5eae64".into();
             let mut extractor = Pair::new("access_token", "$.access_token", "");
             extractor.expires_in = "$.expires_in".into();
             host.load(
@@ -228,8 +228,8 @@ mod tests {
         let reopened =
             window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
         reopened.read_with(window, |host, _| {
-            assert_eq!(host.requests[1].draft.triggers.len(), 1);
-            let token = host.collections[0]
+            assert_eq!(host.workspace.requests[1].draft.triggers.len(), 1);
+            let token = host.workspace.collections[0]
                 .environments
                 .values()
                 .flat_map(|e| e.variables.iter())
@@ -280,7 +280,7 @@ mod tests {
         assert!(host.read_with(window, |host, cx| {
             host.snapshot(cx).body.contains("from child")
         }));
-        let id = host.read_with(window, |host, _| host.requests[0].id.clone());
+        let id = host.read_with(window, |host, _| host.workspace.requests[0].id.clone());
         host.update(window, |host, cx| {
             let result = host.mcp_call("glint_request_update", serde_json::json!({"request_id":id,"draft":{"url":"https://example.test/shared"}}), cx).unwrap();
             assert_eq!(result["version_created"], true);
@@ -293,7 +293,7 @@ mod tests {
                 "https://example.test/shared"
             );
             assert_eq!(
-                editor.requests[0].versions[0].source,
+                editor.workspace.requests[0].versions[0].source,
                 model::VersionSource::Mcp
             );
         });
@@ -409,7 +409,7 @@ mod tests {
             host.read_with(window, |h, cx| {
                 assert_eq!(h.active, 2);
                 assert_eq!(h.snapshot(cx).body, "main stays here");
-                assert_eq!(h.responses[1].as_ref().unwrap().text, "ok");
+                assert_eq!(h.workspace.responses[1].as_ref().unwrap().text, "ok");
                 assert!(h.response_data.is_none());
             });
             if event == 1 {
@@ -429,10 +429,10 @@ mod tests {
                     .count(),
                 1
             );
-            assert_eq!(h.requests[0].history.len(), 1);
+            assert_eq!(h.workspace.requests[0].history.len(), 1);
         });
         host.update(window, |h, cx| {
-            let id = h.requests[0].id.clone();
+            let id = h.workspace.requests[0].id.clone();
             h.mcp_call(
                 "glint_request_cancel",
                 serde_json::json!({"request_id":id}),
@@ -497,8 +497,8 @@ mod tests {
         host.read_with(window, |h, _| {
             assert_eq!(h.active, 1);
             assert!(h.response_data.is_none());
-            assert_eq!(h.responses[0].as_ref().unwrap().text, "promoted");
-            assert_eq!(h.requests[0].history.len(), 1);
+            assert_eq!(h.workspace.responses[0].as_ref().unwrap().text, "promoted");
+            assert_eq!(h.workspace.requests[0].history.len(), 1);
         });
         server.join().unwrap();
     }
@@ -569,7 +569,8 @@ impl Render for RequestWindow {
 
 impl Workbench {
     pub(super) fn shared_request_editor(&self, index: usize) -> Option<Entity<Self>> {
-        self.requests
+        self.workspace
+            .requests
             .get(index)
             .and_then(|request| self.request_editors.get(&request.id))
             .map(|shared| shared.editor.clone())
@@ -584,6 +585,7 @@ impl Workbench {
         if let Some(shared) = self.request_editors.get(request_id) {
             Some(shared.editor.clone().update(cx, |editor, cx| f(editor, cx)))
         } else if self
+            .workspace
             .requests
             .get(self.active)
             .is_some_and(|request| request.id == request_id)
@@ -615,7 +617,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.tab_menu = None;
-        let Some(request) = self.requests.get(index) else {
+        let Some(request) = self.workspace.requests.get(index) else {
             return;
         };
         let name = request.name.clone();
@@ -629,21 +631,21 @@ impl Workbench {
                 self.html_preview = false;
             }
             let data = storage::Workspace {
-                requests: vec![self.requests[index].clone()],
-                collections: self.collections.clone(),
+                requests: vec![self.workspace.requests[index].clone()],
+                collections: self.workspace.collections.clone(),
                 selected_environment: self.selected_environment(cx),
-                environments: self.environment_names.clone(),
-                variables: self.environment_inputs.clone(),
-                proxies: self.proxies.clone(),
-                traces: vec![self.traces[index].clone()],
+                environments: self.workspace.environment_names.clone(),
+                variables: self.workspace.environment_inputs.clone(),
+                proxies: self.workspace.proxies.clone(),
+                traces: vec![self.workspace.traces[index].clone()],
                 responses: vec![if index == self.active {
                     self.response_data.clone()
                 } else {
-                    self.responses[index].clone()
+                    self.workspace.responses[index].clone()
                 }],
-                previews: vec![self.sent_requests[index].clone()],
-                curls: vec![self.sent_curls[index].clone()],
-                update_source: self.update_source.clone(),
+                previews: vec![self.workspace.sent_requests[index].clone()],
+                curls: vec![self.workspace.sent_curls[index].clone()],
+                update_source: self.workspace.update_source.clone(),
             };
             let storage = match storage::Store::memory() {
                 Ok(storage) => storage,
@@ -653,14 +655,14 @@ impl Workbench {
                     return;
                 }
             };
-            let id = self.requests[index].id.clone();
+            let id = self.workspace.requests[index].id.clone();
             let namespace = self.oauth_namespace.clone();
             let owner = cx.entity();
             let theme = self.theme;
             let config = if index == self.active {
                 self.config
             } else if matches!(
-                self.requests[index].draft.method.as_str(),
+                self.workspace.requests[index].draft.method.as_str(),
                 "POST" | "PUT" | "PATCH" | "WS"
             ) {
                 3
@@ -699,10 +701,10 @@ impl Workbench {
                 None
             };
             let selected_version = self.current_versions[index];
-            let storage_error = self.storage_error.clone();
+            let storage_error = self.workspace.storage_error.clone();
             let editor = cx.new(|cx| {
                 let mut editor = Self::with_workspace(storage, data, cx);
-                editor.trigger_requests = Some(self.requests.clone());
+                editor.trigger_requests = Some(self.workspace.requests.clone());
                 editor.sync_pair_tables(cx);
                 editor.request_binding = Some(Binding {
                     namespace: namespace.clone(),
@@ -726,7 +728,7 @@ impl Workbench {
                 editor
                     .subscriptions
                     .push(cx.observe(&owner, |editor, owner, cx| {
-                        let error = owner.read(cx).storage_error.clone();
+                        let error = owner.read(cx).workspace.storage_error.clone();
                         if editor.request_binding.as_ref().is_some_and(|binding| {
                             binding.namespace != owner.read(cx).oauth_namespace
                         }) {
@@ -771,7 +773,7 @@ impl Workbench {
                     signature: String::new(),
                     context: String::new(),
                     selected_environment: self.selected_environment(cx),
-                    collections: self.collections.clone(),
+                    collections: self.workspace.collections.clone(),
                     _subscription: subscription,
                 },
             );
@@ -807,7 +809,7 @@ impl Workbench {
     }
 
     pub(super) fn sync_request_editor(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
-        let Some(index) = self.requests.iter().position(|r| r.id == id) else {
+        let Some(index) = self.workspace.requests.iter().position(|r| r.id == id) else {
             return false;
         };
         let Some(shared) = self.request_editors.get_mut(id) else {
@@ -821,21 +823,22 @@ impl Workbench {
         {
             return false;
         }
-        let mut request = editor.requests[0].clone();
+        let mut request = editor.workspace.requests[0].clone();
         request.draft = editor.snapshot(cx);
         let selected_environment = editor.selected_environment(cx);
         let signature = serde_json::to_string(&(
             &request,
-            &editor.responses,
-            &editor.traces,
-            &editor.sent_requests,
-            &editor.sent_curls,
+            &editor.workspace.responses,
+            &editor.workspace.traces,
+            &editor.workspace.sent_requests,
+            &editor.workspace.sent_curls,
             editor.current_versions[0],
             editor.sending.is_some(),
             editor.ws_active,
             editor.ws_connected,
             &editor.error,
             editor
+                .workspace
                 .collections
                 .iter()
                 .map(|c| (&c.id, &c.environments))
@@ -848,9 +851,14 @@ impl Workbench {
         }
         // A request editor can extract collection variables. Merge only changes
         // since its last publication, preserving other requests' concurrent edits.
-        for collection in &editor.collections {
+        for collection in &editor.workspace.collections {
             let baseline = shared.collections.iter().find(|c| c.id == collection.id);
-            if let Some(target) = self.collections.iter_mut().find(|c| c.id == collection.id) {
+            if let Some(target) = self
+                .workspace
+                .collections
+                .iter_mut()
+                .find(|c| c.id == collection.id)
+            {
                 for (environment, variables) in &collection.environments {
                     let old = baseline.and_then(|c| c.environments.get(environment));
                     let target = target.environments.entry(environment.clone()).or_default();
@@ -881,25 +889,25 @@ impl Workbench {
                 }
             }
         }
-        shared.collections = editor.collections.clone();
+        shared.collections = editor.workspace.collections.clone();
         let environment_changed = shared.selected_environment != selected_environment;
         shared.selected_environment = selected_environment;
         shared.signature = signature;
         shared.running = editor.sending.is_some() || editor.ws_active || editor.ws_connected;
         shared.websocket = editor.ws_active || editor.ws_connected;
         shared.connected = editor.ws_connected;
-        self.requests[index] = request;
-        self.responses[index] = editor.response_data.clone();
-        self.traces[index] = editor.traces[0].clone();
-        self.sent_requests[index] = editor.sent_requests[0].clone();
-        self.sent_curls[index] = editor.sent_curls[0].clone();
+        self.workspace.requests[index] = request;
+        self.workspace.responses[index] = editor.response_data.clone();
+        self.workspace.traces[index] = editor.workspace.traces[0].clone();
+        self.workspace.sent_requests[index] = editor.workspace.sent_requests[0].clone();
+        self.workspace.sent_curls[index] = editor.workspace.sent_curls[0].clone();
         self.current_versions[index] = editor.current_versions[0];
         if environment_changed {
             self.environment.update(cx, |select, cx| {
                 select.set_selected(Some(selected_environment.to_string().into()), cx)
             });
         }
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         true
     }
 
@@ -915,14 +923,15 @@ impl Workbench {
         }
         let selected = self.selected_environment(cx);
         let context = serde_json::to_string(&(
-            self.requests
+            self.workspace
+                .requests
                 .iter()
                 .map(|r| (&r.id, &r.name, &r.collection, &r.group, &r.draft))
                 .collect::<Vec<_>>(),
-            &self.collections,
-            &self.environment_names,
-            &self.environment_inputs,
-            &self.proxies,
+            &self.workspace.collections,
+            &self.workspace.environment_names,
+            &self.workspace.environment_inputs,
+            &self.workspace.proxies,
             &self.disabled_plugins,
             &self.plugin_catalog,
             selected,
@@ -930,33 +939,35 @@ impl Workbench {
         .unwrap();
         for (id, shared) in &mut self.request_editors {
             let request = self
+                .workspace
                 .requests
                 .iter()
                 .find(|request| &request.id == id)
                 .unwrap();
             let current = shared.editor.read(cx);
-            let metadata_changed = current.requests[0].name != request.name
-                || current.requests[0].collection != request.collection
-                || current.requests[0].group != request.group
-                || current.requests[0].tree_order != request.tree_order;
+            let metadata_changed = current.workspace.requests[0].name != request.name
+                || current.workspace.requests[0].collection != request.collection
+                || current.workspace.requests[0].group != request.group
+                || current.workspace.requests[0].tree_order != request.tree_order;
             if shared.context == context && current.theme == self.theme && !metadata_changed {
                 continue;
             }
             shared.context = context.clone();
             shared.selected_environment = selected;
             shared.editor.update(cx, |editor, cx| {
-                editor.requests[0].name = request.name.clone();
-                editor.requests[0].collection = request.collection.clone();
-                editor.requests[0].group = request.group.clone();
-                editor.requests[0].tree_order = request.tree_order;
-                let environment_changed = editor.environment_names != self.environment_names
+                editor.workspace.requests[0].name = request.name.clone();
+                editor.workspace.requests[0].collection = request.collection.clone();
+                editor.workspace.requests[0].group = request.group.clone();
+                editor.workspace.requests[0].tree_order = request.tree_order;
+                let environment_changed = editor.workspace.environment_names
+                    != self.workspace.environment_names
                     || editor.selected_environment(cx) != selected;
-                editor.trigger_requests = Some(self.requests.clone());
+                editor.trigger_requests = Some(self.workspace.requests.clone());
                 editor.sync_pair_tables(cx);
-                editor.collections = self.collections.clone();
-                editor.environment_names = self.environment_names.clone();
-                editor.environment_inputs = self.environment_inputs.clone();
-                editor.proxies = self.proxies.clone();
+                editor.workspace.collections = self.workspace.collections.clone();
+                editor.workspace.environment_names = self.workspace.environment_names.clone();
+                editor.workspace.environment_inputs = self.workspace.environment_inputs.clone();
+                editor.workspace.proxies = self.workspace.proxies.clone();
                 editor.disabled_plugins = self.disabled_plugins.clone();
                 editor.plugin_catalog = self.plugin_catalog.clone();
                 if environment_changed {

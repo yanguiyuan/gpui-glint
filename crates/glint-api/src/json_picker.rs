@@ -235,14 +235,16 @@ impl Render for ExtractorCell {
         let sensitive = ["token", "secret", "password", "authorization", "cookie"]
             .iter()
             .any(|word| format!("{name} {path}").to_lowercase().contains(word))
-            || host.environment_inputs[host.selected_environment(cx)]
+            || host.workspace.environment_inputs[host.selected_environment(cx)]
                 .variables
                 .iter()
                 .chain(
-                    host.requests
+                    host.workspace
+                        .requests
                         .get(host.active)
                         .and_then(|r| {
-                            host.collections
+                            host.workspace
+                                .collections
                                 .iter()
                                 .find(|c| c.collection == r.collection)
                         })
@@ -369,7 +371,7 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.requests.is_empty() {
+        if self.workspace.requests.is_empty() {
             return;
         }
         let index = target
@@ -402,7 +404,7 @@ impl Workbench {
         self.cancel_json_pick(cx);
         self.json_menu = None;
         self.config = 6;
-        self.storage_dirty = true;
+        self.workspace.storage_dirty = true;
         self.sync_pair_tables(cx);
         window.focus(&focus, cx);
         cx.notify();

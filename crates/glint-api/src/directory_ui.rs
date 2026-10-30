@@ -720,9 +720,10 @@ impl Workbench {
         self.tree_delete = None;
         self.current_collection = collection;
         self.current_directory = path.clone();
-        self.show_environments = false;
-        self.show_plugins = false;
-        let groups = self.collections[collection].clone();
+        if matches!(self.page, crate::Page::Plugins | crate::Page::Environments) {
+            self.page = crate::Page::Requests;
+        }
+        let groups = self.workspace.collections[collection].clone();
         let catalog = self.plugin_catalog.clone();
         let theme = self.theme;
         let completions = self.environment_completions_for(cx, Some(&groups.collection));
@@ -736,6 +737,7 @@ impl Workbench {
         self.directory_subscription =
             Some(cx.subscribe(&editor, |this, _, event: &SaveDefaults, cx| {
                 if let Some(groups) = this
+                    .workspace
                     .collections
                     .get_mut(event.collection)
                     .filter(|g| g.contains(&event.path))
@@ -743,9 +745,9 @@ impl Workbench {
                     groups
                         .defaults
                         .insert(event.path.clone(), event.defaults.clone());
-                    this.storage_dirty = true;
+                    this.workspace.storage_dirty = true;
                     this.persist(cx);
-                    let toast = match &this.storage_error {
+                    let toast = match &this.workspace.storage_error {
                         Some(error) => Toast::new("目录默认配置保存失败")
                             .description(error.clone())
                             .kind(ToastKind::Error),
@@ -885,9 +887,13 @@ mod tests {
             host.group_edit = Some(GroupEdit::CreateCollection);
             host.group_name.update(cx, |e, cx| e.set_value("API", cx));
             host.save_group(cx);
-            host.collections[0].add_child("", "Parent").unwrap();
-            host.collections[0].add_child("Parent", "Child").unwrap();
-            host.collections[0].defaults.insert(
+            host.workspace.collections[0]
+                .add_child("", "Parent")
+                .unwrap();
+            host.workspace.collections[0]
+                .add_child("Parent", "Child")
+                .unwrap();
+            host.workspace.collections[0].defaults.insert(
                 "Parent".into(),
                 defaults(
                     &[Section::Endpoint, Section::Auth, Section::Headers],
@@ -913,14 +919,17 @@ mod tests {
                     .unwrap_or_default(),
                 enabled: true,
             };
-            let parent = host.collections[0].defaults.get_mut("Parent").unwrap();
+            let parent = host.workspace.collections[0]
+                .defaults
+                .get_mut("Parent")
+                .unwrap();
             parent.sections.insert(Section::Plugins);
             parent.draft.plugins = vec![binding];
             host.add_request_to("Parent/Child".into(), cx);
             host.show_activity = false;
             host
         });
-        let original = host.read_with(window, |h, _| h.requests[0].draft.clone());
+        let original = host.read_with(window, |h, _| h.workspace.requests[0].draft.clone());
         let bounds = window
             .debug_bounds("request-directory:0:Parent/Child")
             .unwrap();
@@ -966,9 +975,9 @@ mod tests {
         let save = window.debug_bounds("save-directory-defaults").unwrap();
         window.simulate_click(save.center(), gpui::Modifiers::default());
         host.update(window, |h, cx| {
-            assert_eq!(h.requests[0].draft, original);
+            assert_eq!(h.workspace.requests[0].draft, original);
             assert!(
-                h.collections[0].defaults["Parent/Child"]
+                h.workspace.collections[0].defaults["Parent/Child"]
                     .sections
                     .contains(&Section::Auth)
             );
@@ -980,7 +989,7 @@ mod tests {
             assert!(child.token.is_empty());
             assert_eq!(child.headers, original.headers);
             assert_eq!(child.plugins, original.plugins);
-            assert_eq!(h.requests[1].versions[0].draft, child);
+            assert_eq!(h.workspace.requests[1].versions[0].draft, child);
             h.endpoint
                 .update(cx, |f, cx| f.set_text("{{child_baseurl}}/custom", cx));
             h.persist(cx);
@@ -1028,7 +1037,10 @@ mod tests {
             h.add_request_to("Parent/Child".into(), cx);
             assert!(h.snapshot(cx).auth);
             assert_eq!(h.snapshot(cx).token, "{{token}}");
-            assert_eq!(h.requests[1].draft.url, "{{child_baseurl}}/custom");
+            assert_eq!(
+                h.workspace.requests[1].draft.url,
+                "{{child_baseurl}}/custom"
+            );
         });
     }
 }
@@ -1046,7 +1058,8 @@ mod row_delete_tests {
                 storage::Store::open(&dir.path().join("completions.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("API", &[]).unwrap());
             host.add_request(cx);
             host.scoped_environment_mut(0, Some("API"))
@@ -1108,7 +1121,8 @@ mod row_delete_tests {
                 storage::Store::open(&dir.path().join("test.sqlite3")).unwrap(),
                 cx,
             );
-            host.collections
+            host.workspace
+                .collections
                 .push(RequestGroups::create_collection("API", &[]).unwrap());
             host.open_directory_settings(0, String::new(), cx);
             host
