@@ -12,6 +12,7 @@ pub struct ScheduleEditor {
     pub date: Entity<DatePicker>,
     pub time: Entity<TextEntry>,
     pub repeat: usize,
+    pub wake_mode: usize,
     pub notice: Option<String>,
 }
 
@@ -25,15 +26,25 @@ impl ScheduleEditor {
             date: cx.new(|cx| DatePicker::new(cx).selected(Local::now().date_naive())),
             time: cx.new(|cx| TextEntry::new(cx, "HH:MM", "09:00")),
             repeat: 0,
+            wake_mode: 0,
             notice: None,
         }
     }
 }
 
 impl AgentWorkspace {
+    fn partner_repo_name(&self, id: Uuid) -> Option<String> {
+        partners::Repository::new(self.path.clone())
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name)
+    }
     pub fn refresh_calendar(&self, cx: &mut Context<Self>) {
         let mut markers = std::collections::HashMap::new();
-        if let Ok(store) = self.schedules.lock() {
+        if let Ok(mut store) = self.schedules.lock() {
+            let _ = store.refresh();
             for task in &store.tasks {
                 *markers.entry(task.run_at.date_naive()).or_insert(0) += 1;
                 if let Some(last) = task
@@ -59,6 +70,7 @@ impl AgentWorkspace {
         self.schedule_editor.open = true;
         self.schedule_editor.editing = None;
         self.schedule_editor.repeat = 0;
+        self.schedule_editor.wake_mode = 0;
         self.schedule_editor.notice = None;
         self.schedule_editor
             .title
@@ -72,7 +84,7 @@ impl AgentWorkspace {
         cx.notify();
     }
 
-    fn edit_schedule(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    pub(crate) fn edit_schedule(&mut self, id: Uuid, cx: &mut Context<Self>) {
         let task = self
             .schedules
             .lock()
@@ -81,6 +93,8 @@ impl AgentWorkspace {
         if let Some(task) = task {
             self.schedule_editor.open = true;
             self.schedule_editor.editing = Some(id);
+            self.schedule_editor.wake_mode =
+                usize::from(task.wake_mode == schedules::WakeMode::Reflect);
             self.schedule_editor.notice = None;
             self.schedule_editor.repeat = match task.repeat {
                 schedules::Repeat::Once => 0,
@@ -129,6 +143,10 @@ impl AgentWorkspace {
                 return Err("请等待任务执行完成".into());
             }
             let mut task = existing.unwrap_or_else(|| schedules::Schedule {
+                wake_mode: schedules::WakeMode::Work,
+                self_wake: false,
+                partner_id: self.history.active().partner_id,
+                partner_goal: None,
                 id: Uuid::new_v4(),
                 title: String::new(),
                 prompt: String::new(),
@@ -158,6 +176,11 @@ impl AgentWorkspace {
                 .to_owned();
             task.run_at = run_at;
             task.enabled = true;
+            task.wake_mode = if self.schedule_editor.wake_mode == 1 {
+                schedules::WakeMode::Reflect
+            } else {
+                schedules::WakeMode::Work
+            };
             task.repeat = match self.schedule_editor.repeat {
                 1 => schedules::Repeat::Daily,
                 2 => schedules::Repeat::Weekly,
@@ -245,6 +268,18 @@ impl AgentWorkspace {
                                 } else {
                                     "已启用"
                                 }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!(
+                                "{} · {}",
+                                task.wake_mode.label(),
+                                task.partner_id
+                                    .and_then(|id| self.partner_repo_name(id))
+                                    .unwrap_or_else(|| "普通 Agent".into())
                             )),
                     )
                     .when_some(task.project.as_ref(), |row, path| {
@@ -351,6 +386,7 @@ impl AgentWorkspace {
             page=page.child(InputField::new("").label("任务名称").control(editor.title.clone()).theme(self.theme).render().w_full())
                 .child(div().rounded(px(8.)).border_1().border_color(rgb(p.border)).p_3().child(editor.prompt.clone()))
                 .child(div().flex().items_end().gap_3().child(editor.date.clone()).child(InputField::new("").label("本地时间").control(editor.time.clone()).theme(self.theme).render()))
+                .child(SegmentedControl::new([SegmentOption::new("执行任务"),SegmentOption::new("回顾整理")]).id("schedule-wake-mode").selected(editor.wake_mode).theme(self.theme).on_change({let weak=weak.clone(); move |index,_,cx|{let _=weak.update(cx,|this,cx|{this.schedule_editor.wake_mode=index;cx.notify();});}}).render())
                 .child(SegmentedControl::new([SegmentOption::new("一次"),SegmentOption::new("每天"),SegmentOption::new("每周")]).id("schedule-repeat").selected(editor.repeat).theme(self.theme)
                     .on_change(move |index,_,cx|{let _=weak.update(cx,|this,cx|{this.schedule_editor.repeat=index;cx.notify();});}).render())
                 .when_some(editor.notice.clone(),|page,message|page.child(div().text_color(rgb(0xd9342b)).child(message)))
@@ -388,7 +424,10 @@ impl AgentWorkspace {
                             .schedules
                             .lock()
                             .map_err(|_| "日程存储不可用".to_owned())
-                            .and_then(|mut store| store.claim_due(Local::now()));
+                            .and_then(|mut store| {
+                                store.refresh()?;
+                                store.claim_due(Local::now())
+                            });
                         match due {
                             Ok(Some(task)) => {
                                 let config = match task.provider_id {
@@ -406,13 +445,16 @@ impl AgentWorkspace {
                                     }
                                     let mut session = model::Session::new();
                                     session.project = task.project.clone();
+                                    session.partner_id = task.partner_id;
+                                    session.partner_goal = task.partner_goal;
+                                    session.wake_mode = Some(task.wake_mode);
                                     session.title = format!("定时任务 · {}", task.title);
                                     let id = session.id;
                                     this.history.sessions.insert(0, session);
                                     this.running_schedule = Some(task.id);
                                     this.send_to(
                                         id,
-                                        ComposerSubmission::text(task.prompt.clone()),
+                                        ComposerSubmission::text(format!("本次是日程唤醒，模式：{}。唤醒目的：{}\n先回顾自己的常驻记忆、近期经历和未完成目标，再判断现在是否仍需推进。完成后记录结果；若有必要，可用 schedule_create 自己选择下一次唤醒的时间、目的与 wake_mode，避免无进展的重复唤醒。{}", task.wake_mode.label(),task.prompt,if task.wake_mode==schedules::WakeMode::Reflect {"本次只允许阅读、回顾和更新自身记忆，以及安排自己的后续唤醒。"}else{"沿用当前工具权限执行实际工作。"})),
                                         config,
                                         false,
                                         cx,

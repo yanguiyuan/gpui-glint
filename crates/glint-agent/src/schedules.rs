@@ -12,8 +12,32 @@ pub enum Repeat {
     Weekly,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeMode {
+    #[default]
+    Work,
+    Reflect,
+}
+impl WakeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Work => "执行任务",
+            Self::Reflect => "回顾整理",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Schedule {
+    #[serde(default)]
+    pub wake_mode: WakeMode,
+    #[serde(default)]
+    pub self_wake: bool,
+    #[serde(default)]
+    pub partner_id: Option<Uuid>,
+    #[serde(default)]
+    pub partner_goal: Option<Uuid>,
     pub id: Uuid,
     pub title: String,
     pub prompt: String,
@@ -60,6 +84,14 @@ impl ScheduleStore {
         let mut recovered = false;
         for task in &mut store.tasks {
             if task.running {
+                if let Some(goal) = task.partner_goal {
+                    crate::database::open(&store.path)?
+                        .execute(
+                            "UPDATE partner_memories SET kind='goal_failed' WHERE id=?1",
+                            [goal.to_string()],
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
                 task.running = false;
                 recovered = true;
                 task.last_error = Some("上次执行被应用退出中断".into());
@@ -95,6 +127,15 @@ impl ScheduleStore {
         self.tasks = crate::database::load_schedules(&self.path)?.unwrap_or_default();
         Ok(())
     }
+    pub fn refresh(&mut self) -> Result<(), String> {
+        if !self.readable {
+            return Err("日程存储不可用".into());
+        }
+        if let Some(tasks) = crate::database::load_schedules(&self.path)? {
+            self.tasks = tasks;
+        }
+        Ok(())
+    }
     pub fn remove(&mut self, id: Uuid) -> Result<(), String> {
         if !self.readable {
             return Err("日程存储不可用".into());
@@ -126,6 +167,44 @@ impl ScheduleStore {
             return Ok(None);
         };
         let mut task: Schedule = serde_json::from_str(&value).map_err(|error| error.to_string())?;
+        if task.self_wake {
+            let partner = task.partner_id.ok_or("自我唤醒日程缺少伙伴")?;
+            let allowed: bool = transaction
+                .query_row(
+                    "SELECT coalesce((SELECT proactive FROM partner_policy WHERE partner_id=?1),0)",
+                    [partner.to_string()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !allowed {
+                task.enabled = false;
+                crate::database::put_schedule(&transaction, &task)?;
+                transaction.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+            let (count,last):(i64,Option<i64>)=transaction.query_row("SELECT count(*),max(woke_at) FROM partner_wake_log WHERE partner_id=?1 AND woke_at>?2",rusqlite::params![partner.to_string(),now.timestamp()-86400],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+            let next = if count >= 3 {
+                now + Duration::hours(1)
+            } else if last.is_some_and(|t| now.timestamp() - t < 900) {
+                chrono::DateTime::from_timestamp(last.unwrap() + 900, 0)
+                    .unwrap()
+                    .with_timezone(&Local)
+            } else {
+                now
+            };
+            if next > now {
+                task.run_at = next;
+                crate::database::put_schedule(&transaction, &task)?;
+                transaction.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO partner_wake_log(partner_id,schedule_id,woke_at) VALUES(?1,?2,?3)",
+                    rusqlite::params![partner.to_string(), task.id.to_string(), now.timestamp()],
+                )
+                .map_err(|e| e.to_string())?;
+        }
         task.running = true;
         task.last_run = Some(now);
         task.last_error = None;
@@ -165,6 +244,21 @@ impl ScheduleStore {
                 serde_json::from_str(&value).map_err(|error| error.to_string())?;
             task.running = false;
             task.last_error = error;
+            if let Some(goal) = task.partner_goal {
+                transaction
+                    .execute(
+                        "UPDATE partner_memories SET kind=?2 WHERE id=?1",
+                        rusqlite::params![
+                            goal.to_string(),
+                            if task.last_error.is_some() {
+                                "goal_failed"
+                            } else {
+                                "goal_review"
+                            }
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
             crate::database::put_schedule(&transaction, &task)?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
@@ -183,6 +277,10 @@ mod tests {
         let mut store = ScheduleStore::open(path.clone()).unwrap();
         let now = Local::now();
         let mut task = Schedule {
+            wake_mode: WakeMode::Work,
+            self_wake: false,
+            partner_id: None,
+            partner_goal: None,
             id: Uuid::new_v4(),
             title: "Check".into(),
             prompt: "Check project".into(),

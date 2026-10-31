@@ -5,6 +5,7 @@ use super::*;
 pub enum Page {
     Chat,
     Calendar,
+    Partners,
     Settings,
     Vault,
 }
@@ -36,8 +37,15 @@ impl AgentWorkspace {
         self.page = page;
         self.project_picker_open = false;
         match page {
-            Page::Chat => window.focus(&self.composer.focus_handle(cx), cx),
+            Page::Chat => {
+                self.sync_skill_context(cx);
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
             Page::Settings => self.open_settings(window, cx),
+            Page::Partners => {
+                self.open_partners(cx);
+                window.focus(&self.focus, cx);
+            }
             Page::Vault => {
                 window.focus(&self.focus, cx);
             }
@@ -61,6 +69,7 @@ impl AgentWorkspace {
         self.search
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
         self.provider_settings.set_theme(theme, cx);
+        self.partners_ui.set_theme(theme, cx);
         self.skills_ui.set_theme(theme, cx);
         self.mcp_ui.set_theme(theme, cx);
         self.sync_skill_context(cx);
@@ -106,7 +115,7 @@ mod tests {
                 .update(cx, |composer, cx| composer.set_value("保留这条草稿", cx));
             (host.history.active, host.composer.entity_id())
         });
-        for page in [Page::Calendar, Page::Settings, Page::Chat] {
+        for page in [Page::Calendar, Page::Partners, Page::Settings, Page::Chat] {
             window.update(|window, cx| host.update(cx, |host, cx| host.navigate(page, window, cx)));
             window.run_until_parked();
             assert!(window.debug_bounds("host-navigation").is_some());
@@ -126,7 +135,7 @@ mod tests {
             );
             assert_eq!(
                 window.debug_bounds("agent-topbar-search").is_some(),
-                page != Page::Calendar
+                matches!(page, Page::Chat | Page::Settings)
             );
             assert_eq!(
                 window.debug_bounds("agent-topbar-provider").is_some(),

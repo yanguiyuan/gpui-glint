@@ -49,7 +49,7 @@ pub fn open(anchor: &Path) -> Result<Connection, String> {
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    if version > 2 {
+    if version > 3 {
         return Err("数据库版本高于当前应用，请使用较新版本打开".into());
     }
     if version < 2 {
@@ -84,6 +84,11 @@ PRAGMA user_version=2;"#).map_err(|e| e.to_string())?;
         connection
             .execute_batch("COMMIT;")
             .map_err(|error| error.to_string())?;
+    }
+    if version < 3 {
+        connection
+            .execute_batch(crate::partners::SCHEMA)
+            .map_err(|e| e.to_string())?;
     }
     Ok(connection)
 }
@@ -193,7 +198,24 @@ pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<()
             [],
         )
         .map_err(|e| e.to_string())?;
+    let partner_ids: std::collections::HashSet<String> =
+        strings(&transaction, "SELECT id FROM partners")?
+            .into_iter()
+            .collect();
     for (ordinal, session) in history.sessions.iter().enumerate() {
+        // An older queued save must not restore a deleted companion binding.
+        let session = if session
+            .partner_id
+            .is_some_and(|id| !partner_ids.contains(&id.to_string()))
+        {
+            let mut copy = session.clone();
+            copy.partner_id = None;
+            copy.partner_goal = None;
+            std::borrow::Cow::Owned(copy)
+        } else {
+            std::borrow::Cow::Borrowed(session)
+        };
+        let session = &*session;
         let id = session.id.to_string();
         transaction
             .execute("INSERT INTO keep_sessions VALUES(?1)", [&id])
@@ -213,6 +235,7 @@ pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<()
             }
             transaction.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,ordinal) DO UPDATE SET role=excluded.role,text=excluded.text,time=excluded.time,payload=excluded.payload WHERE role!=excluded.role OR text!=excluded.text OR time!=excluded.time OR payload!=excluded.payload",params![id,index as i64,role,message.text,message.time.to_rfc3339(),payload.to_string()]).map_err(|e|e.to_string())?;
         }
+        crate::partners::capture(&transaction, session)?;
         transaction
             .execute(
                 "DELETE FROM messages WHERE session_id=?1 AND ordinal>=?2",
@@ -227,6 +250,12 @@ pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<()
         )
         .map_err(|e| e.to_string())?;
     let mut state = serde_json::to_value(history).map_err(|e| e.to_string())?;
+    if history
+        .preferred_partner
+        .is_some_and(|id| !partner_ids.contains(&id.to_string()))
+    {
+        state["preferred_partner"] = Value::Null;
+    }
     state.as_object_mut().unwrap().remove("sessions");
     state.as_object_mut().unwrap().remove("projects");
     set_meta(&transaction, "history", &state)?;
@@ -307,6 +336,7 @@ pub fn put_schedule(
     connection: &Connection,
     task: &crate::schedules::Schedule,
 ) -> Result<(), String> {
+    set_meta(connection, "schedules", &json!(true))?;
     connection.execute("INSERT INTO schedules VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET run_at=excluded.run_at,enabled=excluded.enabled,running=excluded.running,payload=excluded.payload",params![task.id.to_string(),task.run_at.timestamp(),task.enabled,task.running,serde_json::to_string(task).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
     Ok(())
 }

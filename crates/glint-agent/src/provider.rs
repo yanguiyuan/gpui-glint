@@ -545,6 +545,7 @@ async fn complete(
     let mut records = Vec::new();
     let mut blocks = Vec::new();
     let mut total: Option<crate::generation::GenerationStats> = None;
+    let mut argument_repairs = 0;
     loop {
         // Never wait for recall. Consume it once at the next request boundary,
         // after all preceding tool calls have their matching results.
@@ -654,8 +655,28 @@ async fn complete(
             messages.push(assistant);
         }
         let mut anthropic_results = Vec::new();
+        if !reply.argument_errors.is_empty() {
+            argument_repairs += 1;
+        }
+        let repair_limit = argument_repairs > 2;
         for call in reply.tool_calls {
-            let record = crate::tools::execute(call, context).await;
+            let rejected = repair_limit || reply.argument_errors.contains_key(&call.id);
+            let record = if repair_limit {
+                crate::tools::rejected(
+                    call,
+                    "未执行：工具参数连续修正失败，已停止本轮调用。此前成功的操作不会重复执行。"
+                        .into(),
+                )
+            } else if let Some(error) = reply.argument_errors.remove(&call.id) {
+                crate::tools::rejected(call, error)
+            } else {
+                crate::tools::execute(call, context).await
+            };
+            if rejected {
+                let _ = context
+                    .events
+                    .try_send(crate::tools::ToolEvent::Completed(record.clone()));
+            }
             if config.protocol == Protocol::Anthropic {
                 anthropic_results.push(json!({"type":"tool_result","tool_use_id":record.call.id,"content":record.result,"is_error":!record.success}));
             } else {
@@ -671,6 +692,9 @@ async fn complete(
         }
         if !anthropic_results.is_empty() {
             messages.push(json!({"role":"user","content":anthropic_results}));
+        }
+        if repair_limit {
+            return Err("模型连续返回无效工具参数，自动修正两次后仍未成功；已停止，不会重放此前完成的操作。".into());
         }
     }
 }
@@ -840,7 +864,19 @@ async fn single_request(
             .filter_map(|part| part["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let tool_calls = crate::tools::parse_calls(&parsed["content"], true)?;
+        let decoded = crate::tools::decode_calls(&parsed["content"], true)?;
+        let tool_calls = decoded.calls;
+        let mut raw_content = parsed["content"].clone();
+        if let Some(parts) = raw_content.as_array_mut() {
+            for part in parts {
+                if part["id"]
+                    .as_str()
+                    .is_some_and(|id| decoded.errors.contains_key(id))
+                {
+                    part["input"] = json!({});
+                }
+            }
+        }
         return if text.trim().is_empty() && tool_calls.is_empty() {
             Err(crate::generation::empty_reply_error(
                 stop,
@@ -853,8 +889,9 @@ async fn single_request(
                 text,
                 stats,
                 tool_calls,
-                blocks: crate::generation::anthropic_blocks(&parsed["content"]),
-                raw_content: parsed["content"].clone(),
+                blocks: crate::generation::anthropic_blocks(&raw_content),
+                argument_errors: decoded.errors,
+                raw_content,
                 ..Default::default()
             })
         };
@@ -874,7 +911,8 @@ async fn single_request(
         })
         .or_else(|| message["refusal"].as_str().map(str::to_owned));
     let text = text.unwrap_or_default();
-    let tool_calls = crate::tools::parse_calls(message, false)?;
+    let decoded = crate::tools::decode_calls(message, false)?;
+    let tool_calls = decoded.calls;
     if text.trim().is_empty() && tool_calls.is_empty() {
         return Err(crate::generation::empty_reply_error(
             stop,
@@ -904,6 +942,7 @@ async fn single_request(
         text,
         stats,
         tool_calls,
+        argument_errors: decoded.errors,
         reasoning: message["reasoning_content"].as_str().unwrap_or("").into(),
         ..Default::default()
     })
@@ -941,6 +980,204 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn malformed_streamed_calls_are_repaired_without_replaying_successful_tools_and_retries_are_bounded()
+     {
+        for anthropic in [false, true] {
+            for keep_failing in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || {
+                    let mut requests = Vec::new();
+                    for round in 0..3 {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        let mut socket = loop {
+                            match listener.accept() {
+                                Ok((socket, _)) => break socket,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    assert!(
+                                        std::time::Instant::now() < deadline,
+                                        "missing retry request"
+                                    );
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(e) => panic!("{e}"),
+                            }
+                        };
+                        // macOS inherits O_NONBLOCK on sockets accepted from this listener.
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let offset = loop {
+                            let mut byte = [0];
+                            socket.read_exact(&mut byte).unwrap();
+                            bytes.push(byte[0]);
+                            if bytes.ends_with(b"\r\n\r\n") {
+                                break bytes.len();
+                            }
+                        };
+                        let headers = String::from_utf8_lossy(&bytes).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length: "))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        bytes.resize(offset + length, 0);
+                        socket.read_exact(&mut bytes[offset..]).unwrap();
+                        requests.push(serde_json::from_slice::<Value>(&bytes[offset..]).unwrap());
+                        let mut calls = Vec::new();
+                        if round == 0 {
+                            calls.push(("good".to_owned(),"todo_write",json!({"todos":[{"content":"keep previous work","status":"completed"}]}).to_string()));
+                        }
+                        if keep_failing || round == 0 {
+                            calls.push((
+                                format!("bad-{round}"),
+                                "run_command",
+                                "{\"program\":\"sh\"".into(),
+                            ));
+                        } else if round == 1 {
+                            calls.push(("corrected".into(), "todo_read", "{}".into()));
+                        }
+                        let mut events = Vec::new();
+                        if anthropic {
+                            for (index, (id, name, args)) in calls.iter().enumerate() {
+                                events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}));
+                                events.push(json!({"type":"content_block_delta","index":index,"delta":{"partial_json":args}}));
+                            }
+                            if calls.is_empty() {
+                                events.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}));
+                            }
+                            if calls.is_empty() {
+                                events.push(json!({"type":"content_block_delta","index":0,"delta":{"text":"done"}}));
+                            }
+                            events.push(json!({"type":"message_delta","delta":{"stop_reason":if calls.is_empty(){"end_turn"}else{"tool_use"}}}));
+                            events.push(json!({"type":"message_stop"}));
+                        } else {
+                            let delta = if calls.is_empty() {
+                                json!({"content":"done"})
+                            } else {
+                                json!({"tool_calls":calls.iter().enumerate().map(|(index,(id,name,args))|json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":args}})).collect::<Vec<_>>()})
+                            };
+                            events.push(json!({"choices":[{"delta":delta,"finish_reason":if calls.is_empty(){"stop"}else{"tool_calls"}}]}));
+                        }
+                        let body = events
+                            .iter()
+                            .map(|event| format!("data: {event}\n\n"))
+                            .collect::<String>();
+                        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    }
+                    requests
+                });
+                let config = Config {
+                    base_url,
+                    model: "test-model".into(),
+                    protocol: if anthropic {
+                        Protocol::Anthropic
+                    } else {
+                        Protocol::OpenAi
+                    },
+                    ..Default::default()
+                };
+                let (events, receiver) = async_channel::unbounded();
+                let context = crate::tools::ToolContext {
+                    delegation: Default::default(),
+                    subagents: Default::default(),
+                    todos: Default::default(),
+                    steering: None,
+                    registry: Default::default(),
+                    skills: std::sync::Arc::new(crate::skills::Catalog::empty(
+                        directory.path().join("sessions.json"),
+                    )),
+                    memory: crate::memory::Repository::new(directory.path().join("sessions.json")),
+                    access: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::AccessMode::Ask,
+                    )),
+                    root: Some(directory.path().into()),
+                    schedules: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::schedules::ScheduleStore::open(
+                            directory.path().join("schedules.json"),
+                        )
+                        .unwrap(),
+                    )),
+                    provider_id: config.id,
+                    model: config.model.clone(),
+                    events,
+                    recall: None,
+                };
+                let result = runtime().unwrap().block_on(complete(
+                    config,
+                    "test-only-key".into(),
+                    vec![json!({"role":"user","content":"test"})],
+                    Thinking::Off,
+                    Some(context.clone()),
+                ));
+                if keep_failing {
+                    assert!(result.unwrap_err().contains("自动修正两次"));
+                } else {
+                    let reply = result.unwrap();
+                    assert_eq!(reply.text, "done");
+                    assert_eq!(reply.tool_records.len(), 3);
+                    assert_eq!(reply.tool_records.iter().filter(|r| r.success).count(), 2);
+                }
+                let mut started = Vec::new();
+                let mut rejected = 0;
+                while let Ok(event) = receiver.try_recv() {
+                    match event {
+                        crate::tools::ToolEvent::Started(call) => started.push(call.id),
+                        crate::tools::ToolEvent::Completed(record)
+                            if record.call.id.starts_with("bad-") =>
+                        {
+                            assert!(!record.success);
+                            assert!(record.result.starts_with("未执行："));
+                            rejected += 1;
+                        }
+                        crate::tools::ToolEvent::Approval { .. } => {
+                            panic!("invalid tool reached approval")
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    started,
+                    if keep_failing {
+                        vec!["good"]
+                    } else {
+                        vec!["good", "corrected"]
+                    }
+                );
+                assert_eq!(rejected, if keep_failing { 3 } else { 1 });
+                assert_eq!(context.todos.lock().unwrap().len(), 1);
+                let requests = server.join().unwrap();
+                assert_eq!(requests.len(), 3);
+                let messages = requests[1]["messages"].as_array().unwrap();
+                if anthropic {
+                    let results = messages.last().unwrap()["content"].as_array().unwrap();
+                    assert_eq!(results[0]["tool_use_id"], "good");
+                    assert_eq!(results[0]["is_error"], false);
+                    assert_eq!(results[1]["tool_use_id"], "bad-0");
+                    assert_eq!(results[1]["is_error"], true);
+                } else {
+                    let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
+                    assert_eq!(results.len(), 2);
+                    assert_eq!(results[0]["tool_call_id"], "good");
+                    assert_eq!(results[1]["tool_call_id"], "bad-0");
+                    assert!(
+                        results[1]["content"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("未执行：")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn model_catalog_keeps_real_window_metadata_and_manual_limits_round_trip() {

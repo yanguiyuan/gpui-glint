@@ -9,3 +9,5 @@ design/
 
 # Local plugin registry data includes its signing key.
 /registry-data/
+output/imagegen/
+.ego/avatar-20261031/

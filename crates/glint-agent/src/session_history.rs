@@ -21,7 +21,16 @@ struct ReadArgs {
     include_tools: bool,
 }
 
+#[cfg(test)]
 pub fn read(anchor: &Path, project: Option<&Path>, args: &Value) -> Result<String, String> {
+    read_scoped(anchor, project, None, args)
+}
+pub fn read_scoped(
+    anchor: &Path,
+    project: Option<&Path>,
+    partner: Option<Uuid>,
+    args: &Value,
+) -> Result<String, String> {
     let args: ReadArgs = serde_json::from_value(args.clone())
         .map_err(|error| format!("会话读取参数无效：{error}"))?;
     let project = project.ok_or("请先选择项目，再查看会话历史")?;
@@ -37,8 +46,8 @@ pub fn read(anchor: &Path, project: Option<&Path>, args: &Value) -> Result<Strin
     // FullAccess changes file boundaries, not conversation visibility.
     let title: String = connection
         .query_row(
-            "SELECT title FROM sessions WHERE id=?1 AND project=?2",
-            params![args.session_id.to_string(), project.to_string_lossy()],
+            "SELECT title FROM sessions WHERE id=?1 AND project=?2 AND (?3 IS NULL OR json_extract(payload,'$.partner_id') IS NULL OR json_extract(payload,'$.partner_id')=?3)",
+            params![args.session_id.to_string(), project.to_string_lossy(),partner.map(|id|id.to_string())],
             |row| row.get(0),
         )
         .optional()

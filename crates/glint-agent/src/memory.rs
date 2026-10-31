@@ -16,6 +16,9 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Repository {
     pub anchor: PathBuf,
+    pub partner: Option<Uuid>,
+    pub automatic_goal: bool,
+    pub reflection_only: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -115,7 +118,7 @@ pub struct Draft {
     #[serde(default)]
     pub evidence: Vec<usize>,
 }
-fn terms(text: &str) -> Vec<String> {
+pub(crate) fn terms(text: &str) -> Vec<String> {
     static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
     const STOP: &[&str] = &[
         "我", "你", "他", "她", "它", "的", "地", "得", "了", "和", "是", "在", "把", "个", "一个",
@@ -201,7 +204,20 @@ fn decode_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
 }
 impl Repository {
     pub fn new(anchor: PathBuf) -> Self {
-        Self { anchor }
+        Self {
+            anchor,
+            partner: None,
+            automatic_goal: false,
+            reflection_only: false,
+        }
+    }
+    pub fn for_partner(&self, partner: Option<Uuid>) -> Self {
+        Self {
+            anchor: self.anchor.clone(),
+            partner,
+            automatic_goal: self.automatic_goal,
+            reflection_only: self.reflection_only,
+        }
     }
     pub fn settings(&self) -> Result<Settings, String> {
         let connection = database::open(&self.anchor)?;
@@ -268,6 +284,12 @@ impl Repository {
             .map_err(|e| e.to_string())
     }
     pub fn read(&self, id: Uuid, project: Option<&Path>) -> Result<Record, String> {
+        if let Some(partner) = self.partner {
+            let repo = crate::partners::Repository::new(self.anchor.clone());
+            if let Ok(record) = repo.read(partner, project, id) {
+                return Ok(record);
+            }
+        }
         let connection = database::open(&self.anchor)?;
         connection.query_row("SELECT id,title,summary,project,updated_at,source,content,keywords FROM memories WHERE id=?1 AND (project IS NULL OR project='' OR project=?2)",params![id.to_string(),scope(project)],|row|{
             let source:String=row.get(5)?;let keywords:String=row.get(7)?;
@@ -280,6 +302,10 @@ impl Repository {
         project: Option<&Path>,
         source: Value,
     ) -> Result<Uuid, String> {
+        if let Some(partner) = self.partner {
+            return crate::partners::Repository::new(self.anchor.clone())
+                .explicit(partner, draft, project);
+        }
         let mut connection = database::open(&self.anchor)?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         let id = put(&transaction, draft, project, source)?;
@@ -287,6 +313,12 @@ impl Repository {
         Ok(id)
     }
     pub fn delete(&self, id: Uuid, project: Option<&Path>) -> Result<(), String> {
+        if let Some(partner) = self.partner {
+            let repo = crate::partners::Repository::new(self.anchor.clone());
+            if repo.read(partner, project, id).is_ok() {
+                return repo.delete(partner, project, id);
+            }
+        }
         self.read(id, project)?;
         let mut connection = database::open(&self.anchor)?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
@@ -384,11 +416,22 @@ impl Repository {
                 .then(b.1.total_cmp(&a.1))
                 .then(b.0.updated_at.cmp(&a.0.updated_at))
         });
-        Ok(ranked
+        let mut cards: Vec<_> = ranked
             .into_iter()
             .take(limit.min(40))
             .map(|(card, _, _)| card)
-            .collect())
+            .collect();
+        if let Some(partner) = self.partner {
+            let mut personal: Vec<_> = crate::partners::Repository::new(self.anchor.clone())
+                .search(partner, project, query, true, limit)?
+                .into_iter()
+                .map(|entry| entry.card())
+                .collect();
+            personal.append(&mut cards);
+            cards = personal;
+            cards.truncate(limit.min(40));
+        }
+        Ok(cards)
     }
     pub async fn recall(
         &self,
@@ -408,7 +451,19 @@ impl Repository {
         if !self.settings()?.automatic_recall {
             return Ok(Recall::default());
         }
-        let categories = self.categories(Some(project))?;
+        let mut categories = self.categories(Some(project))?;
+        if let Some(partner) = self.partner {
+            for entry in crate::partners::Repository::new(self.anchor.clone())
+                .entries(partner, Some(project))?
+            {
+                if entry.activation(chrono::Utc::now().timestamp()) >= 0.2 {
+                    let category = entry.card().category;
+                    if !categories.contains(&category) {
+                        categories.push(category);
+                    }
+                }
+            }
+        }
         if categories.is_empty() {
             return Ok(Recall::default());
         }
@@ -434,7 +489,17 @@ impl Repository {
             return Ok(Recall::default());
         }
         let search = format!("{} {}", query, expanded.join(" "));
-        let candidates = self.candidates(&search, &selected_categories, Some(project), 32)?;
+        let mut candidates = self.candidates(&search, &selected_categories, Some(project), 32)?;
+        if let Some(partner) = self.partner {
+            let awake: std::collections::HashSet<_> =
+                crate::partners::Repository::new(self.anchor.clone())
+                    .entries(partner, Some(project))?
+                    .into_iter()
+                    .filter(|e| e.activation(chrono::Utc::now().timestamp()) >= 0.2)
+                    .map(|e| e.id)
+                    .collect();
+            candidates.retain(|c| !c.category.starts_with("伙伴/") || awake.contains(&c.id));
+        }
         if candidates.is_empty() {
             return Ok(Recall::default());
         }
@@ -692,7 +757,7 @@ impl Repository {
     }
     fn batch(&self, run: &ArchiveRun) -> Result<Option<Batch>, String> {
         let connection = database::open(&self.anchor)?;
-        let mut statement=connection.prepare("SELECT s.id,s.project,coalesce(c.message_count,0),coalesce(c.byte_offset,0) FROM sessions s LEFT JOIN memory_cursors c ON c.session_id=s.id WHERE s.project IS NOT NULL ORDER BY s.updated,s.id").map_err(|e|e.to_string())?;
+        let mut statement=connection.prepare("SELECT s.id,s.project,coalesce(c.message_count,0),coalesce(c.byte_offset,0) FROM sessions s LEFT JOIN memory_cursors c ON c.session_id=s.id WHERE s.project IS NOT NULL AND json_extract(s.payload,'$.partner_id') IS NULL ORDER BY s.updated,s.id").map_err(|e|e.to_string())?;
         let sessions = statement
             .query_map([], |row| {
                 Ok((

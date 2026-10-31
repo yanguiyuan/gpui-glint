@@ -215,6 +215,18 @@ pub fn session_groups(
     query: &str,
     running: Option<Uuid>,
 ) -> Vec<GroupListGroup> {
+    session_groups_with_partners(history, query, running, &[])
+}
+
+pub fn session_groups_with_partners(
+    history: &History,
+    query: &str,
+    running: Option<Uuid>,
+    partners: &[partners::Partner],
+) -> Vec<GroupListGroup> {
+    if history.group_by_partner {
+        return partner_session_groups(history, query, running, partners);
+    }
     let query = query.trim().to_lowercase();
     let mut sessions: Vec<_> = history
         .sessions
@@ -293,9 +305,127 @@ pub fn session_groups(
     groups
 }
 
+fn partner_session_groups(
+    history: &History,
+    query: &str,
+    running: Option<Uuid>,
+    partners: &[partners::Partner],
+) -> Vec<GroupListGroup> {
+    let query = query.trim().to_lowercase();
+    let mut groups: Vec<_> = partners
+        .iter()
+        .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+        .map(|p| {
+            GroupListGroup::new(
+                GroupListHeader::new(format!("partner:{}", p.id), p.name.clone())
+                    .icon(Icon::User)
+                    .actions([Icon::Plus, Icon::Settings]),
+            )
+        })
+        .collect();
+    let mut sessions: Vec<_> = history.sessions.iter().collect();
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
+    for session in sessions {
+        let partner = partners.iter().find(|p| Some(p.id) == session.partner_id);
+        if !query.is_empty()
+            && !session.title.to_lowercase().contains(&query)
+            && !session
+                .messages
+                .iter()
+                .any(|m| m.text.to_lowercase().contains(&query))
+            && !partner.is_some_and(|p| p.name.to_lowercase().contains(&query))
+        {
+            continue;
+        }
+        let (id, label, actions) = match partner {
+            Some(p) => (
+                format!("partner:{}", p.id),
+                p.name.clone(),
+                vec![Icon::Plus, Icon::Settings],
+            ),
+            None => ("partner:none".into(), "普通 Agent".into(), vec![Icon::Plus]),
+        };
+        let index = groups
+            .iter()
+            .position(|g| g.header.id.as_ref() == id)
+            .unwrap_or_else(|| {
+                groups.push(GroupListGroup::new(
+                    GroupListHeader::new(id, label)
+                        .icon(Icon::User)
+                        .actions(actions),
+                ));
+                groups.len() - 1
+            });
+        let mut item = GroupListItem::new(session.id.to_string(), session.title.clone())
+            .reserve_icon_space(true)
+            .meta(session.updated.format("%H:%M").to_string())
+            .action(Icon::Trash)
+            .confirm_action("删除此会话？");
+        if running == Some(session.id) {
+            item = item.icon(Icon::Spinner);
+        }
+        groups[index].items.push(item);
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_groups_include_empty_partners_and_cross_project_sessions_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = partners::Repository::new(dir.path().join("sessions.json"));
+        let a = repo.create().unwrap();
+        let b = repo.create().unwrap();
+        repo.update(a, "知微", "◌", "").unwrap();
+        repo.update(b, "林舟", "◌", "").unwrap();
+        let ps = repo.list().unwrap();
+        let mut h = History::default();
+        h.preferred_partner = Some(a);
+        h.active_mut().partner_id = Some(a);
+        h.active_mut().project = Some("/a".into());
+        h.active_mut().push(Role::User, "实现滚动".into());
+        let first = h.active;
+        h.new_session_for(Some("/b".into()));
+        h.active_mut().push(Role::User, "验证边界".into());
+        let second = h.active;
+        h.group_by_partner = true;
+        let groups = session_groups_with_partners(&h, "", Some(first), &ps);
+        assert_eq!(groups.len(), 2);
+        let group = groups
+            .iter()
+            .find(|g| g.header.id.as_ref() == format!("partner:{a}"))
+            .unwrap();
+        assert_eq!(group.items.len(), 2);
+        assert!(
+            group
+                .items
+                .iter()
+                .any(|i| i.id.as_ref() == first.to_string())
+        );
+        assert!(
+            group
+                .items
+                .iter()
+                .any(|i| i.id.as_ref() == second.to_string())
+        );
+        assert!(
+            groups
+                .iter()
+                .find(|g| g.header.id.as_ref() == format!("partner:{b}"))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let searched = session_groups_with_partners(&h, "知微", None, &ps);
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].items.len(), 2);
+        let by_title = session_groups_with_partners(&h, "验证边界", None, &ps);
+        assert_eq!(by_title.len(), 1);
+        assert_eq!(by_title[0].items.len(), 1);
+    }
 
     #[test]
     fn deleting_every_session_preserves_empty_project_headers() {

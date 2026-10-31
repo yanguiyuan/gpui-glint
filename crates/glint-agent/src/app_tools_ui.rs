@@ -99,7 +99,48 @@ fn command_summary(call: &tools::ToolCall) -> String {
     command.join(" ")
 }
 
+fn unresolved_tool_record(call: &tools::ToolCall, complete: bool) -> tools::ToolRecord {
+    tools::rejected(
+        call.clone(),
+        if complete {
+            "调用已中断：此回复未保存该工具的执行结果，请先核对实际状态。"
+        } else {
+            "正在生成参数…"
+        }
+        .into(),
+    )
+}
+
 fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
+    if record.result == "正在生成参数…"
+        || record.result.starts_with("未执行：")
+        || record.result.starts_with("调用已中断：")
+    {
+        let generating = record.result == "正在生成参数…";
+        return ToolPresentation {
+            icon: if record.call.name == "run_command" {
+                Icon::Shell
+            } else {
+                Icon::Workflow
+            },
+            summary: format!(
+                "{} {}",
+                if generating {
+                    "正在生成参数"
+                } else if record.result.starts_with("未执行：") {
+                    "未执行"
+                } else {
+                    "调用已中断"
+                },
+                record.call.name
+            ),
+            body: if generating {
+                "正在接收工具参数，尚未执行。".into()
+            } else {
+                record.result.clone()
+            },
+        };
+    }
     let running = record.result == "执行中…";
     let command_failed = record.call.name == "run_command"
         && record
@@ -725,15 +766,7 @@ impl AgentWorkspace {
                     // Completed calls use their result row and the same panel
                     // identity, so streaming never leaves a duplicate call row.
                     if !completed.contains(call.id.as_str()) {
-                        let running = tools::ToolRecord {
-                            call: call.clone(),
-                            result: "执行中…".into(),
-                            success: false,
-                            elapsed_ms: 0,
-                            live_output: None,
-                            subagent: None,
-                            change: None,
-                        };
+                        let running = unresolved_tool_record(call, complete);
                         let running = if !complete {
                             activity
                                 .iter()
@@ -938,6 +971,41 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[test]
+    fn historical_call_without_result_is_closed_while_streaming_call_is_pending() {
+        let call = tools::ToolCall {
+            id: "orphan".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({}),
+        };
+        let pending = tool_presentation(&unresolved_tool_record(&call, false));
+        assert_eq!(pending.summary, "正在生成参数 run_command");
+        let ended = tool_presentation(&unresolved_tool_record(&call, true));
+        assert_eq!(ended.summary, "调用已中断 run_command");
+        assert!(!ended.body.contains("等待工具返回结果"));
+    }
+
+    #[test]
+    fn generating_rejected_and_interrupted_tools_never_present_as_running() {
+        for (result, label) in [
+            ("正在生成参数…", "正在生成参数"),
+            ("未执行：JSON 错误", "未执行"),
+            ("调用已中断：结果未知", "调用已中断"),
+        ] {
+            let record = tools::rejected(
+                tools::ToolCall {
+                    id: "test".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({}),
+                },
+                result.into(),
+            );
+            let presentation = tool_presentation(&record);
+            assert!(presentation.summary.starts_with(label));
+            assert!(!presentation.body.contains("等待工具返回结果"));
+        }
+    }
 
     #[test]
     fn process_cache_tracks_live_output_timings_and_tool_results() {

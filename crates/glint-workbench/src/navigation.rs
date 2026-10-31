@@ -79,6 +79,10 @@ mod tests {
                 Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
             ),
             (
+                "nav-partners",
+                Action::Navigate(Route::Agent(glint_agent::Page::Partners)),
+            ),
+            (
                 "nav-calendar",
                 Action::Navigate(Route::Agent(glint_agent::Page::Calendar)),
             ),
@@ -152,9 +156,12 @@ impl Render for Navigation {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use glint_agent::Page as Agent;
         use glint_api::Page as Api;
-        let separator = || {
+        let separator = |id: &'static str| {
             div()
-                .w(px(22.))
+                .id(id)
+                .debug_selector(move || id.into())
+                .w(px(24.))
+                .my_1()
                 .h(px(1.))
                 .flex_shrink_0()
                 .bg(rgb(self.theme.palette().border))
@@ -188,32 +195,25 @@ impl Render for Navigation {
                 cx,
             ))
             .child(self.route_button(
-                "nav-plugins",
-                Icon::Script,
-                "插件管理",
-                Route::Api(Api::Plugins),
-                cx,
-            ))
-            .child(self.route_button(
                 "nav-history",
                 Icon::Clock,
                 "请求历史",
                 Route::Api(Api::History),
                 cx,
             ))
-            .child(self.route_button(
-                "nav-mcp",
-                Icon::Workflow,
-                "MCP 调用历史",
-                Route::Api(Api::Mcp),
-                cx,
-            ))
-            .child(separator())
+            .child(separator("nav-api-agent-divider"))
             .child(self.route_button(
                 "nav-agent",
-                Icon::User,
+                Icon::MessageCircle,
                 "Agent 会话",
                 Route::Agent(Agent::Chat),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-partners",
+                Icon::Users,
+                "伙伴",
+                Route::Agent(Agent::Partners),
                 cx,
             ))
             .child(
@@ -237,6 +237,21 @@ impl Render for Navigation {
                 cx,
             ))
             .child(div().flex_1().min_h_0())
+            .child(separator("nav-common-divider"))
+            .child(self.route_button(
+                "nav-plugins",
+                Icon::Script,
+                "插件管理",
+                Route::Api(Api::Plugins),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-mcp",
+                Icon::Workflow,
+                "MCP 调用历史",
+                Route::Api(Api::Mcp),
+                cx,
+            ))
             .child(self.route_button("nav-vault", Icon::Key, "密码箱", Route::Api(Api::Vault), cx))
             .child(self.route_button(
                 "nav-settings",

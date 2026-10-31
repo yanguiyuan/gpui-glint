@@ -50,6 +50,12 @@ struct DraftImageFile {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub partner_id: Option<Uuid>,
+    #[serde(default)]
+    pub partner_goal: Option<Uuid>,
+    #[serde(default)]
+    pub wake_mode: Option<crate::schedules::WakeMode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<crate::todo::Item>,
     #[serde(default)]
@@ -70,6 +76,9 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self {
+            partner_id: None,
+            partner_goal: None,
+            wake_mode: None,
             todos: Vec::new(),
             project: None,
             id: Uuid::new_v4(),
@@ -117,11 +126,15 @@ impl Session {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct History {
     #[serde(default)]
+    pub preferred_partner: Option<Uuid>,
+    #[serde(default)]
     pub access_mode: crate::tools::AccessMode,
     #[serde(default)]
     pub projects: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub group_by_project: bool,
+    #[serde(default)]
+    pub group_by_partner: bool,
     pub sessions: Vec<Session>,
     pub active: Uuid,
 }
@@ -130,9 +143,11 @@ impl Default for History {
     fn default() -> Self {
         let session = Session::new();
         Self {
+            preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
             projects: vec![],
             group_by_project: true,
+            group_by_partner: false,
             active: session.id,
             sessions: vec![session],
         }
@@ -267,11 +282,13 @@ impl History {
                 && s.draft.is_empty()
                 && s.draft_images.is_empty()
                 && s.project == project
+                && s.partner_id == self.preferred_partner
         }) {
             self.active = session.id;
         } else {
             let mut session = Session::new();
             session.project = project;
+            session.partner_id = self.preferred_partner;
             self.active = session.id;
             self.sessions.insert(0, session);
         }

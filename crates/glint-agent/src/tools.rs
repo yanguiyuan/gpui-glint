@@ -154,7 +154,7 @@ pub fn definitions(anthropic: bool) -> Value {
         definition(
             "subagent",
             "Delegate a self-contained task to a subagent using the current model and a fresh conversation. Supply all necessary context in task. Waits for the result (120 second limit); at most 8 tasks per user request. Shares project files and the current approval policy. The subagent cannot create further subagents.",
-            json!({"task":string(),"title":{"type":"string","description":"Short task title for the subagent list, up to 28 characters."}}),
+            json!({"task":string(),"partner_id":{"type":"string","description":"Optional persistent companion ID from partner_list. Delegate to that companion with its own identity and memories."},"title":{"type":"string","description":"Short task title for the subagent list, up to 28 characters."}}),
             &["task"],
         ),
         definition(
@@ -206,8 +206,14 @@ pub fn definitions(anthropic: bool) -> Value {
             &["program", "args"],
         ),
         definition(
+            "partner_list",
+            "List available persistent companions (IDs, names and user descriptions only). Pass partner_id to subagent to collaborate; private memories are not shared.",
+            json!({}),
+            &[],
+        ),
+        definition(
             "memory_search",
-            "Search memory summaries in the current project and global user preferences. Use intent-based queries such as dietary preferences, not generic pronouns. Read full relevant entries with memory_read.",
+            "Search memory summaries in the current project and global user preferences, including the current companion's dormant memories. Use intent-based queries such as dietary preferences, not generic pronouns. Read full relevant entries with memory_read.",
             json!({"query":string()}),
             &["query"],
         ),
@@ -256,13 +262,13 @@ pub fn definitions(anthropic: bool) -> Value {
         definition(
             "schedule_create",
             "Create a scheduled agent task. Subject to the selected access mode. run_at must be an ISO 8601 timestamp with timezone. repeat is once, daily or weekly.",
-            json!({"title":string(),"prompt":string(),"run_at":string(),"repeat":{"type":"string","enum":["once","daily","weekly"]}}),
+            json!({"title":string(),"prompt":string(),"run_at":string(),"wake_mode":{"type":"string","enum":["work","reflect"],"description":"work executes a task; reflect reviews experiences and goals using read-only tools and own memory/scheduling tools."},"repeat":{"type":"string","enum":["once","daily","weekly"]}}),
             &["title", "prompt", "run_at"],
         ),
         definition(
             "schedule_update",
             "Update an existing task by id. Subject to the selected access mode; omitted fields stay unchanged.",
-            json!({"id":string(),"title":string(),"prompt":string(),"run_at":string(),"repeat":{"type":"string","enum":["once","daily","weekly"]},"enabled":{"type":"boolean"}}),
+            json!({"id":string(),"title":string(),"prompt":string(),"run_at":string(),"wake_mode":{"type":"string","enum":["work","reflect"],"description":"work executes a task; reflect reviews experiences and goals using read-only tools and own memory/scheduling tools."},"repeat":{"type":"string","enum":["once","daily","weekly"]},"enabled":{"type":"boolean"}}),
             &["id"],
         ),
         definition(
@@ -346,8 +352,44 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
     let started = Instant::now();
     let _ = context.events.send(ToolEvent::Started(call.clone())).await;
     let result = async {
+        if context.memory.reflection_only
+            && !matches!(
+                call.name.as_str(),
+                "list_files"
+                    | "read_file"
+                    | "search"
+                    | "search_files"
+                    | "memory_search"
+                    | "memory_read"
+                    | "memory_save"
+                    | "memory_delete"
+                    | "session_read"
+                    | "todo_read"
+                    | "todo_write"
+                    | "partner_list"
+                    | "skill_list"
+                    | "skill_read"
+                    | "schedule_list"
+                    | "schedule_create"
+                    | "schedule_update"
+                    | "schedule_delete"
+            )
+        {
+            return Err(
+                "回顾整理模式只能阅读、整理记忆和安排自身唤醒；执行任务请另建 work 模式日程".into(),
+            );
+        }
         let access = *context.access.lock().map_err(|_| "无法读取权限设置")?;
+        let own_wake = context.memory.partner.is_some_and(|partner| {
+            crate::partners::Repository::new(context.memory.anchor.clone())
+                .proactive(partner)
+                .unwrap_or(false)
+        }) && matches!(
+            call.name.as_str(),
+            "schedule_create" | "schedule_update" | "schedule_delete"
+        );
         if access == AccessMode::Ask
+            && !own_wake
             && (needs_approval(&call)
                 || context
                     .registry
@@ -510,8 +552,23 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             )?
             .to_string());
     }
+    if call.name == "partner_list" {
+        let partners = crate::partners::Repository::new(context.memory.anchor.clone()).list()?;
+        return serde_json::to_string(
+            &partners
+                .into_iter()
+                .map(|p| json!({"id":p.id,"name":p.name,"description":p.description}))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| e.to_string());
+    }
     if call.name == "session_read" {
-        return crate::session_history::read(&context.memory.anchor, context.root.as_deref(), args);
+        return crate::session_history::read_scoped(
+            &context.memory.anchor,
+            context.root.as_deref(),
+            context.memory.partner,
+            args,
+        );
     }
     if call.name.starts_with("memory_") {
         return memory_tool(call, context);
@@ -698,6 +755,18 @@ fn memory_tool(call: &ToolCall, context: &ToolContext) -> Result<String, String>
             Ok(format!("记忆已保存：{id}"))
         }
         "memory_delete" => {
+            if context.memory.reflection_only {
+                let partner = context
+                    .memory
+                    .partner
+                    .ok_or("整理模式需要伙伴身份才能删除个人记忆")?;
+                crate::partners::Repository::new(context.memory.anchor.clone()).delete(
+                    partner,
+                    project,
+                    Uuid::parse_str(text(args, "id")?).map_err(|_| "记忆 ID 无效")?,
+                )?;
+                return Ok("记忆已删除".into());
+            }
             context.memory.delete(
                 Uuid::parse_str(text(args, "id")?).map_err(|_| "记忆 ID 无效")?,
                 project,
@@ -761,20 +830,48 @@ async fn command(
 fn schedule_tool(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
     let mut store = context.schedules.lock().map_err(|_| "日程存储不可用")?;
     let args = &call.arguments;
+    store.refresh()?;
     if call.name == "schedule_list" {
-        return serde_json::to_string(&store.tasks).map_err(|_| "无法编码日程".into());
+        let tasks: Vec<_> = store
+            .tasks
+            .iter()
+            .filter(|t| {
+                (context.memory.partner.is_none() || t.partner_id == context.memory.partner)
+                    && t.project == context.root
+            })
+            .collect();
+        return serde_json::to_string(&tasks).map_err(|_| "无法编码日程".into());
     }
     let id = if call.name == "schedule_create" {
         Uuid::new_v4()
     } else {
         Uuid::parse_str(text(args, "id")?).map_err(|_| "日程 ID 无效")?
     };
+    if call.name != "schedule_create"
+        && !store.tasks.iter().any(|t| {
+            t.id == id
+                && t.project == context.root
+                && (context.memory.partner.is_none() || t.partner_id == context.memory.partner)
+        })
+    {
+        return Err("日程不存在或不属于当前伙伴与项目".into());
+    }
+    if context.memory.automatic_goal
+        && call.name != "schedule_create"
+        && store.tasks.iter().any(|t| t.id == id && !t.self_wake)
+    {
+        return Err("自主唤醒不能修改用户安排的日程".into());
+    }
     if call.name == "schedule_delete" {
         store.remove(id)?;
         return Ok("日程已删除".into());
     }
     let mut task = if call.name == "schedule_create" {
         Schedule {
+            wake_mode: crate::schedules::WakeMode::Work,
+            self_wake: context.memory.automatic_goal,
+            partner_id: context.memory.partner,
+            partner_goal: None,
             id,
             title: String::new(),
             prompt: String::new(),
@@ -821,46 +918,133 @@ fn schedule_tool(call: &ToolCall, context: &ToolContext) -> Result<String, Strin
     if let Some(value) = args["enabled"].as_bool() {
         task.enabled = value;
     }
+    if let Some(mode) = args["wake_mode"].as_str() {
+        task.wake_mode = match mode {
+            "work" => crate::schedules::WakeMode::Work,
+            "reflect" => crate::schedules::WakeMode::Reflect,
+            _ => return Err("wake_mode 只能是 work 或 reflect".into()),
+        };
+    }
+    let proactive = context.memory.partner.is_some_and(|id| {
+        crate::partners::Repository::new(context.memory.anchor.clone())
+            .proactive(id)
+            .unwrap_or(false)
+    });
+    if context.memory.automatic_goal || proactive {
+        let partner = context.memory.partner.ok_or("自我唤醒需要伙伴身份")?;
+        if !crate::partners::Repository::new(context.memory.anchor.clone()).proactive(partner)? {
+            return Err("当前伙伴未开启自主唤醒".into());
+        }
+        let pending = store
+            .tasks
+            .iter()
+            .filter(|t| t.partner_id == Some(partner) && t.self_wake && t.enabled && t.id != id)
+            .count();
+        if pending >= 8 {
+            return Err("每个伙伴最多保留 8 个待执行的自主唤醒".into());
+        }
+        task.self_wake = true;
+        if task.run_at < chrono::Local::now() + chrono::Duration::minutes(15) {
+            task.run_at = chrono::Local::now() + chrono::Duration::minutes(15);
+        }
+    }
     store.upsert(task.clone())?;
     serde_json::to_string(&task).map_err(|_| "无法编码日程".into())
 }
 
-pub fn parse_calls(message: &Value, anthropic: bool) -> Result<Vec<ToolCall>, String> {
+/// Keep structurally valid call IDs even when model-generated argument JSON is
+/// malformed, so the provider can return a matching error instead of aborting.
+#[derive(Default)]
+pub struct DecodedCalls {
+    pub calls: Vec<ToolCall>,
+    pub errors: std::collections::HashMap<String, String>,
+}
+pub fn argument_json_error(error: &serde_json::Error) -> String {
+    format!(
+        "未执行：工具参数不是有效的 JSON 对象（第 {} 行，第 {} 列，{}）。请重新生成完整 JSON；字符串中的换行、引号和反斜杠需正确转义。不要重做此前已成功的工具操作。",
+        error.line(),
+        error.column(),
+        if error.is_eof() {
+            "内容不完整"
+        } else {
+            "语法错误"
+        }
+    )
+}
+pub fn decode_calls(message: &Value, anthropic: bool) -> Result<DecodedCalls, String> {
     let entries: Vec<_> = if anthropic {
         message
             .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|item| item["type"] == "tool_use")
-                    .collect()
-            })
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "tool_use")
+            .collect()
     } else {
         message["tool_calls"]
             .as_array()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect()
     };
-    entries
-        .into_iter()
-        .map(|item| {
-            let (name, arguments) = if anthropic {
-                (text(item, "name")?.to_owned(), item["input"].clone())
-            } else {
-                (
-                    text(&item["function"], "name")?.to_owned(),
-                    serde_json::from_str(text(&item["function"], "arguments")?)
-                        .map_err(|_| "工具参数不是有效 JSON")?,
-                )
-            };
-            Ok(ToolCall {
-                id: text(item, "id")?.to_owned(),
-                name,
-                arguments,
-            })
-        })
-        .collect()
+    let mut decoded = DecodedCalls::default();
+    for item in entries {
+        let id = text(item, "id")?.to_owned();
+        let name = if anthropic {
+            text(item, "name")?
+        } else {
+            text(&item["function"], "name")?
+        }
+        .to_owned();
+        if id.is_empty() || name.is_empty() {
+            return Err("Provider 工具调用缺少 ID 或名称".into());
+        }
+        let input = if anthropic {
+            &item["input"]
+        } else {
+            &item["function"]["arguments"]
+        };
+        let parsed = match input {
+            Value::String(raw) if raw.trim().is_empty() => Ok(json!({})),
+            Value::String(raw) => serde_json::from_str::<Value>(raw).map_err(|error| argument_json_error(&error)),
+            Value::Null => Err(
+                "未执行：工具参数缺失，必须提供完整 JSON 对象。请重新生成此调用，不要重做已成功的操作。".into()
+            ),
+            value => Ok(value.clone()),
+        };
+        let arguments = match parsed {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                decoded.errors.insert(
+                    id.clone(),
+                    "未执行：工具参数必须是 JSON 对象，不能是数组、字符串或 null。请重新生成此调用。".into(),
+                );
+                json!({})
+            }
+            Err(error) => {
+                decoded.errors.insert(id.clone(), error);
+                json!({})
+            }
+        };
+        decoded.calls.push(ToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    Ok(decoded)
+}
+
+/// A rejected invocation is still a tool result, but never starts approval or execution.
+pub fn rejected(call: ToolCall, result: String) -> ToolRecord {
+    ToolRecord {
+        call,
+        result,
+        success: false,
+        elapsed_ms: 0,
+        live_output: None,
+        subagent: None,
+        change: None,
+    }
 }
 
 #[cfg(test)]
@@ -1152,5 +1336,141 @@ mod tests {
                 .iter()
                 .any(|tool| tool["name"] == "schedule_create")
         );
+    }
+}
+
+#[cfg(test)]
+mod companion_wake_tests {
+    use super::*;
+    fn context(dir: &Path, partner: Uuid, config: &crate::provider::Config) -> ToolContext {
+        let (events, _) = async_channel::unbounded();
+        let mut memory =
+            crate::memory::Repository::new(dir.join("sessions.json")).for_partner(Some(partner));
+        memory.automatic_goal = true;
+        ToolContext {
+            steering: None,
+            todos: Default::default(),
+            subagents: Default::default(),
+            delegation: Default::default(),
+            registry: Default::default(),
+            skills: Arc::new(crate::skills::Catalog::empty(dir.join("sessions.json"))),
+            memory,
+            access: Arc::new(Mutex::new(AccessMode::Ask)),
+            root: Some(dir.to_path_buf()),
+            schedules: Arc::new(Mutex::new(
+                ScheduleStore::open(dir.join("schedules.json")).unwrap(),
+            )),
+            provider_id: config.id,
+            model: config.model.clone(),
+            events,
+            recall: None,
+        }
+    }
+    #[tokio::test]
+    async fn companion_can_choose_next_wake_time_mode_and_purpose_and_survive_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::partners::Repository::new(dir.path().join("sessions.json"));
+        let id = repo.create().unwrap();
+        let config = crate::provider::Config {
+            enabled: true,
+            ..Default::default()
+        };
+        let ctx = context(dir.path(), id, &config);
+        repo.set_proactive(id, true, Some(dir.path()), &config)
+            .unwrap();
+        let at = chrono::Local::now() + chrono::Duration::hours(3);
+        let call = ToolCall {
+            id: "wake".into(),
+            name: "schedule_create".into(),
+            arguments: json!({"title":"复查测试结果","prompt":"阅读测试产物，决定是否需要进一步修改","run_at":at.to_rfc3339(),"wake_mode":"reflect"}),
+        };
+        // Opting into autonomous wake scheduling authorizes its own schedules, even in Ask mode.
+        let record = tokio::time::timeout(Duration::from_secs(2), execute(call, &ctx))
+            .await
+            .unwrap();
+        assert!(record.success, "{}", record.result);
+        let task: Schedule = serde_json::from_str(&record.result).unwrap();
+        assert_eq!(task.partner_id, Some(id));
+        assert!(task.self_wake);
+        assert_eq!(task.wake_mode, crate::schedules::WakeMode::Reflect);
+        assert_eq!(task.run_at, at);
+        assert!(task.prompt.contains("测试产物"));
+        let reopened = ScheduleStore::open(dir.path().join("schedules.json")).unwrap();
+        assert!(
+            reopened
+                .tasks
+                .iter()
+                .any(|t| t.id == task.id && t.partner_id == Some(id))
+        );
+        let other = repo.create().unwrap();
+        let mut foreign = ctx.clone();
+        foreign.memory = ctx.memory.for_partner(Some(other));
+        *foreign.access.lock().unwrap() = AccessMode::FullAccess;
+        let edited = execute(
+            ToolCall {
+                id: "edit".into(),
+                name: "schedule_update".into(),
+                arguments: json!({"id":task.id,"prompt":"替换"}),
+            },
+            &foreign,
+        )
+        .await;
+        assert!(!edited.success);
+    }
+    #[tokio::test]
+    async fn reflection_cannot_write_files_or_run_commands_even_with_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::partners::Repository::new(dir.path().join("sessions.json"));
+        let id = repo.create().unwrap();
+        let config = crate::provider::Config {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut ctx = context(dir.path(), id, &config);
+        ctx.memory.reflection_only = true;
+        *ctx.access.lock().unwrap() = AccessMode::FullAccess;
+        for (name, args) in [
+            ("write_file", json!({"path":"bad.txt","content":"bad"})),
+            ("run_command", json!({"program":"touch","args":["bad.txt"]})),
+            ("subagent", json!({"task":"write a file"})),
+        ] {
+            let record = execute(
+                ToolCall {
+                    id: name.into(),
+                    name: name.into(),
+                    arguments: args,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(!record.success);
+            assert!(record.result.contains("回顾整理"));
+        }
+        assert!(!dir.path().join("bad.txt").exists());
+    }
+    #[tokio::test]
+    async fn disabled_autonomy_blocks_followup_wakes_and_short_delays_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::partners::Repository::new(dir.path().join("sessions.json"));
+        let id = repo.create().unwrap();
+        let config = crate::provider::Config {
+            enabled: true,
+            ..Default::default()
+        };
+        let ctx = context(dir.path(), id, &config);
+        *ctx.access.lock().unwrap() = AccessMode::FullAccess;
+        let call = ToolCall {
+            id: "wake".into(),
+            name: "schedule_create".into(),
+            arguments: json!({"title":"后续检查","prompt":"检查结果","run_at":chrono::Local::now().to_rfc3339(),"wake_mode":"work"}),
+        };
+        assert!(!execute(call.clone(), &ctx).await.success);
+        repo.set_proactive(id, true, Some(dir.path()), &config)
+            .unwrap();
+        let before = chrono::Local::now();
+        let record = execute(call, &ctx).await;
+        assert!(record.success, "{}", record.result);
+        let task: Schedule = serde_json::from_str(&record.result).unwrap();
+        assert!(task.run_at >= before + chrono::Duration::minutes(15));
     }
 }

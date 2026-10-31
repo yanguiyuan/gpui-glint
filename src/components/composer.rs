@@ -1,4 +1,4 @@
-use super::{Icon, PastedImage, PromptEditor, PromptEditorEvent};
+use super::{Avatar, Icon, PastedImage, PromptEditor, PromptEditorEvent};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -63,6 +63,7 @@ pub struct ComposerChip {
     pub tint: Option<u32>,
     pub chevron: bool,
     pub options: Vec<ComposerOption>,
+    pub option_avatars: HashMap<SharedString, Avatar>,
     pub default_selected: Option<SharedString>,
 }
 
@@ -75,6 +76,7 @@ impl ComposerChip {
             tint: None,
             chevron: false,
             options: Vec::new(),
+            option_avatars: HashMap::new(),
             default_selected: None,
         }
     }
@@ -109,6 +111,12 @@ impl ComposerChip {
             value: value.into(),
             label: label.into(),
         });
+        self
+    }
+
+    /// Avatar for a select option, used in both the chip and its menu row.
+    pub fn option_avatar(mut self, value: impl Into<SharedString>, avatar: Avatar) -> Self {
+        self.option_avatars.insert(value.into(), avatar);
         self
     }
 
@@ -647,6 +655,16 @@ impl Composer {
         }
     }
 
+    /// Consume only the @ query at the caret for an action-only context entry,
+    /// such as changing the recipient. Other prompt text and attachments stay intact.
+    pub fn clear_context_query(&mut self, cx: &mut Context<Self>) {
+        if let Some((range, _)) = self.context_query(cx) {
+            self.editor
+                .update(cx, |editor, cx| editor.replace_range(range, "", cx));
+        }
+        self.close_context_panel(cx);
+    }
+
     /// Register known context tokens for highlighting restored drafts as well as
     /// newly selected tokens. No prompt text or attachments are changed.
     pub fn register_context_tokens(
@@ -1002,6 +1020,10 @@ impl Render for Composer {
                     "glass-composer-chip-{}",
                     chip.id
                 )))
+                .debug_selector({
+                    let id = chip.id.clone();
+                    move || format!("composer-chip:{id}")
+                })
                 .relative()
                 .h(px(26.))
                 .px(px(8.))
@@ -1057,7 +1079,12 @@ impl Render for Composer {
                     // trigger click, which would immediately close again.
                     cx.stop_propagation();
                 });
-            if let Some(icon) = chip.icon {
+            if let Some(avatar) = selection
+                .as_ref()
+                .and_then(|value| chip.option_avatars.get(value))
+            {
+                chip_element = chip_element.child(avatar.clone().size(18.).theme(theme).render());
+            } else if let Some(icon) = chip.icon {
                 chip_element = chip_element.child(icon.render(14.).flex_shrink_0());
             }
             let chip_label = selected_label.or_else(|| chip.label.clone());
@@ -1474,7 +1501,12 @@ impl Composer {
                 )
             })
             .fold(0_f32, f32::max);
-        let menu_width = (label_width + 64.)
+        let avatar_width = if chip.option_avatars.is_empty() {
+            0.
+        } else {
+            28.
+        };
+        let menu_width = (label_width + 64. + avatar_width)
             .clamp(168., 360.)
             .min((f32::from(window.viewport_size().width) - 32.).max(120.));
         let rows = chip.options.iter().enumerate().map(|(index, option)| {
@@ -1484,6 +1516,11 @@ impl Composer {
                     "glass-composer-option-{}-{index}",
                     chip.id
                 )))
+                .debug_selector({
+                    let id = chip.id.clone();
+                    let value = option.value.clone();
+                    move || format!("composer-option:{id}:{value}")
+                })
                 .h(px(30.))
                 .flex_shrink_0()
                 .w_full()
@@ -1509,6 +1546,20 @@ impl Composer {
                         });
                         cx.notify();
                     })
+                })
+                .when(!chip.option_avatars.is_empty(), |row| {
+                    let leading = if let Some(avatar) = chip.option_avatars.get(&option.value) {
+                        avatar.clone().size(18.).theme(theme).render()
+                    } else {
+                        div()
+                            .size(px(18.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(chip.icon, |slot, icon| slot.child(icon.render(14.)))
+                    };
+                    row.child(leading)
                 })
                 .child(
                     div()
@@ -2184,6 +2235,27 @@ mod tests {
             composer.set_value("mail@example.com@", cx);
             composer.add_context_token("$review", 0x007aff, cx);
             assert_eq!(composer.value(cx).as_ref(), "mail@example.com@ $review ");
+        });
+    }
+
+    #[gpui::test]
+    fn action_context_entries_consume_only_the_at_query(cx: &mut gpui::TestAppContext) {
+        let composer = cx.new(|cx| Composer::new("Message", cx).context_on_at(true));
+        composer.update(cx, |c, cx| {
+            c.set_draft(
+                "检查代码 @知微",
+                vec![PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3])],
+                cx,
+            );
+            c.clear_context_query(cx);
+            assert_eq!(c.value(cx).as_ref(), "检查代码 ");
+            assert_eq!(c.attachments().len(), 1);
+            c.set_value("mail@example.com", cx);
+            c.clear_context_query(cx);
+            assert_eq!(c.value(cx).as_ref(), "mail@example.com");
+            c.set_value("没有提及的草稿", cx);
+            c.clear_context_query(cx);
+            assert_eq!(c.value(cx).as_ref(), "没有提及的草稿");
         });
     }
 

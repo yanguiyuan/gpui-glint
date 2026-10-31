@@ -1,4 +1,4 @@
-use super::{Button, ButtonKind, ButtonSize, Icon, Popover};
+use super::{Avatar, Button, ButtonKind, ButtonSize, Icon, Popover};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -15,6 +15,7 @@ use std::collections::HashSet;
 pub struct GroupListHeader {
     pub id: SharedString,
     pub icon: Option<Icon>,
+    pub avatar: Option<Avatar>,
     pub label: SharedString,
     pub actions: Vec<Icon>,
 }
@@ -24,6 +25,7 @@ impl GroupListHeader {
         Self {
             id: id.into(),
             icon: None,
+            avatar: None,
             label: label.into(),
             actions: Vec::new(),
         }
@@ -31,6 +33,12 @@ impl GroupListHeader {
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Optional leading avatar, displayed in place of the header icon.
+    pub fn avatar(mut self, avatar: Avatar) -> Self {
+        self.avatar = Some(avatar);
         self
     }
 
@@ -339,7 +347,9 @@ impl Render for GroupList {
                         cx.notify();
                     }
                 }));
-            if let Some(icon) = group.header.icon {
+            if let Some(avatar) = &group.header.avatar {
+                header = header.child(avatar.clone().size(18.).theme(self.theme).render());
+            } else if let Some(icon) = group.header.icon {
                 // Folder headers follow the expand state like the directory
                 // tree: closed folder while collapsed, open folder once shown.
                 let icon = match icon {

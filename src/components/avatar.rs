@@ -28,6 +28,18 @@ pub struct Avatar {
     text_size: Option<f32>,
     ring: Option<u32>,
 }
+impl std::fmt::Debug for Avatar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Avatar")
+            .field("name", &self.name)
+            .field("text", &self.text)
+            .field("has_image", &self.image.is_some())
+            .field("shape", &self.shape)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
 impl Avatar {
     pub fn new(name: impl Into<SharedString>) -> Self {
         Self {

@@ -42,6 +42,8 @@ impl Status {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trace {
+    #[serde(default)]
+    pub partner_id: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<crate::todo::Item>,
     pub id: uuid::Uuid,
@@ -68,19 +70,11 @@ impl Trace {
     }
 
     fn close_tools(&mut self) {
-        for tool in &mut self.tools {
-            if tool.result == "执行中…" {
-                tool.result = format!(
-                    "{}\n{}",
-                    self.status.label(),
-                    tool.live_output.take().unwrap_or_default()
-                );
-                tool.success = false;
-            }
-            if !self.blocks.iter().any(|block| matches!(block, crate::generation::ContentBlock::ToolResult(record) if record.call.id == tool.call.id)) {
-                self.blocks.push(crate::generation::ContentBlock::ToolResult(tool.clone()));
-            }
-        }
+        crate::generation::close_unfinished_tools(
+            &mut self.blocks,
+            &mut self.tools,
+            self.error.as_deref().unwrap_or("子任务已中断"),
+        );
     }
 }
 
@@ -238,6 +232,7 @@ impl Runner {
             struct Args {
                 task: String,
                 title: Option<String>,
+                partner_id: Option<uuid::Uuid>,
             }
             let args: Args = serde_json::from_value(call.arguments.clone())
                 .map_err(|_| "subagent 参数无效，需要 task")?;
@@ -249,6 +244,7 @@ impl Runner {
             }
             let mut recording = Recording {
                 trace: Trace {
+                    partner_id: args.partner_id,
                     todos: Vec::new(),
                     id: uuid::Uuid::new_v4(),
                     call_id: call.id.clone(),
@@ -277,7 +273,7 @@ impl Runner {
             };
             recording.publish();
             let result = self
-                .complete_child(&args.task, context, &mut recording)
+                .complete_child(&args.task, args.partner_id, context, &mut recording)
                 .await;
             recording.finish(&result);
             result.map(|completion| completion.text)
@@ -287,6 +283,7 @@ impl Runner {
     async fn complete_child(
         &self,
         task: &str,
+        partner_id: Option<uuid::Uuid>,
         context: &ToolContext,
         recording: &mut Recording,
     ) -> Result<crate::generation::Completion, String> {
@@ -298,6 +295,21 @@ impl Runner {
         child.steering = None;
         child.todos = Default::default();
         let mut messages = self.instructions.clone();
+        if let Some(partner) = partner_id {
+            // A peer sees only its own identity, not the parent's resident memories.
+            messages.retain(|m| {
+                !m["content"].as_str().is_some_and(|s| {
+                    s.starts_with("你正在以一个持续存在的伙伴身份工作")
+                        || s.starts_with("自动回忆的候选记忆")
+                })
+            });
+            child.memory = child.memory.for_partner(Some(partner));
+            if let Some(identity) = crate::partners::Repository::new(child.memory.anchor.clone())
+                .context(Some(partner), child.root.as_deref())?
+            {
+                messages.push(json!({"role":"system","content":identity}));
+            }
+        }
         messages.push(json!({"role":"system","content":"You are a subagent executing a single delegated task. Work independently using the provided tools and return a concise result with evidence and any limitations to the parent agent. You cannot delegate work or create further subagents. Follow the inherited project boundaries and approval policy. You share the project files with the parent; avoid unrelated changes."}));
         messages.push(json!({"role":"user","content":task}));
         let request = provider::Request::start_with_tools(
@@ -586,6 +598,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let mut recording = Recording {
             trace: Trace {
+                partner_id: None,
                 todos: Vec::new(),
                 id,
                 call_id: "parent-call".into(),

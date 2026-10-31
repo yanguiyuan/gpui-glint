@@ -103,6 +103,66 @@ pub enum ContentBlock {
     ToolResult(crate::tools::ToolRecord),
 }
 
+/// Close every outstanding invocation on cancellation or response failure.
+/// Never turn an uncertain, already-started command into a claim of non-execution.
+pub fn close_unfinished_tools(
+    blocks: &mut Vec<ContentBlock>,
+    records: &mut Vec<crate::tools::ToolRecord>,
+    reason: &str,
+) {
+    let completed: std::collections::HashSet<_> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult(r) if r.result != "执行中…" => Some(r.call.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut calls: Vec<_> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(c) if !completed.contains(&c.id) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    for r in records.iter() {
+        if !completed.contains(&r.call.id) && !calls.iter().any(|c| c.id == r.call.id) {
+            calls.push(r.call.clone());
+        }
+    }
+    for call in calls {
+        let index = if let Some(i) = records.iter().position(|r| r.call.id == call.id) {
+            i
+        } else {
+            records.push(crate::tools::rejected(
+                call.clone(),
+                format!("未执行：回复在工具参数生成阶段中断。{reason}"),
+            ));
+            records.len() - 1
+        };
+        let record = &mut records[index];
+        if record.result == "执行中…" {
+            let output = record.live_output.take().unwrap_or_default();
+            record.result = format!(
+                "调用已中断：{reason}。执行结果尚未确认，请先核对实际状态。{}",
+                if output.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n最后输出：\n{output}")
+                }
+            );
+            record.success = false;
+        }
+        if let Some(block) = blocks
+            .iter_mut()
+            .find(|b| matches!(b,ContentBlock::ToolResult(r) if r.call.id==call.id))
+        {
+            *block = ContentBlock::ToolResult(record.clone());
+        } else {
+            blocks.push(ContentBlock::ToolResult(record.clone()));
+        }
+    }
+}
+
 #[derive(Clone)]
 enum StreamPart {
     Text(String),
@@ -134,6 +194,7 @@ pub struct Completion {
     pub text: String,
     pub stats: GenerationStats,
     pub tool_calls: Vec<crate::tools::ToolCall>,
+    pub argument_errors: std::collections::HashMap<String, String>,
     pub tool_records: Vec<crate::tools::ToolRecord>,
     pub raw_content: Value,
     pub reasoning: String,
@@ -416,20 +477,58 @@ impl StreamCompletion {
         if let Some(error) = stop_error(self.stop_reason.as_deref()) {
             return Err(error);
         }
+        let mut argument_errors = std::collections::HashMap::new();
         for (index, input) in std::mem::take(&mut self.inputs) {
-            self.blocks.entry(index).or_insert(Value::Null)["input"] =
-                serde_json::from_str(&input).map_err(|_| "工具参数流不是有效 JSON")?;
+            if input.trim().is_empty() {
+                continue;
+            }
+            let block = self
+                .blocks
+                .get_mut(&index)
+                .ok_or("Provider 工具参数缺少对应内容块")?;
+            let id = block["id"]
+                .as_str()
+                .ok_or("Provider 工具参数缺少调用 ID")?
+                .to_owned();
+            match serde_json::from_str::<Value>(&input) {
+                Ok(arguments) => block["input"] = arguments,
+                Err(error) => {
+                    argument_errors.insert(id, crate::tools::argument_json_error(&error));
+                    block["input"] = serde_json::json!({});
+                }
+            }
         }
-        let blocks = self.snapshot();
-        let raw_content = Value::Array(self.blocks.into_values().collect());
-        let calls = if self.calls.is_empty() {
-            crate::tools::parse_calls(&raw_content, true)?
+        let mut raw_content = Value::Array(self.blocks.values().cloned().collect());
+        let decoded = if self.calls.is_empty() {
+            crate::tools::decode_calls(&raw_content, true)?
         } else {
-            crate::tools::parse_calls(
-                &serde_json::json!({"tool_calls":self.calls.into_values().collect::<Vec<_>>()}),
+            crate::tools::decode_calls(
+                &serde_json::json!({"tool_calls":self.calls.values().cloned().collect::<Vec<_>>()}),
                 false,
             )?
         };
+        argument_errors.extend(decoded.errors);
+        // Anthropic requires object inputs in the assistant envelope, even for
+        // rejected arguments. The following tool_result explains the rejection.
+        if let Some(parts) = raw_content.as_array_mut() {
+            for part in parts {
+                if part["id"]
+                    .as_str()
+                    .is_some_and(|id| argument_errors.contains_key(id))
+                {
+                    part["input"] = serde_json::json!({});
+                }
+            }
+        }
+        let mut blocks = self.snapshot();
+        for block in &mut blocks {
+            if let ContentBlock::ToolCall(call) = block {
+                if let Some(final_call) = decoded.calls.iter().find(|c| c.id == call.id) {
+                    *call = final_call.clone();
+                }
+            }
+        }
+        let calls = decoded.calls;
         if self.text.trim().is_empty() && calls.is_empty() {
             return Err(empty_reply_error(
                 self.stop_reason.as_deref(),
@@ -443,6 +542,7 @@ impl StreamCompletion {
             text: self.text,
             stats: self.metrics.finish(elapsed_ms),
             tool_calls: calls,
+            argument_errors,
             raw_content,
             reasoning: self.reasoning,
             tool_records: vec![],
@@ -473,6 +573,113 @@ pub fn empty_reply_error(reason: Option<&str>, thinking: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argument_stream(anthropic: bool, input: &str) -> StreamCompletion {
+        let mut stream = StreamCompletion::default();
+        let start = if anthropic {
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"run_command","input":{}}})
+        } else {
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"run_command","arguments":""}}]}}]})
+        };
+        let mut events = vec![start];
+        for character in input.chars() {
+            let fragment = character.to_string();
+            events.push(if anthropic{serde_json::json!({"type":"content_block_delta","index":0,"delta":{"partial_json":fragment}})}else{serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":fragment}}]}}]})});
+        }
+        events.push(if anthropic {
+            serde_json::json!({"type":"message_stop"})
+        } else {
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+        });
+        for event in events {
+            for byte in format!("data: {event}\n\n").bytes() {
+                stream.push(&[byte], 10).unwrap();
+            }
+        }
+        stream
+    }
+
+    #[test]
+    fn fragmented_arguments_preserve_unicode_quotes_newlines_and_backslashes() {
+        let args = serde_json::json!({"program":"python3","args":["-c","print('你好')\nprint(\"quotes\\\\path\")"]});
+        for anthropic in [false, true] {
+            let reply = argument_stream(anthropic, &args.to_string())
+                .finish(20)
+                .unwrap();
+            assert!(reply.argument_errors.is_empty());
+            assert_eq!(reply.tool_calls[0].arguments, args);
+            assert!(
+                matches!(&reply.blocks[0],ContentBlock::ToolCall(call) if call.arguments==args)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_arguments_become_repairable_errors_without_guessing_or_execution() {
+        for anthropic in [false, true] {
+            for raw in [
+                "{\"program\":\"sh\"",
+                "{\"args\":[\"unescaped\nnewline\"]}",
+                "[]",
+                "null",
+                "\"string\"",
+            ] {
+                let reply = argument_stream(anthropic, raw).finish(20).unwrap();
+                assert!(reply.argument_errors["call-1"].starts_with("未执行："));
+                assert_eq!(reply.tool_calls[0].arguments, serde_json::json!({}));
+                if anthropic {
+                    assert_eq!(reply.raw_content[0]["input"], serde_json::json!({}));
+                }
+            }
+        }
+        for anthropic in [false, true] {
+            assert!(
+                argument_stream(anthropic, "")
+                    .finish(20)
+                    .unwrap()
+                    .argument_errors
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn interruption_closes_unstarted_and_running_calls_and_preserves_completed_results() {
+        let call = |id: &str| crate::tools::ToolCall {
+            id: id.into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({}),
+        };
+        let mut done = crate::tools::rejected(call("done"), "exit: 0\nsaved".into());
+        done.success = true;
+        let mut running = crate::tools::rejected(call("running"), "执行中…".into());
+        running.live_output = Some("last output".into());
+        let mut records = vec![done.clone(), running];
+        let mut blocks = vec![
+            ContentBlock::ToolCall(done.call.clone()),
+            ContentBlock::ToolResult(done),
+            ContentBlock::ToolCall(call("running")),
+            ContentBlock::ToolCall(call("unstarted")),
+        ];
+        close_unfinished_tools(&mut blocks, &mut records, "连接中断");
+        assert!(records[0].success);
+        assert_eq!(records[0].result, "exit: 0\nsaved");
+        assert!(records[1].result.starts_with("调用已中断："));
+        assert!(records[1].result.contains("last output"));
+        assert!(records[1].live_output.is_none());
+        assert!(records[2].result.starts_with("未执行："));
+        let saved = serde_json::to_string(&blocks).unwrap();
+        close_unfinished_tools(&mut blocks, &mut records, "再次收尾");
+        assert_eq!(serde_json::to_string(&blocks).unwrap(), saved);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolResult(_)))
+                .count(),
+            3
+        );
+    }
+
     #[test]
     fn reasoning_only_and_budget_exhaustion_report_the_actual_stop_reason() {
         for anthropic in [false, true] {
