@@ -8,6 +8,22 @@ cargo run -p glint-workbench
 
 默认启用 API 的原生 HTML 预览；不需要时可用 `--no-default-features` 构建。
 
+## macOS 安装包
+
+安装 Rust 和 Xcode Command Line Tools 后，在仓库根目录执行：
+
+```sh
+make macos-installer
+# 或显式指定产品
+make macos-installer PRODUCT=workbench
+```
+
+构建本机架构的 release 程序，生成带图标的 `.app`、拖拽安装的 `.dmg` 和 SHA-256 校验文件。版本读取 `crates/glint-workbench/Cargo.toml`，产物位于 `target/macos-workbench-installer/output/`；设置了 Cargo target-dir 时跟随该目录。`make mac-installer` 是同一命令的别名。
+
+默认使用本地 ad-hoc 签名。可用 `GLINT_CODESIGN_IDENTITY="Developer ID Application: ..." make macos-installer` 指定签名证书；脚本不提交 Apple 公证。Apple Silicon 和 Intel Mac 分别生成 arm64 和 x86_64 包，不生成 Universal 包。
+
+`make macos-installer PRODUCT=api` 构建独立 Glint API，产物仍位于 `target/macos-installer/output/`。原 API 打包脚本和 `GLINT_API_CODESIGN_IDENTITY` 环境变量继续可用。
+
 ## Windows 安装包
 
 在 Windows 上安装 Inno Setup 6 后，从仓库根目录执行：

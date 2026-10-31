@@ -55,6 +55,8 @@ MCP 的 `request_create`、`curl_import` 会保存初始版本；`request_update
 在 macOS 上安装 Rust 和 Xcode Command Line Tools 后，运行：
 
 ```sh
+make macos-installer PRODUCT=api
+# 原入口也可继续使用
 bash crates/glint-api/packaging/macos/build-macos.sh
 ```
 

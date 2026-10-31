@@ -40,7 +40,11 @@ jobs:
           test "$RELEASE_TAG" = "glint-api-v$version"
           test "$(uname -m)" = "$EXPECTED_ARCH"
           # Only packaging comes from this workflow revision; application sources remain at the tag.
+          # The API entry point delegates to the shared script, so both come from this revision.
           git fetch --depth=1 origin "$GITHUB_SHA"
+          mkdir -p packaging/macos
+          git show "$GITHUB_SHA:packaging/macos/build-macos.sh" > packaging/macos/build-macos.sh
+          chmod +x packaging/macos/build-macos.sh
           git show "$GITHUB_SHA:crates/glint-api/packaging/macos/build-macos.sh" > crates/glint-api/packaging/macos/build-macos.sh
       - name: Build and verify macOS DMG
         run: bash crates/glint-api/packaging/macos/build-macos.sh
