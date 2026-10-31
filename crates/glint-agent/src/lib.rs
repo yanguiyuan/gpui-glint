@@ -112,6 +112,7 @@ pub struct AgentWorkspace {
     search: Entity<TextEntry>,
     _subscriptions: Vec<Subscription>,
     scroll: ScrollHandle,
+    message_layout: MessageLayout,
     show_sessions: bool,
     show_auxiliary_sidebar: bool,
     project_picker_open: bool,
@@ -122,6 +123,7 @@ pub struct AgentWorkspace {
     save_worker: Option<Task<()>>,
     save_delay: Option<Task<()>>,
     save_revision: u64,
+    save_full_pending: bool,
     preparing: Option<(Uuid, Task<()>)>,
     context_models: Option<Task<()>>,
     partners_ui: partner_ui::State,
@@ -134,6 +136,14 @@ pub struct AgentWorkspace {
     project_context: project_context::State,
     memory_task: Option<Task<()>>,
     memory_last_probe: Option<std::time::Instant>,
+}
+
+/// Measured rows keep their exact height while distant history is unmounted.
+#[derive(Default)]
+struct MessageLayout {
+    context: Option<(Uuid, ThemePreset, usize)>,
+    width: gpui::Pixels,
+    measure_passes: u8,
 }
 
 impl AgentWorkspace {
@@ -324,8 +334,9 @@ impl AgentWorkspace {
                     ComposerEvent::Changed(value) => {
                         if this.history.active().draft != value.as_ref() {
                             this.history.active_mut().draft = value.to_string();
-                            this.save(cx);
-                            cx.notify();
+                            // The composer owns its input rendering. Draft edits do not
+                            // invalidate the historical message tree.
+                            this.save_draft(cx);
                         }
                     }
                     ComposerEvent::AttachmentsChanged => {
@@ -527,6 +538,7 @@ impl AgentWorkspace {
             search,
             _subscriptions: subscriptions,
             scroll: ScrollHandle::new(),
+            message_layout: MessageLayout::default(),
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
@@ -537,6 +549,7 @@ impl AgentWorkspace {
             save_worker: None,
             save_delay: None,
             save_revision: 0,
+            save_full_pending: true,
             preparing: None,
             context_models: None,
             partners_ui: partner_ui::State::new(cx),
@@ -1645,7 +1658,31 @@ impl AgentWorkspace {
             .as_ref()
             .or(self.preparing.as_ref())
             .is_some_and(|(id, _)| *id == session.id);
+        let layout_context = (session.id, self.theme, session.messages.len());
+        let viewport = self.scroll.bounds();
+        let offset = self.scroll.offset();
+        let can_clip = self.message_layout.context == Some(layout_context)
+            && self.message_layout.width == viewport.size.width
+            && self.message_layout.measure_passes == 0
+            && viewport.size.height > px(0.);
+        let workspace = cx.entity().downgrade();
         let mut messages = div()
+            .on_children_prepainted(move |_, _, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    let width = this.scroll.bounds().size.width;
+                    let layout = &mut this.message_layout;
+                    if layout.context != Some(layout_context) || layout.width != width {
+                        layout.context = Some(layout_context);
+                        layout.width = width;
+                        layout.measure_passes = 2;
+                    }
+                    if layout.measure_passes > 0 || this.scroll.offset() != offset {
+                        layout.measure_passes = layout.measure_passes.saturating_sub(1);
+                        let id = cx.entity_id();
+                        cx.defer(move |cx| cx.notify(id));
+                    }
+                });
+            })
             .id("conversation")
             .track_scroll(&self.scroll)
             .flex_1()
@@ -1670,6 +1707,26 @@ impl AgentWorkspace {
             // The empty state places the composer in the centered stack below.
         } else {
             for (index, message) in session.messages.iter().enumerate() {
+                if can_clip && index + 1 < session.messages.len() {
+                    if let Some(bounds) = self.scroll.bounds_for_item(index) {
+                        let nearby = bounds.bottom() + offset.y >= viewport.top() - px(600.)
+                            && bounds.top() + offset.y <= viewport.bottom() + px(600.);
+                        if !nearby {
+                            messages = messages.child(
+                                div()
+                                    .id(("message", index))
+                                    .debug_selector(move || {
+                                        format!("message-spacer-{index}").into()
+                                    })
+                                    .w_full()
+                                    .max_w(px(800.))
+                                    .h(bounds.size.height)
+                                    .flex_shrink_0(),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let user = message.role == Role::User;
                 let author = match message.role {
                     Role::User => "你".to_owned(),
@@ -1698,6 +1755,7 @@ impl AgentWorkspace {
                 messages = messages.child(
                     div()
                         .id(("message", index))
+                        .flex_shrink_0()
                         .w_full()
                         .max_w(px(800.))
                         .flex()

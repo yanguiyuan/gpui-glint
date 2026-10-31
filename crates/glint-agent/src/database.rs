@@ -179,6 +179,24 @@ pub fn load_history(anchor: &Path) -> Result<Option<Value>, String> {
     history["sessions"] = json!(sessions);
     Ok(Some(history))
 }
+/// Draft typing must not serialize or copy historical messages.
+pub fn save_drafts(anchor: &Path, drafts: &[(uuid::Uuid, String)]) -> Result<(), String> {
+    let mut connection = open(anchor)?;
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    for (id, draft) in drafts {
+        let updated = transaction
+            .execute(
+                "UPDATE sessions SET draft=?2 WHERE id=?1",
+                params![id.to_string(), draft],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("草稿所属会话尚未保存，需要重试完整保存".into());
+        }
+    }
+    transaction.commit().map_err(|e| e.to_string())
+}
+
 pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<(), String> {
     let mut connection = open(anchor)?;
     let transaction = connection

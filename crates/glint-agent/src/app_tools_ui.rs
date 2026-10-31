@@ -15,6 +15,7 @@ pub struct ToolPanel {
 
 pub struct ProcessPanel {
     signature: u64,
+    completed_source: Option<(usize, u64)>,
     theme: ThemePreset,
     complete: bool,
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -838,7 +839,19 @@ impl AgentWorkspace {
         complete: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let split = process_prefix_len(blocks, complete);
+        // Stored replies are immutable. Only live generation needs to scan and
+        // hash tool payloads again; theme/subagent updates still invalidate UI.
+        let cached_source = if complete {
+            self.process_panels
+                .borrow()
+                .get(key)
+                .and_then(|entry| entry.completed_source)
+        } else {
+            None
+        };
+        let split = cached_source
+            .map(|(split, _)| split)
+            .unwrap_or_else(|| process_prefix_len(blocks, complete));
         if split == 0 {
             return self.transcript_view(key, blocks, thinking_ms, complete, cx);
         }
@@ -856,14 +869,20 @@ impl AgentWorkspace {
         } else {
             "工作过程".into()
         };
-        let signature = process_signature(
-            &blocks[..split],
-            thinking_ms,
-            &summary,
-            if complete { &[] } else { &self.tool_activity },
-        ) ^ self.subagent_revision();
+        let source_signature = cached_source
+            .map(|(_, signature)| signature)
+            .unwrap_or_else(|| {
+                process_signature(
+                    &blocks[..split],
+                    thinking_ms,
+                    &summary,
+                    if complete { &[] } else { &self.tool_activity },
+                )
+            });
+        let signature = source_signature ^ self.subagent_revision();
         let entry = cache.entry(key.into()).or_insert_with(|| ProcessPanel {
             signature: 0,
+            completed_source: None,
             theme,
             complete,
             panel: cx.new(|_| {
@@ -873,6 +892,7 @@ impl AgentWorkspace {
                     .theme(theme)
             }),
         });
+        entry.completed_source = complete.then_some((split, source_signature));
         if entry.signature != signature || entry.theme != theme || entry.complete != complete {
             // Build child entities once on expansion, then reuse them while the
             // source is unchanged. Scrolling must not hash every tool result or
@@ -934,7 +954,11 @@ impl AgentWorkspace {
                 .child(entry.panel.clone()),
         );
         // Keep original indices stable as the final reply streams and the process collapses.
-        for (index, block) in blocks.iter().enumerate().skip(split) {
+        for (index, block) in blocks[split..]
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (index + split, block))
+        {
             if let generation::ContentBlock::Text(text) = block {
                 body = body.child(self.markdown_text(format!("{key}:{index}"), text, cx));
             }
@@ -1044,6 +1068,18 @@ mod tests {
         let at_bottom = || scroll.max_offset().y + scroll.offset().y <= px(2.);
         assert!(scroll.max_offset().y > px(400.));
         assert!(at_bottom());
+        assert!(
+            window.debug_bounds("message-spacer-0").is_some(),
+            "distant messages should keep only a measured spacer"
+        );
+        let measured_height = scroll.max_offset().y;
+        workspace.update(window, |_, cx| cx.notify());
+        window.run_until_parked();
+        assert_eq!(
+            scroll.max_offset().y,
+            measured_height,
+            "replacing history with spacers must preserve scroll geometry"
+        );
         let update = |paragraphs| {
             tools::ToolEvent::Transcript(vec![Text("正在输出结果。\n\n".repeat(paragraphs))])
         };
@@ -1127,6 +1163,68 @@ mod tests {
             reading_offset,
             "finishing the reply must not pull the reader down"
         );
+    }
+
+    #[gpui::test]
+    fn measured_history_reappears_after_jump_resize_and_session_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (workspace, window) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            for index in 0..30 {
+                workspace.history.active_mut().push(
+                    Role::User,
+                    format!("History {index} with variable wrapping and paragraphs.\n\n").repeat(6),
+                );
+            }
+            workspace
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        workspace.update(window, |this, cx| {
+            this.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("message-spacer-0").is_some());
+        workspace.update(window, |this, cx| {
+            this.scroll.scroll_to_top_of_item(0);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("message-spacer-0").is_none());
+        let before = workspace.read_with(window, |this, _| this.scroll.max_offset().y);
+        window.simulate_resize(size(px(1000.), px(700.)));
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert_eq!(this.message_layout.measure_passes, 0);
+            assert_eq!(this.message_layout.width, this.scroll.bounds().size.width);
+            assert!(this.scroll.max_offset().y > before);
+        });
+        let original = workspace.read_with(window, |this, _| this.history.active);
+        workspace.update(window, |this, cx| {
+            this.history.new_session_for(None);
+            let id = this.history.active;
+            this.history
+                .active_mut()
+                .push(Role::User, "short session".into());
+            this.switch(id, cx);
+        });
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert_eq!(this.scroll.max_offset().y, px(0.))
+        });
+        workspace.update(window, |this, cx| this.switch(original, cx));
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert!(this.scroll.max_offset().y > px(400.))
+        });
     }
 
     #[test]
