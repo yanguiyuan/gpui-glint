@@ -52,6 +52,14 @@ Codex 原生 shell、插件、浏览器等能力关闭，工具通过 app-server
 
 协议参考：[发送消息](https://365.kdocs.cn/3rd/open/documents/app-integration-dev/wps365/server/message/message_managment/create_message)、[事件长连接](https://365.kdocs.cn/3rd/open/documents/app-integration-dev/wps365/server/event-subscription/event-websocket)。
 
+### 会话标签与用户授权
+
+WPS 会话标签属于用户，只支持用户授权。频道配置的“授权 WPS 账号”使用该应用 App ID 发起 OAuth；也可让伙伴调用 `channel_user_authorize` 返回授权链接。先认领主人，再在运行 Glint 的电脑浏览器中打开链接并同意。应用后台只需开通 `kso.chat.readwrite` 用户权限，登记回调地址 `http://127.0.0.1:17944/oauth/wps/callback`（配置页可复制）。回调校验随机 state、一次性 code，以及发起授权的频道主人记录仍然有效。只申请会话权限，不读取账号基础信息；授权记录绑定到发起流程的频道主人，实际操作范围属于浏览器中同意授权的账号，因此请确认登录的是主人自己的 WPS 账号。只读权限 `kso.chat.read` 可查询会话信息，但打标签需要 `kso.chat.readwrite`。
+
+用户 token 和 refresh token 保存在 `channels.sqlite3`，到期时自动刷新，保持原 refresh token 的截止时间。伙伴只能读取授权状态，不能读取令牌。配置页可取消待完成授权、清除本地令牌；解除主人绑定也会清除用户授权。清除本地令牌不等同于在 WPS 账号侧撤销应用权限。
+
+工具：`channel_user_authorization_status` 检查授权；`wps_chats_list` 分页查询用户会话；`wps_chat_tags_list/create/delete` 管理标签；`wps_chat_tags_get/apply/remove` 查询或修改指定会话的标签；`wps_chat_tags_chats` 查询标签下的会话。会话 ID 省略时优先使用当前频道入站对话，否则使用主人的机器人单聊。`delete` 删除标签及所有会话关联，`remove` 仅移除一个会话的标签关联。标签写入仍遵循当前 Agent 工具权限。可以直接说“给这个会话打上工作和紧急标签”；伙伴会先检查用户授权，创建或复用标签，再关联到会话。
+
 ## 工具与日程
 
 常用工具包括列文件、读文件、搜索、写文件、精确替换、运行程序，以及日程的增删查改。输入框提供持久保存的权限选择器：默认“请求批准”对写入、命令、日程修改和敏感文件读取请求确认；“自动批准”跳过确认并保留项目文件边界；“完全访问权限”同时允许文件工具访问项目外路径。运行期间切换权限即时生效，选择自动批准或完全访问也会放行当前待批准调用。运行程序使用 program/argv 参数，支持取消和超时；用户批准的程序自身能够访问项目外部。

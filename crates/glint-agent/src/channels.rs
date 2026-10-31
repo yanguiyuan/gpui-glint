@@ -1,4 +1,6 @@
 //! Platform-independent bindings, credentials and durable delivery queue in SQLite.
+mod auth;
+pub(crate) mod tags;
 pub(crate) mod tools;
 pub(crate) mod ui;
 mod wps;
@@ -53,6 +55,8 @@ impl Repository {
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS application_secrets(app TEXT PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE,secret TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS user_grants(app TEXT PRIMARY KEY,company TEXT NOT NULL,sender TEXT NOT NULL,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS user_authorizations(state TEXT PRIMARY KEY,app TEXT NOT NULL,company TEXT NOT NULL,sender TEXT NOT NULL,expires INTEGER NOT NULL,status TEXT NOT NULL,error TEXT);
             CREATE TABLE IF NOT EXISTS owners(app TEXT PRIMARY KEY,company TEXT NOT NULL,sender TEXT NOT NULL,chat TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversations(app TEXT,partner TEXT,project TEXT,company TEXT,chat TEXT,sender TEXT NOT NULL,session TEXT NOT NULL,PRIMARY KEY(app,partner,project,company,chat,sender));
             CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY,app TEXT NOT NULL,company TEXT NOT NULL,chat TEXT NOT NULL,message TEXT NOT NULL,sender TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',session TEXT,error TEXT,UNIQUE(app,company,chat,message));
@@ -230,11 +234,19 @@ impl Repository {
         if config.enabled || running > 0 {
             return Err("请先停用应用，并等待伙伴回复结束，再解除主人绑定".into());
         }
+        tx.execute("DELETE FROM user_grants WHERE app=?1", [app.to_string()])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM user_authorizations WHERE app=?1",
+            [app.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM owners WHERE app=?1", [app.to_string()])
             .map_err(|e| e.to_string())?;
         tx.execute("UPDATE inbox SET state='failed',error='主人绑定已解除' WHERE app=?1 AND state='queued'",[app.to_string()]).map_err(|e|e.to_string())?;
         tx.execute("UPDATE outbox SET state='failed',error='主人绑定已解除' WHERE app=?1 AND state='queued'",[app.to_string()]).map_err(|e|e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        auth::cancel(app)
     }
     pub fn recover(&self) -> Result<(), String> {
         self.open()?.execute_batch("INSERT OR IGNORE INTO reactions(inbox,stage) SELECT id,'failed' FROM inbox WHERE state='running' AND message NOT LIKE 'notification:%'; UPDATE inbox SET state='failed',error='上次运行中断；请在会话记录中检查' WHERE state='running'; UPDATE outbox SET state='failed',error='发送时中断，送达状态未知，请核对 WPS 会话' WHERE state='sending';").map_err(|e|e.to_string())

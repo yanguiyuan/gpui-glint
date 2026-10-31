@@ -9,7 +9,7 @@ fn authorized(app: &Application, context: &ToolContext) -> bool {
             .as_ref()
             .is_some_and(|root| std::fs::canonicalize(root).ok().as_ref() == Some(&app.project))
 }
-fn select(
+pub(super) fn select(
     repo: &Repository,
     context: &ToolContext,
     id: Option<&str>,
@@ -59,9 +59,17 @@ pub async fn execute(call: &ToolCall, context: &ToolContext) -> Result<String, S
     if call.name == "channel_list" {
         let apps=repo.applications()?.into_iter().filter(|a|authorized(a,context)).map(|a|{
             let owner=repo.owner(a.id)?;
-            Ok(json!({"application_id":a.id,"platform":"wps","name":a.name,"enabled":a.enabled,"owner_bound":owner.is_some()}))
+            Ok(json!({"application_id":a.id,"platform":"wps","name":a.name,"enabled":a.enabled,"owner_bound":owner.is_some(),"user_authorization":super::auth::status(&repo,a.id)?}))
         }).collect::<Result<Vec<_>,String>>()?;
         return Ok(json!({"applications":apps,"instructions":"Only send notifications to the bound owner. Enable the application and have the owner send 我是你的主人 in its WPS robot direct chat first."}).to_string());
+    }
+    if call.name == "channel_user_authorize" || call.name == "channel_user_authorization_status" {
+        let app = select(&repo, context, call.arguments["application_id"].as_str())?;
+        if call.name == "channel_user_authorization_status" {
+            return Ok(super::auth::status(&repo, app.id)?.to_string());
+        }
+        let url = super::auth::begin(repo, app)?;
+        return Ok(json!({"authorization_url":url,"status":"pending","redirect_uri":super::auth::REDIRECT,"instructions":"请主人在运行 Glint 的电脑浏览器打开链接，确认当前登录的是自己的 WPS 账号后同意授权。此链接只是发起授权，不能声称已授权；完成后调用 channel_user_authorization_status 检查。应用后台须登记此 redirect_uri 并申请 kso.chat.readwrite 用户权限。不要要求用户提供密码、授权码或 token。"}).to_string());
     }
     if call.name == "channel_delivery_status" {
         let id = call.arguments["delivery_id"]

@@ -97,6 +97,11 @@ impl AgentWorkspace {
     }
     fn poll_channels(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        for (_, message) in super::auth::updates() {
+            self.channels.notice = Some(message);
+            changed = true;
+        }
+
         while let Ok((id, status)) = self.channels.receiver.try_recv() {
             self.channels.status.insert(id, status);
             changed = true;
@@ -314,6 +319,36 @@ impl AgentWorkspace {
         self.channels.notice = result.err();
         cx.notify();
     }
+    fn channel_user_auth_label(&self, id: Uuid) -> String {
+        match super::auth::status(&self.channels.repo, id) {
+            Ok(status) if status["authorized"] == true => "用户授权 · 已授权".into(),
+            Ok(status) if status["status"] == "pending" || status["status"] == "processing" => {
+                "用户授权 · 等待确认".into()
+            }
+            Ok(status) if status["status"] == "owner_required" => "用户授权 · 请先认领主人".into(),
+            Ok(_) => "用户授权 · 未授权".into(),
+            Err(error) => error,
+        }
+    }
+    fn authorize_channel_user(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let result = self
+            .channels
+            .apps
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .ok_or_else(|| "请先保存应用".to_owned())
+            .and_then(|app| super::auth::begin(self.channels.repo.clone(), app));
+        match result {
+            Ok(url) => {
+                cx.open_url(&url);
+                self.channels.notice =
+                    Some("请在浏览器中使用频道主人账号授权。完成后会自动返回授权状态。".into());
+            }
+            Err(error) => self.channels.notice = Some(error),
+        }
+        cx.notify();
+    }
     fn choose_channel_directory(&mut self, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
@@ -473,6 +508,7 @@ impl AgentWorkspace {
                     .child(div().flex().flex_wrap().gap_6().text_size(px(12.))
                         .child(div().flex().items_center().gap_2().text_color(rgb(p.text_muted)).child(Icon::User.render(14.)).child(partner))
                         .child(div().flex().items_center().gap_2().text_color(rgb(p.text_muted)).child(Icon::Shield.render(14.)).child(owner.as_ref().map(|(_,sender,_)|format!("主人 · {sender}")).unwrap_or_else(||"等待主人认领".into())))
+                        .child(div().text_color(rgb(p.text_muted)).child(self.channel_user_auth_label(id)))
                         .child(div().text_color(rgb(p.text_muted)).child(self.channels.repo.summary(id).unwrap_or_else(|e|e))))
                     .when(owner.is_none(),|d|d.child(div().px_3().py_2().rounded_lg().bg(rgb(p.panel)).text_color(rgb(p.text_muted)).text_size(px(12.)).child("首次使用：在机器人单聊中发送「我是你的主人」，完成认领。")))
             }))
@@ -544,6 +580,14 @@ impl AgentWorkspace {
                 .child(self.channel_setup_step(Icon::Calendar,"随时通知你","伙伴可以主动发消息，定时任务也能把进展通知给主人。"))
                 .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).line_height(px(19.)).child("仅响应已认领主人的消息。应用运行时保持连接，退出后暂停收发。"))
                 .child(Button::new("查看接入文档").icon(Icon::External).kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(|_,_,_,cx|cx.open_url("https://365.kdocs.cn/3rd/open/documents/app-integration-dev/wps365/server/event-subscription/event-websocket"))))
+                .when_some(self.channels.selected,|d,id|d.child(div().border_t_1().border_color(rgb(p.border)).pt_4().flex().flex_col().items_start().gap_3()
+                    .child(section("用户授权","管理主人自己的 WPS 会话标签。"))
+                    .child(div().text_size(px(12.)).text_color(rgb(p.text_muted)).child(self.channel_user_auth_label(id)))
+                    .child(Button::new("授权 WPS 账号").icon(Icon::Shield).kind(ButtonKind::Tinted).size(ButtonSize::Small).theme(theme).render().debug_selector(||"channel-user-authorize".into()).on_click(cx.listener(move|this,_,_,cx|this.authorize_channel_user(id,cx))))
+                    .child(Button::new("取消授权 / 清除本地令牌").kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match super::auth::revoke(&this.channels.repo,id){Ok(())=>"已清除本地授权，需要使用时可重新授权。".into(),Err(e)=>e});cx.notify();})))
+                    .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).line_height(px(18.)).child("请在应用后台登记回调地址并开启会话读写权限。在运行 Glint 的电脑浏览器中，确认使用主人账号授权。"))
+                    .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("kso.chat.readwrite"))
+                    .child(Button::new("复制授权回调地址").icon(Icon::Copy).kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(|_,_,_,cx|cx.write_to_clipboard(gpui::ClipboardItem::new_string(super::auth::REDIRECT.into())))))))
                 .when_some(self.channels.selected,|d,id|d.child(div().border_t_1().border_color(rgb(p.border)).pt_4().flex().flex_col().items_start().gap_2()
                     .child(Button::new("重试失败发送").icon(Icon::Refresh).kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match this.channels.repo.retry_sends(id){Ok(())=>"已重新排队；此前送达状态不明的消息可能重复。".into(),Err(e)=>e});cx.notify();})))
                     .child(Button::new("解除主人绑定").kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match this.channels.repo.clear_owner(id){Ok(())=>"已解除主人绑定，可在机器人单聊重新认领。".into(),Err(e)=>e});cx.notify();})))
@@ -616,6 +660,7 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("channels-page").is_some());
         assert!(window.debug_bounds("channel-add").is_some());
+        assert!(window.debug_bounds("channel-user-authorize").is_some());
         let form = window.debug_bounds("channel-editor-form").unwrap();
         let guide = window.debug_bounds("channel-editor-guide").unwrap();
         assert!(

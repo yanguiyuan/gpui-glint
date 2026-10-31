@@ -254,6 +254,66 @@ pub fn definitions(anthropic: bool) -> Value {
             &["id"],
         ),
         definition(
+            "channel_user_authorize",
+            "Start WPS user consent using this channel app. Return the authorization_url to the owner; never claim authorized until status confirms it. Must open on the computer running Glint.",
+            json!({"application_id":string()}),
+            &[],
+        ),
+        definition(
+            "channel_user_authorization_status",
+            "Read this channel owner's user authorization state without exposing tokens.",
+            json!({"application_id":string()}),
+            &[],
+        ),
+        definition(
+            "wps_chats_list",
+            "List the authorized owner's WPS conversations, returning real chat IDs and names. Follow next_page_token to find the conversation before applying labels; never invent IDs.",
+            json!({"application_id":string(),"page_size":{"type":"integer","minimum":1,"maximum":100},"page_token":string()}),
+            &[],
+        ),
+        definition(
+            "wps_chat_tags_list",
+            "List the authorized owner's WPS chat labels; follow next_page_token. Requires channel user authorization.",
+            json!({"application_id":string(),"page_size":{"type":"integer","minimum":1,"maximum":100},"page_token":string()}),
+            &[],
+        ),
+        definition(
+            "wps_chat_tags_create",
+            "Create or reuse up to 50 WPS chat label names (each 1-16 characters). Returns tag_id/tag_name; uses current owner's user authorization and selected tool permissions.",
+            json!({"application_id":string(),"tag_names":{"type":"array","items":string(),"minItems":1,"maxItems":50}}),
+            &["tag_names"],
+        ),
+        definition(
+            "wps_chat_tags_delete",
+            "Delete the owner's chat labels by ID; this removes ALL their chat-label associations. Only use when explicitly asked to delete labels, not merely remove labels from a chat.",
+            json!({"application_id":string(),"tag_ids":{"type":"array","items":string(),"minItems":1,"maxItems":50}}),
+            &["tag_ids"],
+        ),
+        definition(
+            "wps_chat_tags_get",
+            "Get owner's labels on a WPS chat. Omit chat_id for current inbound channel conversation (or owner's robot direct chat when no channel request is running).",
+            json!({"application_id":string(),"chat_id":string()}),
+            &[],
+        ),
+        definition(
+            "wps_chat_tags_apply",
+            "Apply existing tag_ids to a WPS chat. Create/reuse labels with wps_chat_tags_create first if only names are known. chat_id defaults to current channel conversation; never invent chat/tag IDs.",
+            json!({"application_id":string(),"chat_id":string(),"tag_ids":{"type":"array","items":string(),"minItems":1,"maxItems":50}}),
+            &["tag_ids"],
+        ),
+        definition(
+            "wps_chat_tags_remove",
+            "Remove tag associations from one chat; preserves the labels and their associations with other chats. chat_id defaults to current channel conversation.",
+            json!({"application_id":string(),"chat_id":string(),"tag_ids":{"type":"array","items":string(),"minItems":1,"maxItems":50}}),
+            &["tag_ids"],
+        ),
+        definition(
+            "wps_chat_tags_chats",
+            "List chat IDs marked with one of the owner's labels. Follow next_page_token.",
+            json!({"application_id":string(),"tag_id":string(),"page_size":{"type":"integer","minimum":1,"maximum":100},"page_token":string()}),
+            &["tag_id"],
+        ),
+        definition(
             "channel_list",
             "List channel applications bound to this partner and project, with enabled/owner_bound state. Owner enrollment requires a direct WPS robot message: 我是你的主人.",
             json!({}),
@@ -358,6 +418,10 @@ fn needs_approval(call: &ToolCall) -> bool {
             | "schedule_create"
             | "schedule_update"
             | "schedule_delete"
+            | "wps_chat_tags_create"
+            | "wps_chat_tags_delete"
+            | "wps_chat_tags_apply"
+            | "wps_chat_tags_remove"
     ) {
         return true;
     }
@@ -390,6 +454,11 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
                     | "partner_list"
                     | "skill_list"
                     | "skill_read"
+                    | "wps_chats_list"
+                    | "wps_chat_tags_list"
+                    | "wps_chat_tags_get"
+                    | "wps_chat_tags_chats"
+                    | "channel_user_authorization_status"
                     | "channel_list"
                     | "channel_send"
                     | "channel_delivery_status"
@@ -499,6 +568,16 @@ pub(crate) fn resolve_file(
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
+    if call.name.starts_with("wps_chat_tags_") || call.name == "wps_chats_list" {
+        return crate::channels::tags::execute(call, context).await;
+    }
+    if matches!(
+        call.name.as_str(),
+        "channel_user_authorize" | "channel_user_authorization_status"
+    ) {
+        return crate::channels::tools::execute(call, context).await;
+    }
+
     if matches!(
         call.name.as_str(),
         "channel_list" | "channel_send" | "channel_delivery_status"

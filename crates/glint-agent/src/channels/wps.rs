@@ -206,6 +206,71 @@ async fn send(
     }
     Ok(())
 }
+pub(super) async fn user_api(
+    client: &reqwest::Client,
+    app: &Application,
+    secret: &str,
+    access: &str,
+    method: reqwest::Method,
+    url: reqwest::Url,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let text = body.as_ref().map(Value::to_string).unwrap_or_default();
+    let content_type = if body.is_some() || url.path() == "/v7/chats" {
+        "application/json"
+    } else {
+        ""
+    };
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+    let uri = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    };
+    let signature = signature(
+        &app.app_id,
+        secret,
+        method.as_str(),
+        &uri,
+        content_type,
+        &date,
+        &text,
+    );
+    let mut request = client
+        .request(method, url)
+        .bearer_auth(access)
+        .header("X-Kso-Date", date)
+        .header("X-Kso-Authorization", signature);
+    if !content_type.is_empty() {
+        request = request.header("Content-Type", content_type);
+    }
+    if body.is_some() {
+        request = request.body(text);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| "WPS 用户接口网络失败，请核对结果后再决定是否重试")?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "WPS 用户接口响应中断")? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("WPS 用户接口响应超过 2 MiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "WPS 用户接口响应不是 JSON")?;
+    if !status.is_success() || value["code"] != 0 {
+        return Err(format!(
+            "WPS 用户接口失败（HTTP {}，code {}），请检查用户授权与会话权限",
+            status.as_u16(),
+            value["code"]
+        ));
+    }
+    Ok(value
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| json!({"success":true})))
+}
 fn reaction_type(stage: &str) -> &'static str {
     match stage {
         "received" => "emoji_receive",
@@ -483,6 +548,87 @@ mod tests {
         );
         ws.send(Message::Text("test-ack".into())).await.unwrap();
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn user_tag_requests_sign_encoded_query_and_json_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = reqwest::Url::parse(&format!(
+                "http://{}/v7/recent_chats/tags?page_size=20&page_token=a%26b",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let expected_method = method.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                let header = |name: &str| {
+                    headers.lines().find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                    })
+                };
+                let length: usize = header("content-length")
+                    .unwrap_or_else(|| "0".into())
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let body = String::from_utf8(body).unwrap();
+                assert_eq!(header("authorization").unwrap(), "Bearer user-test-token");
+                let ct = if expected_method == reqwest::Method::POST {
+                    "application/json"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    header("x-kso-authorization").unwrap(),
+                    signature(
+                        "fixture-ak",
+                        "fixture-key",
+                        expected_method.as_str(),
+                        "/v7/recent_chats/tags?page_size=20&page_token=a%26b",
+                        ct,
+                        &header("x-kso-date").unwrap(),
+                        &body
+                    )
+                );
+                if expected_method == reqwest::Method::POST {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap()["tag_names"],
+                        json!(["工作"])
+                    );
+                }
+                let result =
+                    r#"{"code":0,"data":{"items":[{"tag_id":"tag-1","tag_name":"工作"}]}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}",result.len()).as_bytes()).await.unwrap();
+            });
+            let (_dir, _repo, mut app) = super::super::tests::fixture();
+            app.app_id = "fixture-ak".into();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let body = (method == reqwest::Method::POST).then(|| json!({"tag_names":["工作"]}));
+            let result = user_api(
+                &client,
+                &app,
+                "fixture-key",
+                "user-test-token",
+                method,
+                url,
+                body,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["items"][0]["tag_id"], "tag-1");
+            server.await.unwrap();
+        }
     }
     #[test]
     fn reactions_use_documented_codes_and_encode_message_path_segments() {
