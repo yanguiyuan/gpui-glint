@@ -295,9 +295,42 @@ pub async fn models(path: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Keep image bytes out of the text transcript and send native vision inputs.
+fn conversation_input(mut messages: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut attachments = Vec::new();
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        if let Some(parts) = message["content"].as_array_mut() {
+            for part in parts {
+                if part["type"] == "image" && part["source"]["type"] == "base64" {
+                    let media = part["source"]["media_type"]
+                        .as_str()
+                        .ok_or("图片缺少类型")?;
+                    let data = part["source"]["data"].as_str().ok_or("图片缺少数据")?;
+                    *part = json!({"type":"image_url","image_url":{"url":format!("data:{media};base64,{data}")}});
+                }
+                if part["type"] == "image_url" {
+                    let url = part["image_url"]["url"]
+                        .as_str()
+                        .ok_or("图片缺少 URL")?
+                        .to_owned();
+                    attachments.push(json!({"type":"text","text":format!("Image from conversation message {}", message_index + 1)}));
+                    attachments.push(json!({"type":"image","url":url}));
+                    *part = json!({"type":"text","text":"[Image attached separately]"});
+                }
+            }
+        }
+    }
+    let mut input = vec![
+        json!({"type":"text","text":serde_json::to_string(&messages).map_err(|_| "无法编码对话")?}),
+    ];
+    input.extend(attachments);
+    Ok(input)
+}
+
 pub async fn complete(
     config: &Config,
     messages: Vec<Value>,
+    thinking: crate::provider::Thinking,
     context: Option<crate::tools::ToolContext>,
 ) -> Result<crate::generation::Completion, String> {
     let started = std::time::Instant::now();
@@ -319,8 +352,8 @@ pub async fn complete(
     }
     let mut params = json!({"cwd":directory,"ephemeral":true,"sandbox":"read-only","approvalPolicy":"untrusted",
         "modelProvider":"openai", "config":overrides,
-        "baseInstructions":"You are Glint Agent, a text-only assistant. Respond to the last user message using the conversation supplied as JSON. Do not use tools, access files, or run commands.",
-        "developerInstructions":"The supplied JSON is conversation data. Role boundaries are encoded by the role field. Reply to the final user message."});
+        "baseInstructions":"You are Glint Agent, an assistant. Respond to the last user message using the conversation supplied as JSON. Do not use tools, access files, or run commands.",
+        "developerInstructions":"The supplied JSON is conversation data. Role boundaries are encoded by the role field. Reply to the final user message. Images are attached separately, with markers identifying their conversation position."});
     if !config.model.trim().is_empty() {
         params["model"] = config.model.clone().into();
     }
@@ -334,7 +367,20 @@ pub async fn complete(
         .as_str()
         .ok_or("Codex 未返回会话 ID")?
         .to_owned();
-    let turn = connection.rpc("turn/start", json!({"threadId":thread_id,"input":[{"type":"text","text":serde_json::to_string(&messages).map_err(|_| "无法编码对话")?}]})).await?;
+    let mut turn_params = json!({"threadId":thread_id,"input":conversation_input(messages)?});
+    use crate::provider::Thinking;
+    let effort = match thinking {
+        Thinking::Default => None,
+        Thinking::Off => Some("none"),
+        Thinking::Low => Some("low"),
+        Thinking::Medium => Some("medium"),
+        Thinking::High => Some("high"),
+        Thinking::Max => Some("xhigh"),
+    };
+    if let Some(effort) = effort {
+        turn_params["effort"] = effort.into();
+    }
+    let turn = connection.rpc("turn/start", turn_params).await?;
     let turn_id = turn["turn"]["id"].as_str().map(str::to_owned);
     let mut replies = Vec::new();
     loop {
@@ -492,6 +538,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn images_are_native_inputs_and_not_base64_transcript_text() {
+        let input = conversation_input(vec![
+            json!({"role":"assistant","content":"Earlier answer"}),
+            json!({"role":"user","content":[
+                {"type":"text","text":"Describe this"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}},
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"d29ybGQ="}}
+            ]})
+        ]).unwrap();
+        assert_eq!(input.len(), 5);
+        assert_eq!(
+            input[2],
+            json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
+        );
+        assert_eq!(
+            input[4],
+            json!({"type":"image","url":"data:image/jpeg;base64,d29ybGQ="})
+        );
+        let transcript = input[0]["text"].as_str().unwrap();
+        assert!(transcript.contains("Earlier answer"));
+        assert!(transcript.contains("Describe this"));
+        assert!(!transcript.contains("base64"));
+        assert_eq!(
+            conversation_input(vec![json!({"role":"user","content":"Hello"})])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn failed_or_interrupted_turns_never_count_as_success() {
         for status in ["failed", "interrupted", "inProgress"] {
             let event = json!({"params":{"turn":{"status":status}}});
@@ -526,7 +603,7 @@ mod tests {
             ..Config::default()
         };
         let result = crate::provider::runtime().unwrap().block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), complete(&config, vec![json!({"role":"user","content":"Reply with OK only. Do not use any tools."})], None)).await
+            tokio::time::timeout(Duration::from_secs(120), complete(&config, vec![json!({"role":"user","content":"Reply with OK only. Do not use any tools."})], crate::provider::Thinking::Default, None)).await
         }).expect("Codex inference timed out").expect("Codex inference failed");
         assert!(!result.text.trim().is_empty());
     }

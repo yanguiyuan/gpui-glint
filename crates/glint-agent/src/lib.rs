@@ -689,11 +689,6 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
-        if config.kind == provider::Kind::ChatGpt && !submission.images.is_empty() {
-            self.provider_error = Some("ChatGPT（Codex CLI）暂不支持图片输入。".into());
-            cx.notify();
-            return;
-        }
         if self.preparing.is_some() {
             return;
         }
@@ -2125,6 +2120,7 @@ fn thinking_chip() -> ComposerChip {
         .option("default", "思考 · 默认")
         .option("off", "思考 · 关闭")
         .option("low", "思考 · 低")
+        .option("medium", "思考 · 中")
         .option("high", "思考 · 高")
         .option("max", "思考 · 最大")
         .default_selected("default")

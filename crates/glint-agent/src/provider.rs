@@ -28,6 +28,7 @@ pub enum Thinking {
     Default,
     Off,
     Low,
+    Medium,
     High,
     Max,
 }
@@ -37,6 +38,7 @@ impl Thinking {
         match value {
             "off" => Self::Off,
             "low" => Self::Low,
+            "medium" => Self::Medium,
             "high" => Self::High,
             "max" => Self::Max,
             _ => Self::Default,
@@ -49,12 +51,13 @@ impl Thinking {
             Protocol::Anthropic => match self {
                 Self::Default => {}
                 Self::Off => body["thinking"] = json!({"type": "disabled"}),
-                Self::Low | Self::High | Self::Max => {
+                Self::Low | Self::Medium | Self::High | Self::Max => {
                     body["thinking"] = json!({"type": "enabled"});
                     // Reasoning consumes the token budget; raise the ceiling.
                     body["max_tokens"] = json!(32768);
                     body["output_config"] = json!({"effort": match self {
                         Self::Low => "low",
+                        Self::Medium => "medium",
                         Self::High => "high",
                         _ => "max",
                     }});
@@ -65,9 +68,10 @@ impl Thinking {
                 Self::Off => {
                     body["thinking"] = json!({"type": "disabled", "reasoning_effort": "none"})
                 }
-                Self::Low | Self::High | Self::Max => {
+                Self::Low | Self::Medium | Self::High | Self::Max => {
                     body["thinking"] = json!({"type": "enabled", "reasoning_effort": match self {
                         Self::Low => "low",
+                        Self::Medium => "medium",
                         Self::High => "high",
                         _ => "max",
                     }});
@@ -496,10 +500,10 @@ impl Request {
                 }
             }
             if config.kind == Kind::ChatGpt {
-                // Codex CLI manages its own reasoning configuration.
+                // Pass the composer selection through to the app-server turn.
                 tokio::time::timeout(
                     Duration::from_secs(180),
-                    crate::chatgpt::complete(&config, messages, context),
+                    crate::chatgpt::complete(&config, messages, thinking, context),
                 )
                 .await
                 .map_err(|_| "ChatGPT 请求超时，请稍后重试".to_owned())?
