@@ -22,6 +22,13 @@ keyring = { version = "3.6.3", features = ["apple-native", "windows-native"] }
 async-channel = "2"
 base64 = "0.22"
 sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+httpdate = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "ico", "pnm"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 jieba-rs = "0.11.0"

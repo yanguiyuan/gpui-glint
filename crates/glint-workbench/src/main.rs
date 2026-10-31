@@ -67,6 +67,10 @@ impl Workbench {
                 cx,
             );
             agent.set_host_tools(tools);
+            let source_api = api.clone();
+            agent.set_wps_channel_credential_source(std::rc::Rc::new(move |cx| {
+                source_api.read(cx).wps_channel_credentials(cx)
+            }));
             agent
         });
         let subscriptions = vec![

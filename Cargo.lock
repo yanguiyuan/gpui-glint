@@ -3096,17 +3096,23 @@ dependencies = [
 name = "glint-agent"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "async-channel",
  "base64 0.22.1",
+ "cbc",
  "chrono",
+ "futures-util",
  "glint-vault",
  "gpui-ce",
  "gpui-glint",
  "gpui_ce_platform",
+ "hmac",
+ "httpdate",
  "ignore",
  "image",
  "jieba-rs",
  "keyring",
+ "md-5",
  "objc2 0.6.4",
  "reqwest 0.12.28",
  "rmcp",
@@ -3118,6 +3124,7 @@ dependencies = [
  "strsim",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
  "winresource",
 ]

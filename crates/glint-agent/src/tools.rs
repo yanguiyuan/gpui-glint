@@ -254,6 +254,24 @@ pub fn definitions(anthropic: bool) -> Value {
             &["id"],
         ),
         definition(
+            "channel_list",
+            "List channel applications bound to this partner and project, with enabled/owner_bound state. Owner enrollment requires a direct WPS robot message: 我是你的主人.",
+            json!({}),
+            &[],
+        ),
+        definition(
+            "channel_send",
+            "Send a proactive notification to this partner's bound channel owner, including from scheduled tasks. Enabled channel binding authorizes notifications to that owner only; arbitrary recipients are not accepted. Specify application_id from channel_list when multiple applications exist. Returns actual delivery status after waiting up to 30 seconds. Only sent means accepted by WPS; never claim queued or failed notifications were delivered.",
+            json!({"application_id":string(),"text":{"type":"string","maxLength":16000}}),
+            &["text"],
+        ),
+        definition(
+            "channel_delivery_status",
+            "Check a queued owner notification by delivery_id returned from channel_send.",
+            json!({"delivery_id":{"type":"integer"}}),
+            &["delivery_id"],
+        ),
+        definition(
             "schedule_list",
             "List scheduled agent tasks. Application must be running for execution.",
             json!({}),
@@ -324,6 +342,9 @@ fn safe_path(root: &Path, relative: &str, writing: bool) -> Result<PathBuf, Stri
 }
 
 fn needs_approval(call: &ToolCall) -> bool {
+    // Enabling a channel authorizes notifications to that partner's enrolled owner.
+    // channel_send enforces that scope and cannot accept arbitrary recipients.
+
     if call.name.starts_with("mcp_") && call.name != "mcp_config_read" {
         return true;
     }
@@ -369,6 +390,9 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
                     | "partner_list"
                     | "skill_list"
                     | "skill_read"
+                    | "channel_list"
+                    | "channel_send"
+                    | "channel_delivery_status"
                     | "schedule_list"
                     | "schedule_create"
                     | "schedule_update"
@@ -475,6 +499,13 @@ pub(crate) fn resolve_file(
 }
 
 async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String, String> {
+    if matches!(
+        call.name.as_str(),
+        "channel_list" | "channel_send" | "channel_delivery_status"
+    ) {
+        return crate::channels::tools::execute(call, context).await;
+    }
+
     if context.registry.has_host_tool(&call.name) {
         return context
             .registry

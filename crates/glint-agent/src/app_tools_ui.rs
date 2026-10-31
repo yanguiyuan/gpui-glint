@@ -356,6 +356,23 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     }
 }
 
+/// Keep lifecycle/approval events; superseded full snapshots need no UI work.
+fn coalesce_tool_snapshots(events: Vec<tools::ToolEvent>) -> Vec<tools::ToolEvent> {
+    let mut seen_transcript = false;
+    let mut seen_outputs = std::collections::HashSet::new();
+    let mut latest: Vec<_> = events
+        .into_iter()
+        .rev()
+        .filter(|event| match event {
+            tools::ToolEvent::Transcript(_) => !std::mem::replace(&mut seen_transcript, true),
+            tools::ToolEvent::Output { call_id, .. } => seen_outputs.insert(call_id.clone()),
+            _ => true,
+        })
+        .collect();
+    latest.reverse();
+    latest
+}
+
 impl AgentWorkspace {
     pub fn watch_tools(
         &mut self,
@@ -367,145 +384,163 @@ impl AgentWorkspace {
         self.thinking_timings = Default::default();
         self.tool_listener = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
-                if weak
-                    .update(cx, |this, cx| {
-                        // Follow on the next layout only if the reader is still
-                        // at the bottom of the previous layout. Scrolling back
-                        // through history detaches until they return to the end.
-                        if !matches!(
-                            &event,
-                            tools::ToolEvent::ContextUsage { .. }
-                                | tools::ToolEvent::SubagentUpdated
-                        ) && this.subagent_ui.selected.is_none()
-                            && this
-                                .pending
-                                .as_ref()
-                                .is_some_and(|(id, _)| *id == this.history.active)
-                        {
-                            scroll_follow::follow_if_at_bottom(&this.scroll);
-                        }
-                        match event {
-                            tools::ToolEvent::SteeringFailed(error) => {
-                                this.provider_error =
-                                    Some(format!("引导未生效：{error}。补充要求已保存到会话。"));
-                            }
-                            tools::ToolEvent::TodoUpdated(todos) => {
-                                if let Some((id, _)) = &this.pending {
-                                    if let Some(session) = this
-                                        .history
-                                        .sessions
-                                        .iter_mut()
-                                        .find(|session| session.id == *id)
-                                    {
-                                        session.todos = todos;
-                                    }
-                                }
-                                this.sync_todos(cx);
-                                this.save(cx);
-                            }
-                            tools::ToolEvent::SubagentUpdated => {
-                                if this
-                                    .approval
+                let mut batch = vec![event];
+                for _ in 0..255 {
+                    match receiver.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(_) => break,
+                    }
+                }
+                for event in coalesce_tool_snapshots(batch) {
+                    if weak
+                        .update(cx, |this, cx| {
+                            // Follow on the next layout only if the reader is still
+                            // at the bottom of the previous layout. Scrolling back
+                            // through history detaches until they return to the end.
+                            if !matches!(
+                                &event,
+                                tools::ToolEvent::ContextUsage { .. }
+                                    | tools::ToolEvent::SubagentUpdated
+                            ) && this.subagent_ui.selected.is_none()
+                                && this
+                                    .pending
                                     .as_ref()
-                                    .and_then(|approval| approval.agent_id)
-                                    .is_some_and(|id| {
-                                        this.subagent_ui.live.lock().ok().is_some_and(|traces| {
-                                            traces.iter().any(|trace| {
-                                                trace.id == id && !trace.status.active()
-                                            })
-                                        })
-                                    })
-                                {
-                                    this.approval = None;
+                                    .is_some_and(|(id, _)| *id == this.history.active)
+                            {
+                                scroll_follow::follow_if_at_bottom(&this.scroll);
+                            }
+                            match event {
+                                tools::ToolEvent::SteeringFailed(error) => {
+                                    this.provider_error = Some(format!(
+                                        "引导未生效：{error}。补充要求已保存到会话。"
+                                    ));
                                 }
-                                if this
-                                    .selected_subagent()
-                                    .is_some_and(|trace| trace.status.active())
-                                {
-                                    if let Some(scroll) = this.selected_subagent_scroll() {
-                                        scroll_follow::follow_if_at_bottom(&scroll);
+                                tools::ToolEvent::TodoUpdated(todos) => {
+                                    if let Some((id, _)) = &this.pending {
+                                        if let Some(session) = this
+                                            .history
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|session| session.id == *id)
+                                        {
+                                            session.todos = todos;
+                                        }
+                                    }
+                                    this.sync_todos(cx);
+                                    this.save(cx);
+                                }
+                                tools::ToolEvent::SubagentUpdated => {
+                                    if this
+                                        .approval
+                                        .as_ref()
+                                        .and_then(|approval| approval.agent_id)
+                                        .is_some_and(|id| {
+                                            this.subagent_ui.live.lock().ok().is_some_and(
+                                                |traces| {
+                                                    traces.iter().any(|trace| {
+                                                        trace.id == id && !trace.status.active()
+                                                    })
+                                                },
+                                            )
+                                        })
+                                    {
+                                        this.approval = None;
+                                    }
+                                    if this
+                                        .selected_subagent()
+                                        .is_some_and(|trace| trace.status.active())
+                                    {
+                                        if let Some(scroll) = this.selected_subagent_scroll() {
+                                            scroll_follow::follow_if_at_bottom(&scroll);
+                                        }
                                     }
                                 }
-                            }
-                            tools::ToolEvent::ApprovalResolved => {}
-                            tools::ToolEvent::ContextUsage {
-                                provider_id,
-                                model,
-                                used_tokens,
-                                capacity_tokens,
-                            } => {
-                                if let Some((id, _)) = &this.pending {
-                                    if let Some(session) = this
-                                        .history
-                                        .sessions
-                                        .iter_mut()
-                                        .find(|session| session.id == *id)
+                                tools::ToolEvent::ApprovalResolved => {}
+                                tools::ToolEvent::ContextUsage {
+                                    provider_id,
+                                    model,
+                                    used_tokens,
+                                    capacity_tokens,
+                                } => {
+                                    if let Some((id, _)) = &this.pending {
+                                        if let Some(session) = this
+                                            .history
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|session| session.id == *id)
+                                        {
+                                            session.context =
+                                                Some(context_usage::ContextSnapshot {
+                                                    provider_id,
+                                                    model,
+                                                    used_tokens,
+                                                    capacity_tokens,
+                                                });
+                                        }
+                                    }
+                                    this.sync_context_usage(cx);
+                                }
+                                tools::ToolEvent::Transcript(blocks) => {
+                                    this.thinking_timings.observe(&blocks);
+                                    this.transcript = blocks;
+                                }
+                                tools::ToolEvent::Started(call) => {
+                                    this.tool_activity.push(tools::ToolRecord {
+                                        call,
+                                        result: "执行中…".into(),
+                                        success: false,
+                                        elapsed_ms: 0,
+                                        live_output: None,
+                                        subagent: None,
+                                        change: None,
+                                    })
+                                }
+                                tools::ToolEvent::Output { call_id, output } => {
+                                    if let Some(record) =
+                                        this.tool_activity.iter_mut().find(|record| {
+                                            record.call.id == call_id && record.result == "执行中…"
+                                        })
                                     {
-                                        session.context = Some(context_usage::ContextSnapshot {
-                                            provider_id,
-                                            model,
-                                            used_tokens,
-                                            capacity_tokens,
+                                        record.live_output = Some(output);
+                                    }
+                                }
+                                tools::ToolEvent::Approval {
+                                    call,
+                                    respond,
+                                    agent_id,
+                                } => {
+                                    if *this.access.lock().unwrap() != tools::AccessMode::Ask {
+                                        let _ = respond.send(true);
+                                    } else {
+                                        this.approval = Some(Approval {
+                                            call,
+                                            respond,
+                                            agent_id,
                                         });
                                     }
                                 }
-                                this.sync_context_usage(cx);
-                            }
-                            tools::ToolEvent::Transcript(blocks) => {
-                                this.thinking_timings.observe(&blocks);
-                                this.transcript = blocks;
-                            }
-                            tools::ToolEvent::Started(call) => {
-                                this.tool_activity.push(tools::ToolRecord {
-                                    call,
-                                    result: "执行中…".into(),
-                                    success: false,
-                                    elapsed_ms: 0,
-                                    live_output: None,
-                                    subagent: None,
-                                    change: None,
-                                })
-                            }
-                            tools::ToolEvent::Output { call_id, output } => {
-                                if let Some(record) = this.tool_activity.iter_mut().find(|record| {
-                                    record.call.id == call_id && record.result == "执行中…"
-                                }) {
-                                    record.live_output = Some(output);
+                                tools::ToolEvent::Completed(record) => {
+                                    if record.call.name.starts_with("schedule_") {
+                                        this.refresh_calendar(cx);
+                                    }
+
+                                    if let Some(existing) = this
+                                        .tool_activity
+                                        .iter_mut()
+                                        .find(|item| item.call.id == record.call.id)
+                                    {
+                                        *existing = record;
+                                    } else {
+                                        this.tool_activity.push(record);
+                                    }
                                 }
                             }
-                            tools::ToolEvent::Approval {
-                                call,
-                                respond,
-                                agent_id,
-                            } => {
-                                if *this.access.lock().unwrap() != tools::AccessMode::Ask {
-                                    let _ = respond.send(true);
-                                } else {
-                                    this.approval = Some(Approval {
-                                        call,
-                                        respond,
-                                        agent_id,
-                                    });
-                                }
-                            }
-                            tools::ToolEvent::Completed(record) => {
-                                if let Some(existing) = this
-                                    .tool_activity
-                                    .iter_mut()
-                                    .find(|item| item.call.id == record.call.id)
-                                {
-                                    *existing = record;
-                                } else {
-                                    this.tool_activity.push(record);
-                                }
-                            }
-                        }
-                        this.refresh_calendar(cx);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }));
@@ -1260,5 +1295,41 @@ mod tests {
         assert_eq!(process_prefix_len(&blocks, false), 4);
         assert_eq!(process_prefix_len(&blocks, true), 3);
         assert_eq!(process_prefix_len(&[Text("answer".into())], true), 0);
+    }
+}
+
+#[cfg(test)]
+mod event_burst_tests {
+    use super::*;
+    #[test]
+    fn tool_burst_keeps_lifecycle_and_latest_full_transcript() {
+        let mut events = vec![];
+        for i in 0..1000 {
+            events.push(tools::ToolEvent::Transcript(vec![
+                generation::ContentBlock::Text(i.to_string()),
+            ]));
+            events.push(tools::ToolEvent::Started(tools::ToolCall {
+                id: i.to_string(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            }));
+        }
+        for i in 0..1000 {
+            events.push(tools::ToolEvent::Output {
+                call_id: "command".into(),
+                output: i.to_string(),
+            });
+        }
+        let events = coalesce_tool_snapshots(events);
+        assert_eq!(events.len(), 1002);
+        assert!(matches!(events.last(),Some(tools::ToolEvent::Output{output,..}) if output=="999"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, tools::ToolEvent::Started(_)))
+                .count(),
+            1000
+        );
+        assert!(events.iter().any(|e|matches!(e,tools::ToolEvent::Transcript(blocks) if matches!(&blocks[0],generation::ContentBlock::Text(text) if text=="999"))));
     }
 }

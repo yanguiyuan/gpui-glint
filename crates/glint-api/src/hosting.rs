@@ -253,3 +253,76 @@ impl Workbench {
         self.persist(cx);
     }
 }
+
+impl Workbench {
+    /// Explicit native UI import into Agent; never exposed as a model tool.
+    pub fn wps_channel_credentials(&self, cx: &App) -> Result<(String, String), String> {
+        let values = self.active_environment_values(cx);
+        let draft = self.snapshot(cx);
+        let binding = draft
+            .plugins
+            .iter()
+            .find(|p| p.enabled && p.id == "com.wps.kso1")
+            .or(draft.event_decoder.as_ref());
+        let read = |name: &str| -> Result<String, String> {
+            let custom = binding
+                .and_then(|b| b.environment_bindings.get(name))
+                .map(String::as_str)
+                .unwrap_or(name);
+            let key = if values.0.contains_key(custom) {
+                custom
+            } else {
+                name
+            };
+            let value = values
+                .0
+                .get(key)
+                .ok_or_else(|| format!("当前 API 环境缺少 {name}，请先选择 WPS 请求及其环境"))?;
+            let resolved = template::TemplateResolver::new(&values).resolve(value)?;
+            if resolved.trim().is_empty() {
+                return Err(format!("当前 API 环境的 {name} 为空"));
+            }
+            Ok(resolved)
+        };
+        Ok((read("wps_app_id")?, read("wps_app_key")?))
+    }
+}
+
+#[cfg(test)]
+mod channel_import_tests {
+    use super::*;
+    #[gpui::test]
+    fn channel_import_respects_wps_action_variable_bindings(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = cx.new(|cx| {
+            Workbench::with_store(
+                storage::Store::open(&dir.path().join("api.sqlite3")).unwrap(),
+                cx,
+            )
+        });
+        host.update(cx, |host, cx| {
+            assert!(host.wps_channel_credentials(cx).is_err());
+            host.workspace.environment_inputs[0]
+                .save(None, "channel_ak", "fixture-ak", false)
+                .unwrap();
+            host.workspace.environment_inputs[0]
+                .save(None, "channel_sk", "fixture-sk", true)
+                .unwrap();
+            host.execute_host_tool("collection".into(),"glint_collection_create".into(),serde_json::json!({"name":"WPS"}),std::time::Instant::now()+std::time::Duration::from_secs(30),cx).unwrap();
+            host.execute_host_tool("request".into(),"glint_request_create".into(),serde_json::json!({"collection":"WPS","name":"WPS request","draft":{"method":"GET","url":"https://example.test/"}}),std::time::Instant::now()+std::time::Duration::from_secs(30),cx).unwrap();
+            let mut action = model::BeforeAction::default();
+            action.approval.id = "com.wps.kso1".into();
+            action
+                .environment_bindings
+                .insert("wps_app_id".into(), "channel_ak".into());
+            action
+                .environment_bindings
+                .insert("wps_app_key".into(), "channel_sk".into());
+            host.workspace.requests[host.active].draft.plugins = vec![action];
+            assert_eq!(
+                host.wps_channel_credentials(cx).unwrap(),
+                ("fixture-ak".into(), "fixture-sk".into())
+            );
+        });
+    }
+}

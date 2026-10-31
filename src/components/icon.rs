@@ -38,6 +38,7 @@ pub enum Icon {
     User,
     Users,
     MessageCircle,
+    Radio,
     Sort,
     Filter,
     Close,
@@ -112,6 +113,7 @@ impl Icon {
             Self::User => "user",
             Self::Users => "users",
             Self::MessageCircle => "message-circle",
+            Self::Radio => "radio",
             Self::Sort => "sort",
             Self::Filter => "filter",
             Self::Close => "close",
@@ -464,6 +466,10 @@ fn icon_svg(name: &str) -> Option<String> {
             "<circle cx='12' cy='12' r='8.5'/><path d='M12 7.5V12l3 2'/>",
             "none",
         ),
+        "radio" => (
+            "<circle cx='12' cy='12' r='2'/><path d='M7.76 7.76a6 6 0 0 0 0 8.48m8.48-8.48a6 6 0 0 1 0 8.48M4.93 4.93a10 10 0 0 0 0 14.14m14.14-14.14a10 10 0 0 1 0 14.14'/>",
+            "none",
+        ),
         "message-circle" => (
             "<path d='M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z'/><path d='M8.5 11.5h7'/>",
             "none",
@@ -693,6 +699,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn channel_broadcast_icon_is_distinct_from_conversation_icon() {
+        let render = |icon: Icon| {
+            let svg = GlintAssets
+                .load(&format!("glint-ui/icons/{}.svg", icon.name()))
+                .unwrap()
+                .unwrap();
+            let tree = resvg::usvg::Tree::from_data(&svg, &Default::default()).unwrap();
+            let mut pixels = resvg::tiny_skia::Pixmap::new(24, 24).unwrap();
+            resvg::render(&tree, Default::default(), &mut pixels.as_mut());
+            assert!(pixels.pixels().iter().any(|pixel| pixel.alpha() > 0));
+            pixels.data().to_vec()
+        };
+        assert_ne!(render(Icon::Radio), render(Icon::MessageCircle));
+    }
     #[test]
     fn save_icon_loads_and_renders() {
         let svg = GlintAssets

@@ -52,6 +52,7 @@ pub struct Connection {
     output: BufReader<ChildStdout>,
     queued: VecDeque<Value>,
     sequence: u64,
+    last_publish: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl Connection {
@@ -60,6 +61,7 @@ impl Connection {
             let _ = context
                 .events
                 .try_send(crate::tools::ToolEvent::Transcript(self.blocks.clone()));
+            self.last_publish.set(Some(std::time::Instant::now()));
         }
     }
     fn transcript_text(&mut self, key: String, text: &str, thinking: bool, replace: bool) {
@@ -82,7 +84,14 @@ impl Connection {
                 ContentBlock::Text(text.into())
             });
         }
-        self.publish();
+        if replace
+            || self
+                .last_publish
+                .get()
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(50))
+        {
+            self.publish();
+        }
     }
 
     pub async fn start(path: &str) -> Result<Self, String> {
@@ -138,6 +147,7 @@ impl Connection {
             output,
             queued: VecDeque::new(),
             sequence: 0,
+            last_publish: Default::default(),
         };
         connection.rpc("initialize", json!({"clientInfo":{"name":"glint_agent","title":"Glint Agent","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
         connection

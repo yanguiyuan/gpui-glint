@@ -83,6 +83,10 @@ mod tests {
                 Action::Navigate(Route::Agent(glint_agent::Page::Partners)),
             ),
             (
+                "nav-channels",
+                Action::Navigate(Route::Agent(glint_agent::Page::Channels)),
+            ),
+            (
                 "nav-calendar",
                 Action::Navigate(Route::Agent(glint_agent::Page::Calendar)),
             ),
@@ -214,6 +218,13 @@ impl Render for Navigation {
                 Icon::Users,
                 "伙伴",
                 Route::Agent(Agent::Partners),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-channels",
+                Icon::Radio,
+                "频道",
+                Route::Agent(Agent::Channels),
                 cx,
             ))
             .child(

@@ -6,11 +6,18 @@ pub enum Page {
     Chat,
     Calendar,
     Partners,
+    Channels,
     Settings,
     Vault,
 }
 
+/// A UI-only, explicit credential import; values must never enter model tool output.
+pub type WpsCredentialSource = std::rc::Rc<dyn Fn(&App) -> Result<(String, String), String>>;
 impl AgentWorkspace {
+    pub fn set_wps_channel_credential_source(&mut self, source: WpsCredentialSource) {
+        self.channels.credential_source = Some(source);
+    }
+
     /// Applies to the next request, including scheduled requests and delegated tools.
     pub fn set_host_tools(&mut self, tools: std::sync::Arc<dyn crate::host_tools::HostTools>) {
         self.host_tools = Some(tools);
@@ -46,6 +53,10 @@ impl AgentWorkspace {
                 self.open_partners(cx);
                 window.focus(&self.focus, cx);
             }
+            Page::Channels => {
+                self.open_channels(cx);
+                window.focus(&self.focus, cx);
+            }
             Page::Vault => {
                 window.focus(&self.focus, cx);
             }
@@ -70,6 +81,7 @@ impl AgentWorkspace {
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
         self.provider_settings.set_theme(theme, cx);
         self.partners_ui.set_theme(theme, cx);
+        self.channels.set_theme(theme, cx);
         self.skills_ui.set_theme(theme, cx);
         self.mcp_ui.set_theme(theme, cx);
         self.sync_skill_context(cx);
@@ -115,7 +127,13 @@ mod tests {
                 .update(cx, |composer, cx| composer.set_value("保留这条草稿", cx));
             (host.history.active, host.composer.entity_id())
         });
-        for page in [Page::Calendar, Page::Partners, Page::Settings, Page::Chat] {
+        for page in [
+            Page::Calendar,
+            Page::Partners,
+            Page::Channels,
+            Page::Settings,
+            Page::Chat,
+        ] {
             window.update(|window, cx| host.update(cx, |host, cx| host.navigate(page, window, cx)));
             window.run_until_parked();
             assert!(window.debug_bounds("host-navigation").is_some());
