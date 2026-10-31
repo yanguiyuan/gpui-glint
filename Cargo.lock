@@ -3262,6 +3262,7 @@ dependencies = [
  "gpui-ce",
  "gpui-glint",
  "gpui_ce_platform",
+ "objc2 0.6.4",
  "serde_json",
  "tokio",
  "winresource",

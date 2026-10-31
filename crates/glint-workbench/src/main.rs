@@ -4,6 +4,7 @@
 )]
 
 mod api_tools;
+mod app_icon;
 mod navigation;
 
 use gpui::{
@@ -236,6 +237,7 @@ fn main() {
     gpui_platform::application()
         .with_assets(GlintAssets)
         .run(|cx: &mut App| {
+            app_icon::install();
             glint_api::initialize(cx);
             glint_agent::initialize(cx);
             cx.on_window_closed(|cx, _| {
