@@ -29,6 +29,7 @@ mod provider_catalog;
 mod provider_ui;
 mod schedule_ui;
 mod schedules;
+mod scroll_follow;
 mod session_history;
 mod skills;
 mod skills_ui;
@@ -906,7 +907,9 @@ impl AgentWorkspace {
             });
         }
         self.save(cx);
-        self.scroll.scroll_to_bottom();
+        if self.history.active == id && self.subagent_ui.selected.is_none() {
+            scroll_follow::follow_if_at_bottom(&self.scroll);
+        }
         let task = cx.spawn(async move |weak, cx| {
             let result = request.response().await;
             let reply = result.as_ref().ok().map(|reply| reply.text.clone());
@@ -983,7 +986,7 @@ impl AgentWorkspace {
                 });
                 this.save(cx);
                 if this.history.active == id && this.subagent_ui.selected.is_none() {
-                    this.scroll.scroll_to_bottom();
+                    scroll_follow::follow_if_at_bottom(&this.scroll);
                 }
                 cx.notify();
             });

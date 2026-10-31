@@ -369,9 +369,9 @@ impl AgentWorkspace {
             while let Ok(event) = receiver.recv().await {
                 if weak
                     .update(cx, |this, cx| {
-                        // Request the bottom on the next layout, when the new
-                        // text/tool rows have their updated heights. Background
-                        // sessions and token-usage updates must not move this view.
+                        // Follow on the next layout only if the reader is still
+                        // at the bottom of the previous layout. Scrolling back
+                        // through history detaches until they return to the end.
                         if !matches!(
                             &event,
                             tools::ToolEvent::ContextUsage { .. }
@@ -382,7 +382,7 @@ impl AgentWorkspace {
                                 .as_ref()
                                 .is_some_and(|(id, _)| *id == this.history.active)
                         {
-                            this.scroll.scroll_to_bottom();
+                            scroll_follow::follow_if_at_bottom(&this.scroll);
                         }
                         match event {
                             tools::ToolEvent::SteeringFailed(error) => {
@@ -423,7 +423,7 @@ impl AgentWorkspace {
                                     .is_some_and(|trace| trace.status.active())
                                 {
                                     if let Some(scroll) = this.selected_subagent_scroll() {
-                                        scroll.scroll_to_bottom();
+                                        scroll_follow::follow_if_at_bottom(&scroll);
                                     }
                                 }
                             }
@@ -971,6 +971,128 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn streaming_follows_the_end_detaches_on_wheel_and_resumes_when_reader_returns(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let (workspace, window) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            for index in 0..20 {
+                workspace.history.active_mut().push(
+                    Role::User,
+                    format!("历史记录 {index}，阅读时不应被新回复打断。\n\n").repeat(8),
+                );
+            }
+            workspace.pending = Some((
+                workspace.history.active,
+                cx.spawn(async move |_, _| std::future::pending::<()>().await),
+            ));
+            workspace.watch_tools(receiver, cx);
+            workspace
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        workspace.update(window, |workspace, cx| {
+            workspace.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        let scroll = workspace.read_with(window, |workspace, _| workspace.scroll.clone());
+        let at_bottom = || scroll.max_offset().y + scroll.offset().y <= px(2.);
+        assert!(scroll.max_offset().y > px(400.));
+        assert!(at_bottom());
+        let update = |paragraphs| {
+            tools::ToolEvent::Transcript(vec![Text("正在输出结果。\n\n".repeat(paragraphs))])
+        };
+        let old_max = scroll.max_offset().y;
+        sender.try_send(update(20)).unwrap();
+        window.run_until_parked();
+        assert!(scroll.max_offset().y > old_max);
+        assert!(
+            at_bottom(),
+            "new content should stay pinned while reading the end"
+        );
+
+        // Use the conversation's left padding so nested Markdown controls cannot consume the wheel.
+        let wheel_position = gpui::point(
+            scroll.bounds().left() + px(8.),
+            scroll.bounds().top() + px(80.),
+        );
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: wheel_position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(360.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        assert!(
+            !at_bottom(),
+            "the reader must be able to scroll back during generation"
+        );
+        let reading_offset = scroll.offset();
+        sender.try_send(update(50)).unwrap();
+        window.run_until_parked();
+        assert_eq!(
+            scroll.offset(),
+            reading_offset,
+            "streaming must preserve the history position"
+        );
+
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: wheel_position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-100000.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        assert!(at_bottom());
+        let old_max = scroll.max_offset().y;
+        sender.try_send(update(80)).unwrap();
+        window.run_until_parked();
+        assert!(scroll.max_offset().y > old_max);
+        assert!(
+            at_bottom(),
+            "returning to the bottom should resume following automatically"
+        );
+
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: wheel_position,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(360.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        let reading_offset = scroll.offset();
+        workspace.update(window, |workspace, cx| {
+            let blocks = std::mem::take(&mut workspace.transcript);
+            workspace
+                .history
+                .active_mut()
+                .push(Role::Agent, "正在输出结果。\n\n".repeat(80));
+            workspace
+                .history
+                .active_mut()
+                .messages
+                .last_mut()
+                .unwrap()
+                .blocks = blocks;
+            workspace.pending = None;
+            workspace.tool_listener = None;
+            scroll_follow::follow_if_at_bottom(&workspace.scroll);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert_eq!(
+            scroll.offset(),
+            reading_offset,
+            "finishing the reply must not pull the reader down"
+        );
+    }
 
     #[test]
     fn historical_call_without_result_is_closed_while_streaming_call_is_pending() {
