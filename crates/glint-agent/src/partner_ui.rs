@@ -6,6 +6,7 @@ mod deletion;
 mod memories;
 mod overview;
 mod settings;
+mod transfer;
 mod wake;
 use crate::partners;
 use gpui::ColorExt;
@@ -71,6 +72,7 @@ pub struct State {
     cancel_focus: gpui::FocusHandle,
     confirm_focus: gpui::FocusHandle,
     avatar_task: Option<Task<()>>,
+    transfer_task: Option<Task<()>>,
     expanded: Option<Uuid>,
 }
 impl State {
@@ -109,6 +111,7 @@ impl State {
             cancel_focus: cx.focus_handle(),
             confirm_focus: cx.focus_handle(),
             avatar_task: None,
+            transfer_task: None,
             expanded: None,
         }
     }
@@ -423,11 +426,23 @@ impl AgentWorkspace {
                     .gap_2()
                     .px_2()
                     .mb_4()
+                    .when(compact, |d| d.flex_col())
                     .when(!compact, |d| {
                         d.child(self.partner_section("伙伴"))
                             .child(self.partner_badge(partners.len().to_string(), false))
                             .child(div().flex_1())
                     })
+                    .child(
+                        IconButton::new(Icon::Upload, "导入伙伴")
+                            .theme(self.theme)
+                            .render()
+                            .id("import-partner")
+                            .debug_selector(|| "import-partner".into())
+                            .when(self.partners_ui.transfer_task.is_some(), |button| {
+                                button.opacity(0.5)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.import_partner_file(cx))),
+                    )
                     .child(
                         IconButton::new(Icon::Plus, "创建空白伙伴")
                             .theme(self.theme)
@@ -689,6 +704,19 @@ impl AgentWorkspace {
                             ),
                     )
                     .child(
+                        IconButton::new(Icon::Download, "导出伙伴与头像")
+                            .theme(self.theme)
+                            .render()
+                            .id("export-partner")
+                            .debug_selector(|| "export-partner".into())
+                            .when(self.partners_ui.transfer_task.is_some(), |button| {
+                                button.opacity(0.5)
+                            })
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.export_partner_file(id, cx)),
+                            ),
+                    )
+                    .child(
                         IconButton::new(Icon::Settings, "编辑伙伴设定")
                             .theme(self.theme)
                             .render()
@@ -791,6 +819,14 @@ impl AgentWorkspace {
             );
         } else {
             workspace = workspace
+                .when_some(self.partners_ui.notice.as_ref(), |body, notice| {
+                    body.child(
+                        div()
+                            .px(px(padding))
+                            .pt_3()
+                            .child(self.partner_notice(notice.clone())),
+                    )
+                })
                 .child(
                     div()
                         .px(px(padding))
@@ -962,6 +998,80 @@ mod tests {
         let id = host.read_with(window, |h, _| h.partners_ui.selected.unwrap());
         (dir, host, window, id)
     }
+
+    #[gpui::test]
+    fn partner_transfer_file_pickers_include_picture_and_cancel_without_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (dir, host, window, id) = fixture(cx);
+        let picture = dir.path().join("avatar.png");
+        image::RgbaImage::from_pixel(32, 32, image::Rgba([50, 100, 200, 255]))
+            .save(&picture)
+            .unwrap();
+        host.update(window, |h, cx| {
+            let repo = h.partner_repo();
+            let reference = repo.import_avatar(id, &picture).unwrap();
+            repo.update(id, "知微", &reference, "迁移后继续一起工作")
+                .unwrap();
+            let partner = repo
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.id == id)
+                .unwrap();
+            h.select_partner(&partner, cx);
+            cx.notify();
+        });
+        window.run_until_parked();
+        let file = dir.path().join("知微.glint-partner.json");
+        let export = window.debug_bounds("export-partner").unwrap();
+        window.simulate_click(export.center(), gpui::Modifiers::default());
+        assert!(window.did_prompt_for_new_path());
+        window.simulate_new_path_selection(|_| Some(file.clone()));
+        window.run_until_parked();
+        assert!(file.is_file());
+        host.read_with(window, |h, _| {
+            assert!(h.partners_ui.transfer_task.is_none())
+        });
+        let import = window.debug_bounds("import-partner").unwrap();
+        window.simulate_click(import.center(), gpui::Modifiers::default());
+        assert!(window.did_prompt_for_paths());
+        window.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            Some(vec![file.clone()])
+        });
+        window.run_until_parked();
+        host.read_with(window, |h, _| {
+            let repo = h.partner_repo();
+            assert_eq!(repo.list().unwrap().len(), 2);
+            let imported = repo
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|p| Some(p.id) == h.partners_ui.selected)
+                .unwrap();
+            assert_ne!(imported.id, id);
+            assert_eq!(imported.name, "知微");
+            assert!(repo.avatar_path(&imported.avatar).unwrap().is_file());
+            assert!(h.partners_ui.notice.as_ref().unwrap().contains("已导入"));
+            assert!(h.partners_ui.transfer_task.is_none());
+        });
+        let import = window.debug_bounds("import-partner").unwrap();
+        window.simulate_click(import.center(), gpui::Modifiers::default());
+        window.simulate_path_prompt_response(|_| None);
+        window.run_until_parked();
+        host.update(window, |h, cx| {
+            assert_eq!(h.partner_repo().list().unwrap().len(), 2);
+            h.partners_ui
+                .name
+                .update(cx, |entry, cx| entry.set_value("尚未保存的名字", cx));
+            let selected = h.partners_ui.selected.unwrap();
+            h.export_partner_file(selected, cx);
+            assert!(h.partners_ui.transfer_task.is_none());
+            assert!(h.partners_ui.notice.as_ref().unwrap().contains("先保存"));
+        });
+    }
+
     #[gpui::test]
     fn layout_separates_settings_and_stacks_overview_at_narrow_width(
         cx: &mut gpui::TestAppContext,

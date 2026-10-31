@@ -27,7 +27,7 @@ PRAGMA user_version=3;
 COMMIT;
 "#;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Partner {
     pub id: Uuid,
     pub name: String,

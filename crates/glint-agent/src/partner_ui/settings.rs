@@ -117,6 +117,17 @@ impl AgentWorkspace {
                             }),
                     ),
             )
+            .child(
+                div().mt_6().pt_5().border_t_1().border_color(rgb(p.border)).flex().flex_col().gap_3()
+                    .child(div().font_weight(FontWeight::MEDIUM).child("迁移伙伴"))
+                    .child(div().text_size(px(12.)).text_color(rgb(p.text_muted)).child("将设定、头像、人格、全部记忆、经历和唤醒计划保存到一个迁移文件。导入时创建新伙伴，唤醒计划默认暂停。"))
+                    .child(div().child(
+                        Button::new("导出伙伴").icon(Icon::Download).theme(self.theme)
+                            .when(self.partners_ui.transfer_task.is_some(), |button| button.disabled())
+                            .render().id("export-partner-settings").debug_selector(|| "export-partner-settings".into())
+                            .on_click(cx.listener(move |this,_,_,cx| this.export_partner_file(id,cx)))
+                    ))
+            )
             .into_any_element()
     }
 }

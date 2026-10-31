@@ -20,6 +20,7 @@ mod memory_ui;
 mod model;
 mod outline;
 mod partner_chat;
+mod partner_transfer;
 mod partner_ui;
 mod partners;
 mod project_context;
