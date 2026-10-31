@@ -51,6 +51,8 @@ struct DraftImageFile {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
+    pub compaction: Option<crate::compaction::Summary>,
+    #[serde(default)]
     pub partner_id: Option<Uuid>,
     #[serde(default)]
     pub partner_goal: Option<Uuid>,
@@ -76,6 +78,7 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self {
+            compaction: None,
             partner_id: None,
             partner_goal: None,
             wake_mode: None,
@@ -126,6 +129,10 @@ impl Session {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct History {
     #[serde(default)]
+    pub partner_models: std::collections::HashMap<Uuid, crate::partner_model::Selection>,
+    #[serde(default)]
+    pub compaction_settings: crate::compaction::Settings,
+    #[serde(default)]
     pub preferred_partner: Option<Uuid>,
     #[serde(default)]
     pub access_mode: crate::tools::AccessMode,
@@ -143,6 +150,8 @@ impl Default for History {
     fn default() -> Self {
         let session = Session::new();
         Self {
+            partner_models: Default::default(),
+            compaction_settings: Default::default(),
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
             projects: vec![],

@@ -42,21 +42,30 @@ impl AgentWorkspace {
             .map(|p| p.name)
     }
     pub fn refresh_calendar(&self, cx: &mut Context<Self>) {
-        let mut markers = std::collections::HashMap::new();
+        let mut titles: std::collections::HashMap<_, Vec<String>> = Default::default();
         if let Ok(mut store) = self.schedules.lock() {
             let _ = store.refresh();
-            for task in &store.tasks {
-                *markers.entry(task.run_at.date_naive()).or_insert(0) += 1;
+            let mut tasks: Vec<_> = store.tasks.iter().collect();
+            tasks.sort_by_key(|task| (task.run_at, task.id));
+            for task in tasks {
+                titles
+                    .entry(task.run_at.date_naive())
+                    .or_default()
+                    .push(task.title.clone());
                 if let Some(last) = task
                     .last_run
                     .filter(|last| last.date_naive() != task.run_at.date_naive())
                 {
-                    *markers.entry(last.date_naive()).or_insert(0) += 1;
+                    titles
+                        .entry(last.date_naive())
+                        .or_default()
+                        .push(task.title.clone());
                 }
             }
         }
         self.calendar.update(cx, |calendar, cx| {
-            calendar.set_markers(markers, cx);
+            calendar.set_markers(Default::default(), cx);
+            calendar.set_task_titles(titles, cx);
             calendar.set_theme(self.theme, cx);
         });
     }
@@ -430,7 +439,11 @@ impl AgentWorkspace {
                             });
                         match due {
                             Ok(Some(task)) => {
-                                let config = match task.provider_id {
+                                let partner_config = task.partner_id
+                                    .and_then(|id| this.history.partner_models.get(&id))
+                                    .and_then(|selection| this.catalog.providers.iter()
+                                        .find(|p| p.id == selection.provider_id).cloned());
+                                let config = partner_config.or_else(|| match task.provider_id {
                                     Some(id) => this
                                         .catalog
                                         .providers
@@ -438,7 +451,7 @@ impl AgentWorkspace {
                                         .find(|provider| provider.id == id)
                                         .cloned(),
                                     None => this.catalog.active.map(|_| this.provider.clone()),
-                                };
+                                });
                                 if let Some(mut config) = config {
                                     if !task.model.is_empty() {
                                         config.model = task.model.clone();

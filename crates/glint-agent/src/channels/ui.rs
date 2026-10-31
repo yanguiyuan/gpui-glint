@@ -127,7 +127,13 @@ impl AgentWorkspace {
             || self.pending.is_some()
             || self.preparing.is_some()
             || !self.queued_requests.is_empty()
-            || !self.provider.enabled
+            || (!self.provider.enabled
+                && !self.history.partner_models.values().any(|selection| {
+                    self.catalog
+                        .providers
+                        .iter()
+                        .any(|p| p.id == selection.provider_id && p.enabled)
+                }))
             || !self.storage_readable
         {
             return;

@@ -103,6 +103,8 @@ pub enum ProviderTab {
 }
 
 pub struct Settings {
+    pub compaction_threshold: Entity<TextEntry>,
+    compaction_message: Option<String>,
     pub discovered: Vec<discovery::DiscoveredProvider>,
     pub selected: Option<Uuid>,
     original: provider::Config,
@@ -146,6 +148,8 @@ impl Settings {
             })
         };
         Self {
+            compaction_threshold: entry("1–99，例如 75", "75"),
+            compaction_message: None,
             selected,
             discovered,
             models: config.models.clone(),
@@ -247,6 +251,7 @@ impl Settings {
         }
         for entry in [
             &self.search,
+            &self.compaction_threshold,
             &self.name,
             &self.url,
             &self.model,
@@ -270,10 +275,7 @@ impl AgentWorkspace {
         let chip = model_chip(&self.catalog);
         self.composer.update(cx, |composer, cx| {
             composer.set_menu_chip(chip, cx);
-            composer.set_disabled(
-                !self.provider.enabled || self.pending.is_some() || self.preparing.is_some(),
-                cx,
-            );
+            composer.set_disabled(!self.active_model_enabled() || self.preparing.is_some(), cx);
         });
         self.sync_context_usage(cx);
         self.context_models = None;
@@ -318,8 +320,8 @@ impl AgentWorkspace {
         }
         if self.provider.id == id {
             self.provider = self.catalog.current();
-            self.sync_context_usage(cx);
         }
+        self.sync_context_usage(cx);
         cx.notify();
     }
 
@@ -1495,12 +1497,42 @@ impl AgentWorkspace {
                         "通过 Shift + Enter 插入新行。".into(),
                         "Enter 发送".into(),
                     ));
-                page = page.child(card).child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(p.text_muted))
-                        .child("在左侧选择供应商，分别配置连接和模型。"),
-                );
+                card = card.child(div().border_t_1().border_color(rgb(p.border)))
+                    .child(div().py_4().flex().items_center().gap_3()
+                        .child(div().flex_1().flex().flex_col().gap_1()
+                            .child("自动压缩会话")
+                            .child(div().text_size(px(12.)).text_color(rgb(p.text_muted))
+                                .child("发送前检查上下文占用；达到阈值时摘要旧消息，保留最近两轮。")))
+                        .child(Button::new(if self.history.compaction_settings.enabled { "已开启" } else { "已关闭" })
+                            .kind(ButtonKind::Plain).size(ButtonSize::Small).theme(self.theme).render()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.history.compaction_settings.enabled = !this.history.compaction_settings.enabled;
+                                this.save(cx); cx.notify();
+                            }))))
+                    .child(div().py_4().flex().items_center().gap_3()
+                        .child(div().flex_1().child("自动压缩阈值"))
+                        .child(div().w(px(110.)).child(self.provider_settings.compaction_threshold.clone()))
+                        .child("%")
+                        .child(Button::new("保存").size(ButtonSize::Small).theme(self.theme).render()
+                            .debug_selector(|| "save-compaction-settings".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let value = this.provider_settings.compaction_threshold.read(cx).value().to_owned();
+                                match crate::compaction::parse_threshold(&value) {
+                                    Ok(value) => {
+                                        this.history.compaction_settings.threshold_percent = value;
+                                        this.provider_settings.compaction_message = Some("压缩设置已保存".into());
+                                        this.save(cx);
+                                    }
+                                    Err(error) => this.provider_settings.compaction_message = Some(error),
+                                }
+                                cx.notify();
+                            }))))
+                    .child(div().pb_4().text_size(px(12.)).text_color(rgb(p.text_muted))
+                        .child("原始消息保留在本机。压缩会调用当前模型，产生额外用量；上下文占用未知时不会自动压缩，可在会话顶部手动压缩。"))
+                    .when_some(self.provider_settings.compaction_message.clone(), |card, message| {
+                        card.child(div().pb_4().text_size(px(12.)).child(message))
+                    });
+                page = page.child(card);
             }
             Section::Appearance => {
                 page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("主题"));
@@ -1635,6 +1667,48 @@ mod context_tests {
                 }))
         }
     }
+    #[gpui::test]
+    fn compaction_settings_validate_and_persist_custom_percentage(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            h.page = crate::Page::Settings;
+            h
+        });
+        window.simulate_resize(size(px(1440.), px(1200.)));
+        window.run_until_parked();
+        for (input, expected) in [("90", 90), ("100", 90), ("75%", 75)] {
+            host.update(window, |h, cx| {
+                h.provider_settings
+                    .compaction_threshold
+                    .update(cx, |e, cx| e.set_value(input, cx));
+                cx.notify();
+            });
+            window.run_until_parked();
+            let save = window.debug_bounds("save-compaction-settings").unwrap();
+            window.simulate_click(save.center(), gpui::Modifiers::default());
+            window.run_until_parked();
+            host.read_with(window, |h, _| {
+                assert_eq!(h.history.compaction_settings.threshold_percent, expected)
+            });
+        }
+        host.read_with(window, |h, _| {
+            h.history.save(&h.path).unwrap();
+            assert_eq!(
+                History::load(&h.path)
+                    .unwrap()
+                    .compaction_settings
+                    .threshold_percent,
+                75
+            );
+        });
+    }
+
     #[gpui::test]
     fn repeated_add_labels_dispatch_to_the_correct_model_once(cx: &mut gpui::TestAppContext) {
         let (view, window) = cx.add_window_view(|_, _| ModelRows { added: Vec::new() });

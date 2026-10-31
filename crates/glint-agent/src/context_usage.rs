@@ -51,14 +51,19 @@ pub fn state(config: &provider::Config, session: &model::Session) -> ComposerCon
 
 impl AgentWorkspace {
     pub fn sync_context_usage(&self, cx: &mut Context<Self>) {
-        let state = state(&self.provider, self.history.active());
-        self.composer.update(cx, |composer, cx| {
-            composer.set_context_state(Some(state), cx)
-        });
+        let config = self.session_model(self.history.active, self.provider.clone());
+        let state = config
+            .as_ref()
+            .map(|config| state(config, self.history.active()))
+            .ok();
+        self.composer
+            .update(cx, |composer, cx| composer.set_context_state(state, cx));
     }
 
     pub fn refresh_context_models(&mut self, cx: &mut Context<Self>) {
-        let config = self.provider.clone();
+        let Ok(config) = self.session_model(self.history.active, self.provider.clone()) else {
+            return;
+        };
         if !config.enabled
             || config.kind != provider::Kind::Compatible
             || self.context_models.is_some()

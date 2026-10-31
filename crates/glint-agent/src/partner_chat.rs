@@ -336,4 +336,78 @@ mod tests {
             assert!(h.history.active().partner_id.is_none());
         });
     }
+    #[gpui::test]
+    fn companion_model_routes_requests_and_hides_model_controls(cx: &mut gpui::TestAppContext) {
+        let (_dir, host, window, a, b) = fixture(cx);
+        let provider_id = host.update(window, |h, cx| {
+            let config = provider::Config {
+                enabled: true,
+                name: "Partner provider".into(),
+                model: "a".into(),
+                models: vec!["a".into(), "b".into()],
+                ..Default::default()
+            };
+            let id = config.id;
+            h.catalog.providers.push(config);
+            h.history.partner_models.insert(
+                a,
+                crate::partner_model::Selection {
+                    provider_id: id,
+                    model: "b".into(),
+                    thinking: "high".into(),
+                },
+            );
+            h.select_partner_key(&a.to_string(), false, cx);
+            let chosen = h
+                .session_model(h.history.active, h.provider.clone())
+                .unwrap();
+            assert_eq!(chosen.model, "b");
+            assert_eq!(chosen.id, id);
+            assert_eq!(
+                h.session_thinking(h.history.active),
+                provider::Thinking::High
+            );
+            h.history
+                .active_mut()
+                .push(Role::User, "measured turn".into());
+            h.history.active_mut().context = Some(context_usage::ContextSnapshot {
+                provider_id: id,
+                model: "b".into(),
+                used_tokens: Some(750),
+                capacity_tokens: Some(1000),
+            });
+            assert!(compaction::should_compact(
+                &chosen,
+                h.history.active(),
+                &h.history.compaction_settings
+            ));
+            id
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("composer-chip:model").is_none());
+        assert!(window.debug_bounds("composer-chip:thinking").is_none());
+        assert!(window.debug_bounds("composer-chip:partner").is_some());
+        host.update(window, |h, cx| {
+            h.select_partner_key(&b.to_string(), false, cx);
+            let fallback = h
+                .session_model(h.history.active, h.provider.clone())
+                .unwrap();
+            assert_eq!(fallback.id, h.provider.id);
+            h.select_partner_key("none", false, cx);
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("composer-chip:model").is_some());
+        assert!(window.debug_bounds("composer-chip:thinking").is_some());
+        host.update(window, |h, cx| {
+            h.select_partner_key(&a.to_string(), false, cx);
+            h.history.save(&h.path).unwrap();
+            let loaded = History::load(&h.path).unwrap();
+            assert_eq!(loaded.partner_models[&a].provider_id, provider_id);
+            h.catalog.providers.clear();
+            assert!(
+                h.session_model(h.history.active, h.provider.clone())
+                    .is_err()
+            );
+        });
+    }
 }

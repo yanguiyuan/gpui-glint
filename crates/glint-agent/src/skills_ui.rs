@@ -122,11 +122,19 @@ impl AgentWorkspace {
             .filter(|skill| skill.enabled)
             .map(|skill| (SharedString::from(format!("${}", skill.name)), color))
             .collect();
+        let has_partner = self.history.active().partner_id.is_some();
+        let available = self
+            .session_model(self.history.active, self.provider.clone())
+            .is_ok_and(|config| config.enabled);
         self.composer.update(cx, |composer, cx| {
+            composer.set_menu_chip_visible("model", !has_partner, cx);
+            composer.set_menu_chip_visible("thinking", !has_partner, cx);
+            composer.set_disabled(!available || self.preparing.is_some(), cx);
             composer.set_context_sections(sections, cx);
             composer.set_menu_chip(partner_chip, cx);
             composer.register_context_tokens(tokens, cx);
         });
+        self.sync_context_usage(cx);
     }
     pub fn reset_skill_context(&mut self, cx: &mut Context<Self>) {
         self.skills_ui.catalog = None;

@@ -385,6 +385,7 @@ pub struct Composer {
     theme: ThemePreset,
     chips: Vec<ComposerChip>,
     menu_chips: Vec<ComposerChip>,
+    hidden_menu_chips: std::collections::HashSet<SharedString>,
     chip_values: HashMap<SharedString, SharedString>,
     open_chip: Option<SharedString>,
     context_usage: Option<ComposerContextState>,
@@ -475,6 +476,7 @@ impl Composer {
             theme: ThemePreset::default(),
             chips: Vec::new(),
             menu_chips: Vec::new(),
+            hidden_menu_chips: Default::default(),
             chip_values: HashMap::new(),
             open_chip: None,
             context_usage: None,
@@ -554,6 +556,27 @@ impl Composer {
         }
         self.open_chip = None;
         cx.notify();
+    }
+
+    /// Changes toolbar visibility without resetting the prompt, selection or queue.
+    pub fn set_menu_chip_visible(
+        &mut self,
+        id: impl Into<SharedString>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let id = id.into();
+        let changed = if visible {
+            self.hidden_menu_chips.remove(&id)
+        } else {
+            self.hidden_menu_chips.insert(id.clone())
+        };
+        if changed {
+            if self.open_chip.as_ref() == Some(&id) {
+                self.open_chip = None;
+            }
+            cx.notify();
+        }
     }
 
     /// Makes the chip with this id open the context panel (the `+` /
@@ -1236,7 +1259,12 @@ impl Render for Composer {
             );
         }
         bar = bar
-            .children(self.menu_chips.iter().map(|chip| chip_button(chip, cx)))
+            .children(
+                self.menu_chips
+                    .iter()
+                    .filter(|chip| !self.hidden_menu_chips.contains(&chip.id))
+                    .map(|chip| chip_button(chip, cx)),
+            )
             .child(send_button);
 
         let editor_scroll = div()

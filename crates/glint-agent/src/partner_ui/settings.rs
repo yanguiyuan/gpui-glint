@@ -2,6 +2,22 @@
 use super::*;
 
 impl AgentWorkspace {
+    fn partner_model_draft(&self, cx: &App) -> Option<crate::partner_model::Selection> {
+        let key = self.partners_ui.model.read(cx).value()?;
+        let (id, model) = key.split_once(':')?;
+        Some(crate::partner_model::Selection {
+            provider_id: Uuid::parse_str(id).ok()?,
+            model: model.into(),
+            thinking: self
+                .partners_ui
+                .thinking
+                .read(cx)
+                .value()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "default".into()),
+        })
+    }
+
     pub(super) fn partner_settings(
         &self,
         partner: &partners::Partner,
@@ -9,7 +25,9 @@ impl AgentWorkspace {
     ) -> gpui::AnyElement {
         let p = self.theme.palette();
         let id = partner.id;
-        let dirty = self.partners_ui.name.read(cx).value() != partner.name
+        let selection = self.partner_model_draft(cx);
+        let dirty = selection.as_ref() != self.history.partner_models.get(&id)
+            || self.partners_ui.name.read(cx).value() != partner.name
             || self.partners_ui.avatar.read(cx).value() != partner.avatar
             || self.partners_ui.description.read(cx).value() != partner.description;
         div()
@@ -32,6 +50,12 @@ impl AgentWorkspace {
                             .child("只定义你想定义的部分，其余留给相处。"),
                     ),
             )
+            .child(div().flex().flex_col().gap_3()
+                .child(self.partner_section("模型"))
+                .child(div().debug_selector(|| "partner-model-setting".into()).child(self.partners_ui.model.clone()))
+                .child(div().debug_selector(|| "partner-thinking-setting".into()).child(self.partners_ui.thinking.clone()))
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted))
+                    .child("为这位伙伴选择供应商、模型与思考强度；新请求和会话压缩使用此配置。")))
             .child(self.partner_avatar_settings(partner, cx))
             .child(
                 InputField::new("名字可以以后再起")
@@ -99,6 +123,12 @@ impl AgentWorkspace {
                                     this.partners_ui.description.read(cx).value(),
                                 );
                                 if result.is_ok() {
+                                    if let Some(selection) = this.partner_model_draft(cx) {
+                                        this.history.partner_models.insert(id, selection);
+                                    } else {
+                                        this.history.partner_models.remove(&id);
+                                    }
+                                    this.save(cx);
                                     this.sync_skill_context(cx);
                                 }
                                 this.partners_ui.notice =

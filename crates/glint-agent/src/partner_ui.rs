@@ -10,7 +10,9 @@ mod transfer;
 mod wake;
 use crate::partners;
 use gpui::ColorExt;
-use gpui_glint::components::{Dialog, InputField, PromptEditor, Switch};
+use gpui_glint::components::{
+    Dialog, InputField, PromptEditor, Select, SelectEvent, SelectOption, Switch,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
@@ -57,6 +59,8 @@ impl MemoryFilter {
     }
 }
 pub struct State {
+    model: Entity<Select>,
+    thinking: Entity<Select>,
     pub selected: Option<Uuid>,
     name: Entity<TextEntry>,
     avatar: Entity<TextEntry>,
@@ -81,6 +85,8 @@ impl State {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }
         self.description.update(cx, |e, cx| e.set_theme(theme, cx));
+        self.model.update(cx, |e, cx| e.set_theme(theme, cx));
+        self.thinking.update(cx, |e, cx| e.set_theme(theme, cx));
     }
     pub fn new(cx: &mut Context<AgentWorkspace>) -> Self {
         let search = cx.new(|cx| TextEntry::new(cx, "搜索历史，包括沉睡记忆…", ""));
@@ -95,7 +101,42 @@ impl State {
             cx.observe(editor, |_, _, cx| cx.notify()).detach();
         }
         cx.observe(&description, |_, _, cx| cx.notify()).detach();
+        let model = cx.new(|cx| {
+            Select::new([SelectOption::new("inherit", "跟随普通 Agent 模型")], cx)
+                .selected("inherit")
+                .searchable(true)
+                .width(340.)
+        });
+        let thinking = cx.new(|cx| {
+            Select::new(
+                thinking_chip()
+                    .options
+                    .into_iter()
+                    .map(|o| SelectOption::new(o.value, o.label)),
+                cx,
+            )
+            .selected("default")
+            .disabled(true)
+            .width(200.)
+        });
+        for select in [&model, &thinking] {
+            cx.subscribe(select, |this, select, event: &SelectEvent, cx| {
+                let SelectEvent::Changed(value) = event;
+                if select.entity_id() == this.partners_ui.model.entity_id() {
+                    this.partners_ui.thinking.update(cx, |thinking, cx| {
+                        thinking.set_disabled(value.as_ref() == "inherit", cx)
+                    });
+                }
+                select.update(cx, |select, cx| {
+                    select.set_selected(Some(value.clone()), cx)
+                });
+                cx.notify();
+            })
+            .detach();
+        }
         Self {
+            model,
+            thinking,
             partner_search,
             tab: Tab::Overview,
             filter: MemoryFilter::All,
@@ -141,6 +182,23 @@ impl AgentWorkspace {
         partners::Repository::new(self.path.clone())
     }
     fn select_partner(&mut self, p: &partners::Partner, cx: &mut Context<Self>) {
+        let selection = self.history.partner_models.get(&p.id);
+        let model = selection
+            .map(|s| format!("{}:{}", s.provider_id, s.model))
+            .unwrap_or_else(|| "inherit".into());
+        let thinking = selection
+            .map(|s| s.thinking.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".into());
+        let options = self.partner_model_options();
+        self.partners_ui.model.update(cx, |select, cx| {
+            select.set_options(options, cx);
+            select.set_selected(Some(model.into()), cx);
+        });
+        self.partners_ui.thinking.update(cx, |select, cx| {
+            select.set_selected(Some(thinking.into()), cx);
+            select.set_disabled(selection.is_none(), cx);
+        });
         self.partners_ui.selected = Some(p.id);
         self.partners_ui.confirming_delete = None;
         self.partners_ui.confirming_partner = None;
@@ -1302,6 +1360,46 @@ mod tests {
             assert!(h.history.active().messages.is_empty());
         });
         assert!(window.debug_bounds("chat-partner").is_some());
+    }
+
+    #[gpui::test]
+    fn partner_settings_save_model_and_reasoning_independently_of_global_model(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, host, window, id) = fixture(cx);
+        let provider = host.update(window, |h, cx| {
+            let config = provider::Config {
+                enabled: true,
+                model: "model-a".into(),
+                models: vec!["model-a".into(), "model-b".into()],
+                ..Default::default()
+            };
+            let provider = config.id;
+            h.catalog.providers.push(config);
+            h.open_partner_settings(id, cx);
+            h.partners_ui.model.update(cx, |select, cx| {
+                cx.emit(SelectEvent::Changed(format!("{provider}:model-b").into()));
+                select.set_selected(Some(format!("{provider}:model-b").into()), cx);
+            });
+            h.partners_ui.thinking.update(cx, |select, cx| {
+                select.set_selected(Some("high".into()), cx)
+            });
+            cx.notify();
+            provider
+        });
+        window.simulate_resize(size(px(1440.), px(1800.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("partner-model-setting").is_some());
+        let save = window.debug_bounds("save-partner-settings").unwrap();
+        window.simulate_click(save.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        host.read_with(window, |h, _| {
+            let selection = &h.history.partner_models[&id];
+            assert_eq!(selection.provider_id, provider);
+            assert_eq!(selection.model, "model-b");
+            assert_eq!(selection.thinking, "high");
+            assert_ne!(h.provider.id, provider);
+        });
     }
 }
 
