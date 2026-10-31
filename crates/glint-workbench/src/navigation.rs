@@ -251,7 +251,7 @@ impl Render for Navigation {
             .child(separator("nav-common-divider"))
             .child(self.route_button(
                 "nav-plugins",
-                Icon::Script,
+                Icon::Puzzle,
                 "插件管理",
                 Route::Api(Api::Plugins),
                 cx,

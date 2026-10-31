@@ -13,11 +13,12 @@ pub enum CalendarEvent {
     MonthChanged(NaiveDate),
 }
 
-/// A standalone month calendar with a selected day and per-date event counts.
+/// A standalone month calendar with a selected day and per-date task titles and overflow counts.
 pub struct Calendar {
     month: NaiveDate,
     selected: Option<NaiveDate>,
     markers: HashMap<NaiveDate, usize>,
+    task_titles: HashMap<NaiveDate, Vec<String>>,
     day_height: f32,
     theme: ThemePreset,
 }
@@ -31,6 +32,7 @@ impl Calendar {
             month: today.with_day(1).unwrap(),
             selected: Some(today),
             markers: HashMap::new(),
+            task_titles: HashMap::new(),
             day_height: 72.,
             theme: ThemePreset::default(),
         }
@@ -60,6 +62,19 @@ impl Calendar {
             cx.notify();
         }
     }
+    /// Ordered task titles shown in each day cell. Counts remain available via
+    /// `set_markers` for callers that only have aggregate data.
+    pub fn set_task_titles(
+        &mut self,
+        titles: HashMap<NaiveDate, Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.task_titles != titles {
+            self.task_titles = titles;
+            cx.notify();
+        }
+    }
+
     pub fn set_selected(&mut self, date: NaiveDate, cx: &mut Context<Self>) {
         self.selected = Some(date);
         self.month = date.with_day(1).unwrap();
@@ -88,6 +103,29 @@ pub(crate) fn calendar_days(month: NaiveDate) -> Vec<NaiveDate> {
     (0..42)
         .filter_map(|index| first.checked_add_signed(Duration::days(index - offset)))
         .collect()
+}
+
+/// Reserve a row for the overflow count when all titles cannot fit.
+fn task_rows(height: f32, title_count: usize, total: usize) -> (usize, usize) {
+    let slots = ((height - 16. - 20. - 4.).max(0.) / 14.).floor() as usize;
+    let titles = if total <= slots {
+        title_count.min(total).min(3)
+    } else {
+        title_count.min(slots.saturating_sub(1)).min(3)
+    };
+    let titles = if total > titles && titles == slots {
+        titles.saturating_sub(1)
+    } else {
+        titles
+    };
+    (
+        titles,
+        if slots > 0 {
+            total.saturating_sub(titles)
+        } else {
+            0
+        },
+    )
 }
 
 impl Render for Calendar {
@@ -169,7 +207,18 @@ impl Render for Calendar {
             });
             for (column, date) in week.iter().copied().enumerate() {
                 let selected = self.selected == Some(date);
-                let count = self.markers.get(&date).copied().unwrap_or(0);
+                let titles = self
+                    .task_titles
+                    .get(&date)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let count = self
+                    .markers
+                    .get(&date)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(titles.len());
+                let (visible, remaining) = task_rows(self.day_height, titles.len(), count);
                 row = row.child(
                     div()
                         .id(gpui::SharedString::from(format!("calendar-{date}")))
@@ -177,6 +226,7 @@ impl Render for Calendar {
                         .min_w_0()
                         .h(px(self.day_height))
                         .p_2()
+                        .overflow_hidden()
                         .when(column > 0, |cell| {
                             cell.border_l_1().border_color(rgb(p.border))
                         })
@@ -192,6 +242,8 @@ impl Render for Calendar {
                         }))
                         .child(
                             div()
+                                .h(px(20.))
+                                .line_height(px(20.))
                                 .font_weight(if selected || date == today {
                                     gpui::FontWeight::SEMIBOLD
                                 } else {
@@ -202,10 +254,40 @@ impl Render for Calendar {
                         .when(count > 0, |cell| {
                             cell.child(
                                 div()
-                                    .mt_2()
+                                    .mt_1()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
                                     .text_size(px(10.))
                                     .text_color(rgb(p.accent))
-                                    .child(format!("{count} 项任务")),
+                                    .children(titles.iter().take(visible).enumerate().map(
+                                        |(index, title)| {
+                                            let selector = format!("calendar-task-{date}-{index}");
+                                            div()
+                                                .h(px(14.))
+                                                .line_height(px(14.))
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_ellipsis()
+                                                .debug_selector(move || selector.clone())
+                                                .child(title.clone())
+                                        },
+                                    ))
+                                    .when(remaining > 0, |list| {
+                                        list.child(
+                                            div()
+                                                .h(px(14.))
+                                                .line_height(px(14.))
+                                                .w_full()
+                                                .text_ellipsis()
+                                                .child(if visible == 0 {
+                                                    format!("{remaining} 项任务")
+                                                } else {
+                                                    format!("另 {remaining} 项任务")
+                                                }),
+                                        )
+                                    }),
                             )
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -224,6 +306,50 @@ impl Render for Calendar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_rows_reserve_space_for_overflow_and_keep_totals() {
+        assert_eq!(task_rows(72., 1, 1), (1, 0));
+        assert_eq!(task_rows(72., 2, 2), (2, 0));
+        assert_eq!(task_rows(72., 5, 5), (1, 4));
+        assert_eq!(task_rows(112., 5, 5), (3, 2));
+        assert_eq!(task_rows(72., 0, 5), (0, 5));
+        assert_eq!(task_rows(36., 5, 5), (0, 0));
+        for height in [56., 72., 88., 112., 160.] {
+            for total in 0..30 {
+                let (visible, remaining) = task_rows(height, total, total);
+                assert_eq!(visible + remaining, total);
+                let rows = visible + usize::from(remaining > 0);
+                assert!(rows as f32 * 14. <= height - 40.);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn calendar_shows_titles_that_fit_and_keeps_date_selection(cx: &mut gpui::TestAppContext) {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        let (calendar, window) = cx.add_window_view(|_, cx| Calendar::new(cx).selected(date));
+        window.simulate_resize(gpui::size(px(840.), px(800.)));
+        calendar.update(window, |calendar, cx| {
+            calendar.set_task_titles(
+                HashMap::from([(date, (0..5).map(|index| format!("Task {index}")).collect())]),
+                cx,
+            )
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("calendar-task-2026-10-31-0").is_some());
+        assert!(window.debug_bounds("calendar-task-2026-10-31-1").is_none());
+        calendar.update(window, |calendar, cx| {
+            calendar.day_height = 112.;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("calendar-task-2026-10-31-2").is_some());
+        assert!(window.debug_bounds("calendar-task-2026-10-31-3").is_none());
+        calendar.read_with(window, |calendar, _| {
+            assert_eq!(calendar.value(), Some(date))
+        });
+    }
+
     #[test]
     fn month_grid_covers_leap_day_and_year_boundaries_from_monday() {
         for month in [

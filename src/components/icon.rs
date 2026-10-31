@@ -53,6 +53,7 @@ pub enum Icon {
     Link,
     ApiDoc,
     Script,
+    Puzzle,
     Code,
     Markdown,
     Rust,
@@ -128,6 +129,7 @@ impl Icon {
             Self::Link => "link",
             Self::ApiDoc => "apidoc",
             Self::Script => "script",
+            Self::Puzzle => "puzzle",
             Self::Code => "code",
             Self::Markdown => "markdown",
             Self::Rust => "rust",
@@ -627,6 +629,10 @@ fn icon_svg(name: &str) -> Option<String> {
             "none",
         ),
         "code" => ("<path d='m8 8-4 4 4 4m8-8 4 4-4 4m-3-13-2 18'/>", "none"),
+        "puzzle" => (
+            "<path d='M9 4H4v5c4-1 4 7 0 6v5h5c-1-4 7-4 6 0h5v-5c4 1 4-7 0-6V4h-5c1-4-7-4-6 0Z'/>",
+            "none",
+        ),
         "script" => (
             "<rect x='3' y='4.5' width='18' height='15' rx='2'/><path d='m7.5 9.5 2.8 2.5-2.8 2.5M12.5 15h4'/>",
             "none",

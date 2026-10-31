@@ -178,7 +178,7 @@ impl Workbench {
                     })),
             )
             .child(
-                IconButton::new(Icon::Script, "插件管理")
+                IconButton::new(Icon::Puzzle, "插件管理")
                     .theme(self.theme)
                     .render()
                     .debug_selector(|| "open-plugin-manager".into())
