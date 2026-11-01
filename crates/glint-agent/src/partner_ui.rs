@@ -261,25 +261,41 @@ impl AgentWorkspace {
         }));
     }
     pub(crate) fn partner_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let name = self
-            .partner_repo()
-            .list()
-            .ok()
-            .and_then(|ps| {
-                ps.into_iter()
-                    .find(|p| Some(p.id) == self.history.active().partner_id)
-            })
-            .map(|p| format!("{} {}", p.avatar, p.name))
+        let partner = self.partner_repo().list().ok().and_then(|partners| {
+            partners
+                .into_iter()
+                .find(|partner| Some(partner.id) == self.history.active().partner_id)
+        });
+        let name = partner
+            .as_ref()
+            .map(|p| p.name.clone())
             .unwrap_or_else(|| "选择伙伴".into());
         div()
             .id("chat-partner")
             .debug_selector(|| "chat-partner".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .max_w(px(220.))
             .px_2()
             .py_1()
             .rounded(px(6.))
             .cursor_pointer()
             .text_color(rgb(self.theme.palette().accent))
-            .child(name)
+            .when_some(partner.as_ref(), |row, partner| {
+                row.child(
+                    self.partner_avatar(partner, 18.)
+                        .debug_selector(|| "chat-partner-avatar".into()),
+                )
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .debug_selector(|| "chat-partner-name".into())
+                    .child(name),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.open_partners(cx);
             }))
@@ -1055,6 +1071,50 @@ mod tests {
         window.run_until_parked();
         let id = host.read_with(window, |h, _| h.partners_ui.selected.unwrap());
         (dir, host, window, id)
+    }
+
+    #[gpui::test]
+    fn topbar_renders_avatar_separately_from_partner_name(cx: &mut gpui::TestAppContext) {
+        let (dir, host, window, id) = fixture(cx);
+        let image = dir.path().join("avatar.png");
+        std::fs::write(&image, include_bytes!("../assets/glint-agent-icon.png")).unwrap();
+        let reference = host.update(window, |h, cx| {
+            let reference = h.partner_repo().import_avatar(id, &image).unwrap();
+            h.partner_repo().update(id, "知微", &reference, "").unwrap();
+            h.history.active_mut().partner_id = Some(id);
+            h.page = crate::Page::Chat;
+            cx.notify();
+            reference
+        });
+        for missing in [false, true] {
+            if missing {
+                host.update(window, |h, cx| {
+                    std::fs::remove_file(h.partner_repo().avatar_path(&reference).unwrap())
+                        .unwrap();
+                    cx.notify();
+                });
+            }
+            window.run_until_parked();
+            let avatar = window.debug_bounds("chat-partner-avatar").unwrap();
+            let name = window.debug_bounds("chat-partner-name").unwrap();
+            let switcher = window.debug_bounds("chat-partner").unwrap();
+            assert_eq!(avatar.size.width, px(18.));
+            assert_eq!(avatar.size.height, px(18.));
+            assert!(name.left() >= avatar.right());
+            assert!(switcher.size.width <= px(220.));
+            host.read_with(window, |h, _| {
+                assert_eq!(
+                    h.partner_repo()
+                        .list()
+                        .unwrap()
+                        .into_iter()
+                        .find(|p| p.id == id)
+                        .unwrap()
+                        .avatar,
+                    reference
+                );
+            });
+        }
     }
 
     #[gpui::test]
