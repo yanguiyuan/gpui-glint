@@ -16,6 +16,7 @@ pub struct MarkdownView {
 }
 
 pub struct ToolPanel {
+    output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     signature: String,
     theme: ThemePreset,
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -720,6 +721,7 @@ impl AgentWorkspace {
         let entry = cache
             .entry(format!("{key}:tool:{}", record.call.id))
             .or_insert_with(|| ToolPanel {
+                output_panel: None,
                 signature: String::new(),
                 theme,
                 panel: cx.new(|_| {
@@ -739,6 +741,7 @@ impl AgentWorkspace {
                     cx.new(|cx| {
                         gpui_glint::components::CodeCard::new(cx, "javascript", text)
                             .show_header(false)
+                            .read_only(true)
                             .viewport()
                             .theme(theme)
                     })
@@ -751,21 +754,36 @@ impl AgentWorkspace {
                     .into_iter()
                     .map(|(label, text, language)| {
                         let height =
-                            (text.lines().take(10).count().max(1) as f32 * 20. + 24.).min(224.);
-                        let card = cx.new(|cx| {
-                            gpui_glint::components::CodeCard::new(cx, language, text)
-                                .show_header(false)
-                                .read_only(true)
-                                .viewport()
-                                .theme(theme)
+                            (text.lines().take(10).count().max(1) as f32 * 21. + 16.).min(226.);
+                        let card = (!text.is_empty()).then(|| {
+                            cx.new(|cx| {
+                                gpui_glint::components::CodeCard::new(cx, language, text)
+                                    .show_header(false)
+                                    .read_only(true)
+                                    .viewport()
+                                    .theme(theme)
+                            })
                         });
                         (label, card, height)
                     })
                     .collect::<Vec<_>>()
             });
+            let output_panel = output_cards.map(|cards| {
+                let output = entry.output_panel.get_or_insert_with(|| {
+                    cx.new(|_| CollapsePanel::new("返回值").compact().theme(theme))
+                });
+                output.update(cx, |panel, cx| {
+                    panel.set_theme(theme, cx);
+                    panel.set_content(
+                        move |_, _| code_mode_result_view(&cards, theme).into_any_element(),
+                        cx,
+                    );
+                });
+                output.clone()
+            });
             let source_height = record.call.arguments["code"]
                 .as_str()
-                .map(|code| (code.lines().take(10).count().max(1) as f32 * 20. + 24.).min(240.))
+                .map(|code| (code.lines().take(10).count().max(1) as f32 * 21. + 16.).min(240.))
                 .unwrap_or(64.);
             let weak = cx.entity().downgrade();
             let scope = format!("{key}:tool:{}", record.call.id);
@@ -774,7 +792,7 @@ impl AgentWorkspace {
                 panel.set_summary(presentation.summary, cx);
                 panel.set_content(
                     move |_, cx| {
-                        if script.is_some() || output_cards.is_some() || !nested.is_empty() {
+                        if script.is_some() || output_panel.is_some() || !nested.is_empty() {
                             return weak
                                 .update(cx, |this, cx| {
                                     div()
@@ -782,37 +800,30 @@ impl AgentWorkspace {
                                         .min_w_0()
                                         .flex()
                                         .flex_col()
-                                        .gap_2()
+                                        .gap_3()
                                         .when_some(script.clone(), |body, card| {
                                             body.child(
                                                 div()
                                                     .id("code-mode-source")
+                                                    .debug_selector(|| "code-mode-source".into())
                                                     .h(px(source_height))
                                                     .flex_shrink_0()
+                                                    .overflow_hidden()
+                                                    .rounded(px(8.))
                                                     .child(card),
                                             )
                                         })
-                                        .child(
+                                        .child(if let Some(output_panel) = &output_panel {
                                             div()
-                                                .id("code-mode-result")
-                                                .debug_selector(|| "code-mode-result".into())
-                                                .w_full()
-                                                .min_w_0()
-                                                .flex_shrink_0()
-                                                .max_h(px(320.))
-                                                .overflow_y_scroll()
-                                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                                .debug_selector(|| "code-mode-result-toggle".into())
+                                                .child(output_panel.clone())
+                                                .into_any_element()
+                                        } else {
+                                            div()
                                                 .text_size(px(12.))
-                                                .child(if let Some(cards) = &output_cards {
-                                                    div().flex().flex_col().gap_3().children(cards.iter().map(|(label, card, height)| {
-                                                        div().w_full().min_w_0().flex_shrink_0().flex().flex_col().gap_1()
-                                                            .when_some(label.clone(), |section, label| section.child(
-                                                                div().text_size(px(11.)).font_weight(FontWeight::MEDIUM)
-                                                                    .text_color(rgb(p.text_muted)).child(label)))
-                                                            .child(div().h(px(*height)).flex_shrink_0().child(card.clone()))
-                                                    })).into_any_element()
-                                                } else { div().child(result.clone()).into_any_element() }),
-                                        )
+                                                .child(result.clone())
+                                                .into_any_element()
+                                        })
                                         .children(
                                             nested
                                                 .iter()
@@ -1081,6 +1092,7 @@ impl AgentWorkspace {
                     let entry = cache
                         .entry(format!("{key}:{index}:thinking"))
                         .or_insert_with(|| ToolPanel {
+                            output_panel: None,
                             signature: String::new(),
                             theme,
                             panel: cx
@@ -1318,6 +1330,69 @@ impl AgentWorkspace {
     }
 }
 
+type OutputCard = (
+    Option<String>,
+    Option<Entity<gpui_glint::components::CodeCard>>,
+    f32,
+);
+
+fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
+    let p = theme.palette();
+    div()
+        .id("code-mode-result")
+        .debug_selector(|| "code-mode-result".into())
+        .w_full()
+        .min_w_0()
+        .flex_shrink_0()
+        .max_h(px(320.))
+        .overflow_y_scroll()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(div().flex().flex_col().gap_3().children(cards.iter().map(
+            |(label, card, height)| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .overflow_hidden()
+                    .when_some(label.clone(), |section, label| {
+                        section.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(p.text_muted))
+                                .child(label),
+                        )
+                    })
+                    .when_some(card.clone(), |section, card| {
+                        section.child(
+                            div()
+                                .h(px(*height))
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .child(card),
+                        )
+                    })
+                    .when(card.is_none(), |section| {
+                        section.child(
+                            div()
+                                .px_3()
+                                .pb_2()
+                                .text_size(px(12.))
+                                .text_color(rgb(p.text_muted))
+                                .child("无输出"),
+                        )
+                    })
+            },
+        )))
+}
+
 fn code_mode_output_sections(raw: &str) -> Vec<(Option<String>, String, &'static str)> {
     use serde_json::Value;
     let value = match serde_json::from_str::<Value>(raw) {
@@ -1477,6 +1552,18 @@ mod tests {
         });
         panel.update(window, |panel, cx| panel.set_expanded(true, cx));
         window.run_until_parked();
+        assert!(
+            window.debug_bounds("code-mode-result").is_none(),
+            "return value starts collapsed"
+        );
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_top_of_item(1);
+            cx.notify();
+        });
+        window.run_until_parked();
+        let toggle = window.debug_bounds("code-mode-result-toggle").unwrap();
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        window.run_until_parked();
         host.update(window, |host, cx| {
             host.scroll.scroll_to_bottom();
             cx.notify();
@@ -1489,6 +1576,11 @@ mod tests {
             "waiting label overlaps expanded live response: {waiting:?}, {live:?}"
         );
         let output = window.debug_bounds("code-mode-result").unwrap();
+        let source = window.debug_bounds("code-mode-source").unwrap();
+        assert!(
+            output.top() >= source.bottom() + px(12.),
+            "source and output must have a full gap between them"
+        );
         assert!(
             output.size.height > px(40.),
             "output cards must reserve visible height"
@@ -1497,6 +1589,29 @@ mod tests {
             live.bottom() >= output.bottom(),
             "expanded tool output escapes live response bounds"
         );
+        panel.update(window, |panel, cx| panel.set_expanded(false, cx));
+        window.run_until_parked();
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("code-mode-result").is_some(),
+            "outer toggle preserves return-value expansion"
+        );
+        let output_panel = host.read_with(window, |host, _| {
+            host.tool_panels
+                .borrow()
+                .iter()
+                .find(|(key, _)| key.ends_with(":tool:overlap-test"))
+                .unwrap()
+                .1
+                .output_panel
+                .clone()
+                .unwrap()
+        });
+        output_panel.update(window, |panel, cx| panel.set_expanded(false, cx));
+        window.run_until_parked();
+        assert!(window.debug_bounds("code-mode-result").is_none());
+        assert!(window.debug_bounds("code-mode-source").is_some());
     }
 
     #[gpui::test]
