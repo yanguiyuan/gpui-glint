@@ -2,7 +2,11 @@ use crate::model::{Message, Role};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::Path, sync::OnceLock, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -81,9 +85,12 @@ impl Thinking {
     }
 }
 
-/// Non-secret provider configuration. API keys live in the OS credential store.
+/// Non-secret provider configuration. API keys live in a separate SQLite table.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Runtime-only database anchor; never serialized into provider metadata.
+    #[serde(skip)]
+    pub(crate) credential_store: Option<PathBuf>,
     #[serde(default)]
     pub models_url: Option<String>,
     #[serde(default)]
@@ -114,6 +121,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            credential_store: None,
             models_url: None,
             protocol: Protocol::OpenAi,
             discovery_id: None,
@@ -253,11 +261,6 @@ impl Config {
         Ok(())
     }
 
-    fn credential(&self) -> Result<keyring::Entry, String> {
-        keyring::Entry::new("dev.glint.agent.provider", &self.credential_id.to_string())
-            .map_err(|_| "无法打开系统凭据库".into())
-    }
-
     pub fn key(&self) -> Result<String, String> {
         if let Some(name) = &self.api_key_env {
             return std::env::var(name)
@@ -267,24 +270,27 @@ impl Config {
                     format!("环境变量 {name} 未设置或为空，请从已配置该变量的终端启动应用")
                 });
         }
-        match self.credential()?.get_password() {
-            Ok(key) => Ok(key),
-            Err(keyring::Error::NoEntry) => Ok(String::new()),
-            Err(_) => Err("无法读取 API Key，请解锁或允许访问系统凭据库".into()),
-        }
+        let Some(anchor) = &self.credential_store else {
+            return Ok(String::new());
+        };
+        crate::database::provider_secret(anchor, self.credential_id)
+            .map(|secret| secret.unwrap_or_default())
     }
 
     pub fn save_key(&self, key: &str) -> Result<(), String> {
-        self.credential()?
-            .set_password(key)
-            .map_err(|_| "无法保存 API Key 到系统凭据库".into())
+        let anchor = self
+            .credential_store
+            .as_deref()
+            .ok_or("API Key 存储位置未初始化")?;
+        crate::database::save_provider_secret(anchor, self.credential_id, key)
     }
 
     pub fn remove_key(&self) -> Result<(), String> {
-        match self.credential()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("无法清除已保存的 API Key".into()),
-        }
+        let anchor = self
+            .credential_store
+            .as_deref()
+            .ok_or("API Key 存储位置未初始化")?;
+        crate::database::remove_provider_secret(anchor, self.credential_id)
     }
 }
 
@@ -984,6 +990,69 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn sqlite_keys_survive_restart_stay_out_of_metadata_and_clear_without_keychain() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("providers.json");
+        let mut config = Config {
+            enabled: true,
+            model: "test-model".into(),
+            models: vec!["test-model".into()],
+            credential_store: Some(path.clone()),
+            ..Default::default()
+        };
+        let mut catalog = crate::provider_catalog::ProviderCatalog::load(&path, &[]).unwrap();
+        config.save_key("sqlite-test-secret-only").unwrap();
+        catalog.upsert(config.clone());
+        catalog.activate(config.id, config.model.clone()).unwrap();
+        catalog.save(&path).unwrap();
+        let restored = crate::provider_catalog::ProviderCatalog::load(&path, &[]).unwrap();
+        let current = restored.current();
+        assert_eq!(current.key().unwrap(), "sqlite-test-secret-only");
+        let metadata = serde_json::to_string(&restored).unwrap();
+        assert!(!metadata.contains("sqlite-test-secret-only"));
+        assert!(!metadata.contains("credential_store"));
+        let db = crate::database::open(&path).unwrap();
+        let payload: String = db
+            .query_row(
+                "SELECT payload FROM providers WHERE id=?1",
+                [config.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("sqlite-test-secret-only"));
+        let stored: String = db
+            .query_row(
+                "SELECT secret FROM provider_secrets WHERE credential_id=?1",
+                [config.credential_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "sqlite-test-secret-only");
+        config.save_key("replacement-test-secret").unwrap();
+        assert_eq!(current.key().unwrap(), "replacement-test-secret");
+        let other = tempfile::tempdir().unwrap();
+        config.credential_store = Some(other.path().join("providers.json"));
+        assert_eq!(config.key().unwrap(), "");
+        current.remove_key().unwrap();
+        assert_eq!(current.key().unwrap(), "");
+        current.remove_key().unwrap();
+    }
+
+    #[test]
+    fn environment_auth_does_not_fall_back_to_saved_sqlite_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            credential_store: Some(directory.path().join("providers.json")),
+            ..Default::default()
+        };
+        config.save_key("saved-test-secret").unwrap();
+        config.api_key_env = Some(format!("GLINT_MISSING_KEY_{}", Uuid::new_v4().simple()));
+        assert!(config.key().is_err());
+        config.api_key_env = None;
+        assert_eq!(config.key().unwrap(), "saved-test-secret");
+    }
 
     #[test]
     fn malformed_streamed_calls_are_repaired_without_replaying_successful_tools_and_retries_are_bounded()

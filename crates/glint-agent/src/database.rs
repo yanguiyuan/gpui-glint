@@ -92,6 +92,38 @@ PRAGMA user_version=2;"#).map_err(|e| e.to_string())?;
     }
     Ok(connection)
 }
+// Kept separate from provider JSON so generic config views/exports omit keys.
+fn credential_connection(anchor: &Path) -> Result<Connection, String> {
+    let connection = open(anchor)?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS provider_secrets(credential_id TEXT PRIMARY KEY, secret TEXT NOT NULL);")
+        .map_err(|_| "无法打开 API Key 存储表".to_owned())?;
+    Ok(connection)
+}
+pub fn provider_secret(anchor: &Path, id: uuid::Uuid) -> Result<Option<String>, String> {
+    credential_connection(anchor)?
+        .query_row(
+            "SELECT secret FROM provider_secrets WHERE credential_id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| "无法从 SQLite 读取 API Key".into())
+}
+pub fn save_provider_secret(anchor: &Path, id: uuid::Uuid, secret: &str) -> Result<(), String> {
+    credential_connection(anchor)?.execute("INSERT INTO provider_secrets VALUES(?1,?2) ON CONFLICT(credential_id) DO UPDATE SET secret=excluded.secret", params![id.to_string(),secret])
+        .map_err(|_| "无法保存 API Key 到 SQLite".to_owned())?;
+    Ok(())
+}
+pub fn remove_provider_secret(anchor: &Path, id: uuid::Uuid) -> Result<(), String> {
+    credential_connection(anchor)?
+        .execute(
+            "DELETE FROM provider_secrets WHERE credential_id=?1",
+            [id.to_string()],
+        )
+        .map_err(|_| "无法清除 SQLite 中的 API Key".to_owned())?;
+    Ok(())
+}
+
 fn meta(connection: &Connection, key: &str) -> Result<Option<Value>, String> {
     let value: Option<String> = connection
         .query_row("SELECT value FROM app_meta WHERE key=?1", [key], |row| {

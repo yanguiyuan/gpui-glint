@@ -352,6 +352,7 @@ impl AgentWorkspace {
             .trim_end_matches('/')
             .to_owned();
         let mut config = settings.original.clone();
+        config.credential_store = Some(self.path.clone());
         config.kind = settings.kind;
         config.protocol = settings.protocol;
         config.enabled = true;
@@ -427,6 +428,7 @@ impl AgentWorkspace {
         self.stash_provider(cx);
         let config = provider::Config {
             kind,
+            credential_store: Some(self.path.clone()),
             name: if kind == provider::Kind::ChatGpt {
                 "ChatGPT"
             } else {
@@ -958,11 +960,10 @@ impl AgentWorkspace {
                             .flex()
                             .items_end()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(field("API Key（留空保留已保存的密钥）", &settings.key)),
-                            )
+                            .child(div().flex_1().child(field(
+                                "API Key（本机 SQLite 明文保存，留空保留）",
+                                &settings.key,
+                            )))
                             .child(
                                 IconButton::new(Icon::Trash, "清除已保存的密钥")
                                     .plain()
@@ -971,7 +972,7 @@ impl AgentWorkspace {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.provider_settings.message = Some(
                                             match this.provider_settings.original.remove_key() {
-                                                Ok(()) => "已清除系统凭据库中的密钥。".into(),
+                                                Ok(()) => "已清除 SQLite 中保存的密钥。".into(),
                                                 Err(error) => error,
                                             },
                                         );
@@ -1608,8 +1609,8 @@ impl AgentWorkspace {
                     .child(div().border_t_1().border_color(rgb(p.border)))
                     .child(row(
                         "API Key",
-                        "密钥由操作系统凭据库管理。".into(),
-                        "不写入 SQLite".into(),
+                        "密钥以明文保存在本机 SQLite 独立表中。".into(),
+                        "本地 SQLite".into(),
                     ));
                 page = page.child(card);
             }

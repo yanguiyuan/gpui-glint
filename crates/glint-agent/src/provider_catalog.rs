@@ -65,6 +65,7 @@ impl ProviderCatalog {
             }
         }
         for provider in &mut catalog.providers {
+            provider.credential_store = Some(path.to_path_buf());
             normalize_models(provider);
         }
         if catalog
