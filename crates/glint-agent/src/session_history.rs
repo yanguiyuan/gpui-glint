@@ -221,6 +221,7 @@ mod tests {
             success: true,
             elapsed_ms: 2,
             live_output: None,
+            nested_tools: Default::default(),
             subagent: None,
             change: None,
         });

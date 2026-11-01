@@ -126,6 +126,7 @@ impl AgentWorkspace {
         if !self.channels.apps.iter().any(|a| a.enabled)
             || self.pending.is_some()
             || self.preparing.is_some()
+            || self.edits_ui.undo_task.is_some()
             || !self.queued_requests.is_empty()
             || (!self.provider.enabled
                 && !self.history.partner_models.values().any(|selection| {

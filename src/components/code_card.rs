@@ -700,6 +700,11 @@ impl CodeCard {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Embedded hosts may provide a domain-specific context menu (e.g.
+        // JSONPath picking). Intercept right-click only when opted in.
+        if !self.quote_context {
+            return;
+        }
         self.activate_window(window, cx);
         let offset = self.index_for_mouse_position(event.position);
         if !self.selected_range.contains(&offset) {

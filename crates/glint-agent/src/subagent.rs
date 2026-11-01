@@ -118,6 +118,7 @@ impl Recording {
                     success: false,
                     elapsed_ms: 0,
                     live_output: None,
+                    nested_tools: Default::default(),
                     subagent: None,
                     change: None,
                 });
@@ -130,6 +131,11 @@ impl Recording {
                     .find(|tool| &tool.call.id == call_id)
                 {
                     tool.live_output = Some(output.clone());
+                }
+            }
+            ToolEvent::BatchProgress { call_id, tools } => {
+                if let Some(record) = self.trace.tools.iter_mut().find(|r| &r.call.id == call_id) {
+                    record.nested_tools = tools.clone().into();
                 }
             }
             ToolEvent::Completed(record) => {
@@ -379,6 +385,8 @@ mod tests {
             model: "test".into(),
             events,
             recall: None,
+            session_id: None,
+            changes: Default::default(),
         }
     }
 

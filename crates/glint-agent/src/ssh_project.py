@@ -46,7 +46,7 @@ def run(q):
             raise
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > LIMIT:
             raise ValueError('目标必须是 2MB 以内的普通 UTF-8 文件')
-        with open(path, encoding='utf-8') as f:
+        with open(path, encoding='utf-8', newline='') as f:
             content = f.read(LIMIT + 1)
         if len(content.encode('utf-8')) > LIMIT:
             raise ValueError('文件超过 2MB')
@@ -107,26 +107,99 @@ def run(q):
             except (OSError, ValueError, UnicodeError) as error:
                 notes.append(label + '：' + str(error))
         return {'changes': rows, 'notes': notes}
+    if op == 'undo_changes':
+        import tempfile
+        changes = args.get('changes', [])
+        def state(change):
+            target = change['path']
+            if not os.path.isabs(target) or os.path.realpath(target) != target:
+                raise ValueError('文件或父目录路径发生变化，未撤销')
+            if os.path.lexists(target) and (os.path.islink(target) or not os.path.isfile(target)):
+                raise ValueError('文件类型已变化，未撤销')
+            current = read(target, missing=True)
+            if current == change['before']: return False
+            if current != change['after']: raise ValueError(target + ' 的内容已被其他操作修改，未覆盖')
+            return True
+        for change in changes: state(change)
+        restored = []
+        for change in changes:
+            temporary = None
+            try:
+                target = change['path']
+                if state(change):
+                    if change['before'] is None:
+                        os.unlink(target)
+                    else:
+                        permissions = stat.S_IMODE(os.stat(target).st_mode)
+                        fd, temporary = tempfile.mkstemp(prefix='.glint-undo-', dir=os.path.dirname(target))
+                        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as file:
+                            os.fchmod(file.fileno(), permissions)
+                            file.write(change['before'])
+                            file.flush()
+                            os.fsync(file.fileno())
+                        if state(change): os.replace(temporary, target)
+                restored.append(target)
+            except Exception as error:
+                return {'restored': restored, 'error': str(error)}
+            finally:
+                if temporary and os.path.exists(temporary): os.unlink(temporary)
+        return {'restored': restored, 'error': None}
+
+    if op == 'resolve_directory':
+        if not os.path.isdir(path): raise ValueError('cwd 必须为目录')
+        return path
     if op == 'read_file':
         content = read(path)
         start = max(1, int(args.get('start_line', 1))) - 1
         lines = max(1, min(500, int(args.get('lines', 200))))
-        return '\n'.join('%d: %s' % (i + 1, line) for i, line in enumerate(content.splitlines()) if start <= i < start + lines)
-    if op in ('write_file', 'replace_in_file'):
+        page = '\n'.join('%d: %s' % (i + 1, line) for i, line in enumerate(content.splitlines()) if start <= i < start + lines)
+        numbered = args.get('line_numbers', True)
+        if not numbered: page = ''.join(content.splitlines(keepends=True)[start:start+lines])
+        if args.get('include_metadata'):
+            import hashlib
+            digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+            return {'content':page,'sha256':digest,'expected_sha256':digest,'total_lines':len(content.splitlines()),'start_line':start+1,'path':path,'line_numbers':numbered,'next_line':start+lines+1 if start+lines<len(content.splitlines()) else None,'is_complete':start==0 and lines>=len(content.splitlines())}
+        return page
+    if op in ('write_file', 'replace_in_file', 'prepare_edit', 'commit_edit'):
+        import hashlib, tempfile
         before = read(path, missing=True)
-        if op == 'write_file':
+        digest = lambda value: hashlib.sha256(value.encode('utf-8')).hexdigest() if value is not None else None
+        expected = args.get('expected_sha256')
+        if args.get('create_only') and before is not None: raise ValueError('文件已存在，未覆盖')
+        if expected is not None and digest(before) != expected: raise ValueError('文件版本不匹配，请重新读取')
+        kind = args.get('kind', op)
+        if op == 'commit_edit':
+            if path != args.get('canonical_path'): raise ValueError('父目录路径发生变化，未写入')
+            if (before is None) != bool(args.get('expected_absent')) or digest(before) != expected: raise ValueError('文件已被其他操作修改，未写入')
             after = args['content']
+        elif kind == 'write_file': after = args['content']
         else:
+            if before is None: raise ValueError('目标文件不存在')
             old = args['old']
-            if before is None or not old or before.count(old) != 1:
-                raise ValueError('待替换内容不存在或不唯一，未修改文件')
+            if not old or before.count(old) != 1: raise ValueError('待替换内容不存在或不唯一，未修改文件')
             after = before.replace(old, args['new'], 1)
-        if not isinstance(after, str) or len(after.encode('utf-8')) > LIMIT:
-            raise ValueError('单次写入超过 2MB 或内容不是字符串')
+        if not isinstance(after, str) or len(after.encode('utf-8')) > LIMIT: raise ValueError('单次写入超过 2MB 或内容不是字符串')
+        if op == 'prepare_edit': return {'before':before,'after':after,'path':path,'sha256':digest(before)}
         if before != after:
-            with open(path, 'w', encoding='utf-8', newline='') as f:
-                f.write(after)
-        return {'before': before, 'after': after, 'path': path}
+            import fcntl
+            temporary = None
+            directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_EX)
+                if os.path.realpath(path) != path or read(path, missing=True) != before: raise ValueError('文件已被其他操作修改，未写入')
+                if before is not None and os.stat(path).st_mode & 0o222 == 0: raise ValueError('文件为只读，未写入')
+                fd, temporary = tempfile.mkstemp(prefix='.glint-write-', dir=os.path.dirname(path))
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='') as file:
+                    if before is not None: os.fchmod(file.fileno(), stat.S_IMODE(os.stat(path).st_mode))
+                    file.write(after);file.flush();os.fsync(file.fileno())
+                if os.path.realpath(path) != path or read(path, missing=True) != before: raise ValueError('文件已被其他操作修改，未写入')
+                os.replace(temporary,path)
+                try: os.fsync(directory_fd)
+                except OSError: pass
+            finally:
+                if temporary and os.path.exists(temporary): os.unlink(temporary)
+                os.close(directory_fd)
+        return {'before':before,'after':after,'path':path}
     if op in ('index', 'list_files', 'search_files'):
         entries, matches, skipped = [], [], 0
         cap = 50000 if op == 'index' else 2000

@@ -558,6 +558,25 @@ impl Render for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn thousands_of_commands_render_only_visible_rows_and_search_reaches_the_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (palette, window) = cx.add_window_view(|_, cx| {
+            CommandPalette::new(
+                (0..5000).map(|i| CommandItem::new(format!("command-{i}"), format!("Command {i}"))),
+                cx,
+            )
+        });
+        window.simulate_resize(gpui::size(px(640.), px(500.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("palette-command-0").is_some());
+        assert!(window.debug_bounds("palette-command-4999").is_none());
+        palette.update(window, |p, cx| p.set_query("Command 4999", cx));
+        window.run_until_parked();
+        assert!(window.debug_bounds("palette-command-4999").is_some());
+        palette.read_with(window, |p, cx| assert_eq!(p.visible(cx), vec![4999]));
+    }
     #[test]
     fn search_matches_unicode_keywords_and_empty_query() {
         let items = [

@@ -400,6 +400,16 @@ mod tests {
     };
 
     #[test]
+    fn sqlite_engine_contains_the_wal_mutex_deadlock_fix() {
+        // 3.51.1 recursively enters the Unix VFS mutex in unixIsSharingShmNode.
+        // Both the deadlock and the subsequent WAL-reset fix must be included.
+        assert!(
+            rusqlite::version_number() >= 3_051_003,
+            "SQLite {} is too old",
+            rusqlite::version()
+        );
+    }
+    #[test]
     fn legacy_domains_import_once_into_one_database_and_preserve_originals() {
         let dir = tempfile::tempdir().unwrap();
         let history_path = dir.path().join("sessions.json");
@@ -496,4 +506,21 @@ mod tests {
             999
         );
     }
+}
+
+pub fn save_command_run(anchor: &Path, id: uuid::Uuid, value: &Value) -> Result<(), String> {
+    set_meta(&open(anchor)?, &format!("command_run:{id}"), value)
+}
+pub fn command_run(anchor: &Path, id: uuid::Uuid) -> Result<Option<Value>, String> {
+    meta(&open(anchor)?, &format!("command_run:{id}"))
+}
+
+pub fn remove_command_run(anchor: &Path, id: uuid::Uuid) -> Result<(), String> {
+    open(anchor)?
+        .execute(
+            "DELETE FROM app_meta WHERE key=?1",
+            [format!("command_run:{id}")],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

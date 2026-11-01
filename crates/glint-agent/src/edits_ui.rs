@@ -12,6 +12,8 @@ use std::{
 pub struct State {
     pub open: bool,
     pub selected: Option<PathBuf>,
+    pub undo_task: Option<Task<()>>,
+    undo_notice: Option<(Uuid, String)>,
     aggregates: RefCell<HashMap<String, (Vec<Uuid>, Rc<Vec<Change>>)>>,
     summaries: RefCell<HashMap<String, (Vec<Uuid>, Entity<Summary>)>>,
     diffs: RefCell<HashMap<String, (Uuid, Entity<DiffCard>)>>,
@@ -28,14 +30,124 @@ pub struct State {
 }
 
 impl AgentWorkspace {
+    fn undo_session_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.pending.is_some()
+            || self.preparing.is_some()
+            || !self.queued_requests.is_empty()
+            || self.edits_ui.undo_task.is_some()
+        {
+            return;
+        }
+        let files: Vec<_> = self
+            .session_edits()
+            .iter()
+            .filter(|file| path.as_ref().is_none_or(|p| p == &file.path))
+            .cloned()
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let session = self.history.active;
+        let root = self.history.active().project.clone();
+        let paths = files
+            .iter()
+            .map(|c| c.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let records: Vec<_> = self
+            .history
+            .active()
+            .messages
+            .iter()
+            .flat_map(|m| m.tools.iter())
+            .collect();
+        if let Err(error) = edits::verify_reversal_chain(
+            records.clone(),
+            &paths,
+            &self.history.active().reverted_changes,
+        ) {
+            self.edits_ui.undo_notice = Some((session, error));
+            cx.notify();
+            return;
+        }
+        let by_path = edits::ids_by_path(records, &paths);
+        self.edits_ui.undo_notice = Some((session, "正在撤销文件改动…".into()));
+        self.composer.update(cx, |c, cx| c.set_disabled(true, cx));
+        self.edits_ui.undo_task = Some(cx.spawn(async move |weak, cx| {
+            let work_root = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if work_root.as_deref().is_some_and(ssh_project::is_remote) {
+                        provider::Job::start(async move {
+                            Ok(crate::undo::apply(files, work_root).await)
+                        })
+                        .map_err(|e| e.to_string())?
+                        .result()
+                        .await
+                    } else {
+                        Ok(crate::undo::apply(files, work_root).await)
+                    }
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.edits_ui.undo_task.take() {
+                    task.detach();
+                }
+                let outcome = result.unwrap_or_else(|error| crate::undo::Outcome {
+                    error: Some(error),
+                    ..Default::default()
+                });
+                if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == session) {
+                    for path in &outcome.restored {
+                        if let Some(ids) = by_path.get(path) {
+                            session.reverted_changes.extend(ids);
+                        }
+                    }
+                    session.updated = chrono::Local::now();
+                }
+                let message = match outcome.error {
+                    Some(error) => format!("已撤销 {} 个文件；{error}", outcome.restored.len()),
+                    None => format!("已撤销 {} 个文件的会话改动", outcome.restored.len()),
+                };
+                this.edits_ui.undo_notice = Some((session, message));
+                this.edits_ui.aggregates.borrow_mut().clear();
+                this.file_preview.paths.invalidate(&root, None);
+                for view in this.markdown_views.borrow_mut().values_mut() {
+                    if view.root == root {
+                        view.links_source = None;
+                        view.links_revision += 1;
+                        view.links_task = None;
+                    }
+                }
+                this.reload_preview_after_undo(&outcome.restored, cx);
+                if this.edits_ui.open
+                    && this.edits_ui.workspace_mode
+                    && this.history.active().project == root
+                {
+                    this.refresh_workspace_edits(cx);
+                }
+                this.sync_skill_context(cx);
+                this.save(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
     fn cached_edits(&self, key: &str, records: Vec<&tools::ToolRecord>) -> Rc<Vec<Change>> {
-        let ids = edits::ids(&records);
+        let excluded = &self.history.active().reverted_changes;
+        let ids = edits::ids(&records)
+            .into_iter()
+            .filter(|id| !excluded.contains(id))
+            .collect::<Vec<_>>();
         let mut cache = self.edits_ui.aggregates.borrow_mut();
         let entry = cache
             .entry(key.into())
             .or_insert_with(|| (Vec::new(), Rc::new(Vec::new())));
         if entry.0 != ids {
-            *entry = (ids, Rc::new(edits::aggregate_records(records)));
+            *entry = (
+                ids,
+                Rc::new(edits::aggregate_records_excluding(records, excluded)),
+            );
         }
         entry.1.clone()
     }
@@ -117,6 +229,7 @@ impl AgentWorkspace {
     ) -> gpui::Div {
         let files = self.cached_edits(key, records.iter().collect());
         if files.is_empty() {
+            self.edits_ui.summaries.borrow_mut().remove(key);
             return div();
         }
         let ids = files.iter().map(|file| file.id).collect::<Vec<_>>();
@@ -153,8 +266,12 @@ impl AgentWorkspace {
                 .theme(self.theme)
                 .render()
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.edits_ui.open = !this.edits_ui.open;
-                    cx.notify();
+                    if this.edits_ui.open {
+                        this.edits_ui.open = false;
+                        cx.notify();
+                    } else {
+                        this.open_edits(None, cx);
+                    }
                 })),
         )
     }
@@ -180,6 +297,7 @@ impl AgentWorkspace {
                 .position(|file| Some(&file.path) == self.edits_ui.selected.as_ref())
         };
         let workspace = cx.entity();
+        let undo_workspace = workspace.downgrade();
         let mut list = div()
             .on_children_prepainted(move |_, _, cx| {
                 workspace.update(cx, |this, cx| {
@@ -208,6 +326,11 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
+        let can_undo = !workspace_mode
+            && self.pending.is_none()
+            && self.preparing.is_none()
+            && self.edits_ui.undo_task.is_none()
+            && self.queued_requests.is_empty();
         let mut views = self.edits_ui.file_views.borrow_mut();
         for (index, file) in files.iter().enumerate() {
             let key = format!("{scope}:{}", file.path.display());
@@ -216,6 +339,12 @@ impl AgentWorkspace {
                 .or_insert_with(|| cx.new(|_| FileDiff::new(file.clone(), self.theme)));
             view.update(cx, |view, cx| {
                 view.set_file(file, self.theme, cx);
+                view.workspace = Some(undo_workspace.clone());
+                if view.undo_visible != !workspace_mode || view.undo_enabled != can_undo {
+                    view.undo_visible = !workspace_mode;
+                    view.undo_enabled = can_undo;
+                    cx.notify();
+                }
                 if reveal_index == Some(index) {
                     view.reveal(self.edits_ui.reveal_revision, cx);
                 }
@@ -247,9 +376,24 @@ impl AgentWorkspace {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("文件变更 · {}", files.len())),
                     )
+                    .when(!workspace_mode, |header| {
+                        header.child(
+                            Button::new("全部撤销")
+                                .kind(ButtonKind::Plain)
+                                .when(!can_undo || files.is_empty(), |button| button.disabled())
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "undo-session-changes".into())
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.undo_session_edits(None, cx)),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new("关闭")
                             .icon(Icon::Close)
@@ -302,6 +446,18 @@ impl AgentWorkspace {
                         )
                     }),
             );
+        if let Some((id, message)) = &self.edits_ui.undo_notice
+            && *id == self.history.active
+        {
+            body = body.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(p.text_muted))
+                    .child(message.clone()),
+            );
+        }
         if workspace_mode {
             let status = if !root_matches {
                 Some("项目已切换，请刷新工作区变更。".to_owned())
@@ -405,6 +561,9 @@ impl AgentWorkspace {
 /// Each file owns its disclosure state. Closed files never construct a diff;
 /// opening another file leaves all existing disclosures and scroll positions intact.
 struct FileDiff {
+    workspace: Option<gpui::WeakEntity<AgentWorkspace>>,
+    undo_visible: bool,
+    undo_enabled: bool,
     file: Change,
     theme: ThemePreset,
     expanded: bool,
@@ -415,6 +574,9 @@ struct FileDiff {
 impl FileDiff {
     fn new(file: Change, theme: ThemePreset) -> Self {
         Self {
+            workspace: None,
+            undo_visible: false,
+            undo_enabled: false,
             file,
             theme,
             expanded: false,
@@ -457,6 +619,9 @@ impl Render for FileDiff {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
         let selector = format!("edit-file:{}", self.file.label);
+        let path = self.file.path.clone();
+        let undo_selector = format!("undo-file:{}", path.display());
+        let workspace = self.workspace.clone();
         let mut row = div()
             .w_full()
             .flex_shrink_0()
@@ -498,6 +663,24 @@ impl Render for FileDiff {
                             .child(self.file.label.clone()),
                     )
                     .child(counts(self.file.added, self.file.removed))
+                    .when(self.undo_visible, |header| {
+                        header.child(
+                            Button::new("撤销")
+                                .kind(ButtonKind::Plain)
+                                .when(!self.undo_enabled, |button| button.disabled())
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(move || undo_selector)
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(workspace) = &workspace {
+                                        let _ = workspace.update(cx, |this, cx| {
+                                            this.undo_session_edits(Some(path.clone()), cx)
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.expanded = !this.expanded;
                         cx.notify();
@@ -661,6 +844,90 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn native_undo_buttons_restore_files_and_persist_reverted_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let anchor = root.join("sessions.json");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        std::fs::write(&a, "after-a").unwrap();
+        std::fs::write(&b, "after-b").unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = AgentWorkspace::with_path(anchor.clone(), cx);
+            h.history.active_mut().project = Some(root.clone());
+            h.history
+                .active_mut()
+                .push(model::Role::Agent, "changed files".into());
+            h.history.active_mut().messages.last_mut().unwrap().tools = [
+                (a.clone(), "before-a", "after-a"),
+                (b.clone(), "before-b", "after-b"),
+            ]
+            .into_iter()
+            .map(|(path, before, after)| tools::ToolRecord {
+                call: tools::ToolCall {
+                    id: Uuid::new_v4().to_string(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path":path}),
+                },
+                result: "ok".into(),
+                change: Some(crate::undo::tests::change(path, Some(before), after)),
+                subagent: None,
+                success: true,
+                elapsed_ms: 0,
+                live_output: None,
+                nested_tools: Default::default(),
+            })
+            .collect();
+            h.open_edits(None, cx);
+            h
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let selector = Box::leak(format!("undo-file:{}", a.display()).into_boxed_str());
+        let button = window.debug_bounds(selector).unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "before-a");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "after-b");
+        let button = window.debug_bounds("undo-session-changes").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "before-b");
+        host.read_with(window, |h, _| {
+            assert!(h.session_edits().is_empty());
+            assert_eq!(h.history.active().reverted_changes.len(), 2);
+            h.history.save(&anchor).unwrap();
+        });
+        let history = model::History::load(&anchor).unwrap();
+        assert_eq!(history.active().reverted_changes.len(), 2);
+        let result: serde_json::Value = serde_json::from_str(
+            &crate::session_changes::read(
+                &anchor,
+                Some(&root),
+                None,
+                Some(history.active),
+                &serde_json::json!({"path":""}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["active_changes"], 0);
+        assert!(
+            result["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["reverted"] == true)
+        );
+    }
     #[gpui::test]
     fn files_expand_independently_and_closed_diffs_are_lazy(cx: &mut gpui::TestAppContext) {
         let (stack, window) = cx.add_window_view(|_, cx| {

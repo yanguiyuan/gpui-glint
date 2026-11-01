@@ -57,6 +57,7 @@ impl AgentWorkspace {
                             "已导入新伙伴「{}」。唤醒计划已暂停，请检查项目与模型后再启用。",
                             partner.name
                         ));
+                        this.refresh_partner_snapshot(cx);
                         this.sync_skill_context(cx);
                         this.refresh_calendar(cx);
                     }

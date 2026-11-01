@@ -99,16 +99,14 @@ impl AgentWorkspace {
         if let Some(files) = self.project_context.section() {
             sections.insert(1, files);
         }
-        let partners = crate::partners::Repository::new(self.path.clone())
-            .list()
-            .unwrap_or_default();
+        let partners = self.cached_partners(cx);
         sections.insert(
             1,
             crate::partner_chat::context_section(&partners, self.history.active().partner_id),
         );
         let mut partner_chip =
             crate::partner_chat::selector_chip(&partners, self.history.active().partner_id);
-        for partner in &partners {
+        for partner in partners.iter() {
             partner_chip = partner_chip
                 .option_avatar(partner.id.to_string(), self.partner_avatar_model(partner));
         }
@@ -129,7 +127,10 @@ impl AgentWorkspace {
         self.composer.update(cx, |composer, cx| {
             composer.set_menu_chip_visible("model", !has_partner, cx);
             composer.set_menu_chip_visible("thinking", !has_partner, cx);
-            composer.set_disabled(!available || self.preparing.is_some(), cx);
+            composer.set_disabled(
+                !available || self.preparing.is_some() || self.edits_ui.undo_task.is_some(),
+                cx,
+            );
             composer.set_context_sections(sections, cx);
             composer.set_menu_chip(partner_chip, cx);
             composer.register_context_tokens(tokens, cx);

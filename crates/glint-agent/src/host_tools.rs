@@ -69,6 +69,8 @@ mod tests {
             model: "test".into(),
             events,
             recall: None,
+            session_id: None,
+            changes: Default::default(),
         };
         for anthropic in [false, true] {
             let definitions = context.definitions(anthropic);

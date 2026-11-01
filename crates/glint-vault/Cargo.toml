@@ -12,7 +12,7 @@ publish = false
 gpui-glint = { path = "../.." }
 gpui = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

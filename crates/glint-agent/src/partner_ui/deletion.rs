@@ -67,6 +67,7 @@ impl AgentWorkspace {
         if self.history.preferred_partner == Some(id) {
             self.history.preferred_partner = None;
         }
+        self.refresh_partner_snapshot(cx);
         self.partners_ui.selected = None;
         if let Ok(partners) = self.partner_repo().list() {
             if let Some(p) = partners.first() {

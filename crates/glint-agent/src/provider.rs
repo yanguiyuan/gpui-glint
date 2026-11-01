@@ -1183,6 +1183,8 @@ mod tests {
                     model: config.model.clone(),
                     events,
                     recall: None,
+                    session_id: None,
+                    changes: Default::default(),
                 };
                 let result = runtime().unwrap().block_on(complete(
                     config,
@@ -1566,6 +1568,8 @@ mod tests {
                     model: config.model.clone(),
                     events,
                     recall: Some(recall_receiver.clone()),
+                    session_id: None,
+                    changes: Default::default(),
                 };
                 let request = Request::start_with_tools(
                     config,

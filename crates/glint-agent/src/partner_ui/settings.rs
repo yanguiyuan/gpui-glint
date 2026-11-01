@@ -129,6 +129,7 @@ impl AgentWorkspace {
                                         this.history.partner_models.remove(&id);
                                     }
                                     this.save(cx);
+                                    this.refresh_partner_snapshot(cx);
                                     this.sync_skill_context(cx);
                                 }
                                 this.partners_ui.notice =

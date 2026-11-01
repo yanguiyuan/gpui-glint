@@ -78,6 +78,9 @@ impl AgentWorkspace {
             }
         }));
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
+            if this.pending.is_some() || this.preparing.is_some() {
+                this.stop(cx);
+            }
             this.save_delay = None;
             let (send, receive) = tokio::sync::oneshot::channel();
             if this.storage_readable {
@@ -85,11 +88,14 @@ impl AgentWorkspace {
                 this.save_full_pending = true;
                 this.enqueue_save(Some(send));
             }
+            let anchor = this.path.clone();
             async move {
+                crate::command_runner::shutdown(anchor).await;
                 let _ = receive.await;
             }
         }));
         self._subscriptions.push(cx.on_release(|this, _| {
+            crate::command_runner::cancel_anchor(&this.path);
             if this.storage_readable {
                 this.save_full_pending = true;
                 this.enqueue_save(None);

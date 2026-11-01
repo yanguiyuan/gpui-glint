@@ -220,6 +220,10 @@ impl Render for Workbench {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--glint-code-mode-worker") {
+        glint_agent::run_code_mode_worker();
+        return;
+    }
     if glint_api::handle_background_command() {
         return;
     }

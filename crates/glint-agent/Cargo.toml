@@ -8,6 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+boa_engine = { version = "=0.22.0", default-features = false }
+boa_gc = "=0.22.0"
 glint-vault = { path = "../glint-vault" }
 gpui-glint = { path = "../.." }
 gpui = { package = "gpui-ce", version = "=0.2.2" }
@@ -18,8 +20,9 @@ serde_json = "1"
 pulldown-cmark = "0.13"
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "macros", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "macros", "process", "io-util", "fs"] }
 async-channel = "2"
+libc = "0.2"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
@@ -30,7 +33,7 @@ httpdate = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp", "ico", "pnm"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 jieba-rs = "0.11.0"
 strsim = "0.11"
 serde_yaml_ng = "0.10"

@@ -325,21 +325,25 @@ pub async fn decorate_cached(
             fresh.insert(key, exists);
         }
     }
-    if cache.epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
+    if !fresh.is_empty() {
         let mut values = cache.values.lock().unwrap();
-        for (key, value) in &fresh {
-            if values.len() >= cache.limit
-                && let Some(oldest) = values
-                    .iter()
-                    .min_by_key(|(_, v)| v.0)
-                    .map(|(k, _)| k.clone())
-            {
-                values.remove(&oldest);
+        // Validate the generation under the same lock as the insertion: an
+        // invalidation between a pre-lock check and this lock must win.
+        if cache.epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
+            for (key, value) in &fresh {
+                if values.len() >= cache.limit
+                    && let Some(oldest) = values
+                        .iter()
+                        .min_by_key(|(_, v)| v.0)
+                        .map(|(k, _)| k.clone())
+                {
+                    values.remove(&oldest);
+                }
+                values.insert(
+                    (root.clone(), key.clone()),
+                    (std::time::Instant::now(), *value),
+                );
             }
-            values.insert(
-                (root.clone(), key.clone()),
-                (std::time::Instant::now(), *value),
-            );
         }
     }
     available.extend(fresh);
@@ -574,7 +578,13 @@ impl State {
 }
 impl AgentWorkspace {
     pub fn invalidate_preview_paths(&self, record: &tools::ToolRecord) {
-        let root = self.history.active().project.clone();
+        let root = self
+            .pending
+            .as_ref()
+            .and_then(|(id, _)| self.history.sessions.iter().find(|s| s.id == *id))
+            .unwrap_or_else(|| self.history.active())
+            .project
+            .clone();
         let path = match record.call.name.as_str() {
             "write_file" | "replace_in_file" => record
                 .call
@@ -583,6 +593,21 @@ impl AgentWorkspace {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|p| target(p, &root))
                 .map(|t| t.path),
+            "code_mode" => {
+                for child in record.nested_tools.iter() {
+                    self.invalidate_preview_paths(child);
+                }
+                return;
+            }
+            "command_poll" | "command_stop" => {
+                if serde_json::from_str::<serde_json::Value>(&record.result)
+                    .ok()
+                    .is_some_and(|v| v["status"] == "running")
+                {
+                    return;
+                }
+                None
+            }
             "run_command" => {
                 let program = record.call.arguments["program"].as_str().unwrap_or("");
                 let args = record.call.arguments["args"].as_array();
@@ -609,6 +634,20 @@ impl AgentWorkspace {
                 view.links_source = None;
                 view.links_revision += 1;
                 view.links_task = None;
+            }
+        }
+    }
+    pub fn reload_preview_after_undo(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if !self.file_preview.open {
+            return;
+        }
+        if let Some(current) = self.file_preview.target.clone() {
+            let key = path_key(&current.root, &current.path);
+            if paths.iter().any(|path| {
+                target(&path.to_string_lossy(), &current.root)
+                    .is_some_and(|target| path_key(&target.root, &target.path) == key)
+            }) {
+                self.open_file_preview(current, cx);
             }
         }
     }
@@ -763,6 +802,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn hover_excerpt_bounds_bytes_preserves_utf8_and_respects_line_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        std::fs::write(&path, format!("first\n{}\nlast\n", "汉".repeat(400_000))).unwrap();
+        let target = Target {
+            root: Some(dir.path().into()),
+            path: path.to_string_lossy().into_owned(),
+            line: None,
+        };
+        let mut reference = gpui_glint::components::ComposerReference::file(
+            path.to_string_lossy().into_owned(),
+            false,
+        );
+        reference.start_line = Some(2);
+        reference.end_line = Some(2);
+        let text = load_excerpt(target.clone(), reference.clone())
+            .await
+            .unwrap();
+        assert!(text.len() <= 4097);
+        assert!(text.starts_with("汉"));
+        assert!(!text.contains("last"));
+        reference.start_line = Some(3);
+        reference.end_line = Some(3);
+        assert_eq!(
+            load_excerpt(target.clone(), reference.clone())
+                .await
+                .unwrap(),
+            "last\n"
+        );
+        std::fs::write(&path, [0, 1, 255]).unwrap();
+        assert!(load_excerpt(target, reference).await.is_err());
     }
     #[tokio::test]
     async fn standalone_path_separators_and_operators_are_not_file_references() {

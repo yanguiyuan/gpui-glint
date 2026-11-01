@@ -60,7 +60,7 @@ unicode-segmentation = "1.13"
 [dev-dependencies]
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "brotli", "deflate"] }

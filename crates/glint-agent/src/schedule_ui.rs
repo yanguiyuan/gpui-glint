@@ -426,7 +426,7 @@ impl AgentWorkspace {
                     .await;
                 if weak
                     .update(cx, |this, cx| {
-                        if this.pending.is_some() || this.preparing.is_some() {
+                        if this.pending.is_some() || this.preparing.is_some() || this.edits_ui.undo_task.is_some() {
                             return;
                         }
                         let due = this

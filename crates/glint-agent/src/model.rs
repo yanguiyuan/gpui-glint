@@ -67,6 +67,8 @@ pub struct Session {
     pub updated: DateTime<Local>,
     pub messages: Vec<Message>,
     pub draft: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub reverted_changes: std::collections::BTreeSet<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub draft_references: Vec<gpui_glint::components::ComposerReference>,
     #[serde(skip)]
@@ -91,6 +93,7 @@ impl Session {
             updated: Local::now(),
             messages: vec![],
             draft: String::new(),
+            reverted_changes: Default::default(),
             draft_references: Vec::new(),
             draft_images: Vec::new(),
             context: None,

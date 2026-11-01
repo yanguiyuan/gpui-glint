@@ -49,6 +49,10 @@ fn tool_signature(record: &tools::ToolRecord) -> String {
     record.success.hash(&mut hash);
     record.elapsed_ms.hash(&mut hash);
     record.live_output.hash(&mut hash);
+    for child in record.nested_tools.iter() {
+        child.call.id.hash(&mut hash);
+        child.success.hash(&mut hash);
+    }
     record
         .change
         .as_ref()
@@ -203,10 +207,26 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
                 .take(80)
                 .collect(),
         ),
+        "code_mode" => (
+            Icon::Shell,
+            if running {
+                "正在编排工具"
+            } else if success {
+                "已完成工具编排"
+            } else {
+                "工具编排未完成"
+            },
+            format!("{} 个调用", record.nested_tools.len()),
+        ),
         "run_command" => (
             Icon::Shell,
             if running {
                 "正在运行"
+            } else if serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .is_some_and(|v| v["status"] == "running")
+            {
+                "已启动后台命令"
             } else if success {
                 "已运行"
             } else {
@@ -284,6 +304,28 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
                 .unwrap_or("技能目录")
                 .into(),
         ),
+        "command_poll" | "command_stop" => (
+            Icon::Shell,
+            if running {
+                "正在查询命令"
+            } else if success {
+                "已查询命令状态"
+            } else {
+                "查询命令失败"
+            },
+            args["run_id"].as_str().unwrap_or("").into(),
+        ),
+        "session_changes" => (
+            Icon::Pencil,
+            if running {
+                "正在查询会话变更"
+            } else if success {
+                "已查询会话变更"
+            } else {
+                "查询变更失败"
+            },
+            args["path"].as_str().unwrap_or("当前会话").into(),
+        ),
         "session_read" => (
             Icon::Text,
             if running {
@@ -356,7 +398,66 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     } else if record.call.name == "run_command" && record.result.trim().is_empty() {
         "命令已结束，无输出。".into()
     } else {
-        record.result.clone()
+        if record.call.name == "read_file" {
+            serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .and_then(|v| v["content"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| record.result.clone())
+        } else if record.call.name == "code_mode" {
+            serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .map(|v| {
+                    if v["status"] == "completed" {
+                        serde_json::to_string_pretty(&v["value"]).unwrap_or_default()
+                    } else {
+                        v["error"].as_str().unwrap_or("工具编排未完成").into()
+                    }
+                })
+                .unwrap_or_else(|| record.result.clone())
+        } else if matches!(
+            record.call.name.as_str(),
+            "run_command" | "command_poll" | "command_stop"
+        ) {
+            serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .map(|v| {
+                    let mut parts = Vec::new();
+                    if let Some(page) = v["page"]["content"].as_str() {
+                        parts.push(page.to_owned());
+                    } else {
+                        for key in ["stdout", "stderr"] {
+                            if let Some(text) = v[key].as_str().filter(|s| !s.is_empty()) {
+                                parts.push(text.into());
+                            }
+                        }
+                    }
+                    if let Some(code) = v["exit_code"].as_i64().filter(|n| *n != 0) {
+                        parts.push(format!("退出码：{code}"));
+                    }
+                    if v["status"] == "running" {
+                        parts.push("后台命令已启动，可查询进度或停止。".into());
+                    }
+                    if v["status"] == "timed_out" {
+                        parts.push("命令超时，已停止本地进程组。".into());
+                    }
+                    if v["status"] == "cancelled" {
+                        parts.push("命令已取消。".into());
+                    }
+                    for key in ["error", "remote_state"] {
+                        if let Some(text) = v[key].as_str() {
+                            parts.push(text.into());
+                        }
+                    }
+                    if parts.is_empty() {
+                        "命令已结束，无输出。".into()
+                    } else {
+                        parts.join("\n")
+                    }
+                })
+                .unwrap_or_else(|| record.result.clone())
+        } else {
+            record.result.clone()
+        }
     };
     ToolPresentation {
         icon,
@@ -369,11 +470,13 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
 fn coalesce_tool_snapshots(events: Vec<tools::ToolEvent>) -> Vec<tools::ToolEvent> {
     let mut seen_transcript = false;
     let mut seen_outputs = std::collections::HashSet::new();
+    let mut seen_batches = std::collections::HashSet::new();
     let mut latest: Vec<_> = events
         .into_iter()
         .rev()
         .filter(|event| match event {
             tools::ToolEvent::Transcript(_) => !std::mem::replace(&mut seen_transcript, true),
+            tools::ToolEvent::BatchProgress { call_id, .. } => seen_batches.insert(call_id.clone()),
             tools::ToolEvent::Output { call_id, .. } => seen_outputs.insert(call_id.clone()),
             _ => true,
         })
@@ -464,7 +567,30 @@ impl AgentWorkspace {
                                         }
                                     }
                                 }
-                                tools::ToolEvent::ApprovalResolved => {}
+                                tools::ToolEvent::BatchProgress { call_id, tools } => {
+                                    let previous = this
+                                        .tool_activity
+                                        .iter()
+                                        .find(|r| r.call.id == call_id)
+                                        .map_or(0, |r| r.nested_tools.len());
+                                    for child in tools.iter().skip(previous) {
+                                        this.invalidate_preview_paths(child);
+                                    }
+                                    if let Some(record) =
+                                        this.tool_activity.iter_mut().find(|r| r.call.id == call_id)
+                                    {
+                                        record.nested_tools = tools.into();
+                                    }
+                                }
+                                tools::ToolEvent::ApprovalResolved => {
+                                    if this
+                                        .approval
+                                        .as_ref()
+                                        .is_some_and(|a| a.respond.is_closed())
+                                    {
+                                        this.approval = None;
+                                    }
+                                }
                                 tools::ToolEvent::ContextUsage {
                                     provider_id,
                                     model,
@@ -500,6 +626,7 @@ impl AgentWorkspace {
                                         success: false,
                                         elapsed_ms: 0,
                                         live_output: None,
+                                        nested_tools: Default::default(),
                                         subagent: None,
                                         change: None,
                                     })
@@ -529,7 +656,15 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::Completed(record) => {
-                                    if record.success {
+                                    if record.success
+                                        || matches!(
+                                            record.call.name.as_str(),
+                                            "run_command"
+                                                | "command_poll"
+                                                | "command_stop"
+                                                | "code_mode"
+                                        )
+                                    {
                                         this.invalidate_preview_paths(&record);
                                     }
                                     if record.call.name.starts_with("schedule_") {
@@ -597,6 +732,20 @@ impl AgentWorkspace {
             let presentation = tool_presentation(record);
             let result: SharedString = presentation.body.into();
             let change = record.change.clone();
+            let nested = record.nested_tools.clone();
+            let script = if record.call.name == "code_mode" {
+                record.call.arguments["code"].as_str().map(|source| {
+                    let text: SharedString = source.to_owned().into();
+                    cx.new(|cx| {
+                        gpui_glint::components::CodeCard::new(cx, "javascript", text)
+                            .show_header(false)
+                            .viewport()
+                            .theme(theme)
+                    })
+                })
+            } else {
+                None
+            };
             let weak = cx.entity().downgrade();
             let scope = format!("{key}:tool:{}", record.call.id);
             entry.panel.update(cx, |panel, cx| {
@@ -604,6 +753,41 @@ impl AgentWorkspace {
                 panel.set_summary(presentation.summary, cx);
                 panel.set_content(
                     move |_, cx| {
+                        if script.is_some() || !nested.is_empty() {
+                            return weak
+                                .update(cx, |this, cx| {
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .when_some(script.clone(), |body, card| {
+                                            body.child(
+                                                div()
+                                                    .id("code-mode-source")
+                                                    .max_h(px(240.))
+                                                    .overflow_y_scroll()
+                                                    .child(card),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id("code-mode-result")
+                                                .max_h(px(200.))
+                                                .overflow_y_scroll()
+                                                .text_size(px(12.))
+                                                .child(result.clone()),
+                                        )
+                                        .children(
+                                            nested
+                                                .iter()
+                                                .map(|record| this.tool_panel(&scope, record, cx)),
+                                        )
+                                        .into_any_element()
+                                })
+                                .unwrap_or_else(|_| div().into_any_element());
+                        }
                         if let Some(change) = &change {
                             return weak
                                 .update(cx, |this, cx| {
@@ -699,15 +883,16 @@ impl AgentWorkspace {
                     }
                 },
             );
+            let source = SharedString::from(text.to_owned());
             MarkdownView {
-                source: text.into(),
+                source: source.clone(),
                 theme,
                 editor,
                 root: root.clone(),
                 paths: Default::default(),
                 last_used: std::time::Instant::now(),
                 links_source: None,
-                render_source: text.into(),
+                render_source: source,
                 links_revision: 0,
                 links_task: None,
                 _link_subscription: subscription,
@@ -722,9 +907,9 @@ impl AgentWorkspace {
                 }
             });
             if view.source.as_ref() != text {
-                view.render_source = SharedString::from(text.to_owned());
+                view.source = SharedString::from(text.to_owned());
+                view.render_source = view.source.clone();
             }
-            view.source = text.into();
             view.theme = theme;
         }
         if view.links_source.as_deref() != Some(text) {
@@ -1136,6 +1321,28 @@ mod tests {
     use generation::ContentBlock::{Text, Thinking};
 
     #[gpui::test]
+    fn markdown_cache_is_bounded_and_preserves_recent_editors(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        host.update(window, |h, cx| {
+            for i in 0..300 {
+                h.markdown_preview(format!("bounded-{i}"), "A cached message", false, cx);
+            }
+            let last = h.markdown_preview("bounded-299".into(), "A cached message", false, cx);
+            let cache = h.markdown_views.borrow();
+            assert_eq!(cache.len(), 256);
+            assert!(!cache.contains_key("bounded-0"));
+            assert_eq!(cache["bounded-299"].editor.entity_id(), last.entity_id());
+        });
+    }
+    #[gpui::test]
     fn streaming_follows_the_end_detaches_on_wheel_and_resumes_when_reader_returns(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1379,6 +1586,7 @@ mod tests {
             success: false,
             elapsed_ms: 0,
             live_output: None,
+            nested_tools: Default::default(),
             subagent: None,
             change: None,
         };
@@ -1443,6 +1651,7 @@ mod tests {
             success: true,
             elapsed_ms: 1200,
             live_output: None,
+            nested_tools: Default::default(),
             subagent: None,
             change: None,
         };

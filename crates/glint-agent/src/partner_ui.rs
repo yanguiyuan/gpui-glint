@@ -58,7 +58,14 @@ impl MemoryFilter {
         }
     }
 }
+#[derive(Default)]
+struct CatalogSnapshot {
+    items: std::sync::Arc<Vec<partners::Partner>>,
+    loaded: Option<std::time::Instant>,
+    task: Option<Task<()>>,
+}
 pub struct State {
+    catalog: std::cell::RefCell<CatalogSnapshot>,
     model: Entity<Select>,
     thinking: Entity<Select>,
     pub selected: Option<Uuid>,
@@ -135,6 +142,7 @@ impl State {
             .detach();
         }
         Self {
+            catalog: Default::default(),
             model,
             thinking,
             partner_search,
@@ -158,6 +166,49 @@ impl State {
     }
 }
 impl AgentWorkspace {
+    fn refresh_partner_snapshot(&self, cx: &mut Context<Self>) {
+        {
+            let mut catalog = self.partners_ui.catalog.borrow_mut();
+            catalog.loaded = None;
+            catalog.task = None;
+        }
+        self.cached_partners(cx);
+    }
+    pub(super) fn cached_partners(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> std::sync::Arc<Vec<partners::Partner>> {
+        let mut catalog = self.partners_ui.catalog.borrow_mut();
+        if catalog.task.is_none()
+            && catalog
+                .loaded
+                .is_none_or(|time| time.elapsed() > std::time::Duration::from_secs(2))
+        {
+            let path = self.path.clone();
+            catalog.task = Some(cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { partners::Repository::new(path).list() })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    {
+                        let mut catalog = this.partners_ui.catalog.borrow_mut();
+                        if let Some(task) = catalog.task.take() {
+                            task.detach();
+                        }
+                        catalog.loaded = Some(std::time::Instant::now());
+                        if let Ok(items) = result {
+                            catalog.items = std::sync::Arc::new(items);
+                        }
+                    }
+                    this.sync_skill_context(cx);
+                    cx.notify();
+                });
+            }));
+        }
+        catalog.items.clone()
+    }
+
     pub(crate) fn open_partners(&mut self, cx: &mut Context<Self>) {
         self.page = crate::Page::Partners;
         let target = self
@@ -182,6 +233,17 @@ impl AgentWorkspace {
         partners::Repository::new(self.path.clone())
     }
     fn select_partner(&mut self, p: &partners::Partner, cx: &mut Context<Self>) {
+        {
+            let mut catalog = self.partners_ui.catalog.borrow_mut();
+            catalog.task = None;
+            catalog.loaded = None;
+            let items = std::sync::Arc::make_mut(&mut catalog.items);
+            if let Some(item) = items.iter_mut().find(|item| item.id == p.id) {
+                *item = p.clone();
+            } else {
+                items.push(p.clone());
+            }
+        }
         let selection = self.history.partner_models.get(&p.id);
         let model = selection
             .map(|s| format!("{}:{}", s.provider_id, s.model))

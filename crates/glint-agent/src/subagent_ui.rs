@@ -130,6 +130,7 @@ impl AgentWorkspace {
                     success: trace.status == Status::Completed,
                     elapsed_ms: trace.elapsed_ms,
                     live_output: None,
+                    nested_tools: Default::default(),
                     subagent: Some(trace.clone()),
                     change: None,
                 });

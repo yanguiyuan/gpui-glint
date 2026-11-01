@@ -144,6 +144,7 @@ impl Remote {
         }
         command
     }
+    #[cfg(test)]
     pub fn run(&self, program: &str, args: &[String]) -> tokio::process::Command {
         let argv = std::iter::once(program)
             .chain(args.iter().map(String::as_str))
@@ -151,6 +152,35 @@ impl Remote {
             .collect::<Vec<_>>()
             .join(" ");
         self.command(&format!("cd -- {} && exec {argv}", quote(&self.directory)))
+    }
+    pub fn managed_run(&self, program: &str, args: &[String]) -> tokio::process::Command {
+        const WORKER: &str = r#"import subprocess,sys,signal,threading,os,json
+argv=json.loads(sys.argv[1])
+p=subprocess.Popen(argv,start_new_session=True,stdin=subprocess.DEVNULL)
+def stop(*_):
+ try: os.killpg(p.pid,signal.SIGKILL)
+ except ProcessLookupError: pass
+def eof():
+ sys.stdin.buffer.read()
+ stop()
+for s in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT):signal.signal(s,stop)
+threading.Thread(target=eof,daemon=True).start()
+try: code=p.wait()
+finally: stop()
+sys.exit(code if code>=0 else 128-code)
+"#;
+        let argv = serde_json::to_string(
+            &std::iter::once(program.to_owned())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        self.command(&format!(
+            "cd -- {} && python3 -u -c {} {}",
+            quote(&self.directory),
+            quote(WORKER),
+            quote(&argv)
+        ))
     }
     pub async fn action(&self, op: &str, args: Value, full_access: bool) -> Result<Value, String> {
         let mut command = self.command(&format!("python3 -c {}", quote(HELPER)));
@@ -214,6 +244,62 @@ mod tests {
     use std::io::Write;
 
     #[cfg(unix)]
+    #[test]
+    fn remote_undo_checks_the_batch_and_restores_or_removes_recorded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        std::fs::write(&a, "after").unwrap();
+        std::fs::write(&b, "external").unwrap();
+        let changes = json!({"changes":[{"path":a,"before":"before","after":"after"},{"path":b,"before":null,"after":"created"}]});
+        assert!(helper(&root, "undo_changes", changes.clone(), true).is_err());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "after");
+        std::fs::write(&b, "created").unwrap();
+        let result = helper(&root, "undo_changes", changes.clone(), true).unwrap();
+        assert_eq!(result["restored"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "before");
+        assert!(!b.exists());
+        assert_eq!(
+            helper(&root, "undo_changes", changes, true).unwrap()["restored"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn remote_hover_excerpt_is_bounded_and_reads_only_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("long.rs"),
+            format!("first\n{}\nlast\n", "汉".repeat(400_000)),
+        )
+        .unwrap();
+        let value = helper(
+            dir.path(),
+            "preview_excerpt",
+            json!({"path":"long.rs","start_line":2,"lines":1}),
+            true,
+        )
+        .unwrap();
+        let text = value.as_str().unwrap();
+        assert!(text.len() <= 4097);
+        assert!(text.starts_with("汉"));
+        assert!(!text.contains("last"));
+        assert_eq!(
+            helper(
+                dir.path(),
+                "preview_excerpt",
+                json!({"path":"long.rs","start_line":3,"lines":1}),
+                true
+            )
+            .unwrap(),
+            "last\n"
+        );
+    }
+    #[cfg(unix)]
     fn helper(root: &Path, op: &str, args: Value, full: bool) -> Result<Value, String> {
         let mut child = std::process::Command::new("python3")
             .args(["-c", HELPER])
@@ -244,6 +330,32 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_edit_plan_is_read_only_and_commit_detects_a_concurrent_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("file");
+        std::fs::write(&path, "old").unwrap();
+        let read = helper(
+            &root,
+            "read_file",
+            json!({"path":"file","include_metadata":true}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(read["expected_sha256"], crate::atomic_file::digest("old"));
+        let plan=helper(&root,"prepare_edit",json!({"path":"file","kind":"write_file","content":"new","expected_sha256":read["expected_sha256"]}),false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        let commit = json!({"path":"file","canonical_path":plan["path"],"expected_sha256":plan["sha256"],"expected_absent":false,"content":plan["after"]});
+        std::fs::write(&path, "external").unwrap();
+        assert!(helper(&root, "commit_edit", commit.clone(), false).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+        std::fs::write(&path, "old").unwrap();
+        helper(&root, "commit_edit", commit, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
     #[cfg(unix)]
     #[test]
     fn remote_preview_distinguishes_directories_text_and_binary() {

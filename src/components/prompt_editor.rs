@@ -1599,6 +1599,16 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let (editor, window) = cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message"));
+        let events = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hits = events.clone();
+        window.update(|_, cx| {
+            cx.subscribe(&editor, move |_, event: &PromptEditorEvent, _| {
+                if matches!(event, PromptEditorEvent::ReferenceHovered(_)) {
+                    hits.set(hits.get() + 1);
+                }
+            })
+            .detach()
+        });
         window.simulate_resize(gpui::size(px(520.), px(400.)));
         editor.update(window, |editor, cx| {
             let mut reference = super::super::ComposerReference::selection(
@@ -1623,10 +1633,12 @@ mod tests {
             ..Default::default()
         });
         window.run_until_parked();
+        assert_eq!(events.get(), 0, "hover reads must wait for the dwell delay");
         window
             .executor()
             .advance_clock(std::time::Duration::from_millis(350));
         window.run_until_parked();
+        assert_eq!(events.get(), 1);
         let bounds = window
             .debug_bounds("prompt-reference-preview")
             .expect("hover preview");
