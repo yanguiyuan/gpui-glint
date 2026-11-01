@@ -91,6 +91,33 @@ impl Index {
         index.entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(index)
     }
+    async fn scan_remote(root: PathBuf) -> Result<Self, String> {
+        let remote = crate::ssh_project::Remote::from_path(&root)?;
+        let value = remote.action("index", serde_json::json!({}), false).await?;
+        let entries = value["entries"]
+            .as_array()
+            .ok_or("远程索引响应无效")?
+            .iter()
+            .filter_map(|v| {
+                let path = v["path"].as_str()?.to_owned();
+                let name = v["name"].as_str()?.to_owned();
+                Some(Entry {
+                    key: path.to_lowercase(),
+                    name_key: name.to_lowercase(),
+                    depth: path.matches('/').count() + 1,
+                    path,
+                    name,
+                    directory: v["directory"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect();
+        Ok(Self {
+            root,
+            entries,
+            truncated: value["truncated"].as_bool().unwrap_or(false),
+            skipped: value["skipped"].as_u64().unwrap_or(0) as usize,
+        })
+    }
     pub fn search(&self, query: &str) -> Vec<&Entry> {
         let query = query.to_lowercase().replace('\\', "/");
         let mut entries: Vec<_> = self
@@ -135,6 +162,9 @@ impl Index {
             .any(|part| !matches!(part, Component::Normal(_)))
         {
             return false;
+        }
+        if crate::ssh_project::is_remote(&self.root) {
+            return true;
         }
         self.root
             .join(relative)
@@ -219,9 +249,15 @@ impl AgentWorkspace {
             return;
         };
         self.project_context.error = None;
-        let work = cx
-            .background_executor()
-            .spawn(async move { Index::scan(&root) });
+        let work = cx.background_executor().spawn(async move {
+            if crate::ssh_project::is_remote(&root) {
+                crate::provider::Job::start(Index::scan_remote(root))?
+                    .result()
+                    .await
+            } else {
+                Index::scan(&root)
+            }
+        });
         self.project_context.task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {

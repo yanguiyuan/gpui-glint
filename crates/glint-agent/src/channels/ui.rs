@@ -153,7 +153,9 @@ impl AgentWorkspace {
                 return;
             }
         };
-        if !partners.iter().any(|p| p.id == job.app.partner) || !job.app.project.is_dir() {
+        if !partners.iter().any(|p| p.id == job.app.partner)
+            || !(crate::ssh_project::is_remote(&job.app.project) || job.app.project.is_dir())
+        {
             let _ = self
                 .channels
                 .repo

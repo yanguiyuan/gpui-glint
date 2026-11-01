@@ -46,12 +46,7 @@ impl AgentWorkspace {
             .active()
             .project
             .as_ref()
-            .map(|path| {
-                path.file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|path| ssh_project::label(path))
             .unwrap_or_else(|| "选择项目".into());
         let trigger = div()
             .flex()
@@ -68,11 +63,7 @@ impl AgentWorkspace {
         let mut content = div().flex().flex_col().gap_1();
         for path in &self.history.projects {
             let path = path.clone();
-            let label = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned();
+            let label = ssh_project::label(&path);
             content = content.child(
                 div()
                     .id(SharedString::from(format!(
@@ -105,6 +96,14 @@ impl AgentWorkspace {
                     cx.notify();
                 })),
         );
+        content = content.child(
+            Button::new("打开 SSH 项目…")
+                .icon(Icon::Globe)
+                .kind(ButtonKind::Plain)
+                .theme(self.theme)
+                .render()
+                .on_click(cx.listener(|this, _, window, cx| this.open_ssh_project(window, cx))),
+        );
         let weak = cx.entity().downgrade();
         Popover::new("composer-project-selector", trigger, content)
             .open(self.project_picker_open)
@@ -122,6 +121,18 @@ impl AgentWorkspace {
     }
 
     pub fn pick_context(&mut self, directories: bool, cx: &mut Context<Self>) {
+        if self
+            .history
+            .active()
+            .project
+            .as_deref()
+            .is_some_and(ssh_project::is_remote)
+        {
+            self.refresh_project_context(cx);
+            self.composer
+                .update(cx, |composer, cx| composer.open_context_panel(cx));
+            return;
+        }
         let session = self.history.active;
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: !directories,
@@ -249,15 +260,9 @@ pub fn session_groups_with_partners(
                 continue;
             }
             groups.push(GroupListGroup::new(
-                GroupListHeader::new(
-                    id,
-                    path.file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-                .icon(Icon::Folder)
-                .actions([Icon::Plus]),
+                GroupListHeader::new(id, ssh_project::label(path))
+                    .icon(Icon::Folder)
+                    .actions([Icon::Plus]),
             ));
         }
     }
@@ -266,10 +271,7 @@ pub fn session_groups_with_partners(
             match &session.project {
                 Some(path) => (
                     format!("project:{}", path.display()),
-                    path.file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
+                    ssh_project::label(path),
                     Icon::Folder,
                 ),
                 None => continue,

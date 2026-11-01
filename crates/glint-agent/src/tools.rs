@@ -183,7 +183,7 @@ pub fn definitions(anthropic: bool) -> Value {
         ),
         definition(
             "search_files",
-            "Search project text with ripgrep regex; returns at most 200 matches.",
+            "Search project text with regex (ripgrep locally, Python regex over SSH); returns at most 200 matches.",
             json!({"pattern":string(),"glob":string()}),
             &["pattern"],
         ),
@@ -505,7 +505,21 @@ pub async fn execute(call: ToolCall, context: &ToolContext) -> ToolRecord {
             }
         }
         if matches!(call.name.as_str(), "write_file" | "replace_in_file") {
-            let (result, observed) = crate::edits::apply(&call, context)?;
+            let (result, observed) = if let Some(root) = context
+                .root
+                .as_deref()
+                .filter(|p| crate::ssh_project::is_remote(p))
+            {
+                let remote = crate::ssh_project::Remote::from_path(root)?;
+                let full = *context.access.lock().map_err(|_| "无法读取权限设置")?
+                    == AccessMode::FullAccess;
+                let value = remote
+                    .action(&call.name, call.arguments.clone(), full)
+                    .await?;
+                crate::edits::remote_change(remote, text(&call.arguments, "path")?, value)?
+            } else {
+                crate::edits::apply(&call, context)?
+            };
             change = observed;
             Ok(result)
         } else {
@@ -560,6 +574,9 @@ pub(crate) fn resolve_file(
                 .flatten()
         })
         .ok_or("请先打开项目，再使用文件工具")?;
+    if crate::ssh_project::is_remote(&root) {
+        return Err("远程项目文件必须通过 SSH 文件工具访问".into());
+    }
     if access == AccessMode::FullAccess {
         Ok(root.join(relative))
     } else {
@@ -697,6 +714,27 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
         .as_deref()
         .or(fallback_root.as_deref())
         .ok_or("请先打开项目，再使用文件和命令工具")?;
+    if crate::ssh_project::is_remote(root)
+        && matches!(
+            call.name.as_str(),
+            "read_file" | "list_files" | "search_files"
+        )
+    {
+        let remote = crate::ssh_project::Remote::from_path(root)?;
+        let value = remote
+            .action(&call.name, args.clone(), access == AccessMode::FullAccess)
+            .await?;
+        if call.name == "list_files" {
+            let paths = value["entries"].as_array().ok_or("远程文件列表无效")?;
+            let mut names: Vec<_> = paths.iter().filter_map(|v| v["path"].as_str()).collect();
+            names.sort();
+            return Ok(names.join("\n"));
+        }
+        return value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or("远程文件响应无效".into());
+    }
     let resolve = |path: &str, writing| {
         if access == AccessMode::FullAccess {
             Ok(root.join(path))
@@ -893,10 +931,14 @@ async fn command(
     args: &[String],
     events: Option<(&str, &async_channel::Sender<ToolEvent>)>,
 ) -> Result<String, String> {
-    let mut command = tokio::process::Command::new(program);
+    let mut command = if crate::ssh_project::is_remote(root) {
+        crate::ssh_project::Remote::from_path(root)?.run(program, args)
+    } else {
+        let mut command = tokio::process::Command::new(program);
+        command.args(args).current_dir(root);
+        command
+    };
     command
-        .args(args)
-        .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -924,7 +966,13 @@ async fn command(
         )
     })
     .await
-    .map_err(|_| "命令超过 60 秒，已终止")?;
+    .map_err(|_| {
+        if crate::ssh_project::is_remote(root) {
+            "远程命令超过 60 秒，SSH 通道已关闭；执行结果未确认，请核对远端状态"
+        } else {
+            "命令超过 60 秒，已终止"
+        }
+    })?;
     let status = status.map_err(|_| "命令执行失败")?;
     Ok(format!(
         "exit: {}\n{}\n{}",

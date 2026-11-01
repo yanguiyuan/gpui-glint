@@ -104,7 +104,7 @@ impl Repository {
         if app.app_id.trim().is_empty() || app.name.trim().is_empty() {
             return Err("请填写应用名称和 App ID".into());
         }
-        if !app.project.is_dir() {
+        if !(crate::ssh_project::is_remote(&app.project) || app.project.is_dir()) {
             return Err("请选择存在的项目目录".into());
         }
         let mut db = self.open()?;

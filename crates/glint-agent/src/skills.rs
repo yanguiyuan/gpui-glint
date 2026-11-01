@@ -194,7 +194,7 @@ impl Manager {
     ) -> Result<Catalog, String> {
         let settings = load_settings(&database::open(&self.anchor)?)?;
         let mut roots = Vec::new();
-        if let Some(project) = project {
+        if let Some(project) = project.filter(|path| !crate::ssh_project::is_remote(path)) {
             for folder in [".agents/skills", ".glint/skills", ".codex/skills"] {
                 roots.push((project.join(folder), "项目".into()));
             }

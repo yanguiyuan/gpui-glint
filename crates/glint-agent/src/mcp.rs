@@ -139,7 +139,8 @@ impl Client {
                             .envs(server.env)
                             .kill_on_drop(true);
                         command.stderr(std::process::Stdio::null());
-                        if let Some(root) = root {
+                        if let Some(root) = root.filter(|path| !crate::ssh_project::is_remote(path))
+                        {
                             command.current_dir(root);
                         }
                         ().serve(TokioChildProcess::new(command).map_err(|e| e.to_string())?)

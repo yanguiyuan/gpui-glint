@@ -365,9 +365,15 @@ impl AgentWorkspace {
             cx.notify();
             return;
         };
-        let work = cx
-            .background_executor()
-            .spawn(async move { edits::workspace_changes(&root) });
+        let work = cx.background_executor().spawn(async move {
+            if crate::ssh_project::is_remote(&root) {
+                provider::Job::start(async move { edits::remote_workspace_changes(&root).await })?
+                    .result()
+                    .await
+            } else {
+                edits::workspace_changes(&root)
+            }
+        });
         self.edits_ui.workspace_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {

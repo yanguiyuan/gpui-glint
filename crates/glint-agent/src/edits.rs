@@ -97,6 +97,62 @@ pub fn apply(call: &ToolCall, context: &ToolContext) -> Result<(String, Option<C
     ))
 }
 
+/// Record a confirmed remote write using the same diff presentation as local edits.
+pub(crate) fn remote_change(
+    mut remote: crate::ssh_project::Remote,
+    label: &str,
+    value: serde_json::Value,
+) -> Result<(String, Option<Change>), String> {
+    let before = value["before"].as_str().map(Arc::from);
+    let after: Arc<str> = Arc::from(value["after"].as_str().ok_or("远程写入响应无效")?);
+    if before.as_deref() == Some(after.as_ref()) {
+        return Ok(("文件内容未变化".into(), None));
+    }
+    remote.directory = value["path"].as_str().ok_or("远程写入路径无效")?.into();
+    let mut change = Change {
+        id: uuid::Uuid::new_v4(),
+        path: remote.uri(),
+        label: label.into(),
+        before,
+        after,
+        added: 0,
+        removed: 0,
+        lines: Default::default(),
+    };
+    change.count();
+    Ok((
+        format!("远程文件已更新，+{} -{} 行", change.added, change.removed),
+        Some(change),
+    ))
+}
+
+pub(crate) async fn remote_workspace_changes(
+    root: &Path,
+) -> Result<(Vec<Change>, Vec<String>), String> {
+    let remote = crate::ssh_project::Remote::from_path(root)?;
+    let value = remote
+        .action("workspace_changes", serde_json::json!({}), false)
+        .await?;
+    let rows = value["changes"].as_array().ok_or("远程 Git 响应无效")?;
+    let mut changes = Vec::new();
+    for row in rows {
+        let label = row["label"].as_str().ok_or("远程 Git 文件名无效")?;
+        if let Some(change) = remote_change(remote.clone(), label, row.clone())?.1 {
+            changes.push(change);
+        }
+    }
+    let notes = value["notes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((changes, notes))
+}
+
 /// Fold repeated writes into the net change from first content to last content.
 /// Only these tools' observed edits are included; pre-existing Git changes are not.
 #[cfg(test)]
