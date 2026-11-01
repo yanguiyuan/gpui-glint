@@ -244,6 +244,38 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_preview_distinguishes_directories_text_and_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("file.rs"), "你好\nsource\n").unwrap();
+        std::fs::write(dir.path().join("binary.bin"), [0, 255, 0]).unwrap();
+        let kinds = helper(
+            dir.path(),
+            "preview_stat",
+            json!({"paths":["src","file.rs","binary.bin","gone"]}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(kinds["src"], "directory");
+        assert_eq!(kinds["file.rs"], "text");
+        assert!(kinds["binary.bin"].is_null());
+        assert!(kinds["gone"].is_null());
+        let text = helper(dir.path(), "preview", json!({"path":"file.rs"}), true).unwrap();
+        assert_eq!(text["content"], "你好\nsource\n");
+        let listing = helper(dir.path(), "preview", json!({"path":"."}), true).unwrap();
+        assert_eq!(listing["entries"][0]["name"], "src");
+        assert!(
+            listing["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "binary.bin" && v["previewable"] == false)
+        );
+        assert!(helper(dir.path(), "preview", json!({"path":"binary.bin"}), true).is_err());
+    }
+
     #[test]
     fn ssh_identity_parses_commands_ports_and_round_trips_without_local_paths() {
         let remote = Remote::parse("ssh user@example.com", "/home/user/my project").unwrap();

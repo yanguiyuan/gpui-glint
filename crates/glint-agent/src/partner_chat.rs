@@ -95,10 +95,12 @@ impl AgentWorkspace {
                 let project = source.project.clone();
                 let draft = std::mem::take(&mut source.draft);
                 let images = std::mem::take(&mut source.draft_images);
+                let references = std::mem::take(&mut source.draft_references);
                 self.history.new_session_for(project);
                 let target = self.history.active_mut();
                 target.draft = draft;
                 target.draft_images = images;
+                target.draft_references = references;
                 self.restore_draft(cx);
                 self.scroll = ScrollHandle::new();
             }

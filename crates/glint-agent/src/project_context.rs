@@ -300,9 +300,32 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
-        let color = self.theme.palette().accent;
+        let directory = self
+            .project_context
+            .index
+            .as_ref()
+            .and_then(|index| index.entries.iter().find(|entry| entry.path == path))
+            .is_some_and(|entry| entry.directory);
+        let path = self
+            .history
+            .active()
+            .project
+            .as_ref()
+            .map(|root| {
+                if let Ok(mut remote) = ssh_project::Remote::from_path(root) {
+                    remote.directory =
+                        format!("{}/{}", remote.directory.trim_end_matches('/'), path);
+                    remote.uri().to_string_lossy().into_owned()
+                } else {
+                    root.join(path).to_string_lossy().into_owned()
+                }
+            })
+            .unwrap_or_else(|| path.to_owned());
         self.composer.update(cx, |composer, cx| {
-            composer.add_mention(path.to_owned(), color, cx)
+            composer.add_reference(
+                gpui_glint::components::ComposerReference::file(path, directory),
+                cx,
+            )
         });
         self.capture_draft(cx);
         self.save(cx);

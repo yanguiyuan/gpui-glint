@@ -2,9 +2,17 @@ use super::*;
 use std::hash::{Hash, Hasher};
 
 pub struct MarkdownView {
-    source: String,
+    source: SharedString,
     theme: ThemePreset,
     editor: Entity<gpui_glint::components::DocumentEditor>,
+    pub(super) root: Option<PathBuf>,
+    pub(super) paths: std::collections::HashSet<String>,
+    last_used: std::time::Instant,
+    pub(super) links_source: Option<SharedString>,
+    render_source: SharedString,
+    pub(super) links_revision: u64,
+    pub(super) links_task: Option<Task<()>>,
+    _link_subscription: Subscription,
 }
 
 pub struct ToolPanel {
@@ -521,6 +529,9 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::Completed(record) => {
+                                    if record.success {
+                                        this.invalidate_preview_paths(&record);
+                                    }
                                     if record.call.name.starts_with("schedule_") {
                                         this.refresh_calendar(cx);
                                     }
@@ -596,7 +607,6 @@ impl AgentWorkspace {
                         if let Some(change) = &change {
                             return weak
                                 .update(cx, |this, cx| {
-                                    let path = change.path.clone();
                                     div()
                                         .w_full()
                                         .min_w_0()
@@ -609,15 +619,6 @@ impl AgentWorkspace {
                                                 .max_h(px(360.))
                                                 .overflow_y_scroll()
                                                 .child(this.edit_diff(&scope, change, cx)),
-                                        )
-                                        .child(
-                                            Button::new("在侧栏查看")
-                                                .kind(ButtonKind::Plain)
-                                                .theme(this.theme)
-                                                .render()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_edits(Some(path.clone()), cx)
-                                                })),
                                         )
                                         .into_any_element()
                                 })
@@ -672,30 +673,133 @@ impl AgentWorkspace {
         cx: &mut Context<Self>,
     ) -> Entity<gpui_glint::components::DocumentEditor> {
         let mut cache = self.markdown_views.borrow_mut();
+        let root = self.history.active().project.clone();
+        if cache.get(&key).is_some_and(|view| view.root != root) {
+            cache.remove(&key);
+        }
         let theme = self.theme;
-        let view = cache.entry(key).or_insert_with(|| MarkdownView {
-            source: text.into(),
-            theme,
-            editor: cx.new(|cx| {
-                let editor = gpui_glint::components::DocumentEditor::new(cx, text).theme(theme);
+        let prune = cache.get(&key).is_none_or(|v| v.source.as_ref() != text);
+        let view = cache.entry(key.clone()).or_insert_with(|| {
+            let editor = cx.new(|cx| {
+                let editor = gpui_glint::components::DocumentEditor::new(cx, text)
+                    .theme(theme)
+                    .activate_preview_links(true);
                 if scrollable {
                     editor.scrollable_preview()
                 } else {
                     editor.embedded_preview()
                 }
-            }),
+            });
+            let origin = root.clone();
+            let subscription = cx.subscribe(
+                &editor,
+                move |this, _, event: &gpui_glint::components::DocumentEvent, cx| {
+                    if let gpui_glint::components::DocumentEvent::LinkActivated(link) = event {
+                        this.preview_link(link, &origin, cx);
+                    }
+                },
+            );
+            MarkdownView {
+                source: text.into(),
+                theme,
+                editor,
+                root: root.clone(),
+                paths: Default::default(),
+                last_used: std::time::Instant::now(),
+                links_source: None,
+                render_source: text.into(),
+                links_revision: 0,
+                links_task: None,
+                _link_subscription: subscription,
+            }
         });
-        if view.source != text || view.theme != theme {
+        view.last_used = std::time::Instant::now();
+        if view.source.as_ref() != text || view.theme != theme {
             view.editor.update(cx, |editor, cx| {
                 editor.set_theme(theme, cx);
-                if view.source != text {
+                if view.source.as_ref() != text {
                     editor.set_markdown(text, cx);
                 }
             });
+            if view.source.as_ref() != text {
+                view.render_source = SharedString::from(text.to_owned());
+            }
             view.source = text.into();
             view.theme = theme;
         }
-        view.editor.clone()
+        if view.links_source.as_deref() != Some(text) {
+            view.links_source = Some(view.source.clone());
+            view.links_revision += 1;
+            let revision = view.links_revision;
+            let source = view.source.clone();
+            let paths = self.file_preview.paths.clone();
+            let task_key = key.clone();
+            view.links_task = Some(cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let work_source = source.to_string();
+                let work_root = root.clone();
+                let work = cx.background_executor().spawn(async move {
+                    if work_root.as_deref().is_some_and(ssh_project::is_remote) {
+                        provider::Job::start(file_preview::decorate_cached(
+                            work_source,
+                            work_root,
+                            paths,
+                        ))?
+                        .result()
+                        .await
+                    } else {
+                        file_preview::decorate_cached(work_source, work_root, paths).await
+                    }
+                });
+                let result = work.await;
+                let _ = weak.update(cx, |this, cx| {
+                    let mut cache = this.markdown_views.borrow_mut();
+                    if let Some(view) = cache.get_mut(&task_key) {
+                        if view.links_revision != revision
+                            || view.source != source
+                            || view.root != root
+                        {
+                            return;
+                        }
+                        if let Some(task) = view.links_task.take() {
+                            task.detach();
+                        }
+                        if let Ok(result) = result {
+                            view.paths = result.paths;
+                            let markdown = result.markdown;
+                            if view.render_source.as_ref() != markdown {
+                                view.editor
+                                    .update(cx, |editor, cx| editor.set_markdown(&markdown, cx));
+                                view.render_source = markdown.into();
+                            }
+                        }
+                    }
+                });
+            }));
+        }
+        let editor = view.editor.clone();
+        if prune {
+            let mut bytes: usize = cache
+                .values()
+                .map(|v| v.source.len() + v.render_source.len())
+                .sum();
+            while cache.len() > 256 || bytes > 16 * 1024 * 1024 && cache.len() > 1 {
+                let oldest = cache
+                    .iter()
+                    .filter(|(k, _)| *k != &key)
+                    .min_by_key(|(_, v)| v.last_used)
+                    .map(|(k, _)| k.clone());
+                let Some(oldest) = oldest else {
+                    break;
+                };
+                if let Some(old) = cache.remove(&oldest) {
+                    bytes = bytes.saturating_sub(old.source.len() + old.render_source.len());
+                }
+            }
+        }
+        editor
     }
 
     pub fn transcript_view(

@@ -7,6 +7,23 @@ def run(q):
     root = os.path.realpath(os.path.expanduser(q['root']))
     if not os.path.isdir(root):
         raise ValueError('远程项目目录不存在')
+    def text_file(path):
+        try:
+            metadata = os.stat(path)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > LIMIT: return False
+            with open(path, 'rb') as file: sample = file.read(8192)
+            if b'\x00' in sample: return False
+            import codecs
+            codecs.getincrementaldecoder('utf-8')().decode(sample, final=False)
+            return True
+        except (OSError, UnicodeError):
+            return False
+    if q['op'] == 'preview_stat':
+        result = {}
+        for path in q.get('args', {}).get('paths', [])[:128]:
+            resolved = os.path.realpath(os.path.join(root, os.path.expanduser(path)))
+            result[path] = 'directory' if os.path.isdir(resolved) else 'text' if text_file(resolved) else None
+        return result
     op = q['op']
     if op == 'probe':
         return {'root': root}
@@ -35,6 +52,32 @@ def run(q):
             raise ValueError('文件超过 2MB')
         return content
 
+    if op == 'preview_excerpt':
+        if not text_file(path): raise ValueError('不支持预览此文件')
+        start = max(1, int(args.get('start_line', 1)))
+        lines = max(1, min(25, int(args.get('lines', 25))))
+        with open(path, 'rb') as file:
+            for _ in range(start - 1):
+                if not file.readline(): return ''
+            sample = file.read(4097)
+        if b'\x00' in sample: raise ValueError('二进制文件不支持预览')
+        import codecs
+        text = codecs.getincrementaldecoder('utf-8')().decode(sample, final=len(sample) < 4097)
+        return ''.join(text.splitlines(keepends=True)[:lines])
+
+    if op == 'preview':
+        parent = os.path.dirname(path) if os.path.dirname(path) != path else None
+        if os.path.isdir(path):
+            entries = []
+            with os.scandir(path) as listing:
+                for entry in listing:
+                    entries.append({'name': entry.name, 'path': entry.path, 'directory': entry.is_dir(), 'previewable': text_file(entry.path)})
+                    if len(entries) > 1000: break
+            entries.sort(key=lambda entry: (not entry['directory'], entry['name']))
+            return {'kind': 'directory', 'path': path, 'parent': parent, 'entries': entries[:1000], 'truncated': len(entries) > 1000}
+        content = read(path)
+        if '\x00' in content: raise ValueError('二进制文件不支持文本预览')
+        return {'kind': 'text', 'path': path, 'parent': parent, 'content': content}
     if op == 'workspace_changes':
         status = subprocess.run(['git', '--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all'], cwd=root, capture_output=True, timeout=30)
         if status.returncode:

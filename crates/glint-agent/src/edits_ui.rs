@@ -1,6 +1,6 @@
 use super::*;
 use crate::edits::Change;
-use gpui_glint::components::DiffCard;
+use gpui_glint::components::{DiffCard, DiffCardEvent};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -67,6 +67,7 @@ impl AgentWorkspace {
     }
 
     pub fn open_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_preview.open = false;
         self.edits_ui.open = true;
         self.edits_ui.workspace_mode = false;
         self.edits_ui.selected = path;
@@ -84,14 +85,18 @@ impl AgentWorkspace {
         let key = format!("{scope}:{}", change.path.display());
         let mut cache = self.edits_ui.diffs.borrow_mut();
         let entry = cache.entry(key).or_insert_with(|| {
-            (
-                change.id,
-                cx.new(|cx| {
-                    DiffCard::from_lines(cx, edits::language(&change.path), change.lines())
-                        .name(change.label.clone())
-                        .theme(self.theme)
-                }),
-            )
+            let card = cx.new(|cx| {
+                DiffCard::from_lines(cx, edits::language(&change.path), change.lines())
+                    .name(change.label.clone())
+                    .title_clickable(true)
+                    .theme(self.theme)
+            });
+            let path = change.path.clone();
+            cx.subscribe(&card, move |this, _, _: &DiffCardEvent, cx| {
+                this.open_edits(Some(path.clone()), cx)
+            })
+            .detach();
+            (change.id, card)
         });
         if entry.0 != change.id {
             entry
@@ -220,8 +225,7 @@ impl AgentWorkspace {
         drop(views);
         let source_weak = cx.entity().downgrade();
         let mut body = div()
-            .w(px(480.))
-            .max_w(gpui::relative(0.5))
+            .w(px(self.right_sidebar_width))
             .flex_shrink_0()
             .h_full()
             .min_h_0()
@@ -556,11 +560,22 @@ impl Render for Summary {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(format!("已编辑 {} 个文件", self.files.len()))
-                            .child(counts(total_add, total_remove)),
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .debug_selector(|| "edit-summary-title".into())
+                                    .child(format!("已编辑 {} 个文件", self.files.len())),
+                            )
+                            .child(
+                                counts(total_add, total_remove)
+                                    .flex_shrink_0()
+                                    .debug_selector(|| "edit-summary-totals".into()),
+                            ),
                     )
                     .child(
                         Button::new("查看变更")

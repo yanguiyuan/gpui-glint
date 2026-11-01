@@ -67,6 +67,8 @@ pub struct Session {
     pub updated: DateTime<Local>,
     pub messages: Vec<Message>,
     pub draft: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draft_references: Vec<gpui_glint::components::ComposerReference>,
     #[serde(skip)]
     pub draft_images: Vec<PastedImage>,
     #[serde(default)]
@@ -89,6 +91,7 @@ impl Session {
             updated: Local::now(),
             messages: vec![],
             draft: String::new(),
+            draft_references: Vec::new(),
             draft_images: Vec::new(),
             context: None,
             draft_image_files: Vec::new(),

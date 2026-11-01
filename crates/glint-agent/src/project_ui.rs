@@ -152,27 +152,18 @@ impl AgentWorkspace {
                 }
                 match result {
                     Ok(Ok(Some(paths))) => {
-                        let root = this.history.active().project.as_deref();
-                        let labels: Vec<_> = paths
-                            .iter()
-                            .map(|path| {
-                                let path = root
-                                    .and_then(|root| path.strip_prefix(root).ok())
-                                    .unwrap_or(path);
-                                if path.as_os_str().is_empty() {
-                                    ".".to_string()
-                                } else {
-                                    path.display().to_string()
-                                }
-                            })
-                            .collect();
                         this.composer.update(cx, |composer, cx| {
-                            for label in labels {
-                                composer.add_mention(label, this.theme.palette().accent, cx);
+                            for path in paths {
+                                composer.add_reference(
+                                    gpui_glint::components::ComposerReference::file(
+                                        path.to_string_lossy().into_owned(),
+                                        directories,
+                                    ),
+                                    cx,
+                                );
                             }
                         });
-                        this.history.active_mut().draft =
-                            this.composer.read(cx).value(cx).to_string();
+                        this.capture_draft(cx);
                         this.save(cx);
                     }
                     Ok(Ok(None)) => {}
