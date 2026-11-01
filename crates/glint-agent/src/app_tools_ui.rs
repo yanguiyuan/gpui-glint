@@ -746,6 +746,27 @@ impl AgentWorkspace {
             } else {
                 None
             };
+            let output_cards = (record.call.name == "code_mode").then(|| {
+                code_mode_output_sections(&record.result)
+                    .into_iter()
+                    .map(|(label, text, language)| {
+                        let height =
+                            (text.lines().take(10).count().max(1) as f32 * 20. + 24.).min(224.);
+                        let card = cx.new(|cx| {
+                            gpui_glint::components::CodeCard::new(cx, language, text)
+                                .show_header(false)
+                                .read_only(true)
+                                .viewport()
+                                .theme(theme)
+                        });
+                        (label, card, height)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let source_height = record.call.arguments["code"]
+                .as_str()
+                .map(|code| (code.lines().take(10).count().max(1) as f32 * 20. + 24.).min(240.))
+                .unwrap_or(64.);
             let weak = cx.entity().downgrade();
             let scope = format!("{key}:tool:{}", record.call.id);
             entry.panel.update(cx, |panel, cx| {
@@ -753,7 +774,7 @@ impl AgentWorkspace {
                 panel.set_summary(presentation.summary, cx);
                 panel.set_content(
                     move |_, cx| {
-                        if script.is_some() || !nested.is_empty() {
+                        if script.is_some() || output_cards.is_some() || !nested.is_empty() {
                             return weak
                                 .update(cx, |this, cx| {
                                     div()
@@ -766,18 +787,31 @@ impl AgentWorkspace {
                                             body.child(
                                                 div()
                                                     .id("code-mode-source")
-                                                    .max_h(px(240.))
-                                                    .overflow_y_scroll()
+                                                    .h(px(source_height))
+                                                    .flex_shrink_0()
                                                     .child(card),
                                             )
                                         })
                                         .child(
                                             div()
                                                 .id("code-mode-result")
-                                                .max_h(px(200.))
+                                                .debug_selector(|| "code-mode-result".into())
+                                                .w_full()
+                                                .min_w_0()
+                                                .flex_shrink_0()
+                                                .max_h(px(320.))
                                                 .overflow_y_scroll()
+                                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                                                 .text_size(px(12.))
-                                                .child(result.clone()),
+                                                .child(if let Some(cards) = &output_cards {
+                                                    div().flex().flex_col().gap_3().children(cards.iter().map(|(label, card, height)| {
+                                                        div().w_full().min_w_0().flex_shrink_0().flex().flex_col().gap_1()
+                                                            .when_some(label.clone(), |section, label| section.child(
+                                                                div().text_size(px(11.)).font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(rgb(p.text_muted)).child(label)))
+                                                            .child(div().h(px(*height)).flex_shrink_0().child(card.clone()))
+                                                    })).into_any_element()
+                                                } else { div().child(result.clone()).into_any_element() }),
                                         )
                                         .children(
                                             nested
@@ -1284,6 +1318,35 @@ impl AgentWorkspace {
     }
 }
 
+fn code_mode_output_sections(raw: &str) -> Vec<(Option<String>, String, &'static str)> {
+    use serde_json::Value;
+    let value = match serde_json::from_str::<Value>(raw) {
+        Ok(value) if value["status"] == "completed" => value["value"].clone(),
+        Ok(value) if value.get("error").is_some() => value["error"].clone(),
+        Ok(value) => value,
+        Err(_) => Value::String(raw.into()),
+    };
+    let format_value = |label, value: &Value| match value {
+        Value::String(text) => (label, text.clone(), "text"),
+        value => (
+            label,
+            serde_json::to_string_pretty(value).unwrap_or_default(),
+            "json",
+        ),
+    };
+    if let Value::Object(fields) = &value
+        && !fields.is_empty()
+        && fields.len() <= 32
+    {
+        fields
+            .iter()
+            .map(|(key, value)| format_value(Some(key.clone()), value))
+            .collect()
+    } else {
+        vec![format_value(Some("输出结果".into()), &value)]
+    }
+}
+
 fn thinking_summary(text: &str, active: bool, elapsed_ms: Option<u64>) -> String {
     if active {
         text.lines()
@@ -1319,6 +1382,122 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[test]
+    fn orchestration_outputs_decode_string_values_without_corrupting_literal_escapes() {
+        let raw = serde_json::json!({"status":"completed","value":{
+            "library":"170 GB\t/Library\n60 GB\t/Library/Containers",
+            "literal":r"keep\nunchanged",
+            "nested":{"count":2},
+        }})
+        .to_string();
+        let sections = code_mode_output_sections(&raw);
+        let library = sections
+            .iter()
+            .find(|(key, _, _)| key.as_deref() == Some("library"))
+            .unwrap();
+        assert_eq!(library.1, "170 GB\t/Library\n60 GB\t/Library/Containers");
+        assert_eq!(library.2, "text");
+        assert!(
+            sections
+                .iter()
+                .any(|(key, text, _)| key.as_deref() == Some("literal")
+                    && text == r"keep\nunchanged")
+        );
+        let nested = sections
+            .iter()
+            .find(|(key, _, _)| key.as_deref() == Some("nested"))
+            .unwrap();
+        assert_eq!(nested.2, "json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&nested.1).unwrap(),
+            serde_json::json!({"count":2})
+        );
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(42),
+        ] {
+            let sections = code_mode_output_sections(
+                &serde_json::json!({"status":"completed","value":value}).to_string(),
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&sections[0].1).unwrap(),
+                value
+            );
+        }
+        assert_eq!(code_mode_output_sections("执行中…")[0].1, "执行中…");
+        assert_eq!(
+            code_mode_output_sections(r#"{"status":"failed","error":"失败原因"}"#)[0].1,
+            "失败原因"
+        );
+    }
+
+    #[gpui::test]
+    fn expanded_orchestration_stays_above_waiting_indicator(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            host.history.active_mut().push(Role::User, "检查磁盘".into());
+            let mut record = tools::rejected(tools::ToolCall {
+                id: "overlap-test".into(), name: "code_mode".into(),
+                arguments: serde_json::json!({"code":"const result = await tools.run_command({program: 'df', args: ['-h']});\nreturn result;"}),
+            }, "长输出内容。".repeat(1000));
+            record.result = serde_json::json!({"status":"completed","value":{
+                "library":"170 GB\t/Library\n60 GB\t/Library/Containers\n".repeat(40),
+                "workspace":"510 GB\t/Workspace\n".repeat(20),
+            }}).to_string();
+            record.nested_tools = vec![tools::rejected(tools::ToolCall {
+                id: "nested-command".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"df","args":["-h"]}),
+            }, "输出".into())].into();
+            host.transcript = vec![generation::ContentBlock::ToolResult(record)];
+            for _ in 0..18 {
+                host.transcript.push(Thinking("继续检查".into()));
+            }
+            host.pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
+            host
+        });
+        window.simulate_resize(size(px(1200.), px(700.)));
+        window.run_until_parked();
+        let panel = host.read_with(window, |host, _| {
+            host.tool_panels
+                .borrow()
+                .iter()
+                .find(|(key, _)| key.ends_with(":tool:overlap-test"))
+                .unwrap()
+                .1
+                .panel
+                .clone()
+        });
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        window.run_until_parked();
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        let live = window.debug_bounds("live-response").unwrap();
+        let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        assert!(
+            waiting.top() >= live.bottom(),
+            "waiting label overlaps expanded live response: {waiting:?}, {live:?}"
+        );
+        let output = window.debug_bounds("code-mode-result").unwrap();
+        assert!(
+            output.size.height > px(40.),
+            "output cards must reserve visible height"
+        );
+        assert!(
+            live.bottom() >= output.bottom(),
+            "expanded tool output escapes live response bounds"
+        );
+    }
 
     #[gpui::test]
     fn markdown_cache_is_bounded_and_preserves_recent_editors(cx: &mut gpui::TestAppContext) {

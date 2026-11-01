@@ -388,10 +388,6 @@ impl AgentWorkspace {
                     ComposerEvent::QueueAdded { id, .. } => {
                         this.queued_requests
                             .insert(*id, (this.history.active, this.provider.clone()));
-                        let label =
-                            format!("{} · {}", this.history.active().title, this.provider.model);
-                        this.composer
-                            .update(cx, |composer, cx| composer.set_queue_label(*id, label, cx));
                     }
                     ComposerEvent::QueueSteerRequested { id, submission } => {
                         let target = this.queued_requests.get(id).map(|(session, _)| *session);
@@ -2019,18 +2015,26 @@ impl AgentWorkspace {
                         .map(|session| session.messages.len())
                         .unwrap_or(0)
                 );
-                messages =
-                    messages.child(div().w_full().max_w(px(800.)).child(self.response_view(
-                        &key,
-                        &self.transcript,
-                        None,
-                        &self.thinking_timings.snapshot(),
-                        false,
-                        cx,
-                    )));
+                messages = messages.child(
+                    div()
+                        .debug_selector(|| "live-response".into())
+                        .flex_shrink_0()
+                        .w_full()
+                        .max_w(px(800.))
+                        .child(self.response_view(
+                            &key,
+                            &self.transcript,
+                            None,
+                            &self.thinking_timings.snapshot(),
+                            false,
+                            cx,
+                        )),
+                );
             }
             messages = messages.child(
                 div()
+                    .debug_selector(|| "waiting-for-model".into())
+                    .flex_shrink_0()
                     .w_full()
                     .max_w(px(800.))
                     .flex()
