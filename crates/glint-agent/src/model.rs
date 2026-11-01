@@ -14,6 +14,8 @@ pub enum Role {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quick_replies: Vec<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub thinking_ms: std::collections::BTreeMap<usize, u64>,
     #[serde(default)]
@@ -119,6 +121,7 @@ impl Session {
         }
         self.updated = Local::now();
         self.messages.push(Message {
+            quick_replies: Vec::new(),
             thinking_ms: Default::default(),
             blocks: vec![],
             tools: vec![],
@@ -134,6 +137,8 @@ impl Session {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct History {
+    #[serde(default)]
+    pub quick_replies_enabled: bool,
     #[serde(default)]
     pub partner_models: std::collections::HashMap<Uuid, crate::partner_model::Selection>,
     #[serde(default)]
@@ -157,6 +162,7 @@ impl Default for History {
         let session = Session::new();
         Self {
             partner_models: Default::default(),
+            quick_replies_enabled: false,
             compaction_settings: Default::default(),
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),

@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::InputField;
+use gpui_glint::components::{InputField, Switch};
 use std::collections::HashMap;
 
 fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
@@ -1037,23 +1037,46 @@ impl AgentWorkspace {
                             row.border_t_1().border_color(rgb(p.border))
                         })
                         .child(Icon::Workflow.render(15.).text_color(rgb(p.text_muted)))
-                        .child(div().flex_1().min_w_0().child(model.clone()).when_some(
-                            settings.context_windows.get(model),
-                            |label, capacity| {
-                                label.child(
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
                                     div()
-                                        .text_size(px(10.))
-                                        .text_color(rgb(p.text_muted))
-                                        .child(format!("接口窗口：{capacity} tokens")),
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(model.clone()),
                                 )
-                            },
-                        ))
+                                .when_some(
+                                    settings.context_windows.get(model),
+                                    |label, capacity| {
+                                        label.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(format!("接口窗口：{capacity} tokens")),
+                                        )
+                                    },
+                                ),
+                        )
                         .when_some(settings.window_inputs.get(model), |row, input| {
                             row.child(
                                 div()
-                                    .w(px(180.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .flex_shrink_0()
-                                    .child(field("上下文窗口（tokens）", input)),
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child("上下文窗口（tokens）"),
+                                    )
+                                    .child(div().w(px(180.)).child(input.clone())),
                             )
                         })
                         .child(
@@ -1475,6 +1498,7 @@ impl AgentWorkspace {
         );
         match section {
             Section::General => {
+                let quick_replies_weak = cx.entity().downgrade();
                 page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("会话"));
                 card = card
                     .child(row(
@@ -1498,7 +1522,22 @@ impl AgentWorkspace {
                         "通过 Shift + Enter 插入新行。".into(),
                         "Enter 发送".into(),
                     ));
-                card = card.child(div().border_t_1().border_color(rgb(p.border)))
+                card = card
+                    .child(div().border_t_1().border_color(rgb(p.border)))
+                    .child(div().py_4().flex().items_center().gap_3()
+                        .child(div().flex_1().flex().flex_col().gap_1()
+                            .child("快捷回复建议")
+                            .child(div().text_size(px(12.)).text_color(rgb(p.text_muted))
+                                .child("回复结束后生成可点击发送的建议，也可忽略。会额外调用当前模型。")))
+                        .child(Switch::new("启用")
+                            .checked(self.history.quick_replies_enabled)
+                            .theme(self.theme)
+                            .on_change(move |enabled, _, cx| {
+                                let _ = quick_replies_weak.update(cx, |this, cx| this.set_quick_replies_enabled(enabled, cx));
+                            })
+                            .render()
+                            .debug_selector(|| "quick-replies-enabled".into())))
+                    .child(div().border_t_1().border_color(rgb(p.border)))
                     .child(div().py_4().flex().items_center().gap_3()
                         .child(div().flex_1().flex().flex_col().gap_1()
                             .child("自动压缩会话")

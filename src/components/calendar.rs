@@ -244,12 +244,27 @@ impl Render for Calendar {
                             div()
                                 .h(px(20.))
                                 .line_height(px(20.))
+                                .flex()
+                                .items_center()
                                 .font_weight(if selected || date == today {
                                     gpui::FontWeight::SEMIBOLD
                                 } else {
                                     gpui::FontWeight::NORMAL
                                 })
-                                .child(date.day().to_string()),
+                                .child(
+                                    div()
+                                        .when(date == today, |day| {
+                                            day.debug_selector(|| "calendar-today-badge".into())
+                                                .w(px(20.))
+                                                .h(px(20.))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .text_center()
+                                                .bg(rgb(p.accent))
+                                                .text_color(rgb(0xffffff))
+                                        })
+                                        .child(date.day().to_string()),
+                                ),
                         )
                         .when(count > 0, |cell| {
                             cell.child(
@@ -264,14 +279,36 @@ impl Render for Calendar {
                                     .children(titles.iter().take(visible).enumerate().map(
                                         |(index, title)| {
                                             let selector = format!("calendar-task-{date}-{index}");
+                                            let handle_selector =
+                                                format!("calendar-task-handle-{date}-{index}");
                                             div()
                                                 .h(px(14.))
                                                 .line_height(px(14.))
                                                 .w_full()
                                                 .min_w_0()
-                                                .text_ellipsis()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.))
                                                 .debug_selector(move || selector.clone())
-                                                .child(title.clone())
+                                                .child(
+                                                    div()
+                                                        .w(px(3.))
+                                                        .h(px(12.))
+                                                        .flex_shrink_0()
+                                                        .rounded(px(2.))
+                                                        .bg(rgb(p.accent))
+                                                        .debug_selector(move || {
+                                                            handle_selector.clone()
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .child(title.clone()),
+                                                )
                                         },
                                     ))
                                     .when(remaining > 0, |list| {
@@ -306,6 +343,21 @@ impl Render for Calendar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn today_has_a_round_badge_even_when_another_day_is_selected(cx: &mut gpui::TestAppContext) {
+        let today = Local::now().date_naive();
+        let selected = if today.day() == 1 {
+            today + Duration::days(1)
+        } else {
+            today - Duration::days(1)
+        };
+        let (_, window) = cx.add_window_view(|_, cx| Calendar::new(cx).selected(selected));
+        window.simulate_resize(gpui::size(px(840.), px(800.)));
+        window.run_until_parked();
+        let badge = window.debug_bounds("calendar-today-badge").unwrap();
+        assert_eq!(badge.size, gpui::size(px(20.), px(20.)));
+    }
+
     #[test]
     fn task_rows_reserve_space_for_overflow_and_keep_totals() {
         assert_eq!(task_rows(72., 1, 1), (1, 0));
@@ -337,6 +389,13 @@ mod tests {
         });
         window.run_until_parked();
         assert!(window.debug_bounds("calendar-task-2026-10-31-0").is_some());
+        let row = window.debug_bounds("calendar-task-2026-10-31-0").unwrap();
+        let handle = window
+            .debug_bounds("calendar-task-handle-2026-10-31-0")
+            .unwrap();
+        assert_eq!(handle.size, gpui::size(px(3.), px(12.)));
+        assert_eq!(handle.origin.x, row.origin.x);
+        assert_eq!(handle.center().y, row.center().y);
         assert!(window.debug_bounds("calendar-task-2026-10-31-1").is_none());
         calendar.update(window, |calendar, cx| {
             calendar.day_height = 112.;

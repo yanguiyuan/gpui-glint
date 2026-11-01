@@ -18,33 +18,36 @@ impl AgentWorkspace {
     ) -> gpui::AnyElement {
         let p = self.theme.palette();
         let id = partner.id;
-        let mut filters = div().flex().flex_wrap().gap_2();
-        for (filter, label, key) in [
-            (MemoryFilter::All, "全部记忆", "all"),
-            (MemoryFilter::Active, "活跃", "active"),
-            (MemoryFilter::Dormant, "沉睡", "dormant"),
-            (MemoryFilter::Pinned, "固定保留", "pinned"),
-        ] {
-            let selector = format!("partner-filter-{key}");
-            filters = filters.child(
-                Button::new(label)
-                    .kind(if self.partners_ui.filter == filter {
-                        ButtonKind::Tinted
-                    } else {
-                        ButtonKind::Plain
-                    })
-                    .size(ButtonSize::Small)
-                    .theme(self.theme)
-                    .render()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.partners_ui.filter = filter;
-                        this.partners_ui.confirming_delete = None;
-                        cx.notify();
-                    })),
-            );
-        }
+        let filters = [
+            MemoryFilter::All,
+            MemoryFilter::Active,
+            MemoryFilter::Dormant,
+            MemoryFilter::Pinned,
+        ];
+        let selected = filters
+            .iter()
+            .position(|filter| *filter == self.partners_ui.filter)
+            .unwrap_or(0);
+        let weak = cx.entity().downgrade();
+        let filters = div().flex().child(
+            SegmentedControl::new([
+                SegmentOption::new("全部记忆"),
+                SegmentOption::new("活跃"),
+                SegmentOption::new("沉睡"),
+                SegmentOption::new("固定保留"),
+            ])
+            .id("partner-memory-filter")
+            .selected(selected)
+            .theme(self.theme)
+            .on_change(move |index, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.partners_ui.filter = filters[index];
+                    this.partners_ui.confirming_delete = None;
+                    cx.notify();
+                });
+            })
+            .render(),
+        );
         let mut body = div()
             .flex()
             .flex_col()

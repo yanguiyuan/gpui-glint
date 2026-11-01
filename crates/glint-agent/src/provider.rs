@@ -507,12 +507,9 @@ impl Request {
             }
             if config.kind == Kind::ChatGpt {
                 // Pass the composer selection through to the app-server turn.
-                tokio::time::timeout(
-                    Duration::from_secs(180),
-                    crate::chatgpt::complete(&config, messages, thinking, context),
-                )
-                .await
-                .map_err(|_| "ChatGPT 请求超时，请稍后重试".to_owned())?
+                // The transport bounds model idle time separately. Host tools
+                // retain their own deadlines, including foreground commands.
+                crate::chatgpt::complete(&config, messages, thinking, context).await
             } else {
                 complete(config, key, messages, thinking, context).await
             }

@@ -293,6 +293,7 @@ impl CommandPalette {
         let mut row = div()
             .id(("command", i))
             .debug_selector(move || format!("palette-command-{i}"))
+            .w_full()
             .h(px(36.))
             .flex_shrink_0()
             .px(px(10.))
@@ -558,6 +559,33 @@ impl Render for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn command_rows_fill_the_list_and_hover_in_trailing_space(cx: &mut gpui::TestAppContext) {
+        let (palette, window) = cx.add_window_view(|_, cx| {
+            CommandPalette::new(
+                [
+                    CommandItem::new("new", "新建会话").group("会话"),
+                    CommandItem::new("open", "打开本地项目").group("项目"),
+                ],
+                cx,
+            )
+        });
+        window.simulate_resize(gpui::size(px(640.), px(500.)));
+        window.run_until_parked();
+        let panel = window.debug_bounds("glass-command-palette").unwrap();
+        let row = window.debug_bounds("palette-command-1").unwrap();
+        // One pixel of border and six pixels of list padding on each side.
+        assert_eq!(row.origin.x, panel.origin.x + px(7.));
+        assert_eq!(row.size.width, panel.size.width - px(14.));
+        window.simulate_mouse_move(
+            gpui::point(row.right() - px(10.), row.center().y),
+            None,
+            Default::default(),
+        );
+        window.run_until_parked();
+        palette.read_with(window, |palette, _| assert_eq!(palette.active, Some(1)));
+    }
+
     #[gpui::test]
     fn thousands_of_commands_render_only_visible_rows_and_search_reaches_the_end(
         cx: &mut gpui::TestAppContext,

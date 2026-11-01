@@ -7,6 +7,82 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+const PROXY_ENV: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
+// Codex inherits explicit proxy settings. GUI launches on macOS usually have
+// none, so bridge the system's static proxy settings into the child process.
+async fn configure_proxy(command: &mut Command) {
+    if PROXY_ENV.iter().any(|key| std::env::var_os(key).is_some()) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = Command::new("/usr/sbin/scutil")
+        .arg("--proxy")
+        .kill_on_drop(true)
+        .output()
+        .await
+        && output.status.success()
+    {
+        for (key, value) in system_proxy_env(&String::from_utf8_lossy(&output.stdout)) {
+            command.env(key, value);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = command;
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn system_proxy_env(settings: &str) -> Vec<(&'static str, String)> {
+    let fields: std::collections::HashMap<_, _> = settings
+        .lines()
+        .filter_map(|line| line.trim().split_once(" : "))
+        .collect();
+    let mut proxies = Vec::new();
+    for (prefix, key, scheme) in [
+        ("HTTP", "HTTP_PROXY", "http"),
+        ("HTTPS", "HTTPS_PROXY", "http"),
+        ("SOCKS", "ALL_PROXY", "socks5h"),
+    ] {
+        if fields.get(format!("{prefix}Enable").as_str()) != Some(&"1") {
+            continue;
+        }
+        let Some(host) = fields.get(format!("{prefix}Proxy").as_str()) else {
+            continue;
+        };
+        let Some(port) = fields
+            .get(format!("{prefix}Port").as_str())
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+        else {
+            continue;
+        };
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let candidate = format!("{scheme}://{host}:{port}");
+        if let Ok(url) = reqwest::Url::parse(&candidate)
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && matches!(url.path(), "" | "/")
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
+            proxies.push((key, candidate));
+        }
+    }
+    proxies
+}
+
 pub async fn start_login(path: &str) -> Result<(Connection, String), String> {
     let mut connection = Connection::start(path).await?;
     let result = connection
@@ -96,6 +172,7 @@ impl Connection {
 
     pub async fn start(path: &str) -> Result<Self, String> {
         let mut command = Command::new(path);
+        configure_proxy(&mut command).await;
         command
             .args([
                 "app-server",
@@ -170,12 +247,17 @@ impl Connection {
     }
 
     async fn read(&mut self) -> Result<Value, String> {
+        self.read_with_idle_timeout(Duration::from_secs(180)).await
+    }
+
+    async fn read_with_idle_timeout(&mut self, idle_timeout: Duration) -> Result<Value, String> {
         loop {
             let mut line = String::new();
-            let count = self
-                .output
-                .read_line(&mut line)
+            // Do not count host tool execution or user approval time against
+            // the model's idle timeout.
+            let count = tokio::time::timeout(idle_timeout, self.output.read_line(&mut line))
                 .await
+                .map_err(|_| "ChatGPT 响应等待超时，请稍后重试")?
                 .map_err(|_| "读取 Codex 响应失败")?;
             if count == 0 {
                 return Err("Codex app-server 已退出".into());
@@ -546,6 +628,75 @@ fn error_hint(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_idle_timeout_excludes_foreground_tool_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let call = json!({"id":1,"method":"item/tool/call","params":{
+            "callId":"foreground-test","tool":"run_command","arguments":{
+                "program":"sh","args":["-c","sleep 0.5; echo done"],"timeout_seconds":5
+            }
+        }})
+        .to_string();
+        let mut child = Command::new("sh")
+            .args(["-c", "printf '%s\\n' \"$1\"; IFS= read -r reply; printf '%s\\n' '{\"method\":\"test/done\"}'; IFS= read -r hold", "mock-codex", &call])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .kill_on_drop(true).spawn().unwrap();
+        let mut connection = Connection {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            _child: child,
+            blocks: Vec::new(),
+            transcript_items: Default::default(),
+            tools: Some(crate::edits::tests::context(root.path())),
+            tool_records: Vec::new(),
+            queued: Default::default(),
+            sequence: 0,
+            last_publish: Default::default(),
+        };
+        let event = connection
+            .read_with_idle_timeout(Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert_eq!(event["method"], "test/done");
+        assert!(connection.tool_records[0].success);
+        assert!(connection.tool_records[0].result.contains("done"));
+        assert!(
+            connection
+                .read_with_idle_timeout(Duration::from_millis(250))
+                .await
+                .unwrap_err()
+                .contains("超时")
+        );
+    }
+
+    #[test]
+    fn system_proxy_maps_enabled_protocols_and_ipv6() {
+        let settings = "<dictionary> {\n HTTPEnable : 1\n HTTPProxy : 127.0.0.1\n HTTPPort : 7897\n HTTPSEnable : 1\n HTTPSProxy : ::1\n HTTPSPort : 7897\n SOCKSEnable : 1\n SOCKSProxy : localhost\n SOCKSPort : 1080\n}";
+        assert_eq!(
+            system_proxy_env(settings),
+            vec![
+                ("HTTP_PROXY", "http://127.0.0.1:7897".into()),
+                ("HTTPS_PROXY", "http://[::1]:7897".into()),
+                ("ALL_PROXY", "socks5h://localhost:1080".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_proxy_ignores_disabled_incomplete_and_invalid_settings() {
+        assert!(system_proxy_env("HTTPEnable : 0\nHTTPProxy : localhost\nHTTPPort : 80\nHTTPSEnable : 1\nHTTPSProxy : localhost\nSOCKSEnable : 1\nSOCKSProxy : localhost\nSOCKSPort : 0").is_empty());
+        assert!(
+            system_proxy_env("HTTPEnable : 1\nHTTPProxy : user@localhost\nHTTPPort : 80")
+                .is_empty()
+        );
+        assert!(
+            system_proxy_env("HTTPEnable : 1\nHTTPProxy : localhost/path\nHTTPPort : 80")
+                .is_empty()
+        );
+        assert!(system_proxy_env("ProxyAutoConfigEnable : 1\nProxyAutoConfigURLString : https://example.com/proxy.pac").is_empty());
+    }
 
     #[test]
     fn images_are_native_inputs_and_not_base64_transcript_text() {

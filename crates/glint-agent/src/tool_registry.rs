@@ -52,6 +52,7 @@ impl ToolRegistry {
     }
     pub fn instructions(&self) -> String {
         let mut instructions = self.remote.instructions();
+        instructions.push_str("\n命令执行：构建、测试、安装、脚本等需要取得结果的命令，优先使用 run_command 的非后台模式（background=false 或省略），并按预计耗时设置 timeout_seconds，例如编译可设 300 或 600 秒。若在 code_mode 内调用，外层 timeout_seconds 也要覆盖命令耗时（最多 600 秒）；更长的等待直接调用 run_command。非后台等待时界面仍实时显示输出，不必为显示进度而改用后台。只有启动长期服务，或确实要在命令执行期间做其他独立工作时，才设置 background=true。不要将普通命令转后台后频繁 command_poll；确需查询运行中的后台命令时使用 wait_ms=5000 等待，避免立即重复查询。");
         instructions.push_str("\nWPS 会话标签：使用频道应用的用户授权。先查 channel_user_authorization_status；未授权时调用 channel_user_authorize，把链接交给主人在运行 Glint 的电脑上同意，并等待状态变为已授权。然后用 wps_chat_tags_list/create/get/apply/remove/chats/delete 完成请求。创建标签与给会话添加标签是两步；删除标签会清除全部会话关联，移除单个会话标签使用 remove。绝不索取密码、授权码、token，不要把授权链接生成当作授权成功。");
         instructions.push_str("\n频道通知：需要通知主人时，先用 channel_list 查询当前伙伴绑定的应用，再用 channel_send 发送。定时任务也可以使用此工具。仅 status=sent 才表示 WPS 接收成功；queued 需用 channel_delivery_status 继续查询，不要把入队当作送达。应用主人在机器人单聊中发送‘我是你的主人’认领；不要向其他 sender 或任意接收者发消息。");
         if self.host_tools.is_some() {

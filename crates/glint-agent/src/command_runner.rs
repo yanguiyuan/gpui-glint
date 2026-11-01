@@ -859,6 +859,21 @@ mod tests {
         serde_json::from_str(&run(c,&json!({"program":"sh","args":["-c",script],"background":background,"timeout_seconds":timeout}),"test").await.unwrap()).unwrap()
     }
     #[tokio::test]
+    async fn omitted_background_waits_for_completion_and_final_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let c = context(temp.path());
+        let result = run(
+            &c,
+            &json!({"program":"sh","args":["-c","echo started; sleep 0.1; echo finished"],"timeout_seconds":5}),
+            "foreground-default",
+        ).await.unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("finished"));
+    }
+
+    #[tokio::test]
     async fn nonzero_exit_is_failed_and_rg_no_matches_remains_successful_search() {
         let temp = tempfile::tempdir().unwrap();
         let c = context(temp.path());

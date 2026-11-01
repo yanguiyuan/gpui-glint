@@ -38,6 +38,7 @@ mod project_ui;
 mod provider;
 mod provider_catalog;
 mod provider_ui;
+mod quick_replies;
 mod schedule_ui;
 mod schedules;
 mod scroll_follow;
@@ -137,6 +138,7 @@ pub struct AgentWorkspace {
     outline: Entity<outline::ConversationOutline>,
     pending: Option<(Uuid, Task<()>)>,
     titles: Entity<titles::TitleGenerator>,
+    quick_reply_jobs: std::collections::HashMap<Uuid, Task<()>>,
     save_sender: Option<async_channel::Sender<storage::SaveRequest>>,
     save_worker: Option<Task<()>>,
     save_delay: Option<Task<()>>,
@@ -585,6 +587,7 @@ impl AgentWorkspace {
             outline,
             pending: None,
             titles,
+            quick_reply_jobs: Default::default(),
             save_sender: None,
             save_worker: None,
             save_delay: None,
@@ -686,6 +689,7 @@ impl AgentWorkspace {
         }
         self.capture_draft(cx);
         self.titles.update(cx, |titles, _| titles.cancel(id));
+        self.quick_reply_jobs.remove(&id);
         self.recall_runner.update(cx, |runner, _| runner.cancel(id));
         images::release_previews(self.image_views.borrow_mut().remove_session(id), cx);
         let previous_active = self.history.active;
@@ -791,6 +795,7 @@ impl AgentWorkspace {
             .filter(|s| compaction::should_compact(&config, s, &self.history.compaction_settings))
             .and_then(|s| compaction::plan(s, config.protocol));
         let compact_config = config.clone();
+        self.quick_reply_jobs.remove(&id);
         let raw_images = submission.images;
         let project = self
             .history
@@ -969,6 +974,7 @@ impl AgentWorkspace {
         let title_config =
             (first_turn && config.kind == provider::Kind::Compatible).then(|| config.clone());
         let prompt = text.clone();
+        let quick_reply_config = config.clone();
         let request_provider_id = config.id;
         let request_model = config.model.clone();
         let result = (|| {
@@ -1100,6 +1106,9 @@ impl AgentWorkspace {
                             session.messages.last_mut().unwrap().thinking_ms = thinking_ms;
                         }
                     }
+                }
+                if error.is_none() && this.running_schedule.is_none() {
+                    this.generate_quick_replies(id, quick_reply_config, &prompt, cx);
                 }
                 if let (Some(config), Some(reply)) = (title_config, reply) {
                     if !reply.trim().is_empty() {
@@ -1978,7 +1987,22 @@ impl AgentWorkspace {
                                             .text_color(rgb(p.text_muted))
                                             .child(stats.caption()),
                                     )
-                                }),
+                                })
+                                .when(
+                                    self.history.quick_replies_enabled
+                                        && message.role == Role::Agent
+                                        && index + 1 == session.messages.len()
+                                        && self.pending.is_none()
+                                        && self.preparing.is_none()
+                                        && !message.quick_replies.is_empty(),
+                                    |body| {
+                                        body.child(self.quick_reply_bubbles(
+                                            index,
+                                            &message.quick_replies,
+                                            cx,
+                                        ))
+                                    },
+                                ),
                         ),
                 );
             }
