@@ -274,7 +274,12 @@ impl InputsPage {
                 ComposerEvent::Changed(_)
                 | ComposerEvent::AttachmentsChanged
                 | ComposerEvent::ContextOpened
-                | ComposerEvent::ContextQueryChanged(_) => {}
+                | ComposerEvent::ContextQueryChanged(_)
+                | ComposerEvent::QueueSteerRequested { .. }
+                | ComposerEvent::QueueAdded { .. }
+                | ComposerEvent::QueueSubmitted { .. }
+                | ComposerEvent::QueueRemoved(_)
+                | ComposerEvent::ReferenceHovered(_) => {}
             },
         ));
         let theme_selector = cx.new(|cx| ThemeSelector::new(cx).selected(theme).theme(theme));

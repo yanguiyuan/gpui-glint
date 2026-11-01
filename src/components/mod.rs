@@ -3,7 +3,12 @@ mod button;
 mod calendar;
 mod closable_tabs;
 mod code_card;
+mod composer_reference;
+mod reference_preview;
+pub use composer_reference::ComposerReference;
 mod dialog;
+mod file_preview;
+pub use file_preview::{FilePreview, FilePreviewEntry, FilePreviewEvent};
 mod dropdown;
 mod icon;
 mod inputs;
@@ -57,7 +62,7 @@ pub use tooltip::Tooltip;
 pub use tree_list::{TreeList, TreeListNode, TreeListRow};
 pub use tree_list_item::{TreeDrop, TreeDropPlacement, TreeListItem};
 
-pub use code_card::{CodeCard, CodeCardEvent, CodeColors, bind_code_card_keys};
+pub use code_card::{CodeCard, CodeCardEvent, CodeColors, CodeSelection, bind_code_card_keys};
 
 mod table;
 pub use table::{DataTable, TableAction, TableCell, TableColumn, TableEvent, TableRow};
@@ -113,7 +118,7 @@ mod collapse_panel;
 pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent};
 
 mod diff_card;
-pub use diff_card::{DiffCard, DiffColors, DiffLine, DiffLineKind, diff_lines};
+pub use diff_card::{DiffCard, DiffCardEvent, DiffColors, DiffLine, DiffLineKind, diff_lines};
 
 #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
 mod webview;

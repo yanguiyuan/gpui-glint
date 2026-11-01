@@ -46,12 +46,15 @@ actions!(
         SoftNewline,
         RichBold,
         RichItalic,
+        QuoteSelection,
     ]
 );
 
 /// Register once to enable code editing and clipboard shortcuts.
 pub fn bind_code_card_keys(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("cmd-shift-l", QuoteSelection, Some("GlassCodeCard")),
+        KeyBinding::new("ctrl-shift-l", QuoteSelection, Some("GlassCodeCard")),
         KeyBinding::new("cmd-b", RichBold, Some("GlassCodeCard")),
         KeyBinding::new("cmd-i", RichItalic, Some("GlassCodeCard")),
         KeyBinding::new("backspace", Backspace, Some("GlassCodeCard")),
@@ -86,9 +89,18 @@ pub fn bind_code_card_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeSelection {
+    pub text: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
 /// Notifications for integrating source edits into the owning document.
 #[derive(Clone, Debug)]
 pub enum CodeCardEvent {
+    QuoteRequested,
+    LinkActivated(SharedString),
     Changed(SharedString),
     Focused,
     SelectionStarted {
@@ -190,12 +202,6 @@ fn reference_runs(
     result
 }
 
-#[derive(Clone, Copy)]
-enum ScrollAxis {
-    Horizontal,
-    Vertical,
-}
-
 #[derive(Default)]
 struct WindowLayout {
     scrollbar_drag: Rc<std::cell::Cell<Option<Pixels>>>,
@@ -205,8 +211,6 @@ struct WindowLayout {
     viewport_scroll: gpui::UniformListScrollHandle,
     scroll: ScrollHandle,
     last_lines: Vec<(usize, EditorLine, Bounds<Pixels>)>,
-    scroll_axis: Option<ScrollAxis>,
-    last_scroll: Option<std::time::Instant>,
 }
 
 /// An inline code editor with line numbers, restrained syntax colors and JSON validation.
@@ -222,8 +226,6 @@ pub struct CodeCard {
     fold_revision: u64,
     viewport_cache: Option<ViewportCache>,
     viewport_scroll: gpui::UniformListScrollHandle,
-    scroll_axis: Option<ScrollAxis>,
-    last_scroll: Option<std::time::Instant>,
     layout_revision: u64,
     line_cache: Option<LineCache>,
     search_cache: Option<(SharedString, SharedString, Rc<Vec<Range<usize>>>)>,
@@ -234,6 +236,10 @@ pub struct CodeCard {
     content: SharedString,
     language: SharedString,
     read_only: bool,
+    preview_links: bool,
+    quote_context: bool,
+    context_menu: Option<(gpui::WindowId, gpui::Point<Pixels>)>,
+    hovered_preview_link: bool,
     completions: CompletionState,
     reference_resolver: Option<TextReferenceResolver>,
     reference_cache: Option<(SharedString, Rc<Vec<TextReference>>)>,
@@ -284,8 +290,6 @@ impl CodeCard {
         std::mem::swap(&mut self.viewport_scroll, &mut layout.viewport_scroll);
         std::mem::swap(&mut self.scroll, &mut layout.scroll);
         std::mem::swap(&mut self.last_lines, &mut layout.last_lines);
-        std::mem::swap(&mut self.scroll_axis, &mut layout.scroll_axis);
-        std::mem::swap(&mut self.last_scroll, &mut layout.last_scroll);
         if open.contains(&previous) {
             self.window_layouts.insert(previous, layout);
         }
@@ -545,8 +549,6 @@ impl CodeCard {
             viewport_cache: None,
             viewport_scroll: gpui::UniformListScrollHandle::default(),
             scrollbar_drag: Default::default(),
-            scroll_axis: None,
-            last_scroll: None,
             layout_revision: 0,
             line_cache: None,
             search_cache: None,
@@ -557,6 +559,10 @@ impl CodeCard {
             content,
             language: language.into(),
             read_only: false,
+            preview_links: false,
+            quote_context: false,
+            context_menu: None,
+            hovered_preview_link: false,
             completions: CompletionState::default(),
             reference_resolver: None,
             reference_cache: None,
@@ -590,40 +596,17 @@ impl CodeCard {
         cx: &mut Context<Self>,
     ) {
         self.activate_window(window, cx);
-        let now = std::time::Instant::now();
-        if matches!(event.touch_phase, gpui::TouchPhase::Started)
-            || self
-                .last_scroll
-                .is_none_or(|last| now.duration_since(last).as_millis() > 250)
-        {
-            self.scroll_axis = None;
+        if !event.modifiers.shift {
+            return;
         }
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-        if self.scroll_axis.is_none() && (delta.x != px(0.) || delta.y != px(0.)) {
-            self.scroll_axis = Some(if delta.x.abs() > delta.y.abs() {
-                ScrollAxis::Horizontal
-            } else {
-                ScrollAxis::Vertical
-            });
-        }
-        match self.scroll_axis {
-            Some(ScrollAxis::Horizontal) => {
-                let offset = self.scroll.offset();
-                let x = (offset.x + delta.x).clamp(-self.scroll.max_offset().x, px(0.));
-                self.scroll.set_offset(point(x, px(0.)));
-                // Consume even at the horizontal boundary, so the document
-                // never starts scrolling vertically during the same gesture.
-                cx.stop_propagation();
-                if x != offset.x {
-                    cx.notify();
-                }
-            }
-            Some(ScrollAxis::Vertical) if delta.y == px(0.) => cx.stop_propagation(),
-            _ => {} // The document handles only the vertical component.
-        }
-        self.last_scroll = Some(now);
-        if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
-            self.scroll_axis = None;
+        let horizontal = if delta.x != px(0.) { delta.x } else { delta.y };
+        let offset = self.scroll.offset();
+        let x = (offset.x + horizontal).clamp(-self.scroll.max_offset().x, px(0.));
+        self.scroll.set_offset(point(x, px(0.)));
+        cx.stop_propagation();
+        if x != offset.x {
+            cx.notify();
         }
     }
 
@@ -675,6 +658,152 @@ impl CodeCard {
         self.block_editing = value;
         self
     }
+    pub fn selected_excerpt(&self) -> Option<CodeSelection> {
+        let range = &self.selected_range;
+        if range.is_empty() {
+            return None;
+        }
+        let text = self.content.get(range.clone())?.to_owned();
+        let start_line = self.content.as_bytes()[..range.start]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            + 1;
+        let end_line = self.content.as_bytes()[..range.end.saturating_sub(1)]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            + 1;
+        Some(CodeSelection {
+            text,
+            start_line,
+            end_line,
+        })
+    }
+    fn quote_selection(&mut self, _: &QuoteSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only && self.quote_context && !self.selected_range.is_empty() {
+            self.context_menu = None;
+            cx.emit(CodeCardEvent::QuoteRequested);
+            cx.notify();
+        }
+    }
+
+    /// Adds a quote action to the selection context menu; the host handles QuoteRequested.
+    pub fn quote_context(mut self, enabled: bool) -> Self {
+        self.quote_context = enabled;
+        self
+    }
+
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_window(window, cx);
+        let offset = self.index_for_mouse_position(event.position);
+        if !self.selected_range.contains(&offset) {
+            self.move_to(offset, cx);
+        }
+        self.context_menu = Some((window.window_handle().window_id(), event.position));
+        cx.stop_propagation();
+        cx.notify();
+    }
+    fn context_menu_view(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let (owner, position) = self.context_menu?;
+        if owner != window.window_handle().window_id() {
+            return None;
+        }
+        let theme = self.reference_theme();
+        let p = theme.palette();
+        let selected = !self.selected_range.is_empty();
+        let menu = div()
+            .id("code-card-context-menu")
+            .w(px(220.))
+            .p_1()
+            .rounded(px(7.))
+            .bg(rgb(p.surface))
+            .border_1()
+            .border_color(rgb(p.border))
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .child(
+                super::MenuItem::new("code-card-copy", "复制")
+                    .theme(theme)
+                    .disabled(!selected)
+                    .render()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.copy(&Copy, window, cx);
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            )
+            .when(self.quote_context && self.read_only, |menu| {
+                menu.child(
+                    super::MenuItem::new("code-card-quote", "引用选中内容")
+                        .theme(theme)
+                        .disabled(!selected)
+                        .render()
+                        .debug_selector(|| "code-card-quote".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.quote_selection(&QuoteSelection, window, cx)
+                        })),
+                )
+            })
+            .child(
+                super::MenuItem::new("code-card-select-all", "全选")
+                    .theme(theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_all(&SelectAll, window, cx);
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .with_priority(80)
+            .into_any_element(),
+        )
+    }
+
+    /// Reveal a one-based source line in the read-only viewport without focus changes.
+    pub fn reveal_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let offset = self
+            .content
+            .split_inclusive('\n')
+            .take(line.saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>()
+            .min(self.content.len());
+        self.pending_search_reveal = Some(offset..offset);
+        cx.notify();
+    }
+
+    /// Opt-in activation of Markdown links in a read-only rich-text preview.
+    pub fn set_preview_links(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.preview_links != enabled {
+            self.preview_links = enabled;
+            self.hovered_preview_link = false;
+            cx.notify();
+        }
+    }
+
     pub fn set_read_only(&mut self, value: bool, cx: &mut Context<Self>) {
         if self.read_only != value {
             self.read_only = value;
@@ -1257,8 +1386,19 @@ impl CodeCard {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let click = self.is_selecting && self.selected_range.is_empty();
         self.is_selecting = false;
+        if click && self.read_only && self.preview_links {
+            if let Some((distance, offset)) = self.mouse_text_hit(event.position) {
+                if distance == 0. {
+                    if let Some(url) = self.rich.as_ref().and_then(|rich| rich.link_at(offset)) {
+                        cx.emit(CodeCardEvent::LinkActivated(url.to_owned().into()));
+                        cx.stop_propagation();
+                    }
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -1269,6 +1409,22 @@ impl CodeCard {
         cx: &mut Context<Self>,
     ) {
         self.activate_window(window, cx);
+        let hover = self.read_only
+            && self.preview_links
+            && self
+                .mouse_text_hit(event.position)
+                .is_some_and(|(distance, offset)| {
+                    distance == 0.
+                        && self
+                            .rich
+                            .as_ref()
+                            .and_then(|rich| rich.link_at(offset))
+                            .is_some()
+                });
+        if hover != self.hovered_preview_link {
+            self.hovered_preview_link = hover;
+            cx.notify();
+        }
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -2536,7 +2692,7 @@ impl CodeCard {
     ) {
         self.activate_window(window, cx);
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-        if event.modifiers.shift || delta.x.abs() > delta.y.abs() {
+        if event.modifiers.shift {
             let (width, gutter_width) =
                 self.viewport_cache
                     .as_ref()
@@ -2563,6 +2719,15 @@ impl CodeCard {
             self.scroll.set_offset(point(next, px(0.)));
             cx.stop_propagation();
             if next != offset.x {
+                cx.notify();
+            }
+        } else {
+            let handle = self.viewport_scroll.0.borrow().base_handle.clone();
+            let offset = handle.offset();
+            let next = (offset.y + delta.y).clamp(-handle.max_offset().y, px(0.));
+            handle.set_offset(point(offset.x, next));
+            cx.stop_propagation();
+            if next != offset.y {
                 cx.notify();
             }
         }
@@ -2845,8 +3010,7 @@ impl CodeCard {
             }),
         )
         .size_full()
-        .track_scroll(&self.viewport_scroll)
-        .on_scroll_wheel(cx.listener(Self::viewport_wheel));
+        .track_scroll(&self.viewport_scroll);
         div()
             .size_full()
             .min_h_0()
@@ -2860,11 +3024,20 @@ impl CodeCard {
             .text_color(rgb(colors.comment))
             .bg(rgb(colors.surface))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .when(self.hovered_preview_link, |source| source.cursor_pointer())
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::quote_selection))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.context_menu.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .children(self.show_header.then(|| {
                 div()
                     .h(px(35.))
@@ -2875,7 +3048,35 @@ impl CodeCard {
                     .bg(rgb(colors.head))
                     .child(self.language.clone())
             }))
-            .child(div().flex_1().min_h_0().child(list))
+            .child(
+                div().relative().flex_1().min_h_0().child(list).child(
+                    gpui::canvas(
+                        |bounds, window, _| {
+                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                        },
+                        {
+                            let entity = cx.entity().downgrade();
+                            move |_, hitbox: gpui::Hitbox, window, _cx| {
+                                window.on_mouse_event(
+                                    move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                        if phase == gpui::DispatchPhase::Capture
+                                            && hitbox.should_handle_scroll(window)
+                                        {
+                                            let _ = entity.update(cx, |this, cx| {
+                                                this.viewport_wheel(event, window, cx)
+                                            });
+                                        }
+                                    },
+                                );
+                            }
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                ),
+            )
             .child(self.viewport_horizontal_scrollbar(cx))
     }
 }
@@ -2888,8 +3089,11 @@ impl Render for CodeCard {
         } else {
             CodeColors::LIGHT
         };
+        let context_menu = self.context_menu_view(window, cx);
         if self.viewport && self.read_only && !self.prose {
-            return self.render_viewport(window, cx, colors);
+            return self
+                .render_viewport(window, cx, colors)
+                .children(context_menu);
         }
         let refs = self.resolved_references();
         let focused = self.focus_handle.is_focused(window);
@@ -3315,6 +3519,13 @@ impl Render for CodeCard {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::quote_selection))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.context_menu.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::soft_newline))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -3328,9 +3539,11 @@ impl Render for CodeCard {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::continue_after))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .when(self.hovered_preview_link, |source| source.cursor_pointer())
             .min_h(if rich_mode {
                 line_height
             } else {
@@ -3459,7 +3672,7 @@ impl Render for CodeCard {
                     .with_priority(40),
                 );
             }
-            return container.children(completion_popup);
+            return container.children(completion_popup).children(context_menu);
         }
         div()
             .w_full()
@@ -3476,6 +3689,7 @@ impl Render for CodeCard {
             .children(self.show_header.then_some(head))
             .child(source)
             .children(completion_popup)
+            .children(context_menu)
     }
 }
 
@@ -3526,6 +3740,53 @@ mod tests {
                 assert!(run.underline.is_some());
             }
         }
+    }
+
+    #[gpui::test]
+    fn read_only_preview_links_activate_on_click_but_not_selection(cx: &mut gpui::TestAppContext) {
+        let (editor, window) = cx.add_window_view(|_, cx| {
+            let mut editor = CodeCard::new(cx, "text", "")
+                .rich_text("前 [`src/main.rs`](glint-preview:test) 后")
+                .read_only(true);
+            editor.set_preview_links(true, cx);
+            editor
+        });
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let received = events.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&editor, move |_, _, event: &CodeCardEvent, _| {
+                if let CodeCardEvent::LinkActivated(url) = event {
+                    received.borrow_mut().push(url.clone());
+                }
+            })
+            .detach();
+        });
+        window.run_until_parked();
+        let at = |offset: usize, window: &mut gpui::VisualTestContext| {
+            editor.read_with(window, |editor, _| {
+                let (start, line, bounds) = editor
+                    .last_lines
+                    .iter()
+                    .find(|(start, line, _)| offset >= *start && offset <= *start + line.len())
+                    .unwrap();
+                point(
+                    bounds.left() + line.x_for_index(offset - start),
+                    bounds.center().y,
+                )
+            })
+        };
+        let offset = editor.read_with(window, |editor, _| editor.content.find("src/").unwrap());
+        let from = at(offset + 1, window);
+        let to = at(offset + 5, window);
+        window.simulate_click(from, Default::default());
+        assert_eq!(events.borrow().len(), 1);
+        window.simulate_mouse_down(from, MouseButton::Left, Default::default());
+        window.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        window.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        assert_eq!(events.borrow().len(), 1);
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.content(), "前 src/main.rs 后")
+        });
     }
 
     #[gpui::test]
@@ -4048,13 +4309,33 @@ mod tests {
             assert!(input.history.is_empty());
             assert!(input.viewport_cache.as_ref().unwrap().lines.len() < 80);
         });
+        let before_y = editor.read_with(window, |input, _| {
+            input.viewport_scroll.0.borrow().base_handle.offset().y
+        });
         window.simulate_event(gpui::ScrollWheelEvent {
             position: bounds.center(),
-            delta: gpui::ScrollDelta::Pixels(point(px(-150.), px(0.))),
+            delta: gpui::ScrollDelta::Pixels(point(px(-150.), px(-80.))),
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         window.run_until_parked();
-        editor.update(window, |input, _| assert!(input.scroll.offset().x < px(0.)));
+        editor.update(window, |input, _| {
+            assert!(input.scroll.offset().x < px(0.));
+            assert_eq!(
+                input.viewport_scroll.0.borrow().base_handle.offset().y,
+                before_y
+            );
+        });
+        let selection = editor.read_with(window, |editor, _| editor.selected_range.clone());
+        editor.update(window, |editor, cx| editor.reveal_line(10_000, cx));
+        window.run_until_parked();
+        editor.read_with(window, |editor, _| {
+            assert!(editor.viewport_scroll.0.borrow().base_handle.offset().y < px(-10_000.));
+            assert_eq!(editor.selected_range, selection);
+        });
     }
 
     #[gpui::test]
@@ -4222,6 +4503,10 @@ mod tests {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(-200.), px(-50.))),
             touch_phase: gpui::TouchPhase::Started,
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         editor.update(window, |editor, _| {
@@ -4232,6 +4517,10 @@ mod tests {
         window.simulate_event(gpui::ScrollWheelEvent {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(-1.), px(-100.))),
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         assert_eq!(parent_scroll.offset().y, px(0.));
@@ -4240,6 +4529,10 @@ mod tests {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(-50.), px(-30.))),
             touch_phase: gpui::TouchPhase::Ended,
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         assert_eq!(parent_scroll.offset().y, px(0.));
@@ -4249,12 +4542,20 @@ mod tests {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(-50.), px(-30.))),
             touch_phase: gpui::TouchPhase::Started,
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         // Repeated horizontal gestures, including at the end, never leak vertically.
         window.simulate_event(gpui::ScrollWheelEvent {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(-100000.), px(-20.))),
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
         });
         assert_eq!(parent_scroll.offset().y, px(0.));

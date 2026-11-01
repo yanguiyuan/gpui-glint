@@ -8,8 +8,9 @@ use gpui::{
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, ImageFormat,
     ImageSource, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId,
     LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, SharedString, Style, Styled, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
-    Window, WrappedLine, actions, div, fill, point, px, relative, rgb, size,
+    Render, SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, px, relative,
+    rgb, size,
 };
 
 actions!(
@@ -75,6 +76,7 @@ pub enum PromptEditorEvent {
     /// One or more images were pasted; the editor text is left untouched.
     ImagePasted(Vec<PastedImage>),
     PasteFailed(SharedString),
+    ReferenceHovered(SharedString),
 }
 
 impl EventEmitter<PromptEditorEvent> for PromptEditor {}
@@ -194,6 +196,14 @@ pub struct PromptEditor {
     /// Text tokens painted in a custom color (e.g. `@mentions`), matched
     /// against whole @mentions and registered $skill tokens in the content.
     highlights: Vec<(SharedString, u32)>,
+    reference_styles: Vec<(SharedString, super::Icon, u32)>,
+    reference_previews: Vec<super::ComposerReference>,
+    reference_hitboxes: Vec<(Bounds<Pixels>, SharedString)>,
+    hovered_reference: Option<(SharedString, Bounds<Pixels>)>,
+    reference_popover_open: bool,
+    reference_popover_hovered: bool,
+    reference_hover_task: Option<gpui::Task<()>>,
+    reference_close_task: Option<gpui::Task<()>>,
     paste_task: Option<gpui::Task<()>>,
 }
 
@@ -239,6 +249,55 @@ impl PromptEditor {
         }
     }
 
+    pub fn set_reference_previews(
+        &mut self,
+        references: Vec<super::ComposerReference>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reference_previews != references {
+            self.reference_previews = references;
+            cx.notify();
+        }
+    }
+    fn close_reference_preview(&mut self, cx: &mut Context<Self>) {
+        self.reference_hover_task = None;
+        self.reference_close_task = None;
+        self.hovered_reference = None;
+        self.reference_popover_open = false;
+        self.reference_popover_hovered = false;
+        cx.notify();
+    }
+    fn delay_close_reference_preview(&mut self, cx: &mut Context<Self>) {
+        self.reference_hover_task = None;
+        if self.reference_close_task.is_some() || self.hovered_reference.is_none() {
+            return;
+        }
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(150));
+        self.reference_close_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(task) = this.reference_close_task.take() {
+                    task.detach();
+                }
+                if !this.reference_popover_hovered {
+                    this.close_reference_preview(cx);
+                }
+            });
+        }));
+    }
+    pub fn set_reference_styles(
+        &mut self,
+        mut styles: Vec<(SharedString, super::Icon, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        styles.retain(|(token, _, _)| token.len() > 1 && token.starts_with(['@', '$']));
+        if self.reference_styles != styles {
+            self.reference_styles = styles;
+            cx.notify();
+        }
+    }
     /// Minimum visible rows before the editor stops shrinking.
     pub fn min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
@@ -284,6 +343,9 @@ impl PromptEditor {
 
     pub fn set_value(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.paste_task = None;
+        if self.hovered_reference.is_some() {
+            self.close_reference_preview(cx);
+        }
         let content = value.into();
         let end = content.len();
         self.content = content;
@@ -308,6 +370,14 @@ impl PromptEditor {
             last_bounds: None,
             lines: Vec::new(),
             highlights: Vec::new(),
+            reference_styles: Vec::new(),
+            reference_previews: Vec::new(),
+            reference_hitboxes: Vec::new(),
+            hovered_reference: None,
+            reference_popover_open: false,
+            reference_popover_hovered: false,
+            reference_hover_task: None,
+            reference_close_task: None,
             paste_task: None,
         }
     }
@@ -391,6 +461,9 @@ impl PromptEditor {
     }
 
     fn replace_selection(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.hovered_reference.is_some() {
+            self.close_reference_preview(cx);
+        }
         let range = self.selected_range.clone();
         self.content = format!(
             "{}{}{}",
@@ -722,6 +795,7 @@ impl PromptEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_reference_preview(cx);
         self.is_selecting = true;
         window.focus(&self.focus_handle, cx);
         let offset = self.index_for_mouse_position(event.position);
@@ -739,7 +813,54 @@ impl PromptEditor {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
+            return;
         }
+        if self.reference_popover_hovered {
+            return;
+        }
+        let hit = self
+            .reference_hitboxes
+            .iter()
+            .find(|(bounds, token)| {
+                bounds.contains(&event.position)
+                    && self
+                        .reference_previews
+                        .iter()
+                        .any(|r| r.token == token.as_ref())
+            })
+            .cloned();
+        let Some((bounds, token)) = hit else {
+            self.delay_close_reference_preview(cx);
+            return;
+        };
+        self.reference_close_task = None;
+        if self
+            .hovered_reference
+            .as_ref()
+            .is_some_and(|(old, _)| old == &token)
+        {
+            return;
+        }
+        self.hovered_reference = Some((token.clone(), bounds));
+        self.reference_popover_open = false;
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(300));
+        self.reference_hover_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .hovered_reference
+                    .as_ref()
+                    .is_some_and(|(old, _)| old == &token)
+                {
+                    this.reference_popover_open = true;
+                    cx.emit(PromptEditorEvent::ReferenceHovered(token.clone()));
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
     }
 }
 
@@ -881,6 +1002,9 @@ struct PromptEditorPrepaint {
     placeholder: Option<gpui::ShapedLine>,
     cursor: Option<gpui::PaintQuad>,
     selections: Vec<gpui::PaintQuad>,
+    references: Vec<gpui::PaintQuad>,
+    icons: Vec<(Bounds<Pixels>, super::Icon, u32)>,
+    hitboxes: Vec<(Bounds<Pixels>, SharedString)>,
 }
 
 impl IntoElement for PromptEditorElement {
@@ -943,6 +1067,30 @@ impl Element for PromptEditorElement {
 
         let mut lines = Vec::new();
         let mut selections = Vec::new();
+        let mut reference_backgrounds = Vec::new();
+        let mut reference_hitboxes = Vec::new();
+        let mut reference_icons = Vec::new();
+        let references: Vec<_> = input
+            .reference_styles
+            .iter()
+            .flat_map(|(token, icon, color)| {
+                input
+                    .content
+                    .match_indices(token.as_ref())
+                    .filter(|(start, _)| {
+                        (*start == 0
+                            || input.content[..*start]
+                                .chars()
+                                .next_back()
+                                .is_some_and(char::is_whitespace))
+                            && input.content[*start + token.len()..]
+                                .chars()
+                                .next()
+                                .is_none_or(|c| c.is_whitespace() || ",，。;；)]}".contains(c))
+                    })
+                    .map(move |(start, _)| (start..start + token.len(), *icon, *color))
+            })
+            .collect();
         let mut placeholder = None;
         let cursor = if input.content.is_empty() {
             let run = TextRun {
@@ -971,7 +1119,12 @@ impl Element for PromptEditorElement {
         } else {
             let selected = input.selected_range.clone();
             let marked = input.marked_range.clone();
-            let mentions = mention_ranges(&input.content, &input.highlights, theme.color(0x007aff));
+            let mut mentions =
+                mention_ranges(&input.content, &input.highlights, theme.color(0x007aff));
+            for (range, _, color) in &references {
+                mentions.retain(|(old, _)| old.end <= range.start || old.start >= range.end);
+                mentions.push((range.clone(), *color));
+            }
             let mut rows_above = 0usize;
             let wrap_width = bounds.size.width.max(px(1.));
             let mut line_start = 0usize;
@@ -980,6 +1133,12 @@ impl Element for PromptEditorElement {
                 line_start += piece.len() + 1;
                 let piece_len = piece.len();
                 let mut boundaries = vec![0, piece_len];
+                for (range, _, _) in &references {
+                    if range.start >= start && range.start < start + piece_len {
+                        boundaries.push(range.start - start);
+                        boundaries.push(range.start - start + 1);
+                    }
+                }
                 boundaries.extend(mentions.iter().flat_map(|(range, _)| {
                     [
                         range.start.saturating_sub(start).min(piece_len),
@@ -1010,7 +1169,12 @@ impl Element for PromptEditorElement {
                             .iter()
                             .find(|(range, _)| run_start >= range.start && run_start < range.end)
                             .map(|(_, color)| *color);
-                        let color = if is_selected {
+                        let color = if references
+                            .iter()
+                            .any(|(range, _, _)| run_start == range.start)
+                        {
+                            gpui::rgb_to_hsla(gpui::rgba(0x00000000))
+                        } else if is_selected {
                             gpui::rgb_to_hsla(rgb(0xffffff))
                         } else if let Some(mention) = mention_color {
                             gpui::rgb_to_hsla(rgb(mention))
@@ -1059,6 +1223,88 @@ impl Element for PromptEditorElement {
                         lines.push(EditorLine { start, wrapped });
                     }
                 }
+            }
+
+            let mut row_offset = 0usize;
+            for line in &lines {
+                for (range, icon, color) in &references {
+                    let from = range.start.max(line.start);
+                    let to = range.end.min(line.start + line.wrapped.len());
+                    if from >= to {
+                        continue;
+                    }
+                    let first = line
+                        .wrapped
+                        .position_for_index(from - line.start, line_height)
+                        .unwrap_or(point(px(0.), px(0.)));
+                    let last = line
+                        .wrapped
+                        .position_for_index(to - line.start, line_height)
+                        .unwrap_or(first);
+                    let first_row = (first.y / line_height) as usize;
+                    let last_row = (last.y / line_height) as usize;
+                    for row in first_row..=last_row {
+                        let left = if row == first_row { first.x } else { px(0.) };
+                        let right = if row == last_row {
+                            last.x
+                        } else {
+                            line.wrapped
+                                .unwrapped_layout
+                                .x_for_index(PromptEditor::row_end_index(line, row))
+                                - line
+                                    .wrapped
+                                    .unwrapped_layout
+                                    .x_for_index(PromptEditor::row_start_index(line, row))
+                        };
+                        if right > left {
+                            reference_hitboxes.push((
+                                Bounds::new(
+                                    point(
+                                        bounds.left() + left - px(1.),
+                                        bounds.top()
+                                            + (row_offset + row) as f32 * line_height
+                                            + px(1.),
+                                    ),
+                                    size(right - left + px(2.), line_height - px(2.)),
+                                ),
+                                SharedString::from(input.content[range.clone()].to_owned()),
+                            ));
+                            reference_backgrounds.push(
+                                fill(
+                                    Bounds::new(
+                                        point(
+                                            bounds.left() + left - px(1.),
+                                            bounds.top()
+                                                + (row_offset + row) as f32 * line_height
+                                                + px(1.),
+                                        ),
+                                        size(right - left + px(2.), line_height - px(2.)),
+                                    ),
+                                    gpui::rgba((*color << 8) | 0x18),
+                                )
+                                .corner_radii(px(4.)),
+                            );
+                        }
+                    }
+                    if from == range.start {
+                        let icon_size = px(11.);
+                        reference_icons.push((
+                            Bounds::new(
+                                point(
+                                    bounds.left() + first.x,
+                                    bounds.top()
+                                        + row_offset as f32 * line_height
+                                        + first.y
+                                        + (line_height - icon_size) / 2.,
+                                ),
+                                size(icon_size, icon_size),
+                            ),
+                            *icon,
+                            *color,
+                        ));
+                    }
+                }
+                row_offset += line.wrapped.wrap_boundaries.len() + 1;
             }
 
             if focused && !input.selected_range.is_empty() {
@@ -1127,6 +1373,9 @@ impl Element for PromptEditorElement {
             placeholder,
             cursor,
             selections,
+            references: reference_backgrounds,
+            icons: reference_icons,
+            hitboxes: reference_hitboxes,
         }
     }
 
@@ -1146,6 +1395,9 @@ impl Element for PromptEditorElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        for background in prepaint.references.drain(..) {
+            window.paint_quad(background);
+        }
         for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
@@ -1173,23 +1425,48 @@ impl Element for PromptEditorElement {
                 .ok();
             rows_above += line.wrapped.wrap_boundaries.len() + 1;
         }
+        for (bounds, icon, color) in prepaint.icons.drain(..) {
+            let _ = window.paint_svg(
+                bounds,
+                format!("glint-ui/icons/{}.svg", icon.name()).into(),
+                None,
+                gpui::TransformationMatrix::unit(),
+                gpui::rgb_to_hsla(rgb(color)),
+                cx,
+            );
+        }
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
         }
         let lines = std::mem::take(&mut prepaint.lines);
+        let hitboxes = std::mem::take(&mut prepaint.hitboxes);
         self.input.update(cx, |input, _cx| {
             input.last_bounds = Some(bounds);
             input.lines = lines;
+            input.reference_hitboxes = hitboxes;
         });
     }
 }
 
 impl Render for PromptEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::prelude::FluentBuilder;
+        let popup = self
+            .hovered_reference
+            .as_ref()
+            .filter(|_| self.reference_popover_open)
+            .and_then(|(token, bounds)| {
+                self.reference_previews
+                    .iter()
+                    .find(|r| r.token == token.as_ref())
+                    .map(|r| (r.clone(), *bounds))
+            });
+        let width = (f32::from(window.viewport_size().width) - 24.).clamp(120., 420.);
         let theme = self.theme;
         div()
+            .id("prompt-editor")
             .flex_1()
             .min_w_0()
             .flex()
@@ -1217,10 +1494,46 @@ impl Render for PromptEditor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !hovered {
+                    this.delay_close_reference_preview(cx);
+                }
+            }))
             .line_height(px(self.font_size * 1.5))
             .text_size(px(self.font_size))
             .text_color(rgb(theme.color(0x292d32)))
             .child(PromptEditorElement { input: cx.entity() })
+            .when_some(popup, |root, (reference, bounds)| {
+                root.child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position(point(bounds.left(), bounds.top() - px(8.)))
+                            .anchor(gpui::Anchor::BottomLeft)
+                            .snap_to_window_with_margin(px(12.))
+                            .child(
+                                div()
+                                    .id("reference-hover-popover")
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                                        this.reference_popover_hovered = *hovered;
+                                        if *hovered {
+                                            this.reference_close_task = None;
+                                        } else {
+                                            this.delay_close_reference_preview(cx);
+                                        }
+                                    }))
+                                    .child(super::reference_preview::reference_preview(
+                                        &reference, self.theme, width,
+                                    )),
+                            ),
+                    )
+                    .with_priority(90),
+                )
+            })
     }
 }
 
@@ -1280,6 +1593,52 @@ fn mention_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn reference_hover_is_bounded_fades_long_content_and_preserves_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (editor, window) = cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message"));
+        window.simulate_resize(gpui::size(px(520.), px(400.)));
+        editor.update(window, |editor, cx| {
+            let mut reference = super::super::ComposerReference::selection(
+                "/project/源.rs",
+                2,
+                80,
+                &"第一行文档内容\n".repeat(79),
+            );
+            reference.token = "@源.rs:2-80".into();
+            editor.set_value("解释 @源.rs:2-80 ", cx);
+            editor.set_reference_styles(
+                vec![(reference.token.clone().into(), reference.icon(), 0x007aff)],
+                cx,
+            );
+            editor.set_reference_previews(vec![reference], cx);
+        });
+        window.run_until_parked();
+        let position =
+            editor.read_with(window, |editor, _| editor.reference_hitboxes[0].0.center());
+        window.simulate_event(gpui::MouseMoveEvent {
+            position,
+            ..Default::default()
+        });
+        window.run_until_parked();
+        window
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(350));
+        window.run_until_parked();
+        let bounds = window
+            .debug_bounds("prompt-reference-preview")
+            .expect("hover preview");
+        assert!(bounds.size.height <= px(300.));
+        assert!(window.debug_bounds("reference-preview-fade").is_some());
+        editor.update(window, |editor, cx| {
+            assert_eq!(editor.value(), "解释 @源.rs:2-80 ");
+            editor.set_value("继续提问", cx);
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("prompt-reference-preview").is_none());
+    }
 
     #[gpui::test]
     fn restoring_text_cancels_an_inflight_image_paste(cx: &mut gpui::TestAppContext) {

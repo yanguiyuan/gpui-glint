@@ -200,6 +200,7 @@ impl RenderBlock {
 /// by subscribers to DocumentEvent::Changed. Register bind_document_editor_keys once.
 pub struct DocumentEditor {
     embedded_preview: bool,
+    preview_links: bool,
     scrollable_preview: bool,
     render_blocks: HashMap<u64, Rc<RenderBlock>>,
     render_references: String,
@@ -256,6 +257,7 @@ impl DocumentEditor {
         });
         let mut this = Self {
             embedded_preview: false,
+            preview_links: false,
             scrollable_preview: false,
             render_blocks: HashMap::new(),
             render_references: String::new(),
@@ -311,6 +313,12 @@ impl DocumentEditor {
         self.status_bar_visible = false;
         self.toc_collapsed = true;
         self.rounded_corners = false;
+        self
+    }
+
+    /// Enable LinkActivated events for links in read-only preview text.
+    pub fn activate_preview_links(mut self, enabled: bool) -> Self {
+        self.preview_links = enabled;
         self
     }
 
@@ -606,6 +614,12 @@ impl DocumentEditor {
     }
     fn source_event(&mut self, id: u64, event: &CodeCardEvent, cx: &mut Context<Self>) {
         match event {
+            CodeCardEvent::QuoteRequested => {}
+            CodeCardEvent::LinkActivated(url) => {
+                if self.preview && self.preview_links {
+                    cx.emit(DocumentEvent::LinkActivated(url.clone()));
+                }
+            }
             CodeCardEvent::SelectionStarted {
                 editor,
                 offset,
@@ -987,9 +1001,9 @@ impl DocumentEditor {
                             CodeCardEvent::Changed(value) => {
                                 this.cell_changed(id, 0, col, value, cx)
                             }
-                            CodeCardEvent::Focused | CodeCardEvent::FormatApplied => {
-                                this.source_event(id, event, cx)
-                            }
+                            CodeCardEvent::Focused
+                            | CodeCardEvent::FormatApplied
+                            | CodeCardEvent::LinkActivated(_) => this.source_event(id, event, cx),
                             CodeCardEvent::UndoRequested => this.undo(cx),
                             CodeCardEvent::RedoRequested => this.redo(cx),
                             CodeCardEvent::SelectionStarted { .. } => {
@@ -1020,9 +1034,9 @@ impl DocumentEditor {
                             CodeCardEvent::Changed(value) => {
                                 this.cell_changed(id, row + 1, col, value, cx)
                             }
-                            CodeCardEvent::Focused | CodeCardEvent::FormatApplied => {
-                                this.source_event(id, event, cx)
-                            }
+                            CodeCardEvent::Focused
+                            | CodeCardEvent::FormatApplied
+                            | CodeCardEvent::LinkActivated(_) => this.source_event(id, event, cx),
                             CodeCardEvent::UndoRequested => this.undo(cx),
                             CodeCardEvent::RedoRequested => this.redo(cx),
                             CodeCardEvent::SelectionStarted { .. } => {
@@ -1666,7 +1680,10 @@ impl DocumentEditor {
                     return div().into_any_element();
                 }
                 self.leaf_cursor.set(index + 1);
-                editor.update(cx, |editor, cx| editor.set_read_only(self.preview, cx));
+                editor.update(cx, |editor, cx| {
+                    editor.set_read_only(self.preview, cx);
+                    editor.set_preview_links(self.preview && self.preview_links, cx);
+                });
                 return editor.clone().into_any_element();
             }
         }
@@ -2850,7 +2867,10 @@ impl DocumentEditor {
                     content = content.child(table.clone());
                 }
                 for editor in &self.views[&id].cell_editors {
-                    editor.update(cx, |editor, cx| editor.set_read_only(self.preview, cx));
+                    editor.update(cx, |editor, cx| {
+                        editor.set_read_only(self.preview, cx);
+                        editor.set_preview_links(self.preview && self.preview_links, cx);
+                    });
                 }
             } else if self.source_mode == Some(id) && active {
                 content = content.child(self.views[&id].source.clone());

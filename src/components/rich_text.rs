@@ -195,6 +195,13 @@ impl RichText {
         });
         formats
     }
+    pub fn link_at(&self, offset: usize) -> Option<&str> {
+        self.marks.iter().find_map(|mark| match &mark.format {
+            Format::Link(url) if mark.range.contains(&offset) => Some(url.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn code_ranges(&self, range: Range<usize>) -> Vec<Range<usize>> {
         self.marks
             .iter()

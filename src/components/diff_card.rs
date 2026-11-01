@@ -170,6 +170,10 @@ pub(crate) fn changed_word_ranges(
 const LINE_HEIGHT: f32 = 21.;
 const CONTEXT_VISIBLE: usize = 3;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffCardEvent {
+    TitleClicked,
+}
 /// A read-only unified diff card: file header with add/delete stats, numbered
 /// rows tinted per kind with word-level highlights, and collapsible
 /// "N unmodified lines" hunks. Built for reviewing AI-produced code changes.
@@ -182,6 +186,7 @@ pub struct DiffCard {
     expanded_hunks: HashSet<usize>,
     body_visible: bool,
     header_visible: bool,
+    title_clickable: bool,
     theme: ThemePreset,
     rows: Option<Rc<Vec<Row>>>,
     row_offsets: Vec<f32>,
@@ -191,7 +196,13 @@ pub struct DiffCard {
     totals: (usize, usize),
 }
 
+impl gpui::EventEmitter<DiffCardEvent> for DiffCard {}
 impl DiffCard {
+    /// Opt into title navigation while keeping the disclosure arrow independent.
+    pub fn title_clickable(mut self, enabled: bool) -> Self {
+        self.title_clickable = enabled;
+        self
+    }
     pub fn new(
         cx: &mut Context<Self>,
         language: impl Into<SharedString>,
@@ -207,6 +218,7 @@ impl DiffCard {
             expanded_hunks: HashSet::new(),
             body_visible: true,
             header_visible: true,
+            title_clickable: false,
             theme: ThemePreset::default(),
             rows: None,
             row_offsets: Vec::new(),
@@ -235,6 +247,7 @@ impl DiffCard {
             expanded_hunks: HashSet::new(),
             body_visible: true,
             header_visible: true,
+            title_clickable: false,
             theme: ThemePreset::default(),
             rows: None,
             row_offsets: Vec::new(),
@@ -477,6 +490,7 @@ impl Render for DiffCard {
 
         let header = div()
             .id("glass-diff-card-header")
+            .debug_selector(|| "diff-card-header".into())
             .w_full()
             .h(px(46.))
             .flex_shrink_0()
@@ -494,11 +508,22 @@ impl Render for DiffCard {
             )
             .child(
                 div()
+                    .id("diff-card-title")
+                    .debug_selector(|| "diff-card-title".into())
                     .flex_shrink_0()
                     .text_size(px(13.5))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(p.text))
-                    .child(self.name.clone()),
+                    .child(self.name.clone())
+                    .when(self.title_clickable, |title| {
+                        title
+                            .cursor_pointer()
+                            .hover(|title| title.text_color(rgb(p.accent)))
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(DiffCardEvent::TitleClicked);
+                            }))
+                    }),
             )
             .child(
                 div()
@@ -879,6 +904,37 @@ impl Element for DiffLineElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn clickable_title_emits_navigation_without_folding_diff(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (card, window) = cx.add_window_view(|_, cx| {
+            DiffCard::new(cx, "rust", "old", "new")
+                .name("src/main.rs")
+                .title_clickable(true)
+        });
+        let count = Rc::new(Cell::new(0));
+        let hits = count.clone();
+        window.update(|_, cx| {
+            cx.subscribe(&card, move |_, _: &DiffCardEvent, _| {
+                hits.set(hits.get() + 1)
+            })
+            .detach()
+        });
+        let title = window.debug_bounds("diff-card-title").unwrap();
+        window.simulate_click(title.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert_eq!(count.get(), 1);
+        card.read_with(window, |card, _| assert!(card.body_visible));
+        let header = window.debug_bounds("diff-card-header").unwrap();
+        window.simulate_click(
+            gpui::point(header.right() - px(10.), header.center().y),
+            gpui::Modifiers::default(),
+        );
+        window.run_until_parked();
+        card.read_with(window, |card, _| assert!(!card.body_visible));
+        assert_eq!(count.get(), 1);
+    }
 
     #[gpui::test]
     fn long_diff_only_builds_visible_rows_reuses_highlights_and_scrolls_to_end(

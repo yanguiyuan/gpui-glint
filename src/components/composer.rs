@@ -297,15 +297,30 @@ impl ComposerContextState {
 /// A prompt ready to send: the text plus any images pasted via ⌘/Ctrl-V.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComposerSubmission {
+    pub references: Vec<super::ComposerReference>,
     pub text: SharedString,
     pub images: Vec<PastedImage>,
 }
 
 impl ComposerSubmission {
+    pub fn prompt_text(&self) -> String {
+        let references: Vec<_> = self
+            .references
+            .iter()
+            .filter(|reference| reference.is_present(&self.text))
+            .map(|r| r.prompt())
+            .collect();
+        if references.is_empty() {
+            self.text.to_string()
+        } else {
+            format!("{}\n\n{}", self.text, references.join("\n\n"))
+        }
+    }
     pub fn text(text: impl Into<SharedString>) -> Self {
         Self {
             text: text.into(),
             images: Vec::new(),
+            references: Vec::new(),
         }
     }
 }
@@ -328,6 +343,7 @@ pub enum ComposerEvent {
     /// The prompt text changed.
     Changed(SharedString),
     AttachmentsChanged,
+    ReferenceHovered(super::ComposerReference),
     AttachmentError(SharedString),
     StopRequested,
     /// An accessory chip without options was clicked; the payload is the chip id.
@@ -405,6 +421,7 @@ pub struct Composer {
     context_on_at: bool,
     observed_text: SharedString,
     mention_colors: HashMap<SharedString, u32>,
+    references: Vec<super::ComposerReference>,
     busy: bool,
     stop_on_busy: bool,
     disabled: bool,
@@ -443,6 +460,13 @@ impl Composer {
         });
         let events = cx.subscribe(&editor, |this, _, event: &PromptEditorEvent, cx| {
             match event {
+                PromptEditorEvent::ReferenceHovered(token) => {
+                    if let Some(reference) =
+                        this.references.iter().find(|r| r.token == token.as_ref())
+                    {
+                        cx.emit(ComposerEvent::ReferenceHovered(reference.clone()));
+                    }
+                }
                 PromptEditorEvent::ImagePasted(images) => {
                     if this.attachments.len() + images.len() > 16 {
                         cx.emit(ComposerEvent::AttachmentError(
@@ -495,6 +519,7 @@ impl Composer {
             context_on_at: false,
             observed_text: "".into(),
             mention_colors: HashMap::new(),
+            references: Vec::new(),
             busy: false,
             stop_on_busy: false,
             disabled: false,
@@ -511,7 +536,11 @@ impl Composer {
     }
 
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        if self.theme == theme {
+            return;
+        }
         self.theme = theme;
+        self.sync_reference_styles(cx);
         self.editor
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
         cx.notify();
@@ -654,6 +683,99 @@ impl Composer {
         self.add_context_token(format!("@{}", label.into()), color, cx);
     }
 
+    pub fn references(&self, cx: &App) -> Vec<super::ComposerReference> {
+        let text = self.editor.read(cx).value();
+        self.references
+            .iter()
+            .filter(|r| r.is_present(&text))
+            .cloned()
+            .collect()
+    }
+    pub fn set_references(
+        &mut self,
+        references: Vec<super::ComposerReference>,
+        cx: &mut Context<Self>,
+    ) {
+        for reference in &self.references {
+            self.mention_colors.remove(reference.token.as_str());
+        }
+        self.references = references;
+        self.sync_reference_styles(cx);
+    }
+    fn sync_reference_styles(&mut self, cx: &mut Context<Self>) {
+        let color = self.theme.palette().accent;
+        let mut styles: Vec<_> = self
+            .references
+            .iter()
+            .map(|r| (SharedString::from(r.token.clone()), r.icon(), color))
+            .collect();
+        for (token, color) in &self.mention_colors {
+            if !styles.iter().any(|(t, _, _)| t == token) {
+                styles.push((
+                    token.clone(),
+                    if token.starts_with('$') {
+                        Icon::Workflow
+                    } else {
+                        Icon::User
+                    },
+                    *color,
+                ));
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_reference_styles(styles, cx);
+            editor.set_reference_previews(self.references.clone(), cx);
+        });
+    }
+    pub fn set_reference_preview(
+        &mut self,
+        source: &super::ComposerReference,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reference) = self.references.iter_mut().find(|r| {
+            r.token == source.token
+                && r.path == source.path
+                && r.start_line == source.start_line
+                && r.end_line == source.end_line
+        }) {
+            reference.set_preview(text);
+            self.sync_reference_styles(cx);
+        }
+    }
+    pub fn add_reference(
+        &mut self,
+        mut reference: super::ComposerReference,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self.references.iter_mut().find(|r| {
+            r.path == reference.path
+                && r.start_line == reference.start_line
+                && r.end_line == reference.end_line
+        }) {
+            reference.token = existing.token.clone();
+            *existing = reference.clone();
+        } else {
+            let base = reference.label();
+            let mut token = base.clone();
+            let mut number = 2;
+            while self.references.iter().any(|r| r.token == token)
+                || self.mention_colors.contains_key(token.as_str())
+            {
+                token = format!("{base}·{number}");
+                number += 1;
+            }
+            reference.token = token;
+            self.references.push(reference.clone());
+        }
+        if self.context_query(cx).is_some() || !reference.is_present(self.editor.read(cx).value()) {
+            self.add_context_token(reference.token.clone(), self.theme.palette().accent, cx);
+        }
+        self.sync_reference_styles(cx);
+        cx.emit(ComposerEvent::AttachmentsChanged);
+        cx.notify();
+    }
+
     fn context_query(&self, cx: &App) -> Option<(Range<usize>, String)> {
         let editor = self.editor.read(cx);
         let selection = editor.selection_range();
@@ -703,6 +825,7 @@ impl Composer {
             .collect();
         self.editor
             .update(cx, |editor, cx| editor.set_highlights(highlights, cx));
+        self.sync_reference_styles(cx);
     }
 
     /// Append a literal context token such as `$review`, replacing a trailing
@@ -873,6 +996,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let text = text.into();
+        self.set_references(Vec::new(), cx);
         self.observed_text = text.clone();
         for image in std::mem::replace(&mut self.attachments, images) {
             image.source().remove_asset(cx);
@@ -925,7 +1049,20 @@ impl Composer {
                 image.source().remove_asset(cx);
             }
         }
-        ComposerSubmission { text, images }
+        let references = self
+            .references
+            .iter()
+            .filter(|r| r.is_present(&text))
+            .cloned()
+            .collect();
+        if self.clear_on_submit || self.busy {
+            self.set_references(Vec::new(), cx);
+        }
+        ComposerSubmission {
+            text,
+            images,
+            references,
+        }
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -994,6 +1131,7 @@ impl Composer {
             return;
         }
         let submission = self.queue.remove(index).submission;
+        self.set_references(submission.references, cx);
         for image in std::mem::replace(&mut self.attachments, submission.images) {
             image.source().remove_asset(cx);
         }
@@ -1957,6 +2095,69 @@ fn icon_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn structured_references_stay_compact_restore_and_submit_with_exact_context(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let composer = cx.new(|cx| Composer::new("Message", cx));
+        composer.update(cx, |c, cx| {
+            c.set_value("解释", cx);
+            c.add_reference(
+                super::super::ComposerReference::selection(
+                    "/project/a/源.rs",
+                    2,
+                    3,
+                    "short selection",
+                ),
+                cx,
+            );
+            c.add_reference(
+                super::super::ComposerReference::selection(
+                    "/project/b/源.rs",
+                    2,
+                    3,
+                    "different selection",
+                ),
+                cx,
+            );
+            c.add_reference(
+                super::super::ComposerReference::selection(
+                    "/project/long.rs",
+                    1,
+                    200,
+                    &"long text\n".repeat(200),
+                ),
+                cx,
+            );
+            let text = c.value(cx);
+            let references = c.references(cx);
+            assert!(text.len() < 160);
+            assert!(!text.contains("short selection"));
+            assert_eq!(references.len(), 3);
+            assert_ne!(references[0].token, references[1].token);
+            c.set_draft(text.clone(), Vec::new(), cx);
+            c.set_references(references.clone(), cx);
+            assert_eq!(c.references(cx), references);
+            let submission = c.submission(text, cx);
+            let prompt = submission.prompt_text();
+            assert!(prompt.contains("/project/a/源.rs，行范围 2-3"));
+            assert!(prompt.contains("short selection"));
+            assert!(!prompt.contains("long text"));
+            assert!(c.references(cx).is_empty());
+            c.context_on_at = true;
+            c.set_draft("查看 @main.rs", Vec::new(), cx);
+            c.add_reference(
+                super::super::ComposerReference::file("/project/main.rs", false),
+                cx,
+            );
+            assert_eq!(c.value(cx).as_ref(), "查看 @main.rs ");
+            assert!(!c.context_panel_open());
+            let mut removed = submission.clone();
+            removed.text = "删除全部引用".into();
+            assert_eq!(removed.prompt_text(), "删除全部引用");
+        });
+    }
 
     #[gpui::test]
     fn managed_queue_sends_fifo_keeps_drafts_and_requires_explicit_steering_acceptance(

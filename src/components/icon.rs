@@ -9,7 +9,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px, rgb, svg,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Calendar,
     Search,
@@ -85,7 +85,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Calendar => "calendar",
             Self::Search => "search",
