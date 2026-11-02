@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][ValidateSet('api', 'workbench')][string]$Product,
     [string]$Version,
     [string]$IsccPath,
+    [string]$WebView2BootstrapperPath = $env:GLINT_WEBVIEW2_BOOTSTRAPPER,
     [switch]$Plan
 )
 $ErrorActionPreference = 'Stop'
@@ -51,6 +52,8 @@ if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
     throw 'Inno Setup compiler not found. Install Inno Setup 6 or pass -IsccPath.'
 }
 New-Item -ItemType Directory -Force $stage, $output | Out-Null
+. "$PSScriptRoot\webview2.ps1"
+Get-WebView2Bootstrapper -Destination "$stage\MicrosoftEdgeWebview2Setup.exe" -SourcePath $WebView2BootstrapperPath
 Push-Location $repo
 $previousFlags = $env:RUSTFLAGS
 try {
@@ -60,14 +63,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
     Copy-Item "$repo\target\x86_64-pc-windows-msvc\release\$executable" $stage
     Copy-Item (Join-Path $repo $config.Icon) (Join-Path $stage $iconName)
-    $bootstrapper = "$stage\MicrosoftEdgeWebview2Setup.exe"
-    if (-not (Test-Path -LiteralPath $bootstrapper)) {
-        Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -UseBasicParsing -OutFile $bootstrapper -TimeoutSec 120
-    }
-    $signature = Get-AuthenticodeSignature $bootstrapper
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
-        throw 'WebView2 bootstrapper signature validation failed.'
-    }
     & $IsccPath @defines "$PSScriptRoot\setup.iss"
     if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
     if (-not (Test-Path $installer)) { throw 'Installer output is missing.' }

@@ -9,11 +9,24 @@ make win-installer PRODUCT=workbench
 ./packaging/windows/build-windows.ps1 -Product workbench -Plan
 # Check both products; optionally compile templates using harmless fixture payloads:
 ./packaging/windows/test-packaging.ps1 -IsccPath 'C:/path/to/ISCC.exe'
+# Offline checks for WebView2 downloads, retries and local sources:
+./packaging/windows/test-webview2.ps1
 ```
 
 `PRODUCT` defaults to `workbench`.
 
 `-Version` must match the selected crate's version. `-IsccPath` and the Makefile `VERSION`, `ISCC`, `POWERSHELL` overrides remain supported. Release builds retain static MSVC runtime linking, Microsoft WebView2 signature verification and SHA-256 checksums.
+
+WebView2 downloads enable TLS 1.2 for Windows PowerShell, retry up to three times (using `curl.exe` after the first failure when available), and cache only files with a valid Microsoft signature. Invalid or incomplete cached files are downloaded again. Dependency checks run before the Rust build.
+
+If your network blocks Microsoft's download servers, obtain the **Evergreen Bootstrapper** from the [official WebView2 download page](https://developer.microsoft.com/microsoft-edge/webview2/) using a network that can reach it, then supply the local file. Signature validation still applies:
+
+```powershell
+$env:GLINT_WEBVIEW2_BOOTSTRAPPER = 'C:\Downloads\MicrosoftEdgeWebview2Setup.exe'
+make win-installer PRODUCT=workbench
+# Or pass the file directly:
+./packaging/windows/build-windows.ps1 -Product workbench -WebView2BootstrapperPath 'C:\Downloads\MicrosoftEdgeWebview2Setup.exe'
+```
 
 The API and Workbench keep their original AppId, AppUserModelID, installation directory, shortcuts and artifact names. Their staging/output directories are independent. Add another product by defining its metadata and an allowed `-Product` value, rather than copying the pipeline or template.
 
