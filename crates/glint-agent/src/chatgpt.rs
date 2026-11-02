@@ -1,41 +1,549 @@
-//! Local Codex app-server transport. Codex owns OAuth tokens and renewal.
-use crate::provider::Config;
+//! Direct ChatGPT subscription transport: OAuth and stateless Responses HTTP/SSE.
+use crate::generation::{Completion, ContentBlock, Metrics};
+use crate::provider::{Config, ModelCatalog, Thinking};
 use serde_json::{Value, json};
-use std::{collections::VecDeque, process::Stdio, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-};
+use std::{collections::BTreeMap, time::Duration};
+mod auth;
+pub use auth::{account, finish_login, saved_account_label, sign_out, start_login};
 
-const PROXY_ENV: [&str; 6] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-];
+fn http_error(status: reqwest::StatusCode) -> String {
+    format!(
+        "ChatGPT HTTP {}：{}",
+        status.as_u16(),
+        match status.as_u16() {
+            401 => "登录已失效，请重新登录",
+            403 => "未授权使用订阅，或账号/工作区不允许访问",
+            429 => "订阅额度不足或请求受限，请稍后重试",
+            _ => "请求失败，请检查网络、模型权限或重新授权",
+        }
+    )
+}
 
-// Codex inherits explicit proxy settings. GUI launches on macOS usually have
-// none, so bridge the system's static proxy settings into the child process.
-async fn configure_proxy(command: &mut Command) {
-    if PROXY_ENV.iter().any(|key| std::env::var_os(key).is_some()) {
-        return;
+async fn response_json(mut response: reqwest::Response) -> Result<Value, String> {
+    if !response.status().is_success() {
+        return Err(http_error(response.status()));
     }
-    #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("/usr/sbin/scutil")
-        .arg("--proxy")
-        .kill_on_drop(true)
-        .output()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), response.chunk())
         .await
-        && output.status.success()
+        .map_err(|_| "ChatGPT 网络响应超时")?
+        .map_err(|_| "读取 ChatGPT 响应失败")?
     {
-        for (key, value) in system_proxy_env(&String::from_utf8_lossy(&output.stdout)) {
-            command.env(key, value);
+        if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
+            return Err("ChatGPT 响应超过 4MB 限制".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "ChatGPT 返回了无效 JSON".into())
+}
+
+pub async fn models(config: &Config) -> Result<ModelCatalog, String> {
+    let client = http_client().await?;
+    let mut token = auth::access(config, None).await?;
+    let mut response = client
+        .get("https://api.openai.com/v1/models")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|_| "无法连接 ChatGPT 模型服务")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = auth::access(config, Some(&token)).await?;
+        response = client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| "无法连接 ChatGPT 模型服务")?;
+    }
+    parse_models(&response_json(response).await?)
+}
+
+fn parse_models(value: &Value) -> Result<ModelCatalog, String> {
+    let entries = value["models"]
+        .as_array()
+        .ok_or("ChatGPT 未返回账号模型列表")?;
+    let mut catalog = ModelCatalog::default();
+    for model in entries.iter().filter(|m| m["visibility"] == "list") {
+        if let Some(slug) = model["slug"].as_str().filter(|s| !s.is_empty()) {
+            if !catalog.models.iter().any(|m| m == slug) {
+                catalog.models.push(slug.into());
+            }
+            if let Some(capacity) = model["context_window"].as_u64().filter(|v| *v > 0) {
+                catalog.context_windows.insert(slug.into(), capacity);
+            }
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = command;
+    if catalog.models.is_empty() {
+        return Err("ChatGPT 账号没有可用模型，请检查订阅授权".into());
+    }
+    Ok(catalog)
+}
+
+fn conversation_input(messages: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut input = Vec::new();
+    for message in messages {
+        if let Some(output) = message["responses_output"].as_array() {
+            input.extend(output.iter().cloned());
+            continue;
+        }
+        let role = message["role"].as_str().ok_or("对话缺少角色")?;
+        if role == "tool" {
+            input.push(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":message["content"]}));
+            continue;
+        }
+        let role = match role {
+            "system" => "developer",
+            "developer" | "user" | "assistant" => role,
+            _ => return Err("不支持的对话角色".into()),
+        };
+        let content = if let Some(text) = message["content"].as_str() {
+            json!(text)
+        } else {
+            let mut content = Vec::new();
+            for part in message["content"].as_array().ok_or("无效的对话内容")? {
+                content.push(match part["type"].as_str() {
+                    Some("text") => json!({"type":"input_text","text":part["text"]}),
+                    Some("image_url") => json!({"type":"input_image","image_url":part["image_url"]["url"]}),
+                    Some("image") if part["source"]["type"] == "base64" => json!({"type":"input_image","image_url":format!("data:{};base64,{}",part["source"]["media_type"].as_str().ok_or("图片缺少类型")?,part["source"]["data"].as_str().ok_or("图片缺少数据")?)}),
+                    _ => return Err("不支持的 ChatGPT 消息内容".into()),
+                });
+            }
+            json!(content)
+        };
+        input.push(json!({"role":role,"content":content}));
+    }
+    Ok(input)
+}
+
+fn request_body(
+    model: &str,
+    messages: Vec<Value>,
+    thinking: Thinking,
+    definitions: Option<Value>,
+) -> Result<Value, String> {
+    let mut body = json!({"model":model,"input":conversation_input(messages)?,"store":false,"stream":true,"include":["reasoning.encrypted_content"]});
+    let effort = match thinking {
+        Thinking::Default => None,
+        Thinking::Off => Some("none"),
+        Thinking::Low => Some("low"),
+        Thinking::Medium => Some("medium"),
+        Thinking::High => Some("high"),
+        Thinking::Max => Some("xhigh"),
+    };
+    if let Some(effort) = effort {
+        body["reasoning"] = json!({"effort":effort,"summary":"auto"});
+    }
+    if let Some(definitions) = definitions {
+        let tools: Vec<_> = definitions.as_array().ok_or("无效工具定义")?.iter().map(|t| json!({"type":"function","name":t["name"],"description":t["description"],"parameters":t["input_schema"],"strict":false})).collect();
+        if !tools.is_empty() {
+            body["tools"] = json!([{"type":"namespace","name":"glint","description":"Tools executed by the Glint host under the user's access policy.","tools":tools}]);
+        }
+    }
+    Ok(body)
+}
+
+#[derive(Default)]
+struct ResponseStream {
+    pending: Vec<u8>,
+    data: Vec<String>,
+    items: BTreeMap<usize, Value>,
+    metrics: Metrics,
+    completed: bool,
+}
+
+impl ResponseStream {
+    fn push(&mut self, bytes: &[u8], elapsed: u64) -> Result<(), String> {
+        self.pending.extend_from_slice(bytes);
+        while let Some(index) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<_> = self.pending.drain(..=index).collect();
+            let line = std::str::from_utf8(&line)
+                .map_err(|_| "ChatGPT 流包含无效 UTF-8")?
+                .trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    let data = std::mem::take(&mut self.data).join("\n");
+                    if data != "[DONE]" {
+                        self.event(
+                            serde_json::from_str(&data).map_err(|_| "ChatGPT 流事件格式无效")?,
+                            elapsed,
+                        )?;
+                    }
+                }
+            } else if let Some(data) = line.strip_prefix("data:") {
+                self.data
+                    .push(data.strip_prefix(' ').unwrap_or(data).into());
+            }
+        }
+        Ok(())
+    }
+
+    fn event(&mut self, event: Value, elapsed: u64) -> Result<(), String> {
+        if self.completed {
+            return Ok(());
+        }
+        let index = event["output_index"].as_u64().unwrap_or(0) as usize;
+        match event["type"].as_str() {
+            Some("response.output_item.added" | "response.output_item.done") => {
+                self.items.insert(index, event["item"].clone());
+            }
+            Some("response.content_part.added") => {
+                let i = event["content_index"].as_u64().unwrap_or(0) as usize;
+                if i > 4096 {
+                    return Err("ChatGPT 内容片段过多".into());
+                }
+                if let Some(parts) = self
+                    .items
+                    .get_mut(&index)
+                    .and_then(|item| item["content"].as_array_mut())
+                {
+                    while parts.len() <= i {
+                        parts.push(Value::Null);
+                    }
+                    parts[i] = event["part"].clone();
+                }
+            }
+            Some("response.reasoning_summary_part.added") => {
+                let i = event["summary_index"].as_u64().unwrap_or(0) as usize;
+                if i > 4096 {
+                    return Err("ChatGPT 思考片段过多".into());
+                }
+                if let Some(parts) = self
+                    .items
+                    .get_mut(&index)
+                    .and_then(|item| item["summary"].as_array_mut())
+                {
+                    while parts.len() <= i {
+                        parts.push(Value::Null);
+                    }
+                    parts[i] = event["part"].clone();
+                }
+            }
+            Some(
+                "response.output_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.refusal.delta",
+            ) => {
+                if let Some(delta) = event["delta"].as_str() {
+                    self.metrics.output(elapsed);
+                    let thinking = event["type"] == "response.reasoning_summary_text.delta";
+                    let field = if thinking { "summary" } else { "content" };
+                    let part = event[if thinking {
+                        "summary_index"
+                    } else {
+                        "content_index"
+                    }]
+                    .as_u64()
+                    .unwrap_or(0) as usize;
+                    let text_field = if event["type"] == "response.refusal.delta" {
+                        "refusal"
+                    } else {
+                        "text"
+                    };
+                    if let Some(value) = self
+                        .items
+                        .get_mut(&index)
+                        .and_then(|item| item[field].as_array_mut())
+                        .and_then(|parts| parts.get_mut(part))
+                    {
+                        let mut text = value[text_field].as_str().unwrap_or_default().to_owned();
+                        text.push_str(delta);
+                        value[text_field] = text.into();
+                    }
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let Some(item) = self.items.get_mut(&index) {
+                    let mut args = item["arguments"].as_str().unwrap_or_default().to_owned();
+                    args.push_str(event["delta"].as_str().unwrap_or_default());
+                    item["arguments"] = args.into();
+                }
+            }
+            Some("response.completed") => {
+                if event["response"]["status"] != "completed" {
+                    return Err("ChatGPT 回复未正常完成".into());
+                }
+                let output = event["response"]["output"]
+                    .as_array()
+                    .ok_or("ChatGPT 完成事件缺少输出")?;
+                self.items = output.iter().cloned().enumerate().collect();
+                self.metrics.usage(&event["response"]["usage"]);
+                self.completed = true;
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                let code = event["response"]["error"]["code"]
+                    .as_str()
+                    .or(event["error"]["code"].as_str())
+                    .or(event["code"].as_str())
+                    .unwrap_or_default();
+                return Err(match code {
+                    "subscription_sharing_usage_limit_exceeded" => {
+                        "ChatGPT 订阅授权额度已用尽，请在 ChatGPT 设置 → 用量中检查应用限额"
+                    }
+                    "subscription_sharing_usage_unavailable" => {
+                        "ChatGPT 订阅当前不可用，请检查订阅授权与账号权限"
+                    }
+                    "context_length_exceeded" => "ChatGPT 上下文已满，请压缩或新建会话",
+                    _ => "ChatGPT 回复未完成，请检查额度、网络或重新登录",
+                }
+                .into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Vec<ContentBlock> {
+        let mut blocks = Vec::new();
+        for item in self.items.values() {
+            match item["type"].as_str() {
+                Some("message") => {
+                    for part in item["content"].as_array().into_iter().flatten() {
+                        if let Some(text) = part["text"]
+                            .as_str()
+                            .or(part["refusal"].as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            blocks.push(ContentBlock::Text(text.into()));
+                        }
+                    }
+                }
+                Some("reasoning") => {
+                    for part in item["summary"].as_array().into_iter().flatten() {
+                        if let Some(text) = part["text"].as_str().filter(|s| !s.is_empty()) {
+                            blocks.push(ContentBlock::Thinking(text.into()));
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    if let (Some(id), Some(name)) =
+                        (item["call_id"].as_str(), item["name"].as_str())
+                    {
+                        blocks.push(ContentBlock::ToolCall(crate::tools::ToolCall {
+                            id: id.into(),
+                            name: name.into(),
+                            arguments: serde_json::from_str(
+                                item["arguments"].as_str().unwrap_or_default(),
+                            )
+                            .unwrap_or_else(|_| json!({})),
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks
+    }
+
+    fn finish(self, elapsed: u64) -> Result<Completion, String> {
+        if !self.completed {
+            return Err("ChatGPT 响应流中断，未收到完成事件；请重试".into());
+        }
+        let raw: Vec<_> = self.items.values().cloned().collect();
+        let mut ids = std::collections::HashSet::new();
+        let mut calls = Vec::new();
+        for item in raw.iter().filter(|item| item["type"] == "function_call") {
+            if item["namespace"].as_str().is_some_and(|n| n != "glint") {
+                return Err("ChatGPT 请求了未知工具命名空间".into());
+            }
+            let id = item["call_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("ChatGPT 工具调用缺少标识")?;
+            if !ids.insert(id) {
+                return Err("ChatGPT 返回重复的工具调用标识".into());
+            }
+            calls.push(
+                json!({"id":id,"function":{"name":item["name"],"arguments":item["arguments"]}}),
+            );
+        }
+        let decoded = crate::tools::decode_calls(&json!({"tool_calls":calls}), false)?;
+        let blocks = self.snapshot();
+        let text = blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::Text(text) = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if text.trim().is_empty() && decoded.calls.is_empty() {
+            return Err("ChatGPT 未返回文本或工具调用".into());
+        }
+        Ok(Completion {
+            blocks,
+            text,
+            stats: self.metrics.finish(elapsed),
+            tool_calls: decoded.calls,
+            argument_errors: decoded.errors,
+            raw_content: json!(raw),
+            ..Default::default()
+        })
+    }
+}
+
+pub async fn single_request(
+    config: &Config,
+    mut messages: Vec<Value>,
+    thinking: Thinking,
+    context: Option<&crate::tools::ToolContext>,
+    prefix: &[ContentBlock],
+) -> Result<Completion, String> {
+    let started = std::time::Instant::now();
+    let client = http_client().await?;
+    let mut token = auth::access(config, None).await?;
+    let model = if config.model.trim().is_empty() {
+        models(config)
+            .await?
+            .models
+            .into_iter()
+            .next()
+            .ok_or("请选择 ChatGPT 模型")?
+    } else {
+        config.model.clone()
+    };
+    if context.is_some() {
+        messages.insert(0,json!({"role":"developer","content":"You are Glint Agent. Use the registered host tools to complete the user's task. Host tools enforce the user's selected access mode. Only claim an action succeeded after a tool confirms success."}));
+    }
+    let body = request_body(
+        &model,
+        messages,
+        thinking,
+        context.map(|c| c.definitions(true)),
+    )?;
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(30),
+        client
+            .post("https://api.openai.com/v1/responses")
+            .bearer_auth(&token)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| "ChatGPT 连接超时")?
+    .map_err(|_| "无法连接 ChatGPT 模型服务")?;
+    // Retry authentication once, only before any SSE output or host tool effects.
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = auth::access(config, Some(&token)).await?;
+        response = tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .post("https://api.openai.com/v1/responses")
+                .bearer_auth(&token)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| "ChatGPT 连接超时")?
+        .map_err(|_| "无法连接 ChatGPT 模型服务")?;
+    }
+    receive_response(config, &model, response, context, prefix, started).await
+}
+
+async fn receive_response(
+    config: &Config,
+    model: &str,
+    mut response: reqwest::Response,
+    context: Option<&crate::tools::ToolContext>,
+    prefix: &[ContentBlock],
+    started: std::time::Instant,
+) -> Result<Completion, String> {
+    if !response.status().is_success() {
+        return Err(http_error(response.status()));
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+    {
+        return Err("ChatGPT 未返回预期的事件流".into());
+    }
+    let mut stream = ResponseStream::default();
+    let mut bytes = 0;
+    let mut publish = std::time::Instant::now() - Duration::from_millis(50);
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(180), response.chunk())
+        .await
+        .map_err(|_| "ChatGPT 响应等待超时")?
+        .map_err(|_| "读取 ChatGPT 响应流失败")?
+    {
+        bytes += chunk.len();
+        if bytes > 4 * 1024 * 1024 {
+            return Err("ChatGPT 响应超过 4MB 限制".into());
+        }
+        stream.push(&chunk, started.elapsed().as_millis() as u64)?;
+        if let Some(context) = context {
+            if stream.completed || publish.elapsed() >= Duration::from_millis(50) {
+                let mut blocks = prefix.to_vec();
+                blocks.extend(stream.snapshot());
+                let _ = context
+                    .events
+                    .try_send(crate::tools::ToolEvent::Transcript(blocks));
+                publish = std::time::Instant::now();
+            }
+        }
+        if stream.completed {
+            break;
+        }
+    }
+    stream.metrics.set_context_window(
+        config
+            .context_window_overrides
+            .get(model)
+            .or_else(|| config.model_context_windows.get(model))
+            .copied(),
+    );
+    let reply = stream.finish(started.elapsed().as_millis() as u64)?;
+    Ok(reply)
+}
+
+async fn http_client() -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(180))
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(target_os = "macos")]
+    let builder = {
+        let mut builder = builder;
+        if ![
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+        {
+            if let Ok(output) = crate::child_process::async_command("/usr/sbin/scutil")
+                .arg("--proxy")
+                .kill_on_drop(true)
+                .output()
+                .await
+            {
+                if output.status.success() {
+                    for (key, address) in system_proxy_env(&String::from_utf8_lossy(&output.stdout))
+                    {
+                        let proxy = match key {
+                            "HTTP_PROXY" => reqwest::Proxy::http(address),
+                            "HTTPS_PROXY" => reqwest::Proxy::https(address),
+                            _ => reqwest::Proxy::all(address),
+                        };
+                        if let Ok(proxy) = proxy {
+                            builder = builder.proxy(proxy);
+                        }
+                    }
+                }
+            }
+        }
+        builder
+    };
+    builder
+        .build()
+        .map_err(|_| "无法初始化 ChatGPT 网络客户端".into())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -83,689 +591,219 @@ fn system_proxy_env(settings: &str) -> Vec<(&'static str, String)> {
     proxies
 }
 
-pub async fn start_login(path: &str) -> Result<(Connection, String), String> {
-    let mut connection = Connection::start(path).await?;
-    let result = connection
-        .rpc("account/login/start", json!({"type":"chatgpt"}))
-        .await?;
-    let url = result["authUrl"]
-        .as_str()
-        .ok_or("Codex 未返回登录地址")?
-        .to_owned();
-    let parsed = reqwest::Url::parse(&url).map_err(|_| "Codex 返回了无效登录地址")?;
-    if parsed.scheme() != "https"
-        || !matches!(parsed.host_str(), Some("auth.openai.com" | "chatgpt.com"))
-    {
-        return Err("Codex 返回的登录地址不属于官方登录服务".into());
-    }
-    Ok((connection, url))
-}
-
-pub async fn finish_login(mut connection: Connection) -> Result<String, String> {
-    tokio::time::timeout(Duration::from_secs(600), async {
-        loop {
-            let event = connection.next().await?;
-            if event["method"] == "account/login/completed" {
-                if event["params"]["success"] == true {
-                    connection.account().await?;
-                    return Ok("ChatGPT 登录成功，可以保存并启用。".into());
-                }
-                return Err("ChatGPT 登录未完成，请重新尝试".into());
-            }
-        }
-    })
-    .await
-    .map_err(|_| "ChatGPT 登录已超时，请重试".to_owned())?
-}
-
-pub struct Connection {
-    blocks: Vec<crate::generation::ContentBlock>,
-    transcript_items: std::collections::HashMap<String, usize>,
-    tools: Option<crate::tools::ToolContext>,
-    tool_records: Vec<crate::tools::ToolRecord>,
-    _child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    queued: VecDeque<Value>,
-    sequence: u64,
-    last_publish: std::cell::Cell<Option<std::time::Instant>>,
-}
-
-impl Connection {
-    fn publish(&self) {
-        if let Some(context) = &self.tools {
-            let _ = context
-                .events
-                .try_send(crate::tools::ToolEvent::Transcript(self.blocks.clone()));
-            self.last_publish.set(Some(std::time::Instant::now()));
-        }
-    }
-    fn transcript_text(&mut self, key: String, text: &str, thinking: bool, replace: bool) {
-        use crate::generation::ContentBlock;
-        if let Some(index) = self.transcript_items.get(&key).copied() {
-            if let ContentBlock::Text(previous) | ContentBlock::Thinking(previous) =
-                &mut self.blocks[index]
-            {
-                if replace {
-                    *previous = text.into();
-                } else {
-                    previous.push_str(text);
-                }
-            }
-        } else {
-            self.transcript_items.insert(key, self.blocks.len());
-            self.blocks.push(if thinking {
-                ContentBlock::Thinking(text.into())
-            } else {
-                ContentBlock::Text(text.into())
-            });
-        }
-        if replace
-            || self
-                .last_publish
-                .get()
-                .is_none_or(|last| last.elapsed() >= Duration::from_millis(50))
-        {
-            self.publish();
-        }
-    }
-
-    pub async fn start(path: &str) -> Result<Self, String> {
-        let mut command = crate::child_process::async_command(path);
-        configure_proxy(&mut command).await;
-        command
-            .args([
-                "app-server",
-                "--listen",
-                "stdio://",
-                "-c",
-                "model_provider=\"openai\"",
-                "-c",
-                "forced_login_method=\"chatgpt\"",
-                "-c",
-                "features.hooks=false",
-                "-c",
-                "features.plugins=false",
-                "-c",
-                "features.apps=false",
-                "-c",
-                "features.shell_tool=false",
-                "-c",
-                "features.multi_agent=false",
-                "-c",
-                "web_search=\"disabled\"",
-                "-c",
-                "features.memories=false",
-                "-c",
-                "features.computer_use=false",
-                "-c",
-                "features.browser_use=false",
-                "-c",
-                "features.image_generation=false",
-            ])
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CODEX_API_KEY")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|_| "无法启动 Codex CLI，请在设置中填写可执行文件路径".to_owned())?;
-        let input = child.stdin.take().ok_or("无法打开 Codex 输入通道")?;
-        let output = BufReader::new(child.stdout.take().ok_or("无法打开 Codex 输出通道")?);
-        let mut connection = Self {
-            blocks: vec![],
-            transcript_items: std::collections::HashMap::new(),
-            tools: None,
-            tool_records: vec![],
-            _child: child,
-            input,
-            output,
-            queued: VecDeque::new(),
-            sequence: 0,
-            last_publish: Default::default(),
-        };
-        connection.rpc("initialize", json!({"clientInfo":{"name":"glint_agent","title":"Glint Agent","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
-        connection
-            .write(json!({"method":"initialized","params":{}}))
-            .await?;
-        Ok(connection)
-    }
-
-    async fn write(&mut self, value: Value) -> Result<(), String> {
-        let mut bytes = serde_json::to_vec(&value).map_err(|_| "无法编码 Codex 请求")?;
-        bytes.push(b'\n');
-        self.input
-            .write_all(&bytes)
-            .await
-            .map_err(|_| "Codex 连接已关闭")?;
-        self.input
-            .flush()
-            .await
-            .map_err(|_| "Codex 连接已关闭".into())
-    }
-
-    async fn read(&mut self) -> Result<Value, String> {
-        self.read_with_idle_timeout(Duration::from_secs(180)).await
-    }
-
-    async fn read_with_idle_timeout(&mut self, idle_timeout: Duration) -> Result<Value, String> {
-        loop {
-            let mut line = String::new();
-            // Do not count host tool execution or user approval time against
-            // the model's idle timeout.
-            let count = tokio::time::timeout(idle_timeout, self.output.read_line(&mut line))
-                .await
-                .map_err(|_| "ChatGPT 响应等待超时，请稍后重试")?
-                .map_err(|_| "读取 Codex 响应失败")?;
-            if count == 0 {
-                return Err("Codex app-server 已退出".into());
-            }
-            if line.len() > 8 * 1024 * 1024 {
-                return Err("Codex 响应超过限制".into());
-            }
-            let value: Value =
-                serde_json::from_str(&line).map_err(|_| "Codex 返回了无效协议数据")?;
-            if value["method"] == "item/tool/call" && value.get("id").is_some() {
-                if let Some(context) = self.tools.clone() {
-                    let params = &value["params"];
-                    let call = crate::tools::ToolCall {
-                        id: params["callId"].as_str().unwrap_or("").into(),
-                        name: params["tool"].as_str().unwrap_or("").into(),
-                        arguments: params["arguments"].clone(),
-                    };
-                    self.blocks
-                        .push(crate::generation::ContentBlock::ToolCall(call.clone()));
-                    self.publish();
-                    let record = crate::tools::execute(call, &context).await;
-                    self.blocks
-                        .push(crate::generation::ContentBlock::ToolResult(record.clone()));
-                    self.publish();
-                    let mut content = vec![json!({"type":"inputText","text":record.result})];
-                    // Deliver recall before releasing a tool result, so Codex
-                    // sees it at its very next model iteration even for slow tools.
-                    if let Some(recalled) = context.take_recalled_context() {
-                        content.push(json!({"type":"inputText","text":format!(
-                            "宿主异步提供的历史参考（与工具结果独立）：\n{recalled}"
-                        )}));
-                    }
-                    self.write(json!({"id":value["id"],"result":{"contentItems":content,"success":record.success}})).await?;
-                    self.tool_records.push(record);
-                    continue;
-                }
-            }
-            // Native Codex tools and approvals stay disabled; only the host's
-            // registered tools use the application's visible approval flow.
-            if value.get("method").is_some() && value.get("id").is_some() {
-                self.write(json!({"id":value["id"],"error":{"code":-32601,"message":"Glint Agent text provider does not support tools or approvals"}})).await?;
-                continue;
-            }
-            return Ok(value);
-        }
-    }
-
-    pub async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        self.sequence += 1;
-        let id = self.sequence;
-        self.write(json!({"method":method,"id":id,"params":params}))
-            .await?;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let value = self.read().await?;
-                if value["id"].as_u64() == Some(id) {
-                    if value.get("error").is_some() {
-                        // Do not echo server error bodies, which may contain credentials.
-                        return Err(format!(
-                            "Codex {method} 请求失败，请检查登录状态、模型和 CLI 版本"
-                        ));
-                    }
-                    return Ok(value["result"].clone());
-                }
-                self.queued.push_back(value);
-            }
-        })
-        .await
-        .map_err(|_| "Codex 请求超时".to_owned())?
-    }
-
-    pub async fn next(&mut self) -> Result<Value, String> {
-        if let Some(value) = self.queued.pop_front() {
-            Ok(value)
-        } else {
-            self.read().await
-        }
-    }
-
-    pub async fn account(&mut self) -> Result<Value, String> {
-        let result = self
-            .rpc("account/read", json!({"refreshToken":false}))
-            .await?;
-        if result["account"]["type"] != "chatgpt" {
-            return Err("尚未登录 ChatGPT，请点击「登录 ChatGPT」完成订阅授权".into());
-        }
-        Ok(result["account"].clone())
-    }
-}
-
-pub async fn account(path: &str) -> Result<String, String> {
-    let mut connection = Connection::start(path).await?;
-    let account = connection.account().await?;
-    let plan = account["planType"].as_str().unwrap_or("ChatGPT");
-    Ok(format!(
-        "已登录 ChatGPT · {plan}（可用模型和额度以账户实际权限为准）"
-    ))
-}
-
-pub async fn models(path: &str) -> Result<Vec<String>, String> {
-    let mut connection = Connection::start(path).await?;
-    connection.account().await?;
-    let mut result = Vec::new();
-    let mut cursor = Value::Null;
-    loop {
-        let page = connection
-            .rpc("model/list", json!({"cursor":cursor,"limit":100}))
-            .await?;
-        let models = page["data"].as_array().ok_or("Codex 未返回模型列表")?;
-        result.extend(
-            models
-                .iter()
-                .filter_map(|model| model["model"].as_str().or(model["id"].as_str()))
-                .map(str::to_owned),
-        );
-        cursor = page["nextCursor"].clone();
-        if cursor.is_null() || result.len() >= 1000 {
-            break;
-        }
-    }
-    result.sort();
-    result.dedup();
-    if result.is_empty() {
-        Err("Codex 没有返回模型，请保留默认模型或检查登录状态".into())
-    } else {
-        Ok(result)
-    }
-}
-
-/// Keep image bytes out of the text transcript and send native vision inputs.
-fn conversation_input(mut messages: Vec<Value>) -> Result<Vec<Value>, String> {
-    let mut attachments = Vec::new();
-    for (message_index, message) in messages.iter_mut().enumerate() {
-        if let Some(parts) = message["content"].as_array_mut() {
-            for part in parts {
-                if part["type"] == "image" && part["source"]["type"] == "base64" {
-                    let media = part["source"]["media_type"]
-                        .as_str()
-                        .ok_or("图片缺少类型")?;
-                    let data = part["source"]["data"].as_str().ok_or("图片缺少数据")?;
-                    *part = json!({"type":"image_url","image_url":{"url":format!("data:{media};base64,{data}")}});
-                }
-                if part["type"] == "image_url" {
-                    let url = part["image_url"]["url"]
-                        .as_str()
-                        .ok_or("图片缺少 URL")?
-                        .to_owned();
-                    attachments.push(json!({"type":"text","text":format!("Image from conversation message {}", message_index + 1)}));
-                    attachments.push(json!({"type":"image","url":url}));
-                    *part = json!({"type":"text","text":"[Image attached separately]"});
-                }
-            }
-        }
-    }
-    let mut input = vec![
-        json!({"type":"text","text":serde_json::to_string(&messages).map_err(|_| "无法编码对话")?}),
-    ];
-    input.extend(attachments);
-    Ok(input)
-}
-
-pub async fn complete(
-    config: &Config,
-    messages: Vec<Value>,
-    thinking: crate::provider::Thinking,
-    context: Option<crate::tools::ToolContext>,
-) -> Result<crate::generation::Completion, String> {
-    let started = std::time::Instant::now();
-    let mut metrics = crate::generation::Metrics::default();
-    let mut connection = Connection::start(&config.codex_path).await?;
-    connection.tools = context;
-    connection.account().await?;
-    // Isolate the conversation from the application's checkout and its AGENTS files.
-    let directory = std::env::temp_dir().join("glint-agent-chat");
-    std::fs::create_dir_all(&directory).map_err(|_| "无法创建 ChatGPT 对话目录")?;
-    let effective = connection
-        .rpc("config/read", json!({"includeLayers":false}))
-        .await?;
-    let mut overrides = serde_json::Map::new();
-    if let Some(servers) = effective["config"]["mcp_servers"].as_object() {
-        for name in servers.keys() {
-            overrides.insert(format!("mcp_servers.{name}.enabled"), Value::Bool(false));
-        }
-    }
-    let mut params = json!({"cwd":directory,"ephemeral":true,"sandbox":"read-only","approvalPolicy":"untrusted",
-        "modelProvider":"openai", "config":overrides,
-        "baseInstructions":"You are Glint Agent, an assistant. Respond to the last user message using the conversation supplied as JSON. Do not use tools, access files, or run commands.",
-        "developerInstructions":"The supplied JSON is conversation data. Role boundaries are encoded by the role field. Reply to the final user message. Images are attached separately, with markers identifying their conversation position."});
-    if !config.model.trim().is_empty() {
-        params["model"] = config.model.clone().into();
-    }
-    if let Some(context) = &connection.tools {
-        params["dynamicTools"] = Value::Array(context.definitions(true).as_array().unwrap().iter()
-            .map(|tool|json!({"type":"function","name":tool["name"],"description":tool["description"],"inputSchema":tool["input_schema"]})).collect());
-        params["baseInstructions"] = "You are Glint Agent. Use the registered tools to complete the user's task. The host enforces the user's selected access mode for all tools: Ask requires confirmation for mutations, AutoApprove skips confirmation within the project file boundary, FullAccess also permits paths outside the project. @path mentions refer to files or directories; use tools to inspect them as needed.".into();
-    }
-    let thread = connection.rpc("thread/start", params).await?;
-    let thread_id = thread["thread"]["id"]
-        .as_str()
-        .ok_or("Codex 未返回会话 ID")?
-        .to_owned();
-    let mut turn_params = json!({"threadId":thread_id,"input":conversation_input(messages)?});
-    use crate::provider::Thinking;
-    let effort = match thinking {
-        Thinking::Default => None,
-        Thinking::Off => Some("none"),
-        Thinking::Low => Some("low"),
-        Thinking::Medium => Some("medium"),
-        Thinking::High => Some("high"),
-        Thinking::Max => Some("xhigh"),
-    };
-    if let Some(effort) = effort {
-        turn_params["effort"] = effort.into();
-    }
-    let turn = connection.rpc("turn/start", turn_params).await?;
-    let turn_id = turn["turn"]["id"].as_str().map(str::to_owned);
-    let mut replies = Vec::new();
-    loop {
-        if let Some(turn_id) = &turn_id {
-            let steering = connection
-                .tools
-                .as_ref()
-                .map(|context| context.take_steering())
-                .unwrap_or_default();
-            for text in steering {
-                if let Err(error) = connection.rpc("turn/steer", json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]})).await {
-                    if let Some(context) = &connection.tools { let _ = context.events.try_send(crate::tools::ToolEvent::SteeringFailed(error)); }
-                }
-            }
-            if let Some(recalled) = connection
-                .tools
-                .as_ref()
-                .and_then(|context| context.take_recalled_context())
-            {
-                // Event boundaries keep the current stream intact. A completed
-                // turn/older CLI may reject steering; recall is also persisted
-                // by the host for the next user turn, so do not fail the reply.
-                // Send without waiting for the acknowledgement: event reading
-                // and tool execution must continue even if steering is rejected.
-                connection.sequence += 1;
-                let _ = connection
-                    .write(json!({
-                        "id":connection.sequence,"method":"turn/steer",
-                        "params":{
-                            "threadId":thread_id,"expectedTurnId":turn_id,
-                            "input":[{"type":"text","text":format!(
-                                "宿主异步记忆补充；继续当前任务，无需单独回复此条。\n{}", json!({
-                                "role":"system","content":recalled
-                            }))}]
-                        }
-                    }))
-                    .await;
-            }
-        }
-        let event = connection.next().await?;
-        if event["params"]["threadId"]
-            .as_str()
-            .is_some_and(|id| id != thread_id)
-        {
-            continue;
-        }
-        match event["method"].as_str() {
-            Some("item/completed") if event["params"]["item"]["type"] == "agentMessage" => {
-                if let Some(text) = event["params"]["item"]["text"].as_str() {
-                    replies.push(text.to_owned());
-                    connection.transcript_text(
-                        format!("text:{}", event["params"]["item"]["id"]),
-                        text,
-                        false,
-                        true,
-                    );
-                }
-            }
-            Some("item/agentMessage/delta")
-            | Some("item/reasoning/textDelta")
-            | Some("item/reasoning/summaryTextDelta") => {
-                if let Some(text) = event["params"]["delta"]
-                    .as_str()
-                    .filter(|text| !text.is_empty())
-                {
-                    metrics.output(started.elapsed().as_millis() as u64);
-                    let thinking = event["method"] != "item/agentMessage/delta";
-                    let key = if thinking {
-                        format!(
-                            "{}:{}:{}:{}",
-                            event["method"],
-                            event["params"]["itemId"],
-                            event["params"]["contentIndex"],
-                            event["params"]["summaryIndex"]
-                        )
-                    } else {
-                        format!("text:{}", event["params"]["itemId"])
-                    };
-                    connection.transcript_text(key, text, thinking, false);
-                }
-            }
-            Some("thread/tokenUsage/updated") => {
-                let usage = &event["params"]["tokenUsage"];
-                metrics.usage(&usage["last"]);
-                let capacity = usage["modelContextWindow"].as_u64();
-                metrics.set_context_window(capacity);
-                if let Some(context) = &connection.tools {
-                    let _ = context
-                        .events
-                        .try_send(crate::tools::ToolEvent::ContextUsage {
-                            provider_id: context.provider_id,
-                            model: context.model.clone(),
-                            used_tokens: metrics.context_tokens(),
-                            capacity_tokens: capacity,
-                        });
-                }
-            }
-            Some("turn/completed") => {
-                return completed_reply(&event, replies).map(|text| {
-                    crate::generation::Completion {
-                        text,
-                        blocks: std::mem::take(&mut connection.blocks),
-                        stats: metrics.finish(started.elapsed().as_millis() as u64),
-                        tool_records: std::mem::take(&mut connection.tool_records),
-                        ..Default::default()
-                    }
-                });
-            }
-            Some("error") => {
-                let error = &event["params"]["error"];
-                return Err(error_hint(error));
-            }
-            _ => {}
-        }
-    }
-}
-
-fn completed_reply(event: &Value, replies: Vec<String>) -> Result<String, String> {
-    if event["params"]["turn"]["status"] != "completed" {
-        return Err(error_hint(&event["params"]["turn"]["error"]));
-    }
-    let text = replies.join("\n\n");
-    if text.trim().is_empty() {
-        Err("ChatGPT 未返回文本回复".into())
-    } else {
-        Ok(text)
-    }
-}
-
-fn error_hint(error: &Value) -> String {
-    let message = error["message"].as_str().unwrap_or("").to_lowercase();
-    let detail = if message.contains("connect")
-        || message.contains("network")
-        || message.contains("websocket")
-        || message.contains("stream")
-    {
-        "网络连接或响应流中断，请检查能否访问 ChatGPT/Codex 服务"
-    } else if message.contains("quota")
-        || message.contains("usage limit")
-        || message.contains("rate limit")
-    {
-        "订阅额度不足或请求受限，请稍后重试"
-    } else if message.contains("model") {
-        "所选模型不可用，请留空模型 ID 或选择账户可用模型"
-    } else if message.contains("auth") || message.contains("token") || message.contains("login") {
-        "ChatGPT 登录已失效，请重新登录"
-    } else {
-        "回复未完成，请检查订阅额度、模型权限或重新登录"
-    };
-    format!("ChatGPT：{detail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn model_idle_timeout_excludes_foreground_tool_execution() {
-        let root = tempfile::tempdir().unwrap();
-        let call = json!({"id":1,"method":"item/tool/call","params":{
-            "callId":"foreground-test","tool":"run_command","arguments":{
-                "program":"sh","args":["-c","sleep 0.5; echo done"],"timeout_seconds":5
-            }
-        }})
-        .to_string();
-        let mut child = Command::new("sh")
-            .args(["-c", "printf '%s\\n' \"$1\"; IFS= read -r reply; printf '%s\\n' '{\"method\":\"test/done\"}'; IFS= read -r hold", "mock-codex", &call])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-            .kill_on_drop(true).spawn().unwrap();
-        let mut connection = Connection {
-            input: child.stdin.take().unwrap(),
-            output: BufReader::new(child.stdout.take().unwrap()),
-            _child: child,
-            blocks: Vec::new(),
-            transcript_items: Default::default(),
-            tools: Some(crate::edits::tests::context(root.path())),
-            tool_records: Vec::new(),
-            queued: Default::default(),
-            sequence: 0,
-            last_publish: Default::default(),
-        };
-        let event = connection
-            .read_with_idle_timeout(Duration::from_millis(250))
-            .await
-            .unwrap();
-        assert_eq!(event["method"], "test/done");
-        assert!(connection.tool_records[0].success);
-        assert!(connection.tool_records[0].result.contains("done"));
-        assert!(
-            connection
-                .read_with_idle_timeout(Duration::from_millis(250))
-                .await
-                .unwrap_err()
-                .contains("超时")
-        );
-    }
-
     #[test]
-    fn system_proxy_maps_enabled_protocols_and_ipv6() {
-        let settings = "<dictionary> {\n HTTPEnable : 1\n HTTPProxy : 127.0.0.1\n HTTPPort : 7897\n HTTPSEnable : 1\n HTTPSProxy : ::1\n HTTPSPort : 7897\n SOCKSEnable : 1\n SOCKSProxy : localhost\n SOCKSPort : 1080\n}";
+    fn static_proxy_parser_rejects_bad_ports_and_preserves_protocols() {
         assert_eq!(
-            system_proxy_env(settings),
+            system_proxy_env(
+                "HTTPEnable : 1\nHTTPProxy : proxy.example\nHTTPPort : 8080\nHTTPSEnable : 1\nHTTPSProxy : localhost\nHTTPSPort : 7890"
+            ),
             vec![
-                ("HTTP_PROXY", "http://127.0.0.1:7897".into()),
-                ("HTTPS_PROXY", "http://[::1]:7897".into()),
-                ("ALL_PROXY", "socks5h://localhost:1080".into()),
+                ("HTTP_PROXY", "http://proxy.example:8080".into()),
+                ("HTTPS_PROXY", "http://localhost:7890".into())
             ]
         );
+        assert!(system_proxy_env("HTTPEnable : 1\nHTTPProxy : localhost\nHTTPPort : 0").is_empty());
+    }
+
+    fn event(value: Value) -> String {
+        format!("data: {value}\r\n\r\n")
+    }
+    fn completed(output: Value) -> Value {
+        json!({"type":"response.completed","response":{"status":"completed","output":output,"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":50}}}})
+    }
+    fn message(text: &str) -> Value {
+        json!({"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]})
     }
 
     #[test]
-    fn system_proxy_ignores_disabled_incomplete_and_invalid_settings() {
-        assert!(system_proxy_env("HTTPEnable : 0\nHTTPProxy : localhost\nHTTPPort : 80\nHTTPSEnable : 1\nHTTPSProxy : localhost\nSOCKSEnable : 1\nSOCKSProxy : localhost\nSOCKSPort : 0").is_empty());
-        assert!(
-            system_proxy_env("HTTPEnable : 1\nHTTPProxy : user@localhost\nHTTPPort : 80")
-                .is_empty()
-        );
-        assert!(
-            system_proxy_env("HTTPEnable : 1\nHTTPProxy : localhost/path\nHTTPPort : 80")
-                .is_empty()
-        );
-        assert!(system_proxy_env("ProxyAutoConfigEnable : 1\nProxyAutoConfigURLString : https://example.com/proxy.pac").is_empty());
-    }
-
-    #[test]
-    fn images_are_native_inputs_and_not_base64_transcript_text() {
-        let input = conversation_input(vec![
-            json!({"role":"assistant","content":"Earlier answer"}),
-            json!({"role":"user","content":[
-                {"type":"text","text":"Describe this"},
-                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}},
-                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"d29ybGQ="}}
-            ]})
-        ]).unwrap();
-        assert_eq!(input.len(), 5);
+    fn request_uses_direct_subscription_contract_and_preserves_roles_and_images() {
+        let body = request_body("account-model",vec![json!({"role":"system","content":"instructions"}), json!({"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]}),json!({"role":"assistant","content":"earlier"})],Thinking::High,Some(json!([{"name":"read_file","description":"Read","input_schema":{"type":"object"}}]))).unwrap();
+        assert_eq!(body["model"], "account-model");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(body["input"][0].get("type").is_none());
         assert_eq!(
-            input[2],
-            json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
+            body["input"][1]["content"][1],
+            json!({"type":"input_image","image_url":"data:image/png;base64,YQ=="})
         );
-        assert_eq!(
-            input[4],
-            json!({"type":"image","url":"data:image/jpeg;base64,d29ybGQ="})
-        );
-        let transcript = input[0]["text"].as_str().unwrap();
-        assert!(transcript.contains("Earlier answer"));
-        assert!(transcript.contains("Describe this"));
-        assert!(!transcript.contains("base64"));
-        assert_eq!(
-            conversation_input(vec![json!({"role":"user","content":"Hello"})])
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn failed_or_interrupted_turns_never_count_as_success() {
-        for status in ["failed", "interrupted", "inProgress"] {
-            let event = json!({"params":{"turn":{"status":status}}});
-            assert!(completed_reply(&event, vec!["partial".into()]).is_err());
+        assert_eq!(body["input"][2]["role"], "assistant");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "read_file");
+        for field in [
+            "previous_response_id",
+            "conversation",
+            "max_output_tokens",
+            "temperature",
+            "metadata",
+        ] {
+            assert!(body.get(field).is_none());
         }
-        assert_eq!(
-            completed_reply(
-                &json!({"params":{"turn":{"status":"completed"}}}),
-                vec!["OK".into()]
-            )
-            .unwrap(),
-            "OK"
+    }
+
+    #[test]
+    fn fragmented_sse_streams_thinking_and_text_and_counts_usage_once() {
+        let thinking =
+            json!({"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque"});
+        let mut final_thinking = thinking.clone();
+        final_thinking["summary"] = json!([{"type":"summary_text","text":"plan"}]);
+        let frames = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":thinking}),
+            json!({"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"plan"}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}),
+            json!({"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text","text":""}}),
+            json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"你好"}),
+        ];
+        let data = frames.into_iter().map(event).collect::<String>();
+        let mut stream = ResponseStream::default();
+        for (i, byte) in data.as_bytes().iter().enumerate() {
+            stream.push(&[*byte], i as u64).unwrap();
+        }
+        assert!(
+            matches!(&stream.snapshot()[..],[ContentBlock::Thinking(plan),ContentBlock::Text(text)] if plan=="plan" && text=="你好")
         );
+        let done = event(completed(json!([final_thinking, message("你好")])));
+        for chunk in done.as_bytes().chunks(3) {
+            stream.push(chunk, 1000).unwrap();
+        }
+        let reply = stream.finish(1100).unwrap();
+        assert_eq!(reply.text, "你好");
+        assert_eq!(reply.stats.input_tokens, Some(100));
+        assert_eq!(reply.stats.context_tokens, Some(110));
+        assert_eq!(reply.raw_content[0]["encrypted_content"], "opaque");
+        assert_eq!(reply.blocks.len(), 2);
     }
 
     #[test]
-    #[ignore = "requires an installed, authenticated Codex CLI; performs account read only"]
-    fn installed_codex_reports_chatgpt_account_without_exposing_tokens() {
-        let config = Config::default();
-        let result = crate::provider::runtime()
+    fn tools_keep_encrypted_reasoning_and_call_result_pairing_without_replaying_effects() {
+        let output = json!([{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]},{"id":"fc_1","type":"function_call","namespace":"glint","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.rs\"}"}]);
+        let mut stream = ResponseStream::default();
+        stream.event(completed(output.clone()), 10).unwrap();
+        let reply = stream.finish(20).unwrap();
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].arguments["path"], "a.rs");
+        let next = conversation_input(vec![
+            json!({"responses_output":reply.raw_content}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"file contents"}),
+            json!({"role":"system","content":"recalled memory"}),
+        ])
+        .unwrap();
+        assert_eq!(&next[..2], output.as_array().unwrap().as_slice());
+        assert_eq!(
+            next[2],
+            json!({"type":"function_call_output","call_id":"call_1","output":"file contents"})
+        );
+        assert_eq!(next[3]["role"], "developer");
+        let mut invalid = output.clone();
+        invalid[1]["arguments"] = json!("{broken");
+        let mut stream = ResponseStream::default();
+        stream.event(completed(invalid), 0).unwrap();
+        assert!(
+            stream
+                .finish(1)
+                .unwrap()
+                .argument_errors
+                .contains_key("call_1")
+        );
+        let mut duplicate = output;
+        let call = duplicate[1].clone();
+        duplicate.as_array_mut().unwrap().push(call);
+        let mut stream = ResponseStream::default();
+        stream.event(completed(duplicate), 0).unwrap();
+        assert!(stream.finish(1).is_err());
+    }
+
+    #[test]
+    fn done_marker_and_partial_output_do_not_mask_incomplete_or_usage_failure() {
+        let mut stream = ResponseStream::default();
+        stream.push(b"data: [DONE]\n\n", 0).unwrap();
+        assert!(stream.finish(1).is_err());
+        let mut stream = ResponseStream::default();
+        stream.event(json!({"type":"response.output_item.done","output_index":0,"item":message("partial")}),0).unwrap();
+        assert!(stream.finish(1).is_err());
+        for kind in ["response.failed", "response.incomplete", "error"] {
+            let mut stream = ResponseStream::default();
+            assert!(stream.event(json!({"type":kind,"response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"sensitive-server-detail"}}}),0).unwrap_err().contains("额度"));
+        }
+        let mut stream = ResponseStream::default();
+        assert!(stream.event(json!({"type":"response.completed","response":{"status":"incomplete","output":[message("partial")]}}),0).is_err());
+    }
+
+    #[test]
+    fn account_models_keep_server_order_and_exclude_hidden_models() {
+        let catalog=parse_models(&json!({"models":[{"slug":"z-model","visibility":"list","context_window":128000},{"slug":"hidden","visibility":"hide"},{"slug":"a-model","visibility":"list"},{"slug":"z-model","visibility":"list"}]})).unwrap();
+        assert_eq!(catalog.models, ["z-model", "a-model"]);
+        assert_eq!(catalog.context_windows["z-model"], 128000);
+        assert!(parse_models(&json!({"models":[]})).is_err());
+    }
+
+    async fn fixture(status: &str, data: String) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                data.len()
+            );
+            for chunk in body.as_bytes().chunks(7) {
+                stream.write_all(chunk).await.unwrap();
+            }
+        });
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
             .unwrap()
-            .block_on(account(&config.codex_path))
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_sse_success_interruption_and_non_success_are_distinct() {
+        let config = Config::default();
+        let response = fixture("200 OK", event(completed(json!([message("done")])))).await;
+        let reply = receive_response(&config, "m", response, None, &[], std::time::Instant::now())
+            .await
             .unwrap();
-        assert!(result.starts_with("已登录 ChatGPT"));
+        assert_eq!(reply.text, "done");
+        let response=fixture("200 OK",event(json!({"type":"response.output_item.done","output_index":0,"item":message("partial")}))).await;
+        assert!(
+            receive_response(&config, "m", response, None, &[], std::time::Instant::now())
+                .await
+                .is_err()
+        );
+        let response = fixture("429 Too Many Requests", "server-private-message".into()).await;
+        let error = receive_response(&config, "m", response, None, &[], std::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert!(error.contains("429"));
+        assert!(!error.contains("private"));
     }
 
     #[test]
-    #[ignore = "uses the signed-in ChatGPT subscription for one short text inference"]
-    fn installed_codex_completes_one_text_turn() {
-        let config = Config {
-            kind: crate::provider::Kind::ChatGpt,
-            ..Config::default()
-        };
-        let result = crate::provider::runtime().unwrap().block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), complete(&config, vec![json!({"role":"user","content":"Reply with OK only. Do not use any tools."})], crate::provider::Thinking::Default, None)).await
-        }).expect("Codex inference timed out").expect("Codex inference failed");
-        assert!(!result.text.trim().is_empty());
+    fn legacy_codex_configuration_still_loads_without_serializing_a_cli_path() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value["kind"] = json!("ChatGpt");
+        value["codex_path"] = json!("/removed/codex");
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("codex_path")
+                .is_none()
+        );
     }
 }

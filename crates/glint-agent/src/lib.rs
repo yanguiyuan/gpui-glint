@@ -970,8 +970,8 @@ impl AgentWorkspace {
             session_id: Some(id),
             changes: Default::default(),
         };
-        // The session's first turn gets an AI-generated title once the reply
-        // lands; Codex CLI would boot a whole process for it, so skip that.
+        // Generate titles after the first reply for API providers. Subscription
+        // conversations keep their existing title without an extra request.
         let first_turn = self.history.sessions[index].messages.is_empty();
         let title_config =
             (first_turn && config.kind == provider::Kind::Compatible).then(|| config.clone());

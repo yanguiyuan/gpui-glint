@@ -21,15 +21,17 @@ API 供应商支持 OpenAI Chat Completions 和 Anthropic Messages 协议。设�
 
 API Key 以明文存入本机 `glint-agent.sqlite3` 的独立 `provider_secrets` 表，供应商配置 JSON 和通用配置元数据不包含密钥。也可指定环境变量名，发送时读取应用环境；Finder 启动的应用可能不继承终端环境。两种认证方式二选一，环境变量模式不会回退到 SQLite 密钥。
 
-模型 API Key 仅从 SQLite 或所选环境变量读取，不再包含系统钥匙串访问或导入入口；清除按钮删除 SQLite 中的密钥。ChatGPT 登录仍由官方 Codex 管理。
+模型 API Key 仅从 SQLite 或所选环境变量读取，不再包含系统钥匙串访问或导入入口；清除按钮删除 SQLite 中的密钥。ChatGPT 使用独立的浏览器 OAuth 授权，令牌保存到本机 SQLite 的 `chatgpt_auth` 表，不写入供应商配置或通用导出。
 
 内置 DeepSeek 自动发现，依次检测 `DEEPSEEK_API_KEY` 和 `deepseek_api_key`。默认采用 Anthropic 协议，地址 `https://api.deepseek.com/anthropic`，模型通过认证的 `https://api.deepseek.com/models` 获取。旧版 DeepSeek 根地址配置会迁移，明确保存的协议保持不变。
 
 `src/discovery.rs` 提供 `ProviderDiscovery` trait 与 `DiscoveryRegistry`。实现 `id()` 和 `discover(&dyn DiscoveryEnvironment) -> Option<Config>` 后注册即可扩展。发现器只能查询环境变量是否非空，配置仅保存变量名。重复 ID 替换实现并保持顺序；已保存配置和断开状态优先，不会被重新激活。
 
-ChatGPT 订阅通过本机官方 `codex app-server` 接入：在设置中添加 ChatGPT、检查已有登录或在官方浏览器页面登录、获取模型并启用。凭据由 Codex 管理，应用不复制 OAuth 令牌。模型与额度取决于账户权限。每次请求在隔离的临时目录启动 ephemeral thread，本地上下文随请求传入，不恢复 Codex 原生 thread。
+ChatGPT 订阅通过官方 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source) 直接接入，不需要安装 Codex。设置中添加 ChatGPT 供应商，点击 **Continue with ChatGPT** 在系统浏览器完成登录和订阅授权，再获取模型、选择默认模型并保存启用。每个供应商独立对应一个账号/工作区注册；需要其他账号或工作区时添加另一个 ChatGPT 供应商。“检查登录状态”显示账号与注册标识，“退出 ChatGPT”尝试撤销远端会话并清除本机令牌，保留注册供下次登录复用。旧版 Codex 授权不会自动导入，升级后需重新授权一次。
 
-Codex 原生 shell、插件、浏览器等能力关闭，工具通过 app-server 的 dynamic tools 接入本应用。其他客户端审批请求默认拒绝。此集成面向本地应用；商业和托管服务请参阅官方 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server)。
+OAuth 使用动态公开客户端注册、PKCE、一次性 state/nonce、`127.0.0.1` 随机端口回调和 OpenAI JWKS 身份签名校验；主机 ID 在本机稳定保存。令牌与注册信息在 `chatgpt_auth` 表中以本地明文保存，与 API Key 使用相同的数据目录保护方式。续期会原子替换令牌，文件锁串行化同一供应商跨进程的刷新；登录取消或超时会关闭回调监听。不要共享应用数据目录或数据库。模型列表与额度取决于所授权账号，应用用量和访问权限可在 [ChatGPT 设置 → 用量](https://chatgpt.com/settings/usage) 管理。
+
+模型请求直接访问 `https://api.openai.com/v1/responses`，使用 `store:false`、`stream:true`，逐次发送所需历史，不使用服务端会话恢复。图片保留在对应消息中，思考摘要、流式文字、工具调用和用量通过 Responses SSE 处理；必须收到 `response.completed` 才视为成功，额度错误、响应不完整和断流都会报错。工具按 `glint` namespace 注册，执行、批准、取消、参数修正和子代理统一复用本应用的宿主工具机制。已完成的工具不会因网络错误自动重放。此能力目前为预览；付费或远程托管应用的接入条件参见官方文档。
 
 新会话首页将标题、输入框和下方快捷提示居中排布，发送后输入框固定到底部。新建会话在输入框上方选择项目；项目菜单向上展开并与按钮左侧对齐。空项目保留在侧栏，可通过分组的“+”新建会话。旧独立会话在已有或首次选择的项目中保留，发送前必须选择项目。删除会话通过确认 popover 执行。
 
@@ -43,7 +45,7 @@ Codex 原生 shell、插件、浏览器等能力关闭，工具通过 app-server
 
 在“设置 → 常规”中开启“快捷回复建议”（默认关闭）后，当前模型会在成功回复后通过一次不带工具的后台请求生成最多三条快捷回复，显示在最新回复下方。点击气泡直接发送该回复，保留正在编辑的草稿和附件；也可忽略。建议随消息保存，发送新消息后旧建议隐藏。没有合适建议或生成失败时不显示；日程自动执行不生成快捷回复。关闭开关会隐藏建议并取消尚未完成的生成请求。
 
-输入框默认显示上下文余量环。新会话显示初始状态；收到服务端 usage 后，按当前请求的输入、输出和缓存输入 token 更新，不累加多轮工具请求的账单用量。切换会话或模型时同步刷新；未知窗口/用量会明确提示，不用字符长度估算。ChatGPT 使用 app-server 返回的 `modelContextWindow` 和最近用量；兼容 API 使用模型列表的 `context_window` / `context_length` 等元数据。
+输入框默认显示上下文余量环。新会话显示初始状态；收到服务端 usage 后，按当前请求的输入、输出和缓存输入 token 更新，不累加多轮工具请求的账单用量。切换会话或模型时同步刷新；未知窗口/用量会明确提示，不用字符长度估算。ChatGPT 使用 Responses 返回的最近用量及模型列表的 `context_window`；兼容 API 使用模型列表的 `context_window` / `context_length` 等元数据。
 
 在“供应商 → 模型”中，每个模型都可填写上下文窗口，手动值优先于自动获取；留空恢复自动值。支持 `1M`、`256K`、`1.5M` 和精确整数，K/M 按十进制换算。服务模型列表的“添加”操作以模型 ID 独立定位，添加后原位显示“已添加”，保存后可用于对话。
 
@@ -112,7 +114,7 @@ WPS 会话标签属于用户，只支持用户授权。频道配置的“授权 
 
 设置中的“记忆”页可查看当前项目与全局记忆、读取来源、确认删除，以及开关“记忆主动匹配”和每天整理。主动匹配默认开启，沿用原“自动语义回忆”的保存设置；关闭后取消后台匹配，仍可通过工具按需搜索和读取记忆。发送后在后台使用当前模型理解意图并扩展检索，再审核候选摘要的相关性；例如“明天吃什么”可以关联饮食偏好和忌口。jieba-rs 的停用词过滤、SQLite FTS5 和 strsim 模糊匹配仅辅助找候选，不按泛词命中直接注入。当前项目与全局记忆参与召回，其他项目隔离。
 
-有记忆时，每次提问最多增加两次当前模型调用；无记忆或关闭主动匹配时不调用。主 agent 立即开始，不等待召回。兼容 API 在下一轮模型请求前注入一次结果，保持工具调用和结果配对；ChatGPT 在事件边界通过 `turn/steer` 追加历史参考，或在工具返回时附带结果。已经发送的 HTTP 请求不会被重启或修改。若回答先结束，召回继续运行并保存到原用户消息，后续对话可读取；停止回复或删除会话会取消该会话的召回。召回限时 30 秒，失败不影响对话。只把选中的标题、摘要、ID 和相关原因作为历史参考加入上下文，模型通过 `memory_read` 按需读取全文。对话中可使用 `memory_search`、`memory_save`、`memory_delete`；写入、删除遵循权限选择器。
+有记忆时，每次提问最多增加两次当前模型调用；无记忆或关闭主动匹配时不调用。主 agent 立即开始，不等待召回。所有供应商在下一轮模型请求前注入一次结果，保持工具调用和结果配对。已经发送的 HTTP 请求不会被重启或修改。若回答先结束，召回继续运行并保存到原用户消息，后续对话可读取；停止回复或删除会话会取消该会话的召回。召回限时 30 秒，失败不影响对话。只把选中的标题、摘要、ID 和相关原因作为历史参考加入上下文，模型通过 `memory_read` 按需读取全文。对话中可使用 `memory_search`、`memory_save`、`memory_delete`；写入、删除遵循权限选择器。
 
 `memory_read` 中夜间归档记忆的来源包含 `session_id` 和 `evidence`（从 0 开始的消息序号）。模型可调用只读工具 `session_read({session_id, around_message: evidence序号})` 查看来源附近的对话，或用 `start_message` 分页读取。默认 20 条，最多 50 条、16000 个内容字符；长消息通过 `next` 中的 `start_message/start_offset` 无损续读。`include_tools: true` 可包含原始工具调用和结果；图片仅返回数量，不读取草稿或思考内容。只允许读取当前项目会话，完全访问权限也不会放宽此边界。已删除的会话无法追溯。
 
@@ -166,11 +168,10 @@ cargo test -p glint-agent
 cargo test --lib components::calendar::tests
 ```
 
-真实凭据集成测试默认忽略；后两项会消耗少量模型额度：
+ChatGPT 回归测试使用本地模拟响应，不消耗订阅额度；DeepSeek 真实凭据测试默认忽略，手动执行会消耗少量模型额度：
 
 ```sh
-cargo test -p glint-agent installed_codex_reports_chatgpt_account -- --ignored
-cargo test -p glint-agent installed_codex_completes_one_text_turn -- --ignored
+cargo test -p glint-agent chatgpt::
 cargo test -p glint-agent deepseek_environment_key_completes_real_chat -- --ignored --nocapture
 ```
 

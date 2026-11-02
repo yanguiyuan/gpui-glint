@@ -3103,6 +3103,7 @@ dependencies = [
  "boa_gc",
  "cbc",
  "chrono",
+ "fs2",
  "futures-util",
  "glint-vault",
  "gpui-ce",
@@ -3113,6 +3114,7 @@ dependencies = [
  "ignore",
  "image",
  "jieba-rs",
+ "jsonwebtoken",
  "libc",
  "md-5",
  "objc2 0.6.4",
@@ -4619,6 +4621,21 @@ checksum = "733a844dbd6fef128e98cb4487b887cb55454d92cd9994b1bafe004fabbe670c"
 dependencies = [
  "serde",
  "ucd-trie",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
 ]
 
 [[package]]
@@ -7846,6 +7863,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
 dependencies = [
  "bstr",
+]
+
+[[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint 0.4.8",
+ "num-traits",
+ "thiserror 2.0.21",
+ "time",
 ]
 
 [[package]]

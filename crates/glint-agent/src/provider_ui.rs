@@ -2,6 +2,13 @@ use super::*;
 use gpui_glint::components::{InputField, Switch};
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, PartialEq)]
+enum ChatGptAuth {
+    Login,
+    Check,
+    SignOut,
+}
+
 fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -122,7 +129,6 @@ pub struct Settings {
     pub search: Entity<TextEntry>,
     pub kind: provider::Kind,
     protocol: provider::Protocol,
-    pub codex_path: Entity<TextEntry>,
     pub name: Entity<TextEntry>,
     pub url: Entity<TextEntry>,
     pub model: Entity<TextEntry>,
@@ -132,6 +138,7 @@ pub struct Settings {
     pub message: Option<String>,
     pub testing: Option<Task<()>>,
     pub auth_task: Option<Task<()>>,
+    chatgpt_account: Option<String>,
 }
 
 impl Settings {
@@ -178,7 +185,6 @@ impl Settings {
             protocol: config.protocol,
             search: entry("搜索设置或供应商…", ""),
             name: entry("供应商名称", &config.name),
-            codex_path: entry("Codex CLI 路径", &config.codex_path),
             url: entry("https://your-provider.example/v1", &config.base_url),
             model: entry("输入模型 ID", ""),
             key: entry("输入或替换 API Key", ""),
@@ -187,6 +193,7 @@ impl Settings {
                 config.api_key_env.as_deref().unwrap_or(""),
             ),
             use_env: config.api_key_env.is_some(),
+            chatgpt_account: chatgpt::saved_account_label(&config),
             original: config,
             message: None,
             testing: None,
@@ -205,6 +212,7 @@ impl Settings {
         self.testing = None;
         self.auth_task = None;
         self.selected = Some(config.id);
+        self.chatgpt_account = chatgpt::saved_account_label(&config);
         self.kind = config.kind;
         self.protocol = config.protocol;
         self.models = config.models.clone();
@@ -234,9 +242,6 @@ impl Settings {
             .update(cx, |entry, cx| entry.set_value(config.name.clone(), cx));
         self.url
             .update(cx, |entry, cx| entry.set_value(config.base_url.clone(), cx));
-        self.codex_path.update(cx, |entry, cx| {
-            entry.set_value(config.codex_path.clone(), cx)
-        });
         self.key_env.update(cx, |entry, cx| {
             entry.set_value(config.api_key_env.clone().unwrap_or_default(), cx)
         });
@@ -258,7 +263,6 @@ impl Settings {
             &self.new_model_window,
             &self.key,
             &self.key_env,
-            &self.codex_path,
         ] {
             entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }
@@ -375,7 +379,6 @@ impl AgentWorkspace {
                     .map(|value| (model.clone(), value))
             })
             .collect();
-        config.codex_path = settings.codex_path.read(cx).value().trim().to_owned();
         config.api_key_env = if settings.use_env {
             Some(settings.key_env.read(cx).value().trim().to_owned())
         } else {
@@ -547,13 +550,8 @@ impl AgentWorkspace {
             .trim()
             .to_owned();
         let result = if config.kind == provider::Kind::ChatGpt {
-            let path = config.codex_path.clone();
-            provider::Job::start(async move {
-                Ok(provider::ModelCatalog {
-                    models: chatgpt::models(&path).await?,
-                    ..Default::default()
-                })
-            })
+            let auth_config = config.clone();
+            provider::Job::start(async move { chatgpt::models(&auth_config).await })
         } else {
             let key = if !self.provider_settings.use_env && !provided.is_empty() {
                 Ok(provided)
@@ -656,26 +654,20 @@ impl AgentWorkspace {
         cx.notify();
     }
 
-    fn chatgpt_auth(&mut self, login: bool, cx: &mut Context<Self>) {
+    fn chatgpt_auth(&mut self, action: ChatGptAuth, cx: &mut Context<Self>) {
         if self.provider_settings.auth_task.is_some() {
             self.provider_settings.auth_task = None;
             cx.notify();
             return;
         }
         let id = self.provider_settings.selected;
-        let path = self
-            .provider_settings
-            .codex_path
-            .read(cx)
-            .value()
-            .trim()
-            .to_owned();
-        self.provider_settings.message = Some("正在连接本机 Codex…".into());
+        let config = self.edited_provider(cx);
+        self.provider_settings.message = Some("正在连接 ChatGPT…".into());
         self.provider_settings.auth_task = Some(cx.spawn(async move |weak, cx| {
             let result = async {
-                if login {
+                if action == ChatGptAuth::Login {
                     let (connection, url) =
-                        provider::Job::start(async move { chatgpt::start_login(&path).await })?
+                        provider::Job::start(async move { chatgpt::start_login(&config).await })?
                             .result()
                             .await?;
                     weak.update(cx, |this, cx| {
@@ -688,8 +680,12 @@ impl AgentWorkspace {
                     provider::Job::start(chatgpt::finish_login(connection))?
                         .result()
                         .await
+                } else if action == ChatGptAuth::SignOut {
+                    provider::Job::start(async move { chatgpt::sign_out(&config).await })?
+                        .result()
+                        .await
                 } else {
-                    provider::Job::start(async move { chatgpt::account(&path).await })?
+                    provider::Job::start(async move { chatgpt::account(&config).await })?
                         .result()
                         .await
                 }
@@ -698,6 +694,8 @@ impl AgentWorkspace {
             let _ = weak.update(cx, |this, cx| {
                 this.provider_settings.auth_task = None;
                 if this.provider_settings.selected == id {
+                    this.provider_settings.chatgpt_account =
+                        chatgpt::saved_account_label(&this.edited_provider(cx));
                     this.provider_settings.message = Some(match result {
                         Ok(message) | Err(message) => message,
                     });
@@ -785,7 +783,7 @@ impl AgentWorkspace {
                     .text_size(px(12.))
                     .text_color(rgb(p.text_muted))
                     .child(if chatgpt {
-                        "ChatGPT 订阅 · 本机 Codex 登录"
+                        "ChatGPT 订阅 · 浏览器授权"
                     } else {
                         if settings.protocol == provider::Protocol::Anthropic {
                             "Anthropic Messages 协议"
@@ -841,22 +839,22 @@ impl AgentWorkspace {
                 .child(field("名称", &settings.name));
             if chatgpt {
                 card = card
-                    .child(field("Codex CLI 路径", &settings.codex_path))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_3()
                             .child(
                                 Button::new(if settings.auth_task.is_some() {
                                     "取消登录 / 检查"
                                 } else {
-                                    "登录 ChatGPT"
+                                    "Continue with ChatGPT"
                                 })
                                 .kind(ButtonKind::Glass)
                                 .theme(self.theme)
                                 .render()
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.chatgpt_auth(true, cx)),
+                                    cx.listener(|this, _, _, cx| this.chatgpt_auth(ChatGptAuth::Login, cx)),
                                 ),
                             )
                             .child(
@@ -865,16 +863,30 @@ impl AgentWorkspace {
                                     .theme(self.theme)
                                     .render()
                                     .on_click(
-                                        cx.listener(|this, _, _, cx| this.chatgpt_auth(false, cx)),
+                                        cx.listener(|this, _, _, cx| this.chatgpt_auth(ChatGptAuth::Check, cx)),
                                     ),
+                            )
+                            .child(
+                                Button::new("退出 ChatGPT")
+                                    .kind(ButtonKind::Plain)
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| this.chatgpt_auth(ChatGptAuth::SignOut, cx))),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child("登录与令牌续期由官方 Codex 管理，无需 API Key。"),
+                            .child("通过官方 ChatGPT 页面授权订阅；凭据保存在本机，无需 API Key。每个供应商对应一个账号授权。"),
                     );
+                if let Some(account) = &settings.chatgpt_account {
+                    card = card.child(
+                        div()
+                            .text_size(px(12.))
+                            .child(format!("当前账号：{account}")),
+                    );
+                }
             } else {
                 card = card
                     .child(
@@ -1016,7 +1028,7 @@ impl AgentWorkspace {
             if settings.models.is_empty() {
                 models =
                     models.child(div().p_5().text_color(rgb(p.text_muted)).child(if chatgpt {
-                        "未指定模型时使用 Codex 默认模型。"
+                        "请先获取账号可用模型并选择默认模型。"
                     } else {
                         "添加模型后即可用于对话。"
                     }));

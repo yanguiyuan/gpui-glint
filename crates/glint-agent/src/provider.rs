@@ -109,8 +109,6 @@ pub struct Config {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub kind: Kind,
-    #[serde(default = "default_codex")]
-    pub codex_path: String,
     pub enabled: bool,
     pub name: String,
     pub base_url: String,
@@ -131,7 +129,6 @@ impl Default for Config {
             context_window_overrides: Default::default(),
             api_key_env: None,
             kind: Kind::Compatible,
-            codex_path: default_codex(),
             enabled: false,
             name: "OpenAI 兼容服务".into(),
             base_url: "https://api.openai.com/v1".into(),
@@ -245,11 +242,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.kind == Kind::ChatGpt {
-            return if self.codex_path.trim().is_empty() {
-                Err("请填写 Codex CLI 路径".into())
-            } else {
-                Ok(())
-            };
+            return Ok(());
         }
         self.endpoint()?;
         if self.name.trim().is_empty() {
@@ -505,14 +498,7 @@ impl Request {
                     messages.insert(0, json!({"role":"system","content":format!("本次外部 MCP 连接失败，外部 MCP 工具不可用，可通过配置工具修复；已注册的内置工作台工具仍可使用：{error}")}));
                 }
             }
-            if config.kind == Kind::ChatGpt {
-                // Pass the composer selection through to the app-server turn.
-                // The transport bounds model idle time separately. Host tools
-                // retain their own deadlines, including foreground commands.
-                crate::chatgpt::complete(&config, messages, thinking, context).await
-            } else {
-                complete(config, key, messages, thinking, context).await
-            }
+            complete(config, key, messages, thinking, context).await
         })))
     }
 
@@ -523,31 +509,16 @@ impl Request {
     }
 }
 
-fn default_codex() -> String {
-    // Finder-launched applications often have a minimal PATH.
-    if let Some(home) = std::env::var_os("HOME") {
-        for relative in [".bun/bin/codex", ".cargo/bin/codex", ".local/bin/codex"] {
-            let path = std::path::PathBuf::from(&home).join(relative);
-            if path.is_file() {
-                return path.to_string_lossy().into();
-            }
-        }
-    }
-    for path in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] {
-        if Path::new(path).is_file() {
-            return path.into();
-        }
-    }
-    "codex".into()
-}
-
 async fn complete(
-    config: Config,
+    mut config: Config,
     key: String,
     mut messages: Vec<Value>,
     thinking: Thinking,
     context: Option<crate::tools::ToolContext>,
 ) -> Result<crate::generation::Completion, String> {
+    if config.kind == Kind::ChatGpt {
+        config.protocol = Protocol::OpenAi;
+    }
     let started = std::time::Instant::now();
     let mut records = Vec::new();
     let mut blocks = Vec::new();
@@ -619,7 +590,9 @@ async fn complete(
                 .map(|context| context.take_steering())
                 .unwrap_or_default();
             if !steering.is_empty() {
-                if config.protocol == Protocol::Anthropic {
+                if config.kind == Kind::ChatGpt {
+                    messages.push(json!({"responses_output":reply.raw_content}));
+                } else if config.protocol == Protocol::Anthropic {
                     messages.push(json!({"role":"assistant","content":reply.raw_content}));
                 } else {
                     messages.push(json!({"role":"assistant","content":reply.text,"reasoning_content":reply.reasoning}));
@@ -651,7 +624,9 @@ async fn complete(
         if reply.tool_calls.len() > 16 {
             return Err("单轮工具调用数量超过限制".into());
         }
-        if config.protocol == Protocol::Anthropic {
+        if config.kind == Kind::ChatGpt {
+            messages.push(json!({"responses_output":reply.raw_content}));
+        } else if config.protocol == Protocol::Anthropic {
             messages.push(json!({"role":"assistant","content":reply.raw_content}));
         } else {
             let mut assistant = json!({"role":"assistant","content":if reply.text.is_empty() { Value::Null } else { Value::String(reply.text) },
@@ -714,6 +689,9 @@ async fn single_request(
     context: Option<&crate::tools::ToolContext>,
     prefix: &[crate::generation::ContentBlock],
 ) -> Result<crate::generation::Completion, String> {
+    if config.kind == Kind::ChatGpt {
+        return crate::chatgpt::single_request(&config, messages, thinking, context, prefix).await;
+    }
     let started = std::time::Instant::now();
     let endpoint = config.endpoint()?;
     let client = Client::builder()
