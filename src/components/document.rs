@@ -851,8 +851,6 @@ impl DocumentEditor {
     }
     /// Parsing depends on document text and reference definitions, never scroll position.
     fn refresh_render_blocks(&mut self) {
-        let ids: HashSet<_> = self.blocks.iter().map(|block| block.id).collect();
-        self.views.retain(|id, _| ids.contains(id));
         let unchanged = self
             .blocks
             .iter()
@@ -866,6 +864,8 @@ impl DocumentEditor {
         if unchanged {
             return;
         }
+        let ids: HashSet<_> = self.blocks.iter().map(|block| block.id).collect();
+        self.views.retain(|id, _| ids.contains(id));
         self.layout_measure_passes = 2;
         self.render_order = self.blocks.iter().map(|block| block.id).collect();
         let markdown = self.markdown();
@@ -1308,7 +1308,9 @@ impl DocumentEditor {
         editors
     }
     fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        self.selection = None;
+        if self.selection.take().is_none() {
+            return;
+        }
         for target in self.text_editors() {
             target
                 .editor
@@ -2795,6 +2797,9 @@ impl DocumentEditor {
         let can_clip = !self.embedded_preview
             && self.layout_measure_passes == 0
             && viewport.size.height > px(0.);
+        let selected_blocks = self
+            .ordered_selection()
+            .and_then(|(start, end)| Some((self.index(start.block)?, self.index(end.block)?)));
         for (index, block) in blocks.iter().enumerate() {
             let id = block.id;
             let kind = block.kind();
@@ -2948,11 +2953,8 @@ impl DocumentEditor {
                     |drag, _, _, cx| cx.new(|_| drag.clone()),
                 );
             }
-            let fully_selected = self.ordered_selection().is_some_and(|(start, end)| {
-                let first = self.index(start.block).unwrap_or(index);
-                let last = self.index(end.block).unwrap_or(index);
-                first < index && index < last
-            });
+            let fully_selected =
+                selected_blocks.is_some_and(|(first, last)| first < index && index < last);
             let mut row = div()
                 .id(("document-block", id as usize))
                 .relative()

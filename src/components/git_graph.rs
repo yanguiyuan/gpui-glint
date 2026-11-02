@@ -112,6 +112,7 @@ fn lanes(commits: &[GitCommit]) -> Vec<LaneRow> {
 
 pub struct GitGraph {
     data: GitGraphData,
+    lanes: Vec<LaneRow>,
     theme: ThemePreset,
     compare: Entity<Select>,
     selected: Option<String>,
@@ -134,6 +135,7 @@ impl GitGraph {
         });
         Self {
             data: GitGraphData::default(),
+            lanes: Vec::new(),
             theme: ThemePreset::default(),
             compare,
             selected: None,
@@ -164,6 +166,7 @@ impl GitGraph {
             );
             s.set_selected(Some(data.compare_branch.clone().into()), cx);
         });
+        self.lanes = lanes(&data.commits);
         self.data = data;
         self.error = None;
         self.loading = false;
@@ -172,6 +175,7 @@ impl GitGraph {
     /// Clear previous-project state before an asynchronous reload.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.data = GitGraphData::default();
+        self.lanes.clear();
         self.selected = None;
         self.details = None;
         self.commit_details = None;
@@ -366,7 +370,13 @@ impl GitGraph {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(p.surface_subtle)))
                     .child(Icon::Code.render(13.))
-                    .child(div().flex_1().min_w_0().truncate().child(crate::paths::display_path(&path)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(crate::paths::display_path(&path)),
+                    )
                     .when(file.additions.is_none(), |d| {
                         d.child(
                             div()
@@ -581,7 +591,7 @@ impl Render for GitGraph {
             // Each canvas ends at its row boundary. Keep graph rows contiguous;
             // the outer body's gap is only for notices and the history footer.
             let mut history = div().flex().flex_col().flex_shrink_0();
-            for (commit, lane) in self.data.commits.iter().zip(lanes(&self.data.commits)) {
+            for (commit, lane) in self.data.commits.iter().zip(self.lanes.iter().cloned()) {
                 history = history.child(self.commit_row(commit, Some(lane), cx));
             }
             body = body.child(history);
