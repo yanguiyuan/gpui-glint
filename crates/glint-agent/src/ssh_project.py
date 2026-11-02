@@ -1,5 +1,5 @@
 # Executed by python3 on the SSH host; requests and results use JSON over stdio.
-import fnmatch, json, os, re, stat, subprocess, sys
+import base64, fnmatch, json, os, re, stat, subprocess, sys
 LIMIT = 2 * 1024 * 1024
 SKIP = {'.git', 'node_modules', 'target', '.venv', '.cache', '.ssh', '.gnupg'}
 
@@ -18,11 +18,17 @@ def run(q):
             return True
         except (OSError, UnicodeError):
             return False
+    def png_file(path):
+        try:
+            metadata = os.stat(path)
+            return path.lower().endswith('.png') and stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 20 * 1024 * 1024
+        except OSError:
+            return False
     if q['op'] == 'preview_stat':
         result = {}
         for path in q.get('args', {}).get('paths', [])[:128]:
             resolved = os.path.realpath(os.path.join(root, os.path.expanduser(path)))
-            result[path] = 'directory' if os.path.isdir(resolved) else 'text' if text_file(resolved) else None
+            result[path] = 'directory' if os.path.isdir(resolved) else 'image' if png_file(resolved) else 'text' if text_file(resolved) else None
         return result
     op = q['op']
     if op == 'probe':
@@ -71,10 +77,14 @@ def run(q):
             entries = []
             with os.scandir(path) as listing:
                 for entry in listing:
-                    entries.append({'name': entry.name, 'path': entry.path, 'directory': entry.is_dir(), 'previewable': text_file(entry.path)})
+                    entries.append({'name': entry.name, 'path': entry.path, 'directory': entry.is_dir(), 'previewable': png_file(entry.path) or text_file(entry.path)})
                     if len(entries) > 1000: break
             entries.sort(key=lambda entry: (not entry['directory'], entry['name']))
             return {'kind': 'directory', 'path': path, 'parent': parent, 'entries': entries[:1000], 'truncated': len(entries) > 1000}
+        if png_file(path):
+            with open(path, 'rb') as file: data = file.read(20 * 1024 * 1024 + 1)
+            if len(data) > 20 * 1024 * 1024 or not data.startswith(b'\x89PNG\r\n\x1a\n'): raise ValueError('PNG 图片格式无效或超过 20MB')
+            return {'kind': 'image', 'path': path, 'parent': parent, 'content': base64.b64encode(data).decode('ascii')}
         content = read(path)
         if '\x00' in content: raise ValueError('二进制文件不支持文本预览')
         return {'kind': 'text', 'path': path, 'parent': parent, 'content': content}

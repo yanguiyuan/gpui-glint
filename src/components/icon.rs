@@ -80,6 +80,8 @@ pub enum Icon {
     External,
     Eye,
     Sidebar,
+    Expand,
+    Collapse,
     Shield,
     Spinner,
     Grip,
@@ -157,6 +159,8 @@ impl Icon {
             Self::External => "external",
             Self::Eye => "eye",
             Self::Sidebar => "sidebar",
+            Self::Expand => "expand",
+            Self::Collapse => "collapse",
             Self::Shield => "shield",
             Self::Spinner => "spinner",
             Self::Grip => "grip",
@@ -182,6 +186,21 @@ impl Icon {
             "sql" | "mysql" | "postgresql" | "sqlite" => Self::Sql,
             "yaml" | "yml" => Self::Yaml,
             _ => Self::Code,
+        }
+    }
+
+    /// Resolve a file name to its language icon, retaining a text icon for unknown types.
+    pub fn for_file_name(name: &str) -> Self {
+        let extension = std::path::Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("png") {
+            return Self::ImageGroup;
+        }
+        match Self::for_language(extension) {
+            Self::Code => Self::Text,
+            icon => icon,
         }
     }
 
@@ -396,6 +415,8 @@ fn icon_svg(name: &str) -> Option<String> {
             "<path d='M3 17V5.5A1.5 1.5 0 0 1 4.5 4H9l2.5 3H19.5A1.5 1.5 0 0 1 21 8.5V10'/><path d='M5.5 10h15a1.5 1.5 0 0 1 1.4 2L19.5 19a1.5 1.5 0 0 1-1.4 1H4.5a1.5 1.5 0 0 1-1.4-2l2.4-7a1.5 1.5 0 0 1 1.4-1Z'/>",
             "none",
         ),
+        "expand" => ("<path d='M14 5h5v5M10 19H5v-5'/>", "none"),
+        "collapse" => ("<path d='M19 14h-5v5M5 10h5V5'/>", "none"),
         "sidebar" => (
             "<rect x='3' y='3' width='18' height='18' rx='4'/><path d='M9 3v18'/>",
             "none",
@@ -752,6 +773,24 @@ mod tests {
             pixmap.data().to_vec()
         };
         assert_ne!(render(Icon::Folder), render(Icon::FolderOpen));
+    }
+
+    #[test]
+    fn file_names_resolve_language_icons_and_keep_unknown_files_generic() {
+        for (name, expected) in [
+            ("main.rs", Icon::Rust),
+            ("README.MD", Icon::Markdown),
+            ("app.tsx", Icon::TypeScript),
+            ("package.json", Icon::Json),
+            ("config.yml", Icon::Yaml),
+            ("script.sh", Icon::Shell),
+            ("notes.txt", Icon::Text),
+            ("LICENSE", Icon::Text),
+            (".gitignore", Icon::Text),
+            ("archive.unknown", Icon::Text),
+        ] {
+            assert_eq!(Icon::for_file_name(name), expected, "{name}");
+        }
     }
 
     #[test]

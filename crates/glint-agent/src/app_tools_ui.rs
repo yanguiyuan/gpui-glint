@@ -810,9 +810,62 @@ impl AgentWorkspace {
                 .unwrap_or(64.);
             let weak = cx.entity().downgrade();
             let scope = format!("{key}:tool:{}", record.call.id);
+            let preview_root = self.history.active().project.clone();
+            let preview_workspace = cx.entity().downgrade();
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
-                panel.set_summary(presentation.summary, cx);
+                panel.set_summary(presentation.summary.clone(), cx);
+                if let Some(change) = &record.change {
+                    let path = change.path.clone();
+                    let root = preview_root.clone();
+                    let workspace = preview_workspace.clone();
+                    let label = record.call.arguments["path"]
+                        .as_str()
+                        .unwrap_or(&change.label)
+                        .to_owned();
+                    let summary = presentation.summary.clone();
+                    if let Some(index) = summary.find(&label) {
+                        let prefix = summary[..index].to_owned();
+                        let suffix = summary[index + label.len()..].to_owned();
+                        panel.set_summary_content(
+                            move |_, _cx| {
+                                let path = path.clone();
+                                let root = root.clone();
+                                let workspace = workspace.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .min_w_0()
+                                    .child(prefix.clone())
+                                    .child(
+                                        div()
+                                            .id("tool-file-preview-link")
+                                            .debug_selector(|| "tool-file-preview-link".into())
+                                            .min_w_0()
+                                            .truncate()
+                                            .cursor_pointer()
+                                            .hover(|style| {
+                                                style.text_color(rgb(p.accent)).underline()
+                                            })
+                                            .child(label.clone())
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                let _ = workspace.update(cx, |this, cx| {
+                                                    this.preview_changed_file(
+                                                        &path,
+                                                        root.clone(),
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                    .child(suffix.clone())
+                                    .into_any_element()
+                            },
+                            cx,
+                        );
+                    }
+                }
                 panel.set_content(
                     move |_, cx| {
                         if script.is_some() || output_panel.is_some() || !nested.is_empty() {
@@ -1481,6 +1534,46 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn tool_file_name_opens_preview_without_toggling_panel(cx: &mut gpui::TestAppContext) {
+        struct Root {
+            host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.panel.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("test.md");
+        std::fs::write(&path, "# Preview").unwrap();
+        let record: tools::ToolRecord = serde_json::from_value(serde_json::json!({
+            "call": {"id":"preview", "name":"write_file", "arguments":{"path":"test.md"}},
+            "result":"written", "success":true, "elapsed_ms":10,
+            "change": {"id":uuid::Uuid::new_v4(), "path":path, "label":"test.md", "before":"", "after":"# Preview", "added":1, "removed":0}
+        })).unwrap();
+        let (root, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+            let panel = host.update(cx, |host, cx| host.tool_panel("test", &record, cx));
+            Root { host, panel }
+        });
+        window.run_until_parked();
+        let link = window.debug_bounds("tool-file-preview-link").unwrap();
+        window.simulate_click(link.center(), Default::default());
+        window.run_until_parked();
+        root.read_with(window, |root, cx| {
+            assert!(!root.panel.read(cx).is_expanded());
+            assert!(root.host.read(cx).file_preview.open);
+            assert!(!root.host.read(cx).edits_ui.open);
+        });
+    }
 
     #[test]
     fn orchestration_outputs_decode_string_values_without_corrupting_literal_escapes() {

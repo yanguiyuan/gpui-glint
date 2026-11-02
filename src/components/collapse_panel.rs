@@ -23,6 +23,7 @@ pub enum CollapsePanelEvent {
 pub struct CollapsePanel {
     icon: Option<Icon>,
     summary: SharedString,
+    summary_content: Option<CollapsePanelContent>,
     streaming_summary: bool,
     summary_scroll: ScrollHandle,
     content: Option<CollapsePanelContent>,
@@ -38,6 +39,7 @@ impl CollapsePanel {
         Self {
             icon: None,
             summary: summary.into(),
+            summary_content: None,
             streaming_summary: false,
             summary_scroll: ScrollHandle::new(),
             content: None,
@@ -85,8 +87,20 @@ impl CollapsePanel {
     }
 
     pub fn set_summary(&mut self, summary: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.summary_content = None;
         self.summary = summary.into();
         self.streaming_summary = false;
+        cx.notify();
+    }
+
+    /// Supply custom inline summary content, such as a clickable file name.
+    /// Calling `set_summary` restores the default text summary.
+    pub fn set_summary_content(
+        &mut self,
+        content: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.summary_content = Some(Box::new(content));
         cx.notify();
     }
 
@@ -96,6 +110,7 @@ impl CollapsePanel {
         summary: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.summary_content = None;
         self.summary = summary.into();
         self.streaming_summary = true;
         self.summary_scroll.scroll_to_bottom();
@@ -151,7 +166,9 @@ impl Render for CollapsePanel {
             .text_size(px(13.))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(rgb(p.text_muted));
-        let summary = if self.streaming_summary {
+        let summary = if let Some(content) = &self.summary_content {
+            summary.child(content(window, cx)).into_any_element()
+        } else if self.streaming_summary {
             summary
                 .id("streaming-summary")
                 .debug_selector(|| "streaming-summary".into())

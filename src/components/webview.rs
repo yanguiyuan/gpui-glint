@@ -56,6 +56,44 @@ impl WebView {
             cx,
         )
     }
+    /// Create a passive HTML view entity while preserving native initialization errors.
+    pub fn html_entity(
+        html: &str,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Result<Entity<Self>, String> {
+        Self::html_entity_with_scripts(html, false, window, cx)
+    }
+    /// HTML preview with JavaScript enabled for animations and in-page interactions.
+    /// Navigation, new windows and downloads remain disabled.
+    pub fn interactive_html_entity(
+        html: &str,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Result<Entity<Self>, String> {
+        Self::html_entity_with_scripts(html, true, window, cx)
+    }
+    fn html_entity_with_scripts(
+        html: &str,
+        scripts: bool,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Result<Entity<Self>, String> {
+        use gpui::AppContext;
+        let handle = window.window_handle().map_err(|e| e.to_string())?;
+        let mut builder = wry::WebViewBuilder::new()
+            .with_html(html)
+            .with_incognito(true)
+            .with_navigation_handler(|url| url == "about:blank" || url.starts_with("about:blank#"))
+            .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+            .with_download_started_handler(|_, _| false)
+            .with_visible(false);
+        if !scripts {
+            builder = builder.with_javascript_disabled();
+        }
+        let native = builder.build_as_child(&handle).map_err(|e| e.to_string())?;
+        Ok(cx.new(|cx| Self::from_native(native, cx)))
+    }
     pub fn load_html(&mut self, html: &str, cx: &mut Context<Self>) -> Result<(), String> {
         self.native.load_html(html).map_err(|e| e.to_string())?;
         *self.error.borrow_mut() = None;

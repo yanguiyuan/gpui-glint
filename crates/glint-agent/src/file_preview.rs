@@ -5,6 +5,12 @@ use gpui_glint::components::{FilePreview, FilePreviewEntry, FilePreviewEvent};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Range, path::Path};
+const IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
+fn is_png(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+}
 const LIMIT: u64 = 2 * 1024 * 1024;
 const PREFIX: &str = "glint-preview:";
 
@@ -179,6 +185,9 @@ fn previewable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
+    if meta.is_file() && is_png(path) {
+        return meta.len() <= IMAGE_LIMIT;
+    }
     if !meta.is_file() || meta.len() > LIMIT {
         return false;
     }
@@ -312,7 +321,7 @@ pub async fn decorate_cached(
             for (path, kind) in response.as_object().ok_or("远程预览检查响应无效")? {
                 fresh.insert(
                     path.clone(),
-                    kind.as_str() == Some("directory") || kind.as_str() == Some("text"),
+                    matches!(kind.as_str(), Some("directory" | "text" | "image")),
                 );
             }
         }
@@ -384,6 +393,7 @@ pub async fn decorate_cached(
 }
 enum Loaded {
     File(String),
+    Image(Vec<u8>),
     Directory(Vec<FilePreviewEntry>, bool),
 }
 async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String> {
@@ -394,6 +404,12 @@ async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String
             .await?;
         let path = value["path"].as_str().ok_or("远程预览路径无效")?.to_owned();
         let parent = value["parent"].as_str().map(str::to_owned);
+        if value["kind"] == "image" {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value["content"].as_str().ok_or("远程图片响应无效")?)
+                .map_err(|_| "远程图片数据无效")?;
+            return Ok((path, parent, Loaded::Image(bytes)));
+        }
         if value["kind"] == "text" {
             return Ok((
                 path,
@@ -454,6 +470,20 @@ async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String
         ));
     }
     let metadata = std::fs::metadata(&path).map_err(|_| "无法读取文件属性")?;
+    if metadata.is_file() && is_png(&path) {
+        if metadata.len() > IMAGE_LIMIT {
+            return Err("仅支持预览 20MB 以内的 PNG 图片".into());
+        }
+        let bytes = std::fs::read(&path).map_err(|_| "无法读取图片")?;
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err("PNG 图片格式无效".into());
+        }
+        return Ok((
+            path.to_string_lossy().into_owned(),
+            parent,
+            Loaded::Image(bytes),
+        ));
+    }
     if !metadata.is_file() || metadata.len() > LIMIT {
         return Err("仅支持预览 2MB 以内的普通文本文件".into());
     }
@@ -524,6 +554,7 @@ async fn load_excerpt(
 
 pub struct State {
     pub open: bool,
+    pub expanded: bool,
     pub view: Entity<FilePreview>,
     pub paths: std::sync::Arc<PathCache>,
     target: Option<Target>,
@@ -535,7 +566,13 @@ impl State {
     pub fn new(cx: &mut Context<AgentWorkspace>) -> Self {
         let view = cx.new(FilePreview::new);
         cx.subscribe(&view, |this, _, event: &FilePreviewEvent, cx| match event {
+            FilePreviewEvent::ExpandedChanged(expanded) => {
+                this.file_preview.expanded = *expanded;
+                this.right_sidebar_resize = None;
+                cx.notify();
+            }
             FilePreviewEvent::CloseRequested => {
+                this.file_preview.expanded = false;
                 this.file_preview.open = false;
                 this.file_preview.task = None;
                 cx.notify();
@@ -567,6 +604,7 @@ impl State {
         .detach();
         Self {
             open: false,
+            expanded: false,
             view,
             paths: Default::default(),
             target: None,
@@ -721,7 +759,20 @@ impl AgentWorkspace {
             cx.open_url(link);
         }
     }
+    pub(super) fn preview_changed_file(
+        &mut self,
+        path: &Path,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = target(&path.to_string_lossy(), &root) {
+            self.open_file_preview_mode(target, true, cx);
+        }
+    }
     fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {
+        self.open_file_preview_mode(target, false, cx);
+    }
+    fn open_file_preview_mode(&mut self, target: Target, rendered: bool, cx: &mut Context<Self>) {
         self.file_preview.open = true;
         self.edits_ui.open = false;
         self.file_preview.revision += 1;
@@ -749,6 +800,17 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 this.file_preview.view.update(cx, |view, cx| match result {
+                    Ok((path, parent, Loaded::Image(bytes))) => {
+                        view.set_image(
+                            path,
+                            parent,
+                            std::sync::Arc::new(gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                bytes,
+                            )),
+                            cx,
+                        );
+                    }
                     Ok((path, parent, Loaded::File(content))) => {
                         let language = Path::new(&path)
                             .extension()
@@ -756,6 +818,7 @@ impl AgentWorkspace {
                             .unwrap_or("text")
                             .to_owned();
                         view.set_file(path, parent, language, content, cx);
+                        view.set_rendered_preview(rendered, cx);
                         if let Some(line) = line {
                             view.reveal_line(line, cx);
                         }
@@ -779,11 +842,15 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub fn file_preview_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        self.file_preview
-            .view
-            .update(cx, |view, cx| view.set_theme(self.theme, cx));
+        self.file_preview.view.update(cx, |view, cx| {
+            view.set_theme(self.theme, cx);
+            view.set_expanded(self.file_preview.expanded, cx);
+        });
         div()
-            .w(px(self.right_sidebar_width))
+            .when(self.file_preview.expanded, |view| view.w_full())
+            .when(!self.file_preview.expanded, |view| {
+                view.w(px(self.right_sidebar_width))
+            })
             .flex_shrink_0()
             .h_full()
             .min_h_0()
@@ -802,6 +869,30 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn png_preview_loads_bytes_and_is_available_in_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.PNG");
+        let bytes = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=").unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(previewable(&path));
+        let target = Target {
+            root: None,
+            path: path.to_string_lossy().into_owned(),
+            line: None,
+        };
+        let (_, _, loaded) = load(target.clone()).await.unwrap();
+        assert!(matches!(loaded, Loaded::Image(data) if data == bytes));
+        let (_, _, listing) = load(Target {
+            path: dir.path().to_string_lossy().into_owned(),
+            ..target.clone()
+        })
+        .await
+        .unwrap();
+        assert!(matches!(listing, Loaded::Directory(entries, _) if entries[0].previewable));
+        std::fs::write(&path, b"invalid png").unwrap();
+        assert!(load(target).await.is_err());
     }
     #[tokio::test]
     async fn hover_excerpt_bounds_bytes_preserves_utf8_and_respects_line_ranges() {
@@ -1007,6 +1098,57 @@ mod tests {
             assert_eq!(restored.active().draft, text);
             assert_eq!(h.history.active().draft, text);
         });
+    }
+
+    #[gpui::test]
+    fn changed_file_title_keeps_diff_navigation_and_preview_opens_rendered_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("README.md");
+        std::fs::write(&path, "# Changed file\n\nPreview content").unwrap();
+        let change: crate::edits::Change = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "path": path, "label": "README.md",
+            "before": "", "after": "# Changed file\n\nPreview content", "added": 3, "removed": 0
+        }))
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        host.update(window, |host, cx| {
+            let card = host.edit_diff("preview-test", &change, cx);
+            card.update(cx, |_, cx| {
+                cx.emit(gpui_glint::components::DiffCardEvent::TitleClicked)
+            });
+        });
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.edits_ui.open);
+            assert!(!host.file_preview.open);
+        });
+        host.update(window, |host, cx| {
+            host.preview_changed_file(&path, None, cx)
+        });
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.open);
+            assert!(!host.edits_ui.open);
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                path.to_string_lossy()
+            );
+        });
+        assert!(
+            window
+                .debug_bounds("glass-document-scroll-preview")
+                .is_some()
+        );
     }
 
     #[gpui::test]

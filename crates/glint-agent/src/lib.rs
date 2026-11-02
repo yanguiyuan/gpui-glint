@@ -1331,7 +1331,7 @@ impl AgentWorkspace {
                         self.history.active().title.clone()
                     }),
             )
-            .when(self.page == crate::Page::Chat, |bar| {
+            .when(!matches!(self.page, crate::Page::Channels | crate::Page::Partners | crate::Page::Vault | crate::Page::Settings | crate::Page::Calendar), |bar| {
                 bar.child(self.partner_switcher(cx))
             })
             .child(window_drag_region())
@@ -2207,6 +2207,21 @@ impl AgentWorkspace {
 
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.file_preview.view.update(cx, |view, cx| {
+            view.set_active(
+                self.file_preview.open
+                    && (self.file_preview.expanded
+                        || !matches!(
+                            self.page,
+                            crate::Page::Channels
+                                | crate::Page::Partners
+                                | crate::Page::Vault
+                                | crate::Page::Settings
+                                | crate::Page::Calendar
+                        )),
+                cx,
+            );
+        });
         self.execute_pending_command(window, cx);
         self.refresh_git_repository(false, cx);
         if self.file_preview.open || self.edits_ui.open {
@@ -2274,7 +2289,9 @@ impl Render for AgentWorkspace {
                         self.sidebar(cx)
                     })
                     .into_any_element(),
-                    content: (if self.page == crate::Page::Channels {
+                    content: (if self.file_preview.open && self.file_preview.expanded {
+                        self.file_preview_sidebar(cx)
+                    } else if self.page == crate::Page::Channels {
                         div().size_full().child(self.channels_page(cx))
                     } else if self.page == crate::Page::Partners {
                         self.partners_page(window, cx)
