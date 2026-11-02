@@ -281,7 +281,7 @@ impl Manager {
                             if catalog.warnings.len() < 20 {
                                 catalog
                                     .warnings
-                                    .push(format!("{}：{error}", file.display()));
+                                    .push(format!("{}：{error}", gpui_glint::paths::display_path(&file)));
                             }
                         }
                     }
@@ -307,7 +307,7 @@ impl Manager {
                             if catalog.warnings.len() < 20 {
                                 catalog
                                     .warnings
-                                    .push(format!("无法读取技能目录 {}", canonical.display()));
+                                    .push(format!("无法读取技能目录 {}", gpui_glint::paths::display_path(&canonical)));
                             }
                         }
                     }

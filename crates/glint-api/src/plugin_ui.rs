@@ -1206,7 +1206,7 @@ impl Workbench {
                     div()
                         .text_size(px(10.))
                         .text_color(rgb(p.text_muted))
-                        .child(format!("本地开发目录：{}", path.display())),
+                        .child(format!("本地开发目录：{}", gpui_glint::paths::display_path(path))),
                 );
             }
             for error in &self.plugin_errors {

@@ -375,7 +375,7 @@ impl Workbench {
                 match result {
                     Ok(Some(path)) => {
                         this.workspace_transfer = None;
-                        this.notice = format!("工作区已导出至 {}", path.display());
+                        this.notice = format!("工作区已导出至 {}", gpui_glint::paths::display_path(&path));
                         this.toasts.update(cx, |host, cx| {
                             host.push(Toast::new("工作区导出成功").kind(ToastKind::Success), cx)
                         });
@@ -506,7 +506,7 @@ impl Workbench {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(p.text_muted))
-                        .child(path.display().to_string()),
+                        .child(gpui_glint::paths::display_path(path)),
                 );
             }
             if let Some(archive) = &dialog.archive {

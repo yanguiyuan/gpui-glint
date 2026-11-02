@@ -2,6 +2,8 @@
 
 返回 [Glint UI README](../README.md)。这里的代码片段用于已有 GPUI 视图，`cx`、`window`、`theme` 和应用状态由宿主提供；完整可运行示例见 [`examples`](../examples)。
 
+文件系统路径标签统一使用 `gpui_glint::paths::display_path(path)`，接受 `Path` 或字符串，将 Windows 的 `\\?\C:\...` / `\\?\UNC\...` 展示为常规盘符 / UNC 路径。仅在渲染标签、提示和路径输入框时使用；文件访问、导航事件、引用来源、缓存标识与持久化数据保留原始路径。设备路径、POSIX 路径和 SSH URI 按原样显示。
+
 ## GitGraph
 
 `GitGraph` 是只读 Git 历史与分支对比组件，不依赖本机 Git，也不执行文件或网络操作。宿主负责异步查询 Git，将数据交给组件，并处理事件。完整离线示例见 [`examples/git_graph.rs`](../examples/git_graph.rs)。

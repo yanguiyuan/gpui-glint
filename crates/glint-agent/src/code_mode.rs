@@ -128,7 +128,7 @@ async fn protocol(
         .collect();
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds.unwrap_or(120));
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = crate::child_process::async_command(executable);
     command
         .arg("--glint-code-mode-worker")
         .env_clear()

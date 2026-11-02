@@ -111,7 +111,7 @@ impl Remote {
         format!("{} · {name}", self.target)
     }
     pub fn command(&self, remote_command: &str) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new("ssh");
+        let mut command = crate::child_process::async_command("ssh");
         command.args([
             "-T",
             "-o",
@@ -230,12 +230,9 @@ pub fn label(path: &Path) -> String {
     if is_remote(path) {
         return Remote::from_path(path)
             .map(|r| r.label())
-            .unwrap_or_else(|_| path.display().to_string());
+            .unwrap_or_else(|_| gpui_glint::paths::display_path(path));
     }
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
+    gpui_glint::paths::display_path(Path::new(path.file_name().unwrap_or(path.as_os_str())))
 }
 
 #[cfg(test)]

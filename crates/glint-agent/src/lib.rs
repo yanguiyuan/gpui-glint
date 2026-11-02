@@ -7,6 +7,7 @@ mod app_tools_ui;
 mod atomic_file;
 mod channels;
 mod chatgpt;
+mod child_process;
 mod code_mode;
 mod command_runner;
 pub use code_mode::worker_main as run_code_mode_worker;

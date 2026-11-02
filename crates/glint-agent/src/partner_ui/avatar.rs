@@ -147,7 +147,7 @@ impl AgentWorkspace {
                     .text_color(rgb(p.text_muted))
                     .child(format!(
                         "存放目录：{}",
-                        self.partner_repo().avatar_directory().display()
+                        gpui_glint::paths::display_path(self.partner_repo().avatar_directory())
                     )),
             )
     }

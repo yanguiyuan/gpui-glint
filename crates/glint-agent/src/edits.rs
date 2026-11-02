@@ -564,18 +564,12 @@ pub fn language(path: &Path) -> &'static str {
 /// unstaged and untracked files without modifying the index or attributing
 /// pre-existing changes to the agent.
 pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), String> {
-    use std::process::Command;
     let git = |directory: &Path, arguments: &[&str]| {
-        let mut command = Command::new("git");
+        let mut command = crate::child_process::command("git");
         command
             .current_dir(directory)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(arguments);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
         command
             .output()
             .map_err(|error| format!("无法运行 Git：{error}"))

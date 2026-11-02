@@ -1,22 +1,7 @@
 use super::*;
 use gpui_glint::components::Switch;
+use gpui_glint::paths::display_path as display_skill_path;
 use std::sync::Arc;
-
-// Windows canonicalization adds extended-length syntax for file access. Keep
-// that path internally, but show familiar drive/UNC paths in settings labels.
-fn display_skill_path(path: &std::path::Path) -> String {
-    let path = path.to_string_lossy();
-    if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{share}");
-    }
-    if let Some(drive) = path.strip_prefix(r"\\?\") {
-        let bytes = drive.as_bytes();
-        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\" {
-            return drive.to_owned();
-        }
-    }
-    path.into_owned()
-}
 
 // Metadata is shown above the instructions. Keep YAML descriptions from
 // becoming accidental Markdown headings in the reading pane.

@@ -23,13 +23,11 @@ async fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
             crate::ssh_project::quote(&remote.directory)
         ))
     } else {
-        let mut command = tokio::process::Command::new("git");
+        let mut command = crate::child_process::async_command("git");
         command.current_dir(root).args(args);
         command
     };
     command.env("GIT_TERMINAL_PROMPT", "0").kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
         .map_err(|_| "Git 操作超时".to_owned())?

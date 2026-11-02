@@ -68,12 +68,13 @@ impl ComposerReference {
         }
     }
     pub fn label(&self) -> String {
-        let name = self
-            .path
-            .trim_end_matches('/')
+        let display = crate::paths::display_path(&self.path);
+        let name = display
+            .trim_end_matches(['/', '\\'])
             .rsplit(['/', '\\'])
             .next()
-            .unwrap_or(&self.path);
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&display);
         match (self.start_line, self.end_line) {
             (Some(start), Some(end)) => format!("@{name}:{start}-{end}"),
             _ => format!("@{name}"),
@@ -124,6 +125,15 @@ impl ComposerReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_directory_labels_do_not_expose_prefixes_or_change_source_paths() {
+        let path = r"\\?\D:\项目\src\";
+        let reference = ComposerReference::file(path, true);
+        assert_eq!(reference.label(), "@src");
+        assert_eq!(reference.path, path);
+        assert!(reference.prompt().contains(path));
+        assert_eq!(ComposerReference::file(r"\\?\D:\", true).label(), "@D:");
+    }
     #[test]
     fn short_and_long_context_have_bounded_previews_and_distinct_model_payloads() {
         let short = ComposerReference::selection("/project/源.rs", 3, 4, "你好\nworld");

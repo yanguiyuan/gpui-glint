@@ -13,6 +13,7 @@
 //! Enable the optional `webview` feature for native webview integration on macOS
 //! and Windows.
 pub mod components;
+pub mod paths;
 pub mod theme;
 
 /// Application-independent plugin contracts and optional JavaScript runtime.

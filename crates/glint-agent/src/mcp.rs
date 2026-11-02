@@ -133,7 +133,7 @@ impl Client {
             let connect = async {
                 let client = match (server.command, server.url) {
                     (Some(program), None) => {
-                        let mut command = tokio::process::Command::new(program);
+                        let mut command = crate::child_process::async_command(program);
                         command
                             .args(server.args)
                             .envs(server.env)

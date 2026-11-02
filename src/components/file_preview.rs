@@ -1,5 +1,6 @@
 //! Reusable read-only file/directory preview. The host supplies data and performs I/O.
 use super::{CodeCard, CodeCardEvent, CodeSelection, Icon, IconButton};
+use crate::paths::display_path;
 use crate::theme::ThemePreset;
 use gpui::{
     AppContext, Context, Entity, EventEmitter, Render, SharedString, Window, div, prelude::*, px,
@@ -220,7 +221,7 @@ impl Render for FilePreview {
                             .min_w_0()
                             .text_ellipsis()
                             .text_size(px(12.))
-                            .child(self.path.clone()),
+                            .child(display_path(&self.path)),
                     )
                     .child(
                         IconButton::new(Icon::Close, "关闭预览")

@@ -460,7 +460,7 @@ impl AgentWorkspace {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().truncate().child(diff.path.clone()))
+                            .child(div().truncate().child(gpui_glint::paths::display_path(&diff.path)))
                             .child(
                                 div()
                                     .text_size(px(10.))

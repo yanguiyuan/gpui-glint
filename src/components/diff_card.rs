@@ -531,7 +531,7 @@ impl Render for DiffCard {
                     .truncate()
                     .text_size(px(13.))
                     .text_color(rgb(p.text_muted))
-                    .child(self.path.clone()),
+                    .child(crate::paths::display_path(self.path.as_ref())),
             )
             .child(div().flex_1())
             .child(

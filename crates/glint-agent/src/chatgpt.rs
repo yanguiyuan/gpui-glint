@@ -171,7 +171,7 @@ impl Connection {
     }
 
     pub async fn start(path: &str) -> Result<Self, String> {
-        let mut command = Command::new(path);
+        let mut command = crate::child_process::async_command(path);
         configure_proxy(&mut command).await;
         command
             .args([

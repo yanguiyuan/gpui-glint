@@ -690,7 +690,7 @@ impl AgentWorkspace {
                         )
                         .when(state.show_path, |s| {
                             s.child(caption(
-                                &self.path.with_file_name("mcp.json").display().to_string(),
+                                &gpui_glint::paths::display_path(self.path.with_file_name("mcp.json")),
                             ))
                         }),
                 ),

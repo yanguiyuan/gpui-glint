@@ -1633,16 +1633,12 @@ impl AgentWorkspace {
                     .child(div().border_t_1().border_color(rgb(p.border)))
                     .child(row(
                         "SQLite 数据库",
-                        crate::database::path(&self.path).display().to_string(),
+                        gpui_glint::paths::display_path(crate::database::path(&self.path)),
                         "WAL".into(),
                     ))
                     .child(row(
                         "数据目录",
-                        self.path
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .display()
-                            .to_string(),
+                        gpui_glint::paths::display_path(self.path.parent().unwrap_or(std::path::Path::new("."))),
                         "".into(),
                     ))
                     .child(div().border_t_1().border_color(rgb(p.border)))

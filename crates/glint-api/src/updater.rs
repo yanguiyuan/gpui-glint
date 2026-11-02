@@ -653,7 +653,7 @@ fn installer_failure(code: Option<i32>, log: &Path) -> String {
         Some(code) => format!("安装失败（退出码 {code}）"),
         None => "安装程序异常退出".to_owned(),
     };
-    format!("{reason}；安装日志：{}", log.display())
+    format!("{reason}；安装日志：{}", gpui_glint::paths::display_path(log))
 }
 
 #[cfg(any(target_os = "windows", test))]

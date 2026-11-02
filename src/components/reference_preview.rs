@@ -101,7 +101,7 @@ pub(super) fn reference_preview(
                 .truncate()
                 .text_size(px(11.))
                 .text_color(rgb(p.text_muted))
-                .child(reference.path.clone()),
+                .child(crate::paths::display_path(&reference.path)),
         )
         .child(body)
         .when(clipped, |root| {

@@ -246,7 +246,7 @@ impl Group {
         }
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("taskkill")
+            let _ = crate::child_process::command("taskkill")
                 .args(["/PID", &self.pid.to_string(), "/T", "/F"])
                 .output();
         }
@@ -329,7 +329,7 @@ async fn worker(
         let mut command = if remote {
             ssh_project::Remote::from_path(&cwd)?.managed_run(&program, &args)
         } else {
-            let mut c = tokio::process::Command::new(&program);
+            let mut c = crate::child_process::async_command(&program);
             c.args(&args).current_dir(&cwd);
             c
         };
@@ -844,6 +844,26 @@ pub async fn internal(
         result.stdout,
         result.stderr
     ))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[tokio::test]
+    async fn managed_command_runs_without_a_console_and_keeps_both_output_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let script = r#"Add-Type -Name ConsoleProbe -Namespace GlintTest -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'; [Console]::Write([GlintTest.ConsoleProbe]::GetConsoleWindow().ToInt64()); [Console]::Error.Write('managed stderr'); exit 7"#;
+        let result = foreground_scope(
+            Scope { anchor: PathBuf::new(), root: Some(root.path().to_owned()), partner: None, session: Some(uuid::Uuid::new_v4()) },
+            root.path().to_owned(), "powershell.exe".into(),
+            vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script.into()],
+            30, false, None,
+        ).await.unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "0");
+        assert_eq!(result.stderr, "managed stderr");
+    }
 }
 
 #[cfg(all(test, unix))]

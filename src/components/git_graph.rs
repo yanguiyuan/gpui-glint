@@ -366,7 +366,7 @@ impl GitGraph {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(p.surface_subtle)))
                     .child(Icon::Code.render(13.))
-                    .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(crate::paths::display_path(&path)))
                     .when(file.additions.is_none(), |d| {
                         d.child(
                             div()

@@ -13,6 +13,7 @@ pub struct State {
     app_id: Entity<TextEntry>,
     secret: Entity<TextEntry>,
     project: Entity<TextEntry>,
+    project_source: Option<(String, PathBuf)>,
     partner: Option<Uuid>,
     pub notice: Option<String>,
     pub credential_source: Option<crate::hosting::WpsCredentialSource>,
@@ -47,6 +48,7 @@ impl State {
             app_id,
             secret,
             project,
+            project_source: None,
             partner: None,
             notice,
             credential_source: None,
@@ -62,6 +64,18 @@ impl State {
         for field in [&self.name, &self.app_id, &self.secret, &self.project] {
             field.update(cx, |f, cx| f.set_theme(theme, cx));
         }
+    }
+    fn set_project(&mut self, path: Option<PathBuf>, cx: &mut Context<AgentWorkspace>) {
+        let label = path.as_ref().map(gpui_glint::paths::display_path).unwrap_or_default();
+        self.project_source = path.map(|path| (label.clone(), path));
+        self.project.update(cx, |field, cx| field.set_value(label, cx));
+    }
+    fn project_path(&self, cx: &App) -> PathBuf {
+        let value = self.project.read(cx).value();
+        if let Some((label, source)) = &self.project_source {
+            if value == label { return source.clone(); }
+        }
+        PathBuf::from(value.trim())
     }
     fn sync(&mut self) {
         self.workers
@@ -225,12 +239,7 @@ impl AgentWorkspace {
             f.set_value(app.as_ref().map(|a| a.app_id.as_str()).unwrap_or(""), cx)
         });
         self.channels.secret.update(cx, |f, cx| f.set_value("", cx));
-        self.channels.project.update(cx, |f, cx| {
-            f.set_value(
-                project.map(|p| p.display().to_string()).unwrap_or_default(),
-                cx,
-            )
-        });
+        self.channels.set_project(project, cx);
         self.channels.notice = None;
         cx.notify();
     }
@@ -262,7 +271,7 @@ impl AgentWorkspace {
                 platform: Platform::Wps,
                 name: self.channels.name.read(cx).value().trim().into(),
                 app_id: self.channels.app_id.read(cx).value().trim().into(),
-                project: std::fs::canonicalize(self.channels.project.read(cx).value().trim())
+                project: std::fs::canonicalize(self.channels.project_path(cx))
                     .map_err(|_| "项目目录不存在")?,
                 partner,
                 enabled: false,
@@ -371,9 +380,7 @@ impl AgentWorkspace {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.first() {
-                            this.channels
-                                .project
-                                .update(cx, |f, cx| f.set_value(path.display().to_string(), cx));
+                            this.channels.set_project(Some(path.clone()), cx);
                         }
                     }
                     Ok(Ok(None)) => {}
@@ -692,6 +699,9 @@ mod tests {
             "directory controls should share a height"
         );
         host.read_with(window, |host, cx| {
+            let original = dir.path().canonicalize().unwrap();
+            assert_eq!(host.channels.project.read(cx).value(), gpui_glint::paths::display_path(&original));
+            assert_eq!(host.channels.project_path(cx), original, "Unedited path labels must preserve their source path");
             assert_eq!(host.channels.app_id.read(cx).value(), "test-ak");
             assert_eq!(host.channels.secret.read(cx).value(), "");
             assert!(host.channels.partner.is_some());
