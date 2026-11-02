@@ -503,7 +503,7 @@ async fn start(
                     .map_err(|e| e.to_string())?;
             }
             for name in ["stdout.log", "stderr.log"] {
-                let file = std::fs::OpenOptions::new()
+                let _file = std::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(dir.join(name))
@@ -511,7 +511,7 @@ async fn start(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    _file.set_permissions(std::fs::Permissions::from_mode(0o600))
                         .map_err(|e| e.to_string())?;
                 }
             }

@@ -975,6 +975,8 @@ impl AgentWorkspace {
                         .flex()
                         .flex_col()
                         .justify_center()
+                        .items_center()
+                        .text_center()
                         .px(px(padding))
                         .gap_4()
                         .child(
@@ -989,15 +991,11 @@ impl AgentWorkspace {
                                 .child("创建一个空白伙伴，无需先填写名字、性格或背景。"),
                         )
                         .child(
-                            div().child(
-                                Button::new("创建空白伙伴")
-                                    .icon(Icon::Plus)
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.create_partner(cx)),
-                                    ),
-                            ),
+                            Button::new("创建空白伙伴")
+                                .icon(Icon::Plus)
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|this, _, _, cx| this.create_partner(cx))),
                         )
                         .when_some(error, |d, e| d.child(self.partner_notice(e))),
                 );
