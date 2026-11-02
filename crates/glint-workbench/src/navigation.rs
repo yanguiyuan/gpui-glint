@@ -49,6 +49,17 @@ mod tests {
                 _subscription: subscription,
             }
         });
+        host.read_with(window, |host, cx| {
+            assert_eq!(
+                host.navigation.read(cx).route,
+                Route::Agent(glint_agent::Page::Chat)
+            );
+        });
+        let agent = window.debug_bounds("nav-agent").unwrap();
+        let calendar = window.debug_bounds("nav-calendar").unwrap();
+        let api = window.debug_bounds("nav-api").unwrap();
+        assert!(agent.top() < calendar.top());
+        assert!(calendar.top() < api.top());
         for (selector, action) in [
             (
                 "nav-api",
@@ -116,7 +127,7 @@ pub struct Navigation {
 impl Default for Navigation {
     fn default() -> Self {
         Self {
-            route: Route::Api(glint_api::Page::Requests),
+            route: Route::Agent(glint_agent::Page::Chat),
             theme: ThemePreset::Moonstone,
         }
     }
@@ -178,35 +189,6 @@ impl Render for Navigation {
             .gap_2()
             .py_3()
             .child(self.route_button(
-                "nav-api",
-                Icon::Folders,
-                "API 请求",
-                Route::Api(Api::Requests),
-                cx,
-            ))
-            .child(self.route_button(
-                "nav-environments",
-                Icon::Globe,
-                "环境变量",
-                Route::Api(Api::Environments),
-                cx,
-            ))
-            .child(self.route_button(
-                "nav-proxies",
-                Icon::Shuffle,
-                "代理管理",
-                Route::Api(Api::Proxies),
-                cx,
-            ))
-            .child(self.route_button(
-                "nav-history",
-                Icon::Clock,
-                "请求历史",
-                Route::Api(Api::History),
-                cx,
-            ))
-            .child(separator("nav-api-agent-divider"))
-            .child(self.route_button(
                 "nav-agent",
                 Icon::MessageCircle,
                 "Agent 会话",
@@ -245,6 +227,35 @@ impl Render for Navigation {
                 Icon::Calendar,
                 "日程与定时任务",
                 Route::Agent(Agent::Calendar),
+                cx,
+            ))
+            .child(separator("nav-api-agent-divider"))
+            .child(self.route_button(
+                "nav-api",
+                Icon::Folders,
+                "API 请求",
+                Route::Api(Api::Requests),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-environments",
+                Icon::Globe,
+                "环境变量",
+                Route::Api(Api::Environments),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-proxies",
+                Icon::Shuffle,
+                "代理管理",
+                Route::Api(Api::Proxies),
+                cx,
+            ))
+            .child(self.route_button(
+                "nav-history",
+                Icon::Clock,
+                "请求历史",
+                Route::Api(Api::History),
                 cx,
             ))
             .child(div().flex_1().min_h_0())

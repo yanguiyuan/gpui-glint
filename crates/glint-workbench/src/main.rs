@@ -127,7 +127,7 @@ impl Workbench {
             api,
             agent,
             navigation,
-            route: Route::Api(glint_api::Page::Requests),
+            route: Route::Agent(glint_agent::Page::Chat),
             theme: ThemePreset::Moonstone,
             _subscriptions: subscriptions,
         }
@@ -274,9 +274,12 @@ fn main() {
                         let _ = api.update(cx, |api, cx| api.flush(cx));
                         true
                     });
-                    let entity = app.read(cx).api.clone();
-                    entity.update(cx, |api, cx| {
-                        api.navigate(glint_api::Page::Requests, window, cx)
+                    app.update(cx, |app, cx| {
+                        app.dispatch(
+                            Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
+                            window,
+                            cx,
+                        );
                     });
                     app
                 },
