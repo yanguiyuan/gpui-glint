@@ -8,7 +8,12 @@ mod reference_preview;
 pub use composer_reference::ComposerReference;
 mod dialog;
 mod file_preview;
+mod git_graph;
 pub use file_preview::{FilePreview, FilePreviewEntry, FilePreviewEvent};
+pub use git_graph::{
+    GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraph, GitGraphData,
+    GitGraphEvent,
+};
 mod dropdown;
 mod icon;
 mod inputs;

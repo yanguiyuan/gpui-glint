@@ -2,6 +2,41 @@
 
 返回 [Glint UI README](../README.md)。这里的代码片段用于已有 GPUI 视图，`cx`、`window`、`theme` 和应用状态由宿主提供；完整可运行示例见 [`examples`](../examples)。
 
+## GitGraph
+
+`GitGraph` 是只读 Git 历史与分支对比组件，不依赖本机 Git，也不执行文件或网络操作。宿主负责异步查询 Git，将数据交给组件，并处理事件。完整离线示例见 [`examples/git_graph.rs`](../examples/git_graph.rs)。
+
+```rust
+use gpui_glint::components::{GitGraph, GitGraphData, GitGraphEvent};
+
+let graph = cx.new(GitGraph::new);
+graph.update(cx, |graph, cx| {
+    graph.set_theme(theme, cx);
+    graph.set_data(GitGraphData {
+        current_branch: "feature".into(),
+        branches: vec!["master".into(), "feature".into()],
+        compare_branch: "master".into(),
+        // Supply GitCommit records in topological order: children before parents.
+        commits: vec![],
+        ..Default::default()
+    }, cx);
+});
+```
+
+`GitCommit` 提供完整提交 ID、父提交 ID、摘要、作者、日期和引用标签。组件按父关系绘制分支与合并连线。`GitComparison` 分别提供 `current_only`、`target_only` 提交列表，以及完整的 `current_count`、`target_count`；宿主可限制列表长度，同时保留准确计数。
+
+| 事件 | 宿主行为 |
+| --- | --- |
+| `CompareBranch(branch)` | 重新查询所选分支与当前 HEAD 的双向独有提交，再调用 `set_data` |
+| `SelectCommit(id)` | 异步读取详情，调用 `set_details(&id, text, cx)`；旧选择的返回结果会被忽略 |
+| `OpenFile { commit, path }` | 打开所选提交中该文件的 Diff；宿主保留 GitGraph 实例，以便返回原提交和滚动位置 |
+| `Refresh` | 重新读取仓库数据 |
+| `CloseRequested` | 关闭宿主中的侧栏或面板 |
+
+查询期间调用 `set_loading(cx)`，查询失败调用 `set_error(message, cx)`。切换项目时先调用 `reset(cx)`，清除旧仓库内容、选中提交、详情和滚动位置；宿主仍需校验异步结果所属的项目。选中提交的详情显示于底部独立滚动区域，提交历史不会遮挡详情。
+
+提交详情优先使用 `set_commit_details(GitCommitDetails { ... }, cx)`：提供完整 `id`、父提交、作者/提交者及日期、提交说明和 `files: Vec<GitCommitFile>`。详情区分层展示摘要与正文，提供复制完整 Hash 按钮，文件行显示新增/删除行数并发出 `OpenFile` 事件。`GitCommitFile` 的 `additions` / `deletions` 为 `None` 时标记二进制文件。`set_details` 仍可用于普通文本提示或错误信息。合并提交的文件列表应相对第一父提交计算。
+
 ## 布局与基础控件
 
 `AppLayout` 填满父容器，顶部栏高 42px，下方为可伸缩的横向布局。导航轨道位于外层表面；侧栏和主内容共享带圆角、高光与柔和阴影的面板。各区域均可接收任意 GPUI 元素。

@@ -78,7 +78,7 @@ fn main() {
 | 菜单与命令 | `GroupedDropdown`、`CommandPalette` |
 | 日期与时间 | `DatePicker`、`TimePicker`、`DateTimePicker`、`DateRangePicker`、`TimeRangePicker`、`DateTimeRangePicker` |
 | 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel` |
-| 文档与图表 | `DocumentEditor`、`MermaidDiagram` |
+| 文档与图表 | `DocumentEditor`、`MermaidDiagram`、`GitGraph` |
 | 对话输入 | `Composer`、`PromptEditor` |
 | 状态与身份 | `ToastHost`、`Avatar`、`AvatarGroup`、`ContentBadge`、`TagBadge`、`CountBadge`、`OverlayBadge`、`StatusBadge` |
 | 图标与主题 | `Icon`、`GlintAssets`、`ThemeSelector`、`ThemePreset` |
@@ -143,6 +143,7 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 - `CodeCard` 提供原生输入法、选区、剪贴板、撤销重做、固定行号和横向滚动。Rust、Go、JSON、HTML、XML、CSS、JavaScript 支持语法高亮，其他语言显示纯文本；JSON 支持实时校验和格式化。语言图标覆盖范围与高亮支持范围分别配置。
 - `DocumentEditor` 提供 Markdown 块编辑、目录、跨块选区、搜索高亮和只读预览。悬停标题时显示 `H1`～`H6`；块菜单支持转换、复制、移动和删除。通过 `DocumentEvent` 接入保存、标题变更和链接操作，组件不自行写入文档文件。
 - `MermaidDiagram` 在后台离线渲染图表，支持源码切换、复制与 PNG 导出。语法覆盖取决于上游解析器；不执行原始 HTML，也不支持外部图片节点。文档中的 Mermaid 围栏会自动使用该组件。
+- `GitGraph` 展示带父提交连线的历史、分支引用、提交详情和双向独有提交对比。宿主通过 `GitGraphData` 提供数据，通过 `GitGraphEvent` 接收对比分支、提交选择、刷新和关闭请求；组件不执行 Git 命令。运行 `cargo run --example git_graph` 查看离线示例。
 
 远程图片需要宿主配置 GPUI HTTP 客户端；Markdown 数学内容保留为文本，不进行 TeX 排版。
 

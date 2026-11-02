@@ -28,6 +28,7 @@ pub enum Icon {
     Database,
     Globe,
     Workflow,
+    GitBranch,
     Pulse,
     Key,
     Folders,
@@ -104,6 +105,7 @@ impl Icon {
             Self::Database => "database",
             Self::Globe => "globe",
             Self::Workflow => "workflow",
+            Self::GitBranch => "git-branch",
             Self::Pulse => "pulse",
             Self::Key => "key",
             Self::Folders => "folders",
@@ -537,6 +539,10 @@ fn icon_svg(name: &str) -> Option<String> {
         ),
         "database" => (
             "<ellipse cx='12' cy='5.5' rx='8' ry='3'/><path d='M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3'/>",
+            "none",
+        ),
+        "git-branch" => (
+            "<circle cx='6' cy='5' r='2.5'/><circle cx='6' cy='19' r='2.5'/><circle cx='18' cy='5' r='2.5'/><path d='M6 7.5v9M18 7.5v2a7 7 0 0 1-7 7H6'/>",
             "none",
         ),
         "workflow" => (
