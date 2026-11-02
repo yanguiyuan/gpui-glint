@@ -177,7 +177,10 @@ pub fn anthropic_blocks(content: &Value) -> Vec<ContentBlock> {
         .flatten()
         .filter_map(|block| match block["type"].as_str()? {
             "text" => Some(ContentBlock::Text(block["text"].as_str()?.into())),
-            "thinking" => Some(ContentBlock::Thinking(block["thinking"].as_str()?.into())),
+            "thinking" => block["thinking"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| ContentBlock::Thinking(text.into())),
             "tool_use" => Some(ContentBlock::ToolCall(crate::tools::ToolCall {
                 id: block["id"].as_str()?.into(),
                 name: block["name"].as_str()?.into(),
@@ -312,6 +315,9 @@ impl StreamCompletion {
     }
 
     fn append_part(&mut self, text: &str, thinking: bool) {
+        if text.is_empty() {
+            return;
+        }
         match (self.order.last_mut(), thinking) {
             (Some(StreamPart::Text(previous)), false)
             | (Some(StreamPart::Thinking(previous)), true) => previous.push_str(text),
@@ -331,7 +337,9 @@ impl StreamCompletion {
             .iter()
             .filter_map(|part| match part {
                 StreamPart::Text(text) => Some(ContentBlock::Text(text.clone())),
-                StreamPart::Thinking(text) => Some(ContentBlock::Thinking(text.clone())),
+                StreamPart::Thinking(text) => {
+                    (!text.trim().is_empty()).then(|| ContentBlock::Thinking(text.clone()))
+                }
                 StreamPart::Tool(index) => self.calls.get(index).map(|call| {
                     ContentBlock::ToolCall(crate::tools::ToolCall {
                         id: call["id"].as_str().unwrap_or("").into(),
@@ -573,6 +581,64 @@ pub fn empty_reply_error(reason: Option<&str>, thinking: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_reasoning_deltas_do_not_create_blocks_around_tools() {
+        let mut stream = StreamCompletion::default();
+        for event in [
+            serde_json::json!({"choices":[{"delta":{"reasoning_content":""}}]}),
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}),
+            serde_json::json!({"choices":[{"delta":{"reasoning_content":""}}]}),
+            serde_json::json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ] {
+            stream
+                .push(format!("data: {event}\n\n").as_bytes(), 10)
+                .unwrap();
+        }
+        stream.push(b"data: [DONE]\n\n", 20).unwrap();
+        let reply = stream.finish(20).unwrap();
+        assert!(
+            matches!(&reply.blocks[..],[ContentBlock::ToolCall(_),ContentBlock::Text(text)] if text=="done")
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_placeholders_wait_for_content_and_keep_protocol_data() {
+        let mut stream = StreamCompletion::default();
+        for event in [
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"signature":"opaque"}}),
+        ] {
+            stream
+                .push(format!("data: {event}\n\n").as_bytes(), 10)
+                .unwrap();
+        }
+        assert!(stream.snapshot().is_empty());
+        let event = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"thinking":"actual reasoning"}});
+        stream
+            .push(format!("data: {event}\n\n").as_bytes(), 20)
+            .unwrap();
+        assert!(
+            matches!(&stream.snapshot()[..],[ContentBlock::Thinking(text)] if text=="actual reasoning")
+        );
+        for event in [
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":" \n"}}),
+            serde_json::json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":2,"delta":{"text":"answer"}}),
+            serde_json::json!({"type":"message_stop"}),
+        ] {
+            stream
+                .push(format!("data: {event}\n\n").as_bytes(), 30)
+                .unwrap();
+        }
+        let reply = stream.finish(40).unwrap();
+        assert!(matches!(
+            &reply.blocks[..],
+            [ContentBlock::Thinking(_), ContentBlock::Text(_)]
+        ));
+        assert_eq!(reply.raw_content[0]["signature"], "opaque");
+        assert_eq!(reply.raw_content[1]["thinking"], " \n");
+    }
 
     fn argument_stream(anthropic: bool, input: &str) -> StreamCompletion {
         let mut stream = StreamCompletion::default();

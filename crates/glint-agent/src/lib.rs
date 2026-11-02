@@ -58,6 +58,7 @@ mod titles;
 mod todo;
 mod tool_registry;
 mod tools;
+mod trajectory;
 mod undo;
 
 use gpui::{
@@ -82,6 +83,7 @@ use uuid::Uuid;
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
 pub struct AgentWorkspace {
+    trajectory: trajectory::State,
     git_ui: git_ui::State,
     commands: commands::State,
     right_sidebar_width: f32,
@@ -529,6 +531,7 @@ impl AgentWorkspace {
             cx.observe(&provider_settings.search, |_, _, cx| cx.notify()),
         ];
         let mut workspace = Self {
+            trajectory: Default::default(),
             commands: commands::State::new(cx),
             right_sidebar_width: 480.,
             right_sidebar_resize: None,
@@ -667,6 +670,7 @@ impl AgentWorkspace {
         self.provider_error = None;
         self.capture_draft(cx);
         self.history.active = id;
+        self.trajectory.close_detail();
         self.history.preferred_partner = self.history.active().partner_id;
         self.project_picker_open = false;
         images::release_previews(self.image_views.borrow_mut().clear(), cx);
@@ -708,6 +712,8 @@ impl AgentWorkspace {
     }
 
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.trajectory.open = false;
+        self.trajectory.close_detail();
         if matches!(
             self.page,
             crate::Page::Vault
@@ -1764,303 +1770,313 @@ impl AgentWorkspace {
                 .find(|p| p.id == id)
                 .cloned()
         });
-        let outline_entries = self.outline_entries();
-        let show_outline = outline_entries.len() >= 2;
-        self.outline.update(cx, |outline, cx| {
-            outline.set(
-                session.id,
-                outline_entries,
-                self.scroll.top_item(),
-                self.theme,
-                cx,
-            )
-        });
-        let running = self
-            .pending
-            .as_ref()
-            .or(self.preparing.as_ref())
-            .is_some_and(|(id, _)| *id == session.id);
-        let layout_context = (session.id, self.theme, session.messages.len());
-        let viewport = self.scroll.bounds();
-        let offset = self.scroll.offset();
-        let can_clip = self.message_layout.context == Some(layout_context)
-            && self.message_layout.width == viewport.size.width
-            && self.message_layout.measure_passes == 0
-            && viewport.size.height > px(0.);
-        let workspace = cx.entity().downgrade();
-        let mut messages = div()
-            .on_children_prepainted(move |_, _, cx| {
-                let _ = workspace.update(cx, |this, cx| {
-                    let width = this.scroll.bounds().size.width;
-                    let layout = &mut this.message_layout;
-                    if layout.context != Some(layout_context) || layout.width != width {
-                        layout.context = Some(layout_context);
-                        layout.width = width;
-                        layout.measure_passes = 2;
-                    }
-                    if layout.measure_passes > 0 || this.scroll.offset() != offset {
-                        layout.measure_passes = layout.measure_passes.saturating_sub(1);
-                        let id = cx.entity_id();
-                        cx.defer(move |cx| cx.notify(id));
-                    }
-                });
-            })
-            .id("conversation")
-            .track_scroll(&self.scroll)
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .items_center()
-            .px(px(40.))
-            .pt_6()
-            // The todo panel floats above the composer. Keep enough scrollable
-            // space for its expanded height so the final message stays visible.
-            .pb(px(if session.todos.is_empty() { 96. } else { 300. }))
-            .gap_6()
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                // Keep the outline's active tick tracking the scroll position.
-                this.outline.update(cx, |outline, cx| {
-                    outline.set_top(this.scroll.top_item(), cx)
-                });
-            }));
-        if session.messages.is_empty() {
-            // The empty state places the composer in the centered stack below.
+        let conversation = if self.trajectory.open {
+            self.trajectory_page(cx)
         } else {
-            for (index, message) in session.messages.iter().enumerate() {
-                if can_clip && index + 1 < session.messages.len() {
-                    if let Some(bounds) = self.scroll.bounds_for_item(index) {
-                        let nearby = bounds.bottom() + offset.y >= viewport.top() - px(600.)
-                            && bounds.top() + offset.y <= viewport.bottom() + px(600.);
-                        if !nearby {
-                            messages = messages.child(
-                                div()
-                                    .id(("message", index))
-                                    .debug_selector(move || {
-                                        format!("message-spacer-{index}").into()
-                                    })
-                                    .w_full()
-                                    .max_w(px(800.))
-                                    .h(bounds.size.height)
-                                    .flex_shrink_0(),
-                            );
-                            continue;
+            let outline_entries = self.outline_entries();
+            let show_outline = outline_entries.len() >= 2;
+            self.outline.update(cx, |outline, cx| {
+                outline.set(
+                    session.id,
+                    outline_entries,
+                    self.scroll.top_item(),
+                    self.theme,
+                    cx,
+                )
+            });
+            let running = self
+                .pending
+                .as_ref()
+                .or(self.preparing.as_ref())
+                .is_some_and(|(id, _)| *id == session.id);
+            let layout_context = (session.id, self.theme, session.messages.len());
+            let viewport = self.scroll.bounds();
+            let offset = self.scroll.offset();
+            let can_clip = self.message_layout.context == Some(layout_context)
+                && self.message_layout.width == viewport.size.width
+                && self.message_layout.measure_passes == 0
+                && viewport.size.height > px(0.);
+            let workspace = cx.entity().downgrade();
+            let mut messages = div()
+                .on_children_prepainted(move |_, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        let width = this.scroll.bounds().size.width;
+                        let layout = &mut this.message_layout;
+                        if layout.context != Some(layout_context) || layout.width != width {
+                            layout.context = Some(layout_context);
+                            layout.width = width;
+                            layout.measure_passes = 2;
+                        }
+                        if layout.measure_passes > 0 || this.scroll.offset() != offset {
+                            layout.measure_passes = layout.measure_passes.saturating_sub(1);
+                            let id = cx.entity_id();
+                            cx.defer(move |cx| cx.notify(id));
+                        }
+                    });
+                })
+                .id("conversation")
+                .debug_selector(|| "agent-chat-conversation".into())
+                .track_scroll(&self.scroll)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px(px(40.))
+                .pt_6()
+                // The todo panel floats above the composer. Keep enough scrollable
+                // space for its expanded height so the final message stays visible.
+                .pb(px(if session.todos.is_empty() { 96. } else { 300. }))
+                .gap_6()
+                .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                    // Keep the outline's active tick tracking the scroll position.
+                    this.outline.update(cx, |outline, cx| {
+                        outline.set_top(this.scroll.top_item(), cx)
+                    });
+                }));
+            if session.messages.is_empty() {
+                // The empty state places the composer in the centered stack below.
+            } else {
+                for (index, message) in session.messages.iter().enumerate() {
+                    if can_clip && index + 1 < session.messages.len() {
+                        if let Some(bounds) = self.scroll.bounds_for_item(index) {
+                            let nearby = bounds.bottom() + offset.y >= viewport.top() - px(600.)
+                                && bounds.top() + offset.y <= viewport.bottom() + px(600.);
+                            if !nearby {
+                                messages = messages.child(
+                                    div()
+                                        .id(("message", index))
+                                        .debug_selector(move || {
+                                            format!("message-spacer-{index}").into()
+                                        })
+                                        .w_full()
+                                        .max_w(px(800.))
+                                        .h(bounds.size.height)
+                                        .flex_shrink_0(),
+                                );
+                                continue;
+                            }
                         }
                     }
-                }
-                let user = message.role == Role::User;
-                let author = match message.role {
-                    Role::User => "你".to_owned(),
-                    Role::Notice => "提示".to_owned(),
-                    Role::Agent => partner
-                        .as_ref()
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "Glint Agent".into()),
-                };
-                let avatar = match (&message.role, partner.as_ref()) {
-                    (Role::Agent, Some(partner)) => self.partner_avatar(partner, 28.),
-                    _ => div()
-                        .size(px(28.))
-                        .flex_shrink_0()
-                        .rounded(px(8.))
-                        .bg(rgb(if user {
-                            p.surface_subtle
-                        } else {
-                            p.accent_tint
-                        }))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(if user { Icon::User } else { Icon::Workflow }.render(16.)),
-                };
-                messages = messages.child(
-                    div()
-                        .id(("message", index))
-                        .flex_shrink_0()
-                        .w_full()
-                        .max_w(px(800.))
-                        .flex()
-                        .gap_3()
-                        .child(avatar)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_3()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(author)
-                                        .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .font_weight(FontWeight::NORMAL)
-                                                .text_color(rgb(p.text_muted))
-                                                .child(message.time.format("%H:%M").to_string()),
-                                        ),
-                                )
-                                .child(if message.blocks.is_empty() {
-                                    div()
-                                        .child(self.markdown_text(
-                                            format!("{}:{index}:legacy", self.history.active),
-                                            &message.text,
-                                            cx,
-                                        ))
-                                        .when(!message.tools.is_empty(), |body| {
-                                            body.child(self.tool_records(
-                                                &format!("{}:{index}", self.history.active),
-                                                &message.tools,
-                                                cx,
-                                            ))
-                                        })
-                                } else {
-                                    div()
-                                        .child(self.response_view(
-                                            &format!("{}:{index}", self.history.active),
-                                            &message.blocks,
-                                            message.stats.as_ref(),
-                                            &message.thinking_ms,
-                                            true,
-                                            cx,
-                                        ))
-                                        .when(message.role == Role::Notice, |body| {
-                                            body.child(self.markdown_text(
-                                                format!("{}:{index}:notice", self.history.active),
+                    let user = message.role == Role::User;
+                    let author = match message.role {
+                        Role::User => "你".to_owned(),
+                        Role::Notice => "提示".to_owned(),
+                        Role::Agent => partner
+                            .as_ref()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "Glint Agent".into()),
+                    };
+                    let avatar = match (&message.role, partner.as_ref()) {
+                        (Role::Agent, Some(partner)) => self.partner_avatar(partner, 28.),
+                        _ => div()
+                            .size(px(28.))
+                            .flex_shrink_0()
+                            .rounded(px(8.))
+                            .bg(rgb(if user {
+                                p.surface_subtle
+                            } else {
+                                p.accent_tint
+                            }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if user { Icon::User } else { Icon::Workflow }.render(16.)),
+                    };
+                    messages = messages.child(
+                        div()
+                            .id(("message", index))
+                            .flex_shrink_0()
+                            .w_full()
+                            .max_w(px(800.))
+                            .flex()
+                            .gap_3()
+                            .child(avatar)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(author)
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .font_weight(FontWeight::NORMAL)
+                                                    .text_color(rgb(p.text_muted))
+                                                    .child(
+                                                        message.time.format("%H:%M").to_string(),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(if message.blocks.is_empty() {
+                                        div()
+                                            .child(self.markdown_text(
+                                                format!("{}:{index}:legacy", self.history.active),
                                                 &message.text,
                                                 cx,
                                             ))
-                                        })
-                                })
-                                .when_some(message.memory_recall.as_ref(), |body, recall| {
-                                    body.child(
+                                            .when(!message.tools.is_empty(), |body| {
+                                                body.child(self.tool_records(
+                                                    &format!("{}:{index}", self.history.active),
+                                                    &message.tools,
+                                                    cx,
+                                                ))
+                                            })
+                                    } else {
                                         div()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(p.text_muted))
-                                            .child(format!(
-                                                "自动回忆 {} 条：{}",
-                                                recall.matches.len(),
-                                                recall
-                                                    .matches
-                                                    .iter()
-                                                    .map(|memory| memory.title.as_str())
-                                                    .collect::<Vec<_>>()
-                                                    .join("、")
-                                            )),
-                                    )
-                                })
-                                .when(user && !message.images.is_empty(), |body| {
-                                    body.child(div().flex().flex_wrap().gap_2().children(
-                                        message.images.iter().enumerate().filter_map(
-                                            |(image_index, image)| {
-                                                let key = format!(
-                                                    "{}:{index}:img{image_index}",
-                                                    self.history.active
-                                                );
-                                                self.user_image(key, image, cx).map(|source| {
-                                                    img(source)
-                                                        .w(px(160.))
-                                                        .h(px(120.))
-                                                        .object_fit(ObjectFit::Cover)
-                                                        .rounded(px(8.))
-                                                        .border_1()
-                                                        .border_color(rgb(p.border))
-                                                })
-                                            },
-                                        ),
-                                    ))
-                                })
-                                .when(!user && !message.tools.is_empty(), |body| {
-                                    body.child(self.edits_summary(
-                                        &format!("{}:{index}:edits", self.history.active),
-                                        &message.tools,
-                                        cx,
-                                    ))
-                                })
-                                .when_some(message.stats.as_ref(), |body, stats| {
-                                    body.child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(p.text_muted))
-                                            .child(stats.caption()),
-                                    )
-                                })
-                                .when(
-                                    self.history.quick_replies_enabled
-                                        && message.role == Role::Agent
-                                        && index + 1 == session.messages.len()
-                                        && self.pending.is_none()
-                                        && self.preparing.is_none()
-                                        && !message.quick_replies.is_empty(),
-                                    |body| {
-                                        body.child(self.quick_reply_bubbles(
-                                            index,
-                                            &message.quick_replies,
+                                            .child(self.response_view(
+                                                &format!("{}:{index}", self.history.active),
+                                                &message.blocks,
+                                                message.stats.as_ref(),
+                                                &message.thinking_ms,
+                                                true,
+                                                cx,
+                                            ))
+                                            .when(message.role == Role::Notice, |body| {
+                                                body.child(self.markdown_text(
+                                                    format!(
+                                                        "{}:{index}:notice",
+                                                        self.history.active
+                                                    ),
+                                                    &message.text,
+                                                    cx,
+                                                ))
+                                            })
+                                    })
+                                    .when_some(message.memory_recall.as_ref(), |body, recall| {
+                                        body.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(format!(
+                                                    "自动回忆 {} 条：{}",
+                                                    recall.matches.len(),
+                                                    recall
+                                                        .matches
+                                                        .iter()
+                                                        .map(|memory| memory.title.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join("、")
+                                                )),
+                                        )
+                                    })
+                                    .when(user && !message.images.is_empty(), |body| {
+                                        body.child(div().flex().flex_wrap().gap_2().children(
+                                            message.images.iter().enumerate().filter_map(
+                                                |(image_index, image)| {
+                                                    let key = format!(
+                                                        "{}:{index}:img{image_index}",
+                                                        self.history.active
+                                                    );
+                                                    self.user_image(key, image, cx).map(|source| {
+                                                        img(source)
+                                                            .w(px(160.))
+                                                            .h(px(120.))
+                                                            .object_fit(ObjectFit::Cover)
+                                                            .rounded(px(8.))
+                                                            .border_1()
+                                                            .border_color(rgb(p.border))
+                                                    })
+                                                },
+                                            ),
+                                        ))
+                                    })
+                                    .when(!user && !message.tools.is_empty(), |body| {
+                                        body.child(self.edits_summary(
+                                            &format!("{}:{index}:edits", self.history.active),
+                                            &message.tools,
                                             cx,
                                         ))
-                                    },
-                                ),
-                        ),
-                );
+                                    })
+                                    .when_some(message.stats.as_ref(), |body, stats| {
+                                        body.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(stats.caption()),
+                                        )
+                                    })
+                                    .when(
+                                        self.history.quick_replies_enabled
+                                            && message.role == Role::Agent
+                                            && index + 1 == session.messages.len()
+                                            && self.pending.is_none()
+                                            && self.preparing.is_none()
+                                            && !message.quick_replies.is_empty(),
+                                        |body| {
+                                            body.child(self.quick_reply_bubbles(
+                                                index,
+                                                &message.quick_replies,
+                                                cx,
+                                            ))
+                                        },
+                                    ),
+                            ),
+                    );
+                }
             }
-        }
-        if running {
-            if !self.transcript.is_empty() {
-                let key = format!(
-                    "{}:{}",
-                    self.history.active,
-                    self.history
-                        .sessions
-                        .iter()
-                        .find(|session| session.id == self.history.active)
-                        .map(|session| session.messages.len())
-                        .unwrap_or(0)
-                );
+            if running {
+                if !self.transcript.is_empty() {
+                    let key = format!(
+                        "{}:{}",
+                        self.history.active,
+                        self.history
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == self.history.active)
+                            .map(|session| session.messages.len())
+                            .unwrap_or(0)
+                    );
+                    messages = messages.child(
+                        div()
+                            .debug_selector(|| "live-response".into())
+                            .flex_shrink_0()
+                            .w_full()
+                            .max_w(px(800.))
+                            .child(self.response_view(
+                                &key,
+                                &self.transcript,
+                                None,
+                                &self.thinking_timings.snapshot(),
+                                false,
+                                cx,
+                            )),
+                    );
+                }
                 messages = messages.child(
                     div()
-                        .debug_selector(|| "live-response".into())
+                        .debug_selector(|| "waiting-for-model".into())
                         .flex_shrink_0()
                         .w_full()
                         .max_w(px(800.))
-                        .child(self.response_view(
-                            &key,
-                            &self.transcript,
-                            None,
-                            &self.thinking_timings.snapshot(),
-                            false,
-                            cx,
-                        )),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(rgb(p.text_muted))
+                        .child(
+                            ShimmerText::new("agent-waiting-reply", self.subagent_waiting_label())
+                                .theme(self.theme),
+                        ),
                 );
             }
-            messages = messages.child(
-                div()
-                    .debug_selector(|| "waiting-for-model".into())
-                    .flex_shrink_0()
-                    .w_full()
-                    .max_w(px(800.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_color(rgb(p.text_muted))
-                    .child(
-                        ShimmerText::new("agent-waiting-reply", self.subagent_waiting_label())
-                            .theme(self.theme),
-                    ),
-            );
-        }
-        let conversation = div()
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .flex()
-            .flex_col()
-            .child(messages)
-            .when(show_outline, |wrap| wrap.child(self.outline.clone()));
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .flex()
+                .flex_col()
+                .child(messages)
+                .when(show_outline, |wrap| wrap.child(self.outline.clone()))
+        };
         let composer = div()
             .w_full()
             .max_w(px(800.))
@@ -2090,7 +2106,7 @@ impl AgentWorkspace {
                     })
                     .child(self.composer.clone()),
             );
-        if session.messages.is_empty() {
+        if session.messages.is_empty() && !self.trajectory.open {
             return div()
                 .size_full()
                 .flex()
@@ -2130,6 +2146,7 @@ impl AgentWorkspace {
                             .font_weight(FontWeight::MEDIUM)
                             .child(session.title.clone()),
                     )
+                    .child(self.session_view_tabs(cx))
                     .when_some(session.compaction.as_ref(), |row, summary| {
                         row.child(
                             div()
@@ -2151,37 +2168,40 @@ impl AgentWorkspace {
                 root.child(div().px_5().py_2().text_color(rgb(0xd9342b)).child(error))
             })
             .child(conversation)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w_full()
-                    .px(px(40.))
-                    .pb_3()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .child(composer)
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .child(if active_provider.enabled {
-                                let image_hint = if active_provider.kind == provider::Kind::ChatGpt
-                                {
-                                    "仅文本对话"
+            .when(!self.trajectory.open, |root| {
+                root.child(
+                    div()
+                        .debug_selector(|| "agent-composer-panel".into())
+                        .flex_shrink_0()
+                        .w_full()
+                        .px(px(40.))
+                        .pb_3()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .child(composer)
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(if active_provider.enabled {
+                                    let image_hint =
+                                        if active_provider.kind == provider::Kind::ChatGpt {
+                                            "仅文本对话"
+                                        } else {
+                                            "支持图片输入"
+                                        };
+                                    format!(
+                                        "{} · {} · {image_hint}",
+                                        active_provider.name, active_provider.model
+                                    )
                                 } else {
-                                    "支持图片输入"
-                                };
-                                format!(
-                                    "{} · {} · {image_hint}",
-                                    active_provider.name, active_provider.model
-                                )
-                            } else {
-                                "请先在设置中连接 Provider".into()
-                            }),
-                    ),
-            )
+                                    "请先在设置中连接 Provider".into()
+                                }),
+                        ),
+                )
+            })
     }
 }
 

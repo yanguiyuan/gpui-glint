@@ -126,6 +126,25 @@ fn unresolved_tool_record(call: &tools::ToolCall, complete: bool) -> tools::Tool
 }
 
 fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
+    tool_presentation_with_body(record, true)
+}
+
+pub(super) fn tool_summary(
+    call: &tools::ToolCall,
+    record: Option<&tools::ToolRecord>,
+) -> (Icon, String) {
+    let pending;
+    let record = if let Some(record) = record {
+        record
+    } else {
+        pending = unresolved_tool_record(call, false);
+        &pending
+    };
+    let presentation = tool_presentation_with_body(record, false);
+    (presentation.icon, presentation.summary)
+}
+
+fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -> ToolPresentation {
     if record.result == "正在生成参数…"
         || record.result.starts_with("未执行：")
         || record.result.starts_with("调用已中断：")
@@ -148,7 +167,9 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
                 },
                 record.call.name
             ),
-            body: if generating {
+            body: if !include_body {
+                String::new()
+            } else if generating {
                 "正在接收工具参数，尚未执行。".into()
             } else {
                 record.result.clone()
@@ -390,7 +411,9 @@ fn tool_presentation(record: &tools::ToolRecord) -> ToolPresentation {
     if record.call.name == "run_command" && !running {
         summary.push_str(&format!(" · {:.1}s", record.elapsed_ms as f64 / 1000.));
     }
-    let body = if running {
+    let body = if !include_body {
+        String::new()
+    } else if running {
         record
             .live_output
             .clone()
@@ -1084,6 +1107,7 @@ impl AgentWorkspace {
                             .into(),
                     );
                 }
+                ContentBlock::Thinking(text) if text.trim().is_empty() => {}
                 ContentBlock::Thinking(text) => {
                     let active = !complete && index + 1 == blocks.len();
                     let summary = thinking_summary(text, active, thinking_ms.get(&index).copied());
