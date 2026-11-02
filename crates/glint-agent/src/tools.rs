@@ -408,17 +408,17 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("缺少参数 {name}"))
 }
 
-fn safe_path(root: &Path, relative: &str, writing: bool) -> Result<PathBuf, String> {
-    let relative = Path::new(relative);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
-    {
+fn safe_path(root: &Path, requested: &str, writing: bool) -> Result<PathBuf, String> {
+    let requested = Path::new(requested);
+    if requested.components().any(|part| {
+        matches!(part, Component::ParentDir)
+            || (!requested.is_absolute()
+                && matches!(part, Component::Prefix(_) | Component::RootDir))
+    }) {
         return Err("路径必须位于项目目录内".into());
     }
     let root = root.canonicalize().map_err(|_| "项目目录不可用")?;
-    let path = root.join(relative);
+    let path = root.join(requested);
     let existing = if path.exists() {
         path.clone()
     } else if writing {
@@ -430,7 +430,7 @@ fn safe_path(root: &Path, relative: &str, writing: bool) -> Result<PathBuf, Stri
         .canonicalize()
         .map_err(|_| "目录不存在，请先选择已有目录")?;
     if !resolved.starts_with(&root) {
-        return Err("符号链接指向了项目之外".into());
+        return Err("路径必须位于项目目录内（包括符号链接的实际目标）".into());
     }
     Ok(path)
 }
@@ -1507,6 +1507,73 @@ mod tests {
                     })
             );
         }
+    }
+
+    #[test]
+    fn project_absolute_paths_are_allowed_but_sibling_paths_still_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("项目 with spaces");
+        let sibling = directory.path().join("项目 with spaces-other");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(root.join("src/file.txt"), "inside").unwrap();
+        std::fs::write(sibling.join("outside.txt"), "outside").unwrap();
+        for path in [root.clone(), root.join("src"), root.join("src/file.txt")] {
+            assert_eq!(
+                safe_path(&root, path.to_str().unwrap(), false)
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                path.canonicalize().unwrap()
+            );
+        }
+        assert!(safe_path(&root, ".", false).is_ok());
+        assert!(safe_path(&root, "src/file.txt", false).is_ok());
+        assert!(safe_path(&root, root.join("new.txt").to_str().unwrap(), true).is_ok());
+        for path in [sibling.clone(), sibling.join("outside.txt")] {
+            assert!(safe_path(&root, path.to_str().unwrap(), false).is_err());
+        }
+        assert!(safe_path(&root, sibling.join("new.txt").to_str().unwrap(), true).is_err());
+        assert!(safe_path(&root, "../项目 with spaces-other/outside.txt", false).is_err());
+        #[cfg(windows)]
+        for path in [r"C:src", r"\Windows", r"/Windows"] {
+            assert!(safe_path(&root, path, false).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_cannot_escape_through_symlink_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("data"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(safe_path(&root, root.join("link/data").to_str().unwrap(), false).is_err());
+        assert!(safe_path(&root, root.join("link/new").to_str().unwrap(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn command_with_absolute_project_cwd_reaches_the_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let context = crate::edits::tests::context(&root);
+        let record=execute(ToolCall {id:"absolute-project-cwd".into(),name:"run_command".into(),arguments:json!({"program":"git","args":["--version"],"cwd":root,"timeout_seconds":30})},&context).await;
+        assert!(record.success, "{}", record.result);
+        let result: serde_json::Value = serde_json::from_str(&record.result).unwrap();
+        assert_eq!(result["status"], "completed");
+        assert!(
+            result["stdout"]
+                .as_str()
+                .unwrap()
+                .starts_with("git version")
+        );
+        let outside=execute(ToolCall {id:"outside-project-cwd".into(),name:"run_command".into(),arguments:json!({"program":"must-not-be-started","args":[],"cwd":directory.path()})},&context).await;
+        assert!(!outside.success);
+        assert!(outside.result.contains("项目目录内"));
     }
 
     #[test]
