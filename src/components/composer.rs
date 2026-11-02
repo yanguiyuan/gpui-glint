@@ -583,7 +583,16 @@ impl Composer {
         } else {
             self.menu_chips.push(chip);
         }
-        self.open_chip = None;
+        // Refreshing another toolbar menu must not dismiss the active menu.
+        // Keep this menu open too while its options are still available.
+        if self.open_chip.as_ref().is_some_and(|id| {
+            self.menu_chips
+                .iter()
+                .find(|chip| &chip.id == id)
+                .is_none_or(|chip| chip.options.is_empty())
+        }) {
+            self.open_chip = None;
+        }
         cx.notify();
     }
 
@@ -2632,6 +2641,56 @@ mod tests {
             composer.set_menu_chip(ComposerChip::new("model").option("c", "C"), cx);
             assert_eq!(composer.chip_values["model"].as_ref(), "c");
         });
+    }
+
+    #[gpui::test]
+    fn toolbar_refresh_keeps_model_menu_open_until_options_are_removed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let composer = cx.new(|cx| {
+            Composer::new("Message", cx).menu_chip(ComposerChip::new("model").option("a", "A"))
+        });
+        composer.update(cx, |composer, cx| {
+            composer.open_chip = Some("model".into());
+            composer.set_menu_chip(ComposerChip::new("partner").option("none", "None"), cx);
+            assert_eq!(composer.open_chip.as_deref(), Some("model"));
+            composer.set_menu_chip(ComposerChip::new("model").option("b", "B"), cx);
+            assert_eq!(composer.open_chip.as_deref(), Some("model"));
+            assert_eq!(composer.chip_values["model"].as_ref(), "b");
+            composer.set_menu_chip(ComposerChip::new("model"), cx);
+            assert!(composer.open_chip.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn hovering_between_model_rows_keeps_menu_open(cx: &mut gpui::TestAppContext) {
+        let (composer, window) = cx.add_window_view(|_, cx| {
+            Composer::new("Message", cx).menu_chip(
+                ComposerChip::new("model")
+                    .option("a", "A")
+                    .option("b", "B")
+                    .option("c", "C"),
+            )
+        });
+        composer.update(window, |composer, cx| {
+            composer.open_chip = Some("model".into());
+            cx.notify();
+        });
+        for selector in [
+            "composer-option:model:a",
+            "composer-option:model:b",
+            "composer-option:model:c",
+            "composer-option:model:b",
+            "composer-option:model:a",
+        ] {
+            let row = window.debug_bounds(selector).unwrap();
+            window.simulate_mouse_move(row.center(), None, Default::default());
+            window.run_until_parked();
+            composer.read_with(window, |composer, _| {
+                assert_eq!(composer.open_chip.as_deref(), Some("model"));
+            });
+            assert!(window.debug_bounds("composer-chip-menu").is_some());
+        }
     }
 
     #[gpui::test]
