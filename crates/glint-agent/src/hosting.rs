@@ -43,6 +43,7 @@ impl AgentWorkspace {
     pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
         self.project_picker_open = false;
+        self.git_ui.picker_open = false;
         match page {
             Page::Chat => {
                 self.sync_skill_context(cx);
@@ -75,6 +76,7 @@ impl AgentWorkspace {
 
     pub fn set_host_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         self.theme = theme;
+        self.set_git_theme(theme, cx);
         self.composer
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
         self.search

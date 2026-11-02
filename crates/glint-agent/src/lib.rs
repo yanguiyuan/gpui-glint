@@ -20,6 +20,8 @@ mod edits;
 mod edits_ui;
 mod file_preview;
 mod generation;
+mod git_project;
+mod git_ui;
 mod images;
 mod mcp;
 mod mcp_ui;
@@ -79,6 +81,7 @@ use uuid::Uuid;
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
 pub struct AgentWorkspace {
+    git_ui: git_ui::State,
     commands: commands::State,
     right_sidebar_width: f32,
     right_sidebar_resize: Option<(gpui::Pixels, f32)>,
@@ -580,6 +583,7 @@ impl AgentWorkspace {
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
+            git_ui: git_ui::State::new(theme, cx),
             outline,
             pending: None,
             titles,
@@ -638,6 +642,7 @@ impl AgentWorkspace {
     }
 
     fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        self.git_ui.picker_open = false;
         self.file_preview.hover_task = None;
         self.file_preview.open = false;
         self.sync_todos(cx);
@@ -2077,7 +2082,9 @@ impl AgentWorkspace {
                                 .items_center()
                                 .px_3()
                                 .py_2()
-                                .child(self.project_selector(cx)),
+                                .gap_2()
+                                .child(self.project_selector(cx))
+                                .children(self.git_branch_selector(cx)),
                         )
                     })
                     .child(self.composer.clone()),
@@ -2180,6 +2187,10 @@ impl AgentWorkspace {
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.execute_pending_command(window, cx);
+        self.refresh_git_repository(false, cx);
+        if self.file_preview.open || self.edits_ui.open {
+            self.git_ui.open = false;
+        }
         let command_overlay = self
             .commands
             .palette
@@ -2258,36 +2269,51 @@ impl Render for AgentWorkspace {
                             .min_w_0()
                             .flex()
                             .child(div().flex_1().min_w_0().h_full().child(self.content(cx)))
-                            .when(self.file_preview.open || self.edits_ui.open, |body| {
-                                body.child(
-                                    div()
-                                        .id("agent-right-sidebar-resize")
-                                        .debug_selector(|| "agent-right-sidebar-resize".into())
-                                        .w(px(5.))
-                                        .h_full()
-                                        .flex_shrink_0()
-                                        .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                        .hover(|s| s.bg(rgb(self.theme.palette().accent)))
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            cx.listener(
-                                                |this, event: &gpui::MouseDownEvent, _, cx| {
-                                                    this.right_sidebar_resize = Some((
-                                                        event.position.x,
-                                                        this.right_sidebar_width,
-                                                    ));
-                                                    cx.stop_propagation();
-                                                    cx.notify();
-                                                },
+                            .when(
+                                self.file_preview.open || self.edits_ui.open || self.git_ui.open,
+                                |body| {
+                                    body.child(
+                                        div()
+                                            .id("agent-right-sidebar-resize")
+                                            .debug_selector(|| "agent-right-sidebar-resize".into())
+                                            .w(px(5.))
+                                            .h_full()
+                                            .flex_shrink_0()
+                                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                            .hover(|s| s.bg(rgb(self.theme.palette().accent)))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                        this.right_sidebar_resize = Some((
+                                                            event.position.x,
+                                                            this.right_sidebar_width,
+                                                        ));
+                                                        cx.stop_propagation();
+                                                        cx.notify();
+                                                    },
+                                                ),
                                             ),
-                                        ),
-                                )
-                            })
+                                    )
+                                },
+                            )
                             .when(self.file_preview.open, |body| {
                                 body.child(self.file_preview_sidebar(cx))
                             })
                             .when(self.edits_ui.open, |body| {
                                 body.child(self.edits_sidebar(cx))
+                            })
+                            .when(self.git_ui.open, |body| {
+                                body.child(
+                                    div()
+                                        .w(px(self.right_sidebar_width))
+                                        .min_w(px(240.))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .border_l_1()
+                                        .border_color(rgb(self.theme.palette().border))
+                                        .child(self.git_sidebar_content(cx)),
+                                )
                             })
                     })
                     .into_any_element(),
@@ -2324,6 +2350,7 @@ impl Render for AgentWorkspace {
                 root.child(self.ssh_project_dialog(cx))
             })
             .children(command_overlay)
+            .child(self.git_ui.toasts.clone())
     }
 }
 

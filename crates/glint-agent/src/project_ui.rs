@@ -115,6 +115,9 @@ impl AgentWorkspace {
             .on_open_change(move |open, _, cx| {
                 let _ = weak.update(cx, |this, cx| {
                     this.project_picker_open = open;
+                    if open {
+                        this.git_ui.picker_open = false;
+                    }
                     cx.notify();
                 });
             })

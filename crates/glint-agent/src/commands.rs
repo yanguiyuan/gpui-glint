@@ -51,6 +51,11 @@ impl AgentWorkspace {
             CommandItem::new("ssh", "打开 SSH 项目")
                 .icon(Icon::Globe)
                 .group("项目"),
+            CommandItem::new("gitgraph", "打开 GitGraph 侧栏")
+                .icon(Icon::GitBranch)
+                .group("项目")
+                .keywords("git graph 分支 提交 历史 对比 差异")
+                .disabled(session.project.is_none()),
             CommandItem::new("settings", "设置")
                 .icon(Icon::Settings)
                 .group("应用"),
@@ -80,6 +85,7 @@ impl AgentWorkspace {
             "compact" => self.compact_session(cx),
             "local" => self.open_project(cx),
             "ssh" => self.open_ssh_project(window, cx),
+            "gitgraph" => self.open_git_graph(cx),
             "settings" => self.open_settings(window, cx),
             value if value.starts_with("session:") => {
                 if let Ok(id) = Uuid::parse_str(&value[8..]) {
