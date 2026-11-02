@@ -16,8 +16,10 @@ use gpui_glint::{
     theme::ThemePreset,
 };
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 gpui::actions!(
@@ -36,7 +38,8 @@ struct OpenDoc {
     id: u64,
     path: PathBuf,
     markdown: String,
-    saved: String,
+    persistence: Arc<storage::SaveSession>,
+    autosave: Option<gpui::Task<()>>,
     editor: Entity<DocumentEditor>,
     source: Entity<CodeCard>,
     source_mode: bool,
@@ -58,6 +61,9 @@ struct MarkdownWorkspace {
     search: Entity<TextEntry>,
     notice: String,
     toasts: Entity<ToastHost>,
+    search_query: String,
+    search_matches: HashSet<PathBuf>,
+    search_task: Option<gpui::Task<()>>,
     _search_subscription: Subscription,
     _theme_subscription: Subscription,
 }
@@ -67,6 +73,11 @@ impl MarkdownWorkspace {
         let search = cx.new(|cx| TextEntry::new(cx, "搜索文档内容或标题", ""));
         let subscription = cx.observe(&search, |this, search, cx| {
             let query = search.read(cx).value().trim().to_owned();
+            if this.search_query == query {
+                return;
+            }
+            this.search_query = query.clone();
+            this.refresh_search(cx);
             for doc in &this.documents {
                 doc.editor
                     .update(cx, |editor, cx| editor.set_search_query(query.clone(), cx));
@@ -109,6 +120,9 @@ impl MarkdownWorkspace {
             root,
             search,
             notice: "改动自动保存到本机".into(),
+            search_query: String::new(),
+            search_matches: HashSet::new(),
+            search_task: None,
             _search_subscription: subscription,
             _theme_subscription: theme_subscription,
         };
@@ -292,7 +306,8 @@ impl MarkdownWorkspace {
             self.documents.push(OpenDoc {
                 id,
                 path: path.clone(),
-                saved,
+                persistence: Arc::new(storage::SaveSession::new(saved)),
+                autosave: None,
                 markdown,
                 editor,
                 source,
@@ -325,30 +340,84 @@ impl MarkdownWorkspace {
         self.open_path(path, cx);
     }
 
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
+        self.search_matches.clear();
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            return;
+        }
+        let paths = self.recent.clone();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            let matches = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter(|path| {
+                            storage::title(path).to_lowercase().contains(&query)
+                                || fs::read_to_string(path)
+                                    .is_ok_and(|s| s.to_lowercase().contains(&query))
+                        })
+                        .collect::<HashSet<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.search_matches = matches;
+                cx.notify();
+            });
+        }));
+    }
+
     fn changed(&mut self, id: u64, content: String, cx: &mut Context<Self>) {
         if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
             doc.markdown = content;
+            let revision = doc.persistence.advance();
+            let persistence = doc.persistence.clone();
+            let path = doc.path.clone();
+            doc.autosave = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                let Ok(Some(source)) = this.update(cx, |this, _| {
+                    this.documents
+                        .iter()
+                        .find(|doc| doc.id == id)
+                        .map(|doc| doc.markdown.clone())
+                }) else {
+                    return;
+                };
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { persistence.save(&path, &source, revision) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(true) => this.notice = "已保存到本机".into(),
+                        Ok(false) => return,
+                        Err(error) => {
+                            this.notice = format!("保存失败，改动仍在当前标签中：{error}")
+                        }
+                    }
+                    cx.notify();
+                });
+            }));
         }
-        self.save(id);
         cx.notify();
     }
 
+    // Explicit save/close/quit must flush the latest snapshot before proceeding.
     fn save(&mut self, id: u64) -> bool {
         let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) else {
             return true;
         };
-        if doc.markdown == doc.saved {
-            storage::clear_recovery(&doc.path);
-            return true;
-        }
-        if let Err(error) = storage::write_recovery(&doc.path, &doc.saved, &doc.markdown) {
-            self.notice = format!("恢复记录写入失败，改动仍在当前标签中：{error}");
-            return false;
-        }
-        match storage::save(&doc.path, &doc.saved, &doc.markdown) {
-            Ok(()) => {
-                doc.saved = doc.markdown.clone();
-                storage::clear_recovery(&doc.path);
+        doc.autosave = None;
+        let revision = doc.persistence.advance();
+        match doc.persistence.save(&doc.path, &doc.markdown, revision) {
+            Ok(_) => {
                 self.notice = "已保存到本机".into();
                 true
             }
@@ -385,6 +454,7 @@ impl MarkdownWorkspace {
                     .map(|d| d.id);
             }
         }
+        self.refresh_search(cx);
         self.persist_session();
         cx.notify();
     }
@@ -423,6 +493,7 @@ impl MarkdownWorkspace {
                 }
             }
         }
+        self.refresh_search(cx);
         self.persist_session();
         cx.notify();
     }
@@ -727,9 +798,7 @@ impl Render for MarkdownWorkspace {
             let content_matches = !query.is_empty()
                 && open_doc
                     .map(|d| d.markdown.to_lowercase().contains(&query))
-                    .unwrap_or_else(|| {
-                        fs::read_to_string(path).is_ok_and(|s| s.to_lowercase().contains(&query))
-                    });
+                    .unwrap_or_else(|| self.search_matches.contains(path));
             if !query.is_empty() && !name.to_lowercase().contains(&query) && !content_matches {
                 continue;
             }

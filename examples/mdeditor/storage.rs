@@ -155,6 +155,44 @@ pub fn write_recovery(path: &Path, saved: &str, source: &str) -> io::Result<()> 
     )
 }
 
+/// Serializes background and explicit saves, rejecting superseded snapshots.
+pub struct SaveSession {
+    saved: std::sync::Mutex<String>,
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl SaveSession {
+    pub fn new(saved: String) -> Self {
+        Self {
+            saved: std::sync::Mutex::new(saved),
+            revision: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn advance(&self) -> u64 {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    pub fn save(&self, path: &Path, source: &str, revision: u64) -> io::Result<bool> {
+        let mut saved = self
+            .saved
+            .lock()
+            .map_err(|_| io::Error::other("保存任务异常"))?;
+        if self.revision.load(std::sync::atomic::Ordering::SeqCst) != revision {
+            return Ok(false);
+        }
+        if *saved != source {
+            write_recovery(path, &saved, source)?;
+            save(path, &saved, source)?;
+            *saved = source.to_owned();
+        }
+        clear_recovery(path);
+        Ok(true)
+    }
+}
+
 pub fn read_recovery(path: &Path) -> io::Result<Option<(String, String)>> {
     let contents = match fs::read_to_string(recovery_path(path)) {
         Ok(contents) => contents,
@@ -257,6 +295,29 @@ mod tests {
         for invalid in ["", "../escape", "a/b", "a\\b", ".hidden", "a\n"] {
             assert!(filename(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn save_session_skips_stale_jobs_and_serializes_snapshots() {
+        let root = Library::new();
+        let path = create(&root.0, "autosave", "original").unwrap();
+        let session = SaveSession::new("original".into());
+        let stale = session.advance();
+        let current = session.advance();
+        assert!(!session.save(&path, "stale", stale).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert!(session.save(&path, "current", current).unwrap());
+        assert!(!session.save(&path, "stale", stale).unwrap());
+        let next = session.advance();
+        assert!(session.save(&path, "next", next).unwrap());
+        fs::write(&path, "external").unwrap();
+        assert!(
+            session
+                .save(&path, "conflicting", session.advance())
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        assert_eq!(read_recovery(&path).unwrap().unwrap().1, "conflicting");
     }
 
     #[test]
