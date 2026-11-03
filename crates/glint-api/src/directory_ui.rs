@@ -2,6 +2,11 @@ use super::*;
 use model::{DefaultSection as Section, DirectoryDefaults};
 use std::collections::{BTreeMap, BTreeSet};
 
+struct ActionEnvironmentSettings {
+    fields: Vec<(String, Entity<TextEntry>)>,
+    panel: Entity<gpui_glint::components::CollapsePanel>,
+}
+
 pub(super) struct DirectorySettings {
     pub(super) collection: usize,
     path: String,
@@ -21,6 +26,7 @@ pub(super) struct DirectorySettings {
     form: Vec<PairInput>,
     pair_delete: Option<(Section, bool, gpui::EntityId)>,
     actions: Vec<(String, model::BeforeAction)>,
+    action_settings: BTreeMap<(String, String), ActionEnvironmentSettings>,
     triggers: Vec<model::Trigger>,
     tls: bool,
     completions: Vec<TextCompletion>,
@@ -214,6 +220,38 @@ impl DirectorySettings {
                 }
             }
         }
+        let mut action_settings = BTreeMap::new();
+        for (_, binding) in &actions {
+            let Some(plugin) = catalog.iter().find(|p| p.identity() == binding.id) else {
+                continue;
+            };
+            let fields: Vec<_> = plugin
+                .manifest
+                .capabilities
+                .iter()
+                .filter_map(|c| c.strip_prefix("environment.read."))
+                .map(|name| {
+                    let value = binding
+                        .environment_bindings
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let entry = cx.new(|cx| {
+                        TextEntry::new(cx, name.to_owned(), value)
+                            .font_size(12.)
+                            .theme(theme)
+                    });
+                    (name.to_owned(), entry)
+                })
+                .collect();
+            if !fields.is_empty() {
+                let panel = super::plugin_ui::environment_settings_panel(fields.clone(), theme, cx);
+                action_settings.insert(
+                    (binding.id.clone(), binding.action_id.clone()),
+                    ActionEnvironmentSettings { fields, panel },
+                );
+            }
+        }
         Self {
             collection,
             path: path.clone(),
@@ -237,6 +275,7 @@ impl DirectorySettings {
             form,
             pair_delete: None,
             actions,
+            action_settings,
             triggers: draft.triggers.clone(),
             tls: draft.skip_tls_verification,
             completions,
@@ -250,6 +289,14 @@ impl DirectorySettings {
     ) {
         self.theme = theme;
         self.completions = completions.clone();
+        for settings in self.action_settings.values() {
+            for (_, entry) in &settings.fields {
+                entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
+            }
+            settings
+                .panel
+                .update(cx, |panel, cx| panel.set_theme(theme, cx));
+        }
         for field in [&self.endpoint, &self.authentication] {
             field.update(cx, |field, cx| {
                 field.set_theme(theme, cx);
@@ -319,7 +366,29 @@ impl DirectorySettings {
             body: self.body.read(cx).content().into(),
             body_format: self.body_format,
             form: pairs(&self.form),
-            plugins: self.actions.iter().map(|(_, a)| a.clone()).collect(),
+            plugins: self
+                .actions
+                .iter()
+                .map(|(_, a)| {
+                    let mut action = a.clone();
+                    if let Some(settings) = self
+                        .action_settings
+                        .get(&(a.id.clone(), a.action_id.clone()))
+                    {
+                        for (name, entry) in &settings.fields {
+                            let value = entry.read(cx).value().trim();
+                            if value.is_empty() {
+                                action.environment_bindings.remove(name);
+                            } else {
+                                action
+                                    .environment_bindings
+                                    .insert(name.clone(), value.to_owned());
+                            }
+                        }
+                    }
+                    action
+                })
+                .collect(),
             triggers: self.triggers.clone(),
             skip_tls_verification: self.tls,
             ..Draft::default()
@@ -647,8 +716,8 @@ impl Render for DirectorySettings {
                         .child("按列表顺序执行，使用箭头调整顺序。");
                     for (i, (title, binding)) in self.actions.iter().enumerate() {
                         let owner = cx.entity();
-                        list = list.child(
-                            div()
+                        let settings = self.action_settings.get(&(binding.id.clone(), binding.action_id.clone()));
+                        let header = div()
                                 .id(("directory-action", i))
                                 .flex()
                                 .items_center()
@@ -689,8 +758,14 @@ impl Render for DirectorySettings {
                                             });
                                         })
                                         .render(),
-                                ),
-                        );
+                                );
+                        list = list.child(div().id(("directory-action-card", i))
+                            .p_3().border_1().border_color(rgb(p.border)).rounded_md()
+                            .flex().flex_col().gap_2().child(header)
+                            .when_some(settings, |card, settings| card
+                                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted))
+                                    .child(format!("所需环境变量：{}", settings.fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join("、"))))
+                                .child(settings.panel.clone())));
                     }
                     list
                 }
@@ -770,6 +845,100 @@ mod tests {
             sections: sections.iter().copied().collect(),
             draft,
         }
+    }
+    #[gpui::test]
+    fn directory_plugin_bindings_survive_reorder_save_inheritance_and_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            h.group_edit = Some(GroupEdit::CreateCollection);
+            h.group_name.update(cx, |e, cx| e.set_value("API", cx));
+            h.save_group(cx);
+            h.workspace.collections[0].add_child("", "Parent").unwrap();
+            h.workspace.collections[0]
+                .add_child("Parent", "Child")
+                .unwrap();
+            h.open_directory_settings(0, "Parent".into(), cx);
+            h
+        });
+        let editor = host.read_with(window, |h, _| h.directory_settings.clone().unwrap());
+        let key = editor.update(window, |e, cx| {
+            e.sections.insert(Section::Plugins);
+            e.selected = Section::Plugins;
+            let i = e
+                .actions
+                .iter()
+                .position(|(_, a)| a.id == "com.wps.wps2")
+                .unwrap();
+            e.actions[i].1.enabled = true;
+            let a = &e.actions[i].1;
+            let key = (a.id.clone(), a.action_id.clone());
+            let settings = &e.action_settings[&key];
+            for (name, entry) in &settings.fields {
+                entry.update(cx, |entry, cx| {
+                    entry.set_value(format!("  {name}_custom  "), cx)
+                });
+            }
+            e.actions.swap(0, i);
+            e.save(cx);
+            key
+        });
+        window.run_until_parked();
+        host.update(window, |h, cx| {
+            let inherited = h.workspace.collections[0].request_defaults("Parent/Child");
+            assert_eq!(inherited.plugins[0].id, key.0);
+            assert!(inherited.plugins[0].enabled);
+            assert_eq!(
+                inherited.plugins[0].environment_bindings["wps_app_id"],
+                "wps_app_id_custom"
+            );
+            assert_eq!(
+                inherited.plugins[0].environment_bindings["wps_app_key"],
+                "wps_app_key_custom"
+            );
+            h.add_request_to("Parent/Child".into(), cx);
+            assert_eq!(h.snapshot(cx).plugins, inherited.plugins);
+            h.persist(cx);
+            h.open_directory_settings(0, "Parent/Child".into(), cx);
+        });
+        let restored = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(
+            restored.collections[0]
+                .request_defaults("Parent/Child")
+                .plugins[0]
+                .environment_bindings["wps_app_key"],
+            "wps_app_key_custom"
+        );
+        let child = host.read_with(window, |h, _| h.directory_settings.clone().unwrap());
+        child.update(window, |e, cx| {
+            e.sections.insert(Section::Plugins);
+            let settings = &e.action_settings[&key];
+            let entry = &settings
+                .fields
+                .iter()
+                .find(|(name, _)| name == "wps_app_id")
+                .unwrap()
+                .1;
+            assert_eq!(entry.read(cx).value(), "wps_app_id_custom");
+            entry.update(cx, |entry, cx| entry.set_value("  ", cx));
+            e.actions[0].1.enabled = false;
+            let saved = e.snapshot(cx);
+            assert!(!saved.draft.plugins[0].enabled);
+            assert!(
+                !saved.draft.plugins[0]
+                    .environment_bindings
+                    .contains_key("wps_app_id")
+            );
+            assert_eq!(
+                saved.draft.plugins[0].environment_bindings["wps_app_key"],
+                "wps_app_key_custom"
+            );
+            e.sections.remove(&Section::Plugins);
+            assert!(e.snapshot(cx).draft.plugins.is_empty());
+        });
     }
     #[test]
     fn nested_defaults_replace_sections_and_follow_tree_changes() {

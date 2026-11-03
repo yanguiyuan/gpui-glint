@@ -7,5 +7,6 @@ declare const glint: {
 
 /** Crypto host calls require the `crypto` capability. */
 // crypto.md5Hex(text): lowercase hexadecimal digest.
+// crypto.sha1Hex(text): lowercase hexadecimal digest (legacy protocol compatibility).
 // crypto.hmacSha256VerifyBase64Url(key, text, signature): boolean; no Base64 padding.
 // crypto.aes256CbcPkcs7DecryptBase64(key, iv, ciphertext): UTF-8 plaintext, strict padding.

@@ -11,6 +11,40 @@ pub(super) struct EnvironmentSettings {
     _subscriptions: Vec<Subscription>,
 }
 
+pub(super) fn environment_settings_panel<V: 'static>(
+    fields: Vec<(String, Entity<TextEntry>)>,
+    theme: ThemePreset,
+    cx: &mut Context<V>,
+) -> Entity<gpui_glint::components::CollapsePanel> {
+    cx.new(|_| {
+        gpui_glint::components::CollapsePanel::new("更多设置")
+            .compact()
+            .theme(theme)
+            .content(move |_, _| {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .child("填写优先读取的环境变量名；留空或名称不存在时回退到默认变量。"),
+                    )
+                    .children(fields.iter().map(|(name, entry)| {
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_size(px(11.)).child(format!("{name} · 优先读取")))
+                            .child(entry.clone())
+                    }))
+                    .into_any_element()
+            })
+    })
+}
+
 fn metadata_badge(label: impl Into<gpui::SharedString>, theme: ThemePreset) -> gpui::Div {
     CountBadge::new(label)
         .kind(CountBadgeKind::Muted)
@@ -152,35 +186,7 @@ impl Workbench {
                 .collect();
             let content_fields = fields.clone();
             EnvironmentSettings {
-                panel: cx.new(|_| {
-                    gpui_glint::components::CollapsePanel::new("更多设置")
-                        .compact()
-                        .theme(self.theme)
-                        .content(move |_, _| {
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(div().text_size(px(11.)).child(
-                                    "填写优先读取的环境变量名；留空或名称不存在时回退到默认变量。",
-                                ))
-                                .children(content_fields.iter().map(|(name, entry)| {
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .child(format!("{name} · 优先读取")),
-                                        )
-                                        .child(entry.clone())
-                                }))
-                                .into_any_element()
-                        })
-                }),
+                panel: environment_settings_panel(content_fields, self.theme, cx),
                 fields,
                 saved: binding.environment_bindings.clone(),
                 _subscriptions: subscriptions,
@@ -1206,7 +1212,10 @@ impl Workbench {
                     div()
                         .text_size(px(10.))
                         .text_color(rgb(p.text_muted))
-                        .child(format!("本地开发目录：{}", gpui_glint::paths::display_path(path))),
+                        .child(format!(
+                            "本地开发目录：{}",
+                            gpui_glint::paths::display_path(path)
+                        )),
                 );
             }
             for error in &self.plugin_errors {

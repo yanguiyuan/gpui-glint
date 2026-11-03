@@ -15,6 +15,13 @@ fn arg(args: &Value, index: usize) -> crate::Result<&str> {
         .ok_or_else(|| PluginError("Expected string".into()))
 }
 pub(crate) fn extend(host: &mut HostRegistry) {
+    host.register("crypto.sha1Hex", "crypto", |args| {
+        Ok(Value::String(format!(
+            "{:x}",
+            sha1::Sha1::digest(arg(&args, 0)?.as_bytes())
+        )))
+    })
+    .expect("unique builtin");
     host.register("crypto.md5Hex", "crypto", |args| {
         Ok(Value::String(format!(
             "{:x}",

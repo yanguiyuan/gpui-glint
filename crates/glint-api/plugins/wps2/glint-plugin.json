@@ -1,0 +1,10 @@
+{
+  "id": "com.wps.wps2",
+  "name": "WPS-2 签名",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": ["crypto", "request.read", "environment.read.wps_app_id", "environment.read.wps_app_key", "request.header.date", "request.header.content-type", "request.header.content-md5", "request.header.authorization"],
+  "hooks": ["request.before-send"],
+  "contributions": [{"id":"sign-request","kind":"request.before-send","title":"WPS-2 签名","hook":"request.before-send"}]
+}

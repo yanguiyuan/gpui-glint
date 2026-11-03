@@ -291,12 +291,14 @@ impl Workbench {
                                     .gap_2()
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_size(px(12.))
                                             .child(r.label.clone()),
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .px_2()
                                             .py(px(2.))
                                             .rounded_full()
@@ -313,10 +315,14 @@ impl Workbench {
                                             }))
                                             .child(if current { "当前" } else { "基线" }),
                                     )
-                                    .child(div().flex_1().min_w_0())
                                     .child(self.version_tag_popover(i, r, cx))
                                     .child(
                                         div()
+                                            .debug_selector(move || {
+                                                format!("version-time-{i}").into()
+                                            })
+                                            .flex_shrink_0()
+                                            .whitespace_nowrap()
                                             .font_family("Menlo")
                                             .text_size(px(9.))
                                             .text_color(rgb(p.text_muted))

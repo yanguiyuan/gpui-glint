@@ -299,7 +299,9 @@ WPS 与飞书的预设配置分别来自独立插件 `plugins/wps-oauth/glint-pl
 
 内置 `WPS KSO-1 签名`：在当前环境中保存 `wps_app_id` 和 `wps_app_key`，将后者标记为敏感，再在请求的前置动作页启用。它可以与 Bearer 同时使用。算法只存在于 `plugins/wps-kso1/main.js`，不写入公共运行时；使用实际编码后的 URI、原始发送 body 和最终 Content-Type，空 body 的摘要为空字符串。
 
-卡片的「更多设置」默认收起，可指定优先读取的变量名，例如 wps_app_id1；名称不存在或设置留空时回退到原变量名。匹配到空值时会提示补全。配置按请求保存，并随版本、历史和工作区恢复；插件仅接收已声明的输入。
+内置 `WPS-2 签名`：在前置动作页启用，`wps_app_id` 对应 access key，`wps_app_key` 对应 secret key，也可在「更多设置」中绑定自定义变量名。按 pixeldata 的默认 auto 规则，body 去除空白后非空时对原始 body 做 MD5，否则对实际编码后的路径及 query 做 MD5（保留网关前缀、参数顺序和编码）。沿用请求的 Content-Type，缺省为 `application/json`，每次发送生成 UTC Date，并写入 Date、Content-Type、Content-MD5 和 `Authorization: WPS-2:<accessKey>:<SHA1(secretKey + contentMD5 + contentType + date)>`。此动作会覆盖 Authorization，应与请求的授权配置保持一致。算法位于 `plugins/wps2/main.js`。
+
+请求页与目录设置中的前置动作卡片均提供默认收起的「更多设置」，可指定优先读取的变量名，例如 wps_app_id1；名称不存在或设置留空时回退到原变量名。匹配到空值时会提示补全。目录中的绑定随默认配置保存、继承到子目录并复制到新建请求，动作排序与开关不会清除绑定。请求中的配置按请求保存，并随版本、历史和工作区恢复；插件仅接收已声明的输入。
 
 自定义插件放在工作区 SQLite 文件旁的 `plugins/<插件目录>/`，包含 `glint-plugin.json` 和 `main.js`，在插件管理页点击“刷新已安装插件”重新发现，再在请求中显式启用。可从内置模板复制，使用不同的插件 ID。通过 `contributions` 注册 `request.before-send` 类型动作，每个动作独立指定 ID、标题和同步 hook；不接受页面贡献；未安装或权限无效的已启用插件会阻止发送。
 

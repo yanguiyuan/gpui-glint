@@ -5,6 +5,29 @@ fn plugin(source: &str, capabilities: &[&str]) -> Plugin {
     Plugin::from_source(&json!({"id":"test.plugin","name":"Test","version":"1.0.0","api_version":1,"entry":"main.js","capabilities":capabilities,"hooks":["database.inspect"]}).to_string(), source).unwrap()
 }
 #[test]
+fn sha1_legacy_digest_requires_crypto_capability_and_string_input() {
+    for capabilities in [vec!["crypto"], vec![]] {
+        let p = plugin(
+            "glint.on('database.inspect', text => glint.host.call('crypto.sha1Hex', text));",
+            &capabilities,
+        );
+        let mut runtime = PluginRuntime::activate(
+            &p,
+            HostRegistry::default().with_crypto(),
+            p.manifest.capabilities.clone(),
+            Limits::default(),
+        )
+        .unwrap();
+        let digest = runtime.invoke("database.inspect", &json!("abc"));
+        if capabilities.is_empty() {
+            assert!(digest.is_err());
+        } else {
+            assert_eq!(digest.unwrap(), "a9993e364706816aba3e25717850c26c9cd0d89d");
+            assert!(runtime.invoke("database.inspect", &json!(123)).is_err());
+        }
+    }
+}
+#[test]
 fn database_host_api_is_independent_of_http_and_gpui() {
     let plugin = plugin(
         "glint.on('database.inspect', input => glint.host.call('database.describe', input.table));",

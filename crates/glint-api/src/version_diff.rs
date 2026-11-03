@@ -350,9 +350,37 @@ impl Render for VersionDiff {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(16.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{} · 版本对比", self.name)),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{} · 版本对比", self.name)),
+                            )
+                            .child(
+                                Button::new(if self.show_unchanged {
+                                    "隐藏未修改项"
+                                } else {
+                                    "显示未修改项"
+                                })
+                                .kind(ButtonKind::Plain)
+                                .size(ButtonSize::Mini)
+                                .theme(self.theme)
+                                .render()
+                                .flex_shrink_0()
+                                .debug_selector(|| "diff-toggle-unchanged".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.show_unchanged = !this.show_unchanged;
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
                     )
                     .child(
                         div()
@@ -385,22 +413,6 @@ impl Render for VersionDiff {
                                     ""
                                 }
                             )),
-                    )
-                    .child(
-                        Button::new(if self.show_unchanged {
-                            "隐藏未修改项"
-                        } else {
-                            "显示未修改项"
-                        })
-                        .kind(ButtonKind::Plain)
-                        .size(ButtonSize::Mini)
-                        .theme(self.theme)
-                        .render()
-                        .debug_selector(|| "diff-toggle-unchanged".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_unchanged = !this.show_unchanged;
-                            cx.notify();
-                        })),
                     ),
             )
             .child(

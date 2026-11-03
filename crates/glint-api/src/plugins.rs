@@ -71,7 +71,12 @@ pub fn catalog() -> (Vec<Plugin>, Vec<String>) {
         include_str!("../plugins/wps-event-decrypt/main.js"),
     )
     .expect("valid bundled event decoder");
-    let mut plugins = vec![builtin, oauth, feishu, decoder];
+    let wps2 = Plugin::from_source(
+        include_str!("../plugins/wps2/glint-plugin.json"),
+        include_str!("../plugins/wps2/main.js"),
+    )
+    .expect("valid bundled WPS-2 plugin");
+    let mut plugins = vec![builtin, oauth, feishu, decoder, wps2];
     let mut errors = vec![];
     if let Ok(directory) = directory() {
         if let Ok(entries) = std::fs::read_dir(directory) {
@@ -276,6 +281,7 @@ pub fn is_bundled(plugin: &Plugin) -> bool {
     plugin.origin.is_none()
         && [
             "com.wps.kso1",
+            "com.wps.wps2",
             "com.wps.oauth",
             "com.feishu.oauth",
             "com.wps.event-decrypt",
@@ -747,6 +753,79 @@ fn event_presentation(output: Value) -> Result<DecodedEvent, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundled_wps2_matches_independent_vectors_for_body_and_path() {
+        for (body, uri, content_type, md5, signature) in [
+            (
+                "",
+                "/v7/test?key=a%20b&key=a%2Fb&empty=",
+                "",
+                "d0c59de440cbad6c366be76ad77b52cd",
+                "46bea7e0e61a81b7bb781fee7e22d7efa83b2bc6",
+            ),
+            (
+                " \r\n\t",
+                "/v7/test?next=/openapi/v7/a",
+                "application/json",
+                "889cfb550fb79278f593cccd4be00156",
+                "cb98003c1b03fcb1f7ff1d951b1ce77c07e29237",
+            ),
+            (
+                "{\"text\":\"中文\"}\n",
+                "/v7/test",
+                "application/json; charset=utf-8",
+                "d00fc8f8c9e44360b7f7dbdfd330a9fc",
+                "c66f62d1f1e285704d2336bd0748acd1ea999cc3",
+            ),
+        ] {
+            let mut plugin = catalog()
+                .0
+                .into_iter()
+                .find(|p| p.manifest.id == "com.wps.wps2")
+                .unwrap();
+            assert!(is_bundled(&plugin));
+            // Freeze only the clock; digests were computed independently with Python hashlib.
+            plugin.source = format!(
+                "const Date = class {{ toUTCString() {{ return 'Mon, 02 Jan 2006 15:04:05 GMT'; }} }};\n{}",
+                plugin.source
+            );
+            let output = run_job(Job {
+                plugin: plugin.clone(),
+                action_id: "sign-request".into(),
+                request: json!({"method":"POST","uri":uri,"body":body,"headers":{"content-type":content_type}}),
+                variables: BTreeMap::from([
+                    ("wps_app_id".into(), "AK123456".into()),
+                    ("wps_app_key".into(), "sk098765".into()),
+                ]),
+            })
+            .unwrap();
+            let headers = &output["setHeaders"];
+            assert_eq!(headers["Content-MD5"], md5);
+            assert_eq!(
+                headers["Authorization"],
+                format!("WPS-2:AK123456:{signature}")
+            );
+            assert_eq!(headers["Date"], "Mon, 02 Jan 2006 15:04:05 GMT");
+            assert_eq!(
+                headers["Content-Type"],
+                if content_type.is_empty() {
+                    "application/json"
+                } else {
+                    content_type
+                }
+            );
+            assert_eq!(headers.as_object().unwrap().len(), 4);
+            assert!(
+                run_job(Job {
+                    plugin,
+                    action_id: "sign-request".into(),
+                    request: json!({}),
+                    variables: BTreeMap::new(),
+                })
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn custom_environment_names_override_fallback_and_keep_worker_permissions_scoped() {
         let plugin = catalog().0.remove(0);

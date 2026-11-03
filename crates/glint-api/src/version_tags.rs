@@ -33,7 +33,8 @@ impl Workbench {
         let trigger = div()
             .debug_selector(move || format!("version-tag-{index}").into())
             .h(px(22.))
-            .max_w(px(100.))
+            .w_full()
+            .min_w_0()
             .px_1()
             .flex()
             .items_center()
@@ -53,11 +54,17 @@ impl Workbench {
             .child(Icon::Pencil.render(11.).flex_shrink_0().when(!open, |s| {
                 s.opacity(0.).group_hover(hover_group, |s| s.opacity(1.))
             }))
-            .child(div().min_w_0().truncate().child(if record.tag.is_empty() {
-                "标签".to_owned()
-            } else {
-                record.tag.clone()
-            }));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(if record.tag.is_empty() {
+                        "标签".to_owned()
+                    } else {
+                        record.tag.clone()
+                    }),
+            );
         let content = div()
             .debug_selector(|| "version-tag-editor".into())
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
@@ -146,6 +153,10 @@ impl Workbench {
                 });
             })
             .render()
+            .flex_1()
+            .min_w_0()
+            .max_w(px(100.))
+            .ml_auto()
             .into_any_element()
     }
 }
@@ -232,6 +243,11 @@ mod tests {
         });
         click(window, "save-version-tag");
         assert!(window.debug_bounds("version-tag-1").unwrap().size.width <= px(100.));
+        let row = window.debug_bounds("version-record-1").unwrap();
+        let time = window.debug_bounds("version-time-1").unwrap();
+        let tag = window.debug_bounds("version-tag-1").unwrap();
+        assert!(time.right() <= row.right());
+        assert!(tag.right() <= time.left());
         host.update(window, |h, cx| {
             assert_eq!(h.workspace.requests[0].versions[1].tag, long_tag);
             assert_eq!(h.snapshot(cx), latest);
