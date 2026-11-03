@@ -125,6 +125,9 @@ pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent
 mod diff_card;
 pub use diff_card::{DiffCard, DiffCardEvent, DiffColors, DiffLine, DiffLineKind, diff_lines};
 
+mod scroll_chain;
+pub use scroll_chain::ChainScroll;
+
 #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
 mod webview;
 #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]

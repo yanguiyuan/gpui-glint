@@ -160,6 +160,7 @@ impl AgentWorkspace {
                 let mid = goal.id;
                 goal_section = goal_section.child(
                     div()
+                        .id(mid)
                         .p_4()
                         .border_1()
                         .border_color(rgb(p.border))
@@ -198,6 +199,7 @@ impl AgentWorkspace {
                             IconButton::new(Icon::ChevronRight, "查看目标")
                                 .theme(self.theme)
                                 .render()
+                                .debug_selector(move || format!("partner-goal-open-{mid}"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_partner_memory(mid, cx);
                                 })),
@@ -218,6 +220,7 @@ impl AgentWorkspace {
                 let mid = entry.id;
                 timeline = timeline.child(
                     div()
+                        .id(mid)
                         .flex()
                         .gap_3()
                         .py_2()
@@ -279,6 +282,7 @@ impl AgentWorkspace {
                             IconButton::new(Icon::ChevronRight, "查看这段经历")
                                 .theme(self.theme)
                                 .render()
+                                .debug_selector(move || format!("partner-experience-open-{mid}"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_partner_memory(mid, cx);
                                 })),

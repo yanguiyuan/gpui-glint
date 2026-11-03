@@ -9,9 +9,13 @@ mod channels;
 mod chatgpt;
 mod child_process;
 mod code_mode;
+mod code_fonts;
+mod code_fonts_ui;
 mod command_runner;
+mod executable;
 pub use code_mode::worker_main as run_code_mode_worker;
 mod commands;
+mod terminal_ui;
 mod compaction;
 mod context_usage;
 mod database;
@@ -19,6 +23,8 @@ mod discovery;
 mod edit_journal;
 mod edits;
 mod edits_ui;
+mod workspace_diff;
+mod merge_conflicts;
 mod file_preview;
 mod generation;
 mod git_project;
@@ -89,6 +95,7 @@ pub struct AgentWorkspace {
     right_sidebar_width: f32,
     right_sidebar_resize: Option<(gpui::Pixels, f32)>,
     file_preview: file_preview::State,
+    terminal_ui: terminal_ui::State,
     ssh_ui: ssh_ui::State,
     channels: channels::ui::State,
     page: crate::Page,
@@ -96,7 +103,8 @@ pub struct AgentWorkspace {
     focus: gpui::FocusHandle,
     host_shell: Option<gpui_glint::components::ShellRenderer>,
     edits_ui: edits_ui::State,
-    steering_sender: Option<(Uuid, async_channel::Sender<String>)>,
+    code_fonts: code_fonts_ui::State,
+    steering_sender: Option<(Uuid, async_channel::Sender<provider::Steering>)>,
     queued_requests: std::collections::HashMap<u64, (Uuid, provider::Config)>,
     todo_live: todo::Store,
     group_list: Entity<GroupList>,
@@ -397,12 +405,27 @@ impl AgentWorkspace {
                     }
                     ComposerEvent::QueueSteerRequested { id, submission } => {
                         let target = this.queued_requests.get(id).map(|(session, _)| *session);
+                        let text = submission.prompt_text();
+                        // 引导与普通发送共用图片校验/编码；失败时保留队列项并提示原因。
+                        let images = match images::prepare(&submission.images) {
+                            Ok(images) => images,
+                            Err(error) => {
+                                this.provider_error = Some(error);
+                                cx.notify();
+                                return;
+                            }
+                        };
                         let sent =
                             this.steering_sender
                                 .as_ref()
                                 .is_some_and(|(session, sender)| {
                                     Some(*session) == target
-                                        && sender.try_send(submission.prompt_text()).is_ok()
+                                        && sender
+                                            .try_send(provider::Steering {
+                                                text: text.clone(),
+                                                images: images.clone(),
+                                            })
+                                            .is_ok()
                                 });
                         if sent {
                             if let Some((session, _)) = this.queued_requests.remove(id) {
@@ -412,9 +435,10 @@ impl AgentWorkspace {
                                     .iter_mut()
                                     .find(|item| item.id == session)
                                 {
-                                    session.push(
+                                    session.push_message(
                                         Role::User,
-                                        format!("执行中补充：{}", submission.prompt_text()),
+                                        format!("执行中补充：{text}"),
+                                        images,
                                     );
                                 }
                             }
@@ -536,6 +560,7 @@ impl AgentWorkspace {
             right_sidebar_width: 480.,
             right_sidebar_resize: None,
             file_preview: file_preview::State::new(cx),
+            terminal_ui: Default::default(),
             ssh_ui: ssh_ui::State::new(cx),
             channels: channels::ui::State::new(&path, cx),
             host_tools: None,
@@ -556,6 +581,7 @@ impl AgentWorkspace {
             tool_listener: None,
             queued_requests: Default::default(),
             edits_ui: Default::default(),
+            code_fonts: code_fonts_ui::State::new(&path, cx),
             steering_sender: None,
             todo_live: Default::default(),
             tool_activity: vec![],
@@ -627,6 +653,7 @@ impl AgentWorkspace {
             },
         ));
         workspace.start_storage(cx);
+        workspace.restore_code_font(cx);
         workspace.restore_draft(cx);
         workspace.refresh_calendar(cx);
         workspace.start_scheduler(cx);
@@ -646,6 +673,7 @@ impl AgentWorkspace {
     }
 
     fn restore_draft(&mut self, cx: &mut Context<Self>) {
+        self.terminal_ui.open = false;
         self.git_ui.picker_open = false;
         self.file_preview.hover_task = None;
         self.file_preview.open = false;
@@ -772,6 +800,7 @@ impl AgentWorkspace {
             return;
         }
         let text = submission.prompt_text().trim().to_owned();
+        let display = model::MessageDisplay::from_submission(&submission);
         if text.is_empty() && submission.images.is_empty() {
             return;
         }
@@ -874,6 +903,7 @@ impl AgentWorkspace {
                             this.begin_request(
                                 id,
                                 text,
+                                display,
                                 images,
                                 skills,
                                 config,
@@ -912,6 +942,7 @@ impl AgentWorkspace {
         &mut self,
         id: Uuid,
         text: String,
+        display: Option<model::MessageDisplay>,
         images: Vec<model::MessageImage>,
         skills: std::sync::Arc<skills::Catalog>,
         config: provider::Config,
@@ -1039,6 +1070,7 @@ impl AgentWorkspace {
         self.memory_ui.notice = None;
         let message_index = self.history.sessions[index].messages.len();
         self.history.sessions[index].push_message(Role::User, text.clone(), images);
+        self.history.sessions[index].messages.last_mut().unwrap().display = display;
         if let Some(project) = recall_project
             .or_else(|| partner_id.map(|_| PathBuf::new()))
             .filter(|_| recall_enabled)
@@ -1921,7 +1953,7 @@ impl AgentWorkspace {
                                         div()
                                             .child(self.markdown_text(
                                                 format!("{}:{index}:legacy", self.history.active),
-                                                &message.text,
+                                                &message.display_markdown(self.history.active, index),
                                                 cx,
                                             ))
                                             .when(!message.tools.is_empty(), |body| {
@@ -2207,6 +2239,7 @@ impl AgentWorkspace {
 
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_terminal_theme(cx);
         self.file_preview.view.update(cx, |view, cx| {
             view.set_active(
                 self.file_preview.open
@@ -2224,7 +2257,7 @@ impl Render for AgentWorkspace {
         });
         self.execute_pending_command(window, cx);
         self.refresh_git_repository(false, cx);
-        if self.file_preview.open || self.edits_ui.open {
+        if self.file_preview.open || self.edits_ui.open || self.terminal_ui.open {
             self.git_ui.open = false;
         }
         let command_overlay = self
@@ -2291,6 +2324,8 @@ impl Render for AgentWorkspace {
                     .into_any_element(),
                     content: (if self.file_preview.open && self.file_preview.expanded {
                         self.file_preview_sidebar(cx)
+                    } else if self.edits_ui.open && self.edits_ui.expanded {
+                        self.edits_sidebar(cx)
                     } else if self.page == crate::Page::Channels {
                         div().size_full().child(self.channels_page(cx))
                     } else if self.page == crate::Page::Partners {
@@ -2308,7 +2343,7 @@ impl Render for AgentWorkspace {
                             .flex()
                             .child(div().flex_1().min_w_0().h_full().child(self.content(cx)))
                             .when(
-                                self.file_preview.open || self.edits_ui.open || self.git_ui.open,
+                                self.file_preview.open || self.edits_ui.open || self.git_ui.open || self.terminal_ui.open,
                                 |body| {
                                     body.child(
                                         div()
@@ -2340,6 +2375,9 @@ impl Render for AgentWorkspace {
                             })
                             .when(self.edits_ui.open, |body| {
                                 body.child(self.edits_sidebar(cx))
+                            })
+                            .when(self.terminal_ui.open, |body| {
+                                body.child(self.project_terminal_sidebar(cx))
                             })
                             .when(self.git_ui.open, |body| {
                                 body.child(
@@ -2615,6 +2653,7 @@ pub fn initialize(cx: &mut App) {
     gpui_glint::components::bind_code_card_keys(cx);
     bind_text_entry_keys(cx);
     bind_prompt_editor_keys(cx);
+    terminal_ui::bind_keys(cx);
     bind_composer_keys(cx);
     for modifier in ["cmd", "ctrl"] {
         cx.bind_keys([

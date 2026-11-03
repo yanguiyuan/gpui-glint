@@ -1627,7 +1627,7 @@ impl AgentWorkspace {
                             }),
                         ),
                     );
-                page = page.child(card);
+                page = page.child(card).child(self.code_font_settings(cx));
             }
             Section::Storage => {
                 page = page.child(

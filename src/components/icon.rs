@@ -29,6 +29,7 @@ pub enum Icon {
     Globe,
     Workflow,
     GitBranch,
+    GitConflict,
     Pulse,
     Key,
     Folders,
@@ -73,6 +74,7 @@ pub enum Icon {
     Yaml,
     Tag,
     Star,
+    Sparkles,
     CheckCircle,
     HalfCircle,
     Seal,
@@ -108,6 +110,7 @@ impl Icon {
             Self::Globe => "globe",
             Self::Workflow => "workflow",
             Self::GitBranch => "git-branch",
+            Self::GitConflict => "git-conflict",
             Self::Pulse => "pulse",
             Self::Key => "key",
             Self::Folders => "folders",
@@ -152,6 +155,7 @@ impl Icon {
             Self::Yaml => "yaml",
             Self::Tag => "tag",
             Self::Star => "star",
+            Self::Sparkles => "sparkles",
             Self::CheckCircle => "check-circle",
             Self::HalfCircle => "half-circle",
             Self::Seal => "seal",
@@ -407,6 +411,7 @@ impl AssetSource for GlintAssets {
 
 fn icon_svg(name: &str) -> Option<String> {
     let (body, _fill) = match name {
+        "sparkles" => ("<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z'/><path d='m20 2 .6 1.4L22 4l-1.4.6L20 6l-.6-1.4L18 4l1.4-.6L20 2Z'/>", "none"),
         "folder" => (
             "<path d='M3 7V5.5A1.5 1.5 0 0 1 4.5 4H9l2.5 3H19.5A1.5 1.5 0 0 1 21 8.5v10A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5V7Z'/><path d='M3 9h18'/>",
             "none",
@@ -564,6 +569,10 @@ fn icon_svg(name: &str) -> Option<String> {
         ),
         "git-branch" => (
             "<circle cx='6' cy='5' r='2.5'/><circle cx='6' cy='19' r='2.5'/><circle cx='18' cy='5' r='2.5'/><path d='M6 7.5v9M18 7.5v2a7 7 0 0 1-7 7H6'/>",
+            "none",
+        ),
+        "git-conflict" => (
+            "<circle cx='6' cy='5' r='2.5'/><circle cx='18' cy='5' r='2.5'/><circle cx='6' cy='19' r='2.5'/><circle cx='18' cy='19' r='2.5'/><path d='M6 7.5v2.5l12 4.5v2M18 7.5v2.5L6 14.5v2'/>",
             "none",
         ),
         "workflow" => (
@@ -773,6 +782,22 @@ mod tests {
             pixmap.data().to_vec()
         };
         assert_ne!(render(Icon::Folder), render(Icon::FolderOpen));
+    }
+
+    #[test]
+    fn git_conflict_icon_renders_and_differs_from_the_branch_icon() {
+        let render = |icon: Icon| {
+            let asset = GlintAssets
+                .load(&format!("glint-ui/icons/{}.svg", icon.name()))
+                .unwrap()
+                .unwrap();
+            let tree = resvg::usvg::Tree::from_data(&asset, &Default::default()).unwrap();
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(24, 24).unwrap();
+            resvg::render(&tree, Default::default(), &mut pixmap.as_mut());
+            assert!(pixmap.pixels().iter().any(|pixel| pixel.alpha() > 0));
+            pixmap.data().to_vec()
+        };
+        assert_ne!(render(Icon::GitConflict), render(Icon::GitBranch));
     }
 
     #[test]

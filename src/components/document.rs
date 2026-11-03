@@ -1981,7 +1981,7 @@ impl DocumentEditor {
                         .p_3()
                         .rounded(px(8.))
                         .bg(rgb(theme.color(0xf5f5f7)))
-                        .font_family("Menlo")
+                        .font_family(crate::code_font::family())
                         .child(self.highlighted_text(plain(children))),
                     Tag::FootnoteDefinition(label) => div()
                         .text_size(px(12.))
@@ -2937,7 +2937,7 @@ impl DocumentEditor {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .font_family("Menlo")
+                    .font_family(crate::code_font::family())
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(theme.palette().text_muted));

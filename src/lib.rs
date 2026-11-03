@@ -13,6 +13,7 @@
 //! Enable the optional `webview` feature for native webview integration on macOS
 //! and Windows.
 pub mod components;
+pub mod code_font;
 pub mod paths;
 pub mod theme;
 

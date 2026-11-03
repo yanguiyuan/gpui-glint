@@ -17,6 +17,7 @@ pub struct MarkdownView {
 
 pub struct ToolPanel {
     output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
+    output_scroll: ScrollHandle,
     signature: String,
     theme: ThemePreset,
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -251,6 +252,9 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
                 "已启动后台命令"
             } else if success {
                 "已运行"
+            } else if serde_json::from_str::<serde_json::Value>(&record.result).ok()
+                .is_some_and(|value| value["status"] == "cancelled") {
+                "命令已终止"
             } else {
                 "命令失败"
             },
@@ -745,6 +749,7 @@ impl AgentWorkspace {
             .entry(format!("{key}:tool:{}", record.call.id))
             .or_insert_with(|| ToolPanel {
                 output_panel: None,
+                output_scroll: ScrollHandle::new(),
                 signature: String::new(),
                 theme,
                 panel: cx.new(|_| {
@@ -792,13 +797,14 @@ impl AgentWorkspace {
                     .collect::<Vec<_>>()
             });
             let output_panel = output_cards.map(|cards| {
+                let output_scroll = entry.output_scroll.clone();
                 let output = entry.output_panel.get_or_insert_with(|| {
                     cx.new(|_| CollapsePanel::new("返回值").compact().theme(theme))
                 });
                 output.update(cx, |panel, cx| {
                     panel.set_theme(theme, cx);
                     panel.set_content(
-                        move |_, _| code_mode_result_view(&cards, theme).into_any_element(),
+                        move |_, _| code_mode_result_view(&cards, theme, &output_scroll).into_any_element(),
                         cx,
                     );
                 });
@@ -815,6 +821,38 @@ impl AgentWorkspace {
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
                 panel.set_summary(presentation.summary.clone(), cx);
+                if record.call.name == "run_command" && record.result == "执行中…" {
+                    let anchor = self.memory.anchor.clone();
+                    let session = self.history.active;
+                    let call_id = record.call.id.clone();
+                    let summary = presentation.summary.clone();
+                    let host = weak.clone();
+                    panel.set_summary_content(move |_, _| {
+                        let cancelling = crate::command_runner::call_cancelling(&anchor, session, &call_id);
+                        let anchor = anchor.clone();
+                        let call_id = call_id.clone();
+                        let host = host.clone();
+                        div().w_full().min_w_0().flex().items_center().gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(summary.clone()))
+                            .child(div().id("stop-running-command").debug_selector(|| "stop-running-command".into())
+                                .flex_shrink_0().px_2().py_1().rounded(px(5.)).cursor_pointer().text_size(px(11.)).text_color(rgb(p.text_muted))
+                                .child(if cancelling { "正在终止…" } else { "终止" })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let accepted = crate::command_runner::cancel_call(&anchor, session, &call_id);
+                                    let _ = host.update(cx, |this, cx| {
+                                        if !accepted {
+                                            this.git_ui.toasts.update(cx, |toasts, cx| {
+                                                toasts.push(gpui_glint::components::Toast::new("命令尚未启动或已经结束")
+                                                    .description("若命令刚开始，请稍后重试。"), cx);
+                                            });
+                                        }
+                                        cx.notify();
+                                    });
+                                }))
+                            .into_any_element()
+                    }, cx);
+                }
                 if let Some(change) = &record.change {
                     let path = change.path.clone();
                     let root = preview_root.clone();
@@ -1170,6 +1208,7 @@ impl AgentWorkspace {
                         .entry(format!("{key}:{index}:thinking"))
                         .or_insert_with(|| ToolPanel {
                             output_panel: None,
+                            output_scroll: ScrollHandle::new(),
                             signature: String::new(),
                             theme,
                             panel: cx
@@ -1413,8 +1452,9 @@ type OutputCard = (
     f32,
 );
 
-fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
+fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset, scroll: &ScrollHandle) -> gpui::Stateful<gpui::Div> {
     let p = theme.palette();
+    let scroll = scroll.clone();
     div()
         .id("code-mode-result")
         .debug_selector(|| "code-mode-result".into())
@@ -1422,8 +1462,9 @@ fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset) -> gpui::Stat
         .min_w_0()
         .flex_shrink_0()
         .max_h(px(320.))
+        .relative()
         .overflow_y_scroll()
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .track_scroll(&scroll)
         .child(div().flex().flex_col().gap_3().children(cards.iter().map(
             |(label, card, height)| {
                 div()
@@ -1468,6 +1509,23 @@ fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset) -> gpui::Stat
                     })
             },
         )))
+        .child(gpui::canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+            move |_, hitbox: gpui::Hitbox, window, _| {
+                let view = window.current_view();
+                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture || !hitbox.should_handle_scroll(window) { return; }
+                    let delta = event.delta.pixel_delta(px(21.));
+                    let offset = scroll.offset();
+                    let next = (offset.y+delta.y).clamp(-scroll.max_offset().y, px(0.));
+                    if next != offset.y {
+                        scroll.set_offset(point(offset.x, next));
+                        cx.stop_propagation();
+                        cx.notify(view);
+                    }
+                });
+            },
+        ).absolute().top_0().left_0().size_full())
 }
 
 fn code_mode_output_sections(raw: &str) -> Vec<(Option<String>, String, &'static str)> {
@@ -1534,6 +1592,53 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn running_command_stop_button_does_not_toggle_tool_details(cx: &mut gpui::TestAppContext) {
+        struct Preview { _host: Entity<AgentWorkspace>, panel: Entity<gpui_glint::components::CollapsePanel> }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().w(px(600.)).child(self.panel.clone()) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+            let record = tools::rejected(tools::ToolCall { id: "stop-test".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"rg","args":["search"]}) }, "执行中…".into());
+            let panel = host.update(cx, |host, cx| host.tool_panel("stop-test", &record, cx));
+            Preview { _host: host, panel }
+        });
+        let button = window.debug_bounds("stop-running-command").expect("active command stop button");
+        window.simulate_click(button.center(), Default::default());
+        preview.read_with(window, |preview, cx| assert!(!preview.panel.read(cx).is_expanded()));
+    }
+
+    #[gpui::test]
+    fn orchestration_output_scroll_chains_at_its_boundary(cx: &mut gpui::TestAppContext) {
+        struct Nested { outer: ScrollHandle, inner: ScrollHandle }
+        impl Render for Nested {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let cards = (0..12).map(|i| (Some(format!("section {i}")), None, 50.)).collect::<Vec<_>>();
+                div().id("outer-output").h(px(400.)).w(px(400.)).track_scroll(&self.outer).overflow_y_scroll()
+                    .child(div().flex().flex_col().child(div().h(px(300.)).flex_shrink_0())
+                        .child(code_mode_result_view(&cards, ThemePreset::default(), &self.inner))
+                        .child(div().h(px(500.)).flex_shrink_0()))
+            }
+        }
+        let (host, window) = cx.add_window_view(|_, _| Nested { outer: ScrollHandle::new(), inner: ScrollHandle::new() });
+        host.update(window, |host, cx| { host.outer.set_offset(point(px(0.), px(-250.))); cx.notify(); });
+        window.run_until_parked();
+        let bounds = window.debug_bounds("code-mode-result").unwrap();
+        let position = point(bounds.left()+px(8.), bounds.top()+px(8.));
+        let initial = host.read_with(window, |host, _| host.outer.offset().y);
+        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.run_until_parked();
+        host.read_with(window, |host, _| { assert!(host.inner.offset().y < px(0.)); assert_eq!(host.outer.offset().y, initial); });
+        host.update(window, |host, cx| { host.inner.scroll_to_bottom(); cx.notify(); });
+        window.run_until_parked();
+        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.run_until_parked();
+        assert!(host.read_with(window, |host, _| host.outer.offset().y) < initial, "exhausted output must release the outer conversation");
+    }
 
     #[gpui::test]
     fn tool_file_name_opens_preview_without_toggling_panel(cx: &mut gpui::TestAppContext) {
@@ -1688,6 +1793,10 @@ mod tests {
         window.run_until_parked();
         let live = window.debug_bounds("live-response").unwrap();
         let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        let viewport = host.read_with(window, |host, _| host.scroll.bounds());
+        let composer = window.debug_bounds("agent-composer-panel").unwrap();
+        assert!(waiting.bottom() <= viewport.bottom()+px(1.), "the last row must be reachable at the true scroll bottom: {waiting:?}, {viewport:?}");
+        assert!(viewport.bottom() <= composer.top()+px(1.), "the composer must not cover the chat viewport");
         assert!(
             waiting.top() >= live.bottom(),
             "waiting label overlaps expanded live response: {waiting:?}, {live:?}"

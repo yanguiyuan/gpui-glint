@@ -18,6 +18,12 @@ pub struct Change {
 }
 
 impl Change {
+    pub(super) fn preview(path: PathBuf, label: String, before: Option<Arc<str>>, after: Arc<str>, stats: Option<(usize, usize)>) -> Self {
+        let mut change = Self { id: uuid::Uuid::new_v4(), path, label, before, after, added: 0, removed: 0, lines: Default::default() };
+        if let Some((added, removed)) = stats { change.added = added; change.removed = removed; }
+        else { change.count(); }
+        change
+    }
     pub fn lines(&self) -> Vec<DiffLine> {
         self.lines
             .get_or_init(|| diff_lines(self.before.as_deref().unwrap_or(""), &self.after))
@@ -563,6 +569,7 @@ pub fn language(path: &Path) -> &'static str {
 /// Read-only snapshot, executed on the background executor. It includes staged,
 /// unstaged and untracked files without modifying the index or attributing
 /// pre-existing changes to the agent.
+#[cfg(test)]
 pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), String> {
     let git = |directory: &Path, arguments: &[&str]| {
         let mut command = crate::child_process::command("git");
@@ -610,12 +617,15 @@ pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), Stri
             name
         };
         if field[..2].contains(&b'U') || field[..2] == *b"AA" || field[..2] == *b"DD" {
-            notes.push(format!("{name}：合并冲突尚未解决，请在编辑器查看。"));
             continue;
         }
         let path = top.join(name);
         // Do not follow symlinks outside the repository during preview.
         let after = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() > 2 * 1024 * 1024 => {
+                notes.push(format!("{name}：大文件（{:.1} MiB），为保持流畅已跳过全文 Diff。", meta.len() as f64 / (1024. * 1024.)));
+                continue;
+            }
             Ok(meta) if meta.is_file() && meta.len() <= 2 * 1024 * 1024 => {
                 std::fs::read(&path).ok()
             }
@@ -642,7 +652,8 @@ pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), Stri
                     None
                 }
             } else {
-                None
+                notes.push(format!("{name}：HEAD 版本超过 2 MiB，为保持流畅已跳过全文 Diff。"));
+                continue;
             }
         };
         let text = |bytes: Option<Vec<u8>>| {

@@ -406,6 +406,9 @@ pub struct Composer {
     open_chip: Option<SharedString>,
     context_usage: Option<ComposerContextState>,
     queue: Vec<QueueEntry>,
+    queue_editor: Option<(u64, Entity<PromptEditor>)>,
+    queue_editor_references: Vec<super::ComposerReference>,
+    queue_editor_subscription: Option<Subscription>,
     managed_queue: bool,
     next_queue_id: u64,
     /// Images pasted with ⌘/Ctrl-V, submitted with the next send.
@@ -440,7 +443,11 @@ impl Focusable for Composer {
 
 impl Composer {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(|cx| PromptEditor::new(cx, placeholder).min_rows(2));
+        let editor = cx.new(|cx| {
+            PromptEditor::new(cx, placeholder)
+                .min_rows(2)
+                .attach_long_pastes(true)
+        });
         let subscription = cx.observe(&editor, |this, _, cx| {
             let text: SharedString = this.editor.read(cx).value().to_owned().into();
             if text != this.observed_text {
@@ -460,6 +467,11 @@ impl Composer {
         });
         let events = cx.subscribe(&editor, |this, _, event: &PromptEditorEvent, cx| {
             match event {
+                PromptEditorEvent::TextAttached(reference) => {
+                    this.references.push(reference.clone());
+                    this.sync_reference_styles(cx);
+                    cx.emit(ComposerEvent::AttachmentsChanged);
+                }
                 PromptEditorEvent::ReferenceHovered(token) => {
                     if let Some(reference) =
                         this.references.iter().find(|r| r.token == token.as_ref())
@@ -505,6 +517,9 @@ impl Composer {
             open_chip: None,
             context_usage: None,
             queue: Vec::new(),
+            queue_editor: None,
+            queue_editor_references: Vec::new(),
+            queue_editor_subscription: None,
             managed_queue: false,
             next_queue_id: 0,
             attachments: Vec::new(),
@@ -1109,6 +1124,13 @@ impl Composer {
         if self.queue.is_empty() {
             return;
         }
+        if self
+            .queue_editor
+            .as_ref()
+            .is_some_and(|(id, _)| *id == self.queue[0].id)
+        {
+            return;
+        }
         let next = self.queue.remove(0);
         if self.managed_queue {
             cx.emit(ComposerEvent::QueueSubmitted {
@@ -1133,10 +1155,46 @@ impl Composer {
     }
 
     fn queue_edit(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.managed_queue {
+        if index >= self.queue.len() {
             return;
         }
-        if index >= self.queue.len() {
+        if self.managed_queue {
+            let entry = &self.queue[index];
+            let text = entry.text.clone();
+            self.queue_editor_references = entry.submission.references.clone();
+            let editor = cx.new(|cx| {
+                let mut editor = PromptEditor::new(cx, "编辑排队消息")
+                    .min_rows(1)
+                    .attach_long_pastes(true)
+                    .theme(self.theme);
+                editor.set_value(text, cx);
+                editor.set_reference_styles(
+                    self.queue_editor_references
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.token.clone().into(),
+                                r.icon(),
+                                self.theme.palette().accent,
+                            )
+                        })
+                        .collect(),
+                    cx,
+                );
+                editor.set_reference_previews(self.queue_editor_references.clone(), cx);
+                editor
+            });
+            self.queue_editor_subscription = Some(cx.subscribe(
+                &editor,
+                |this, _, event: &PromptEditorEvent, cx| {
+                    if let PromptEditorEvent::TextAttached(reference) = event {
+                        this.queue_editor_references.push(reference.clone());
+                        cx.notify();
+                    }
+                },
+            ));
+            self.queue_editor = Some((entry.id, editor));
+            cx.notify();
             return;
         }
         let submission = self.queue.remove(index).submission;
@@ -1150,11 +1208,64 @@ impl Composer {
         cx.notify();
     }
 
+    fn save_queue_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((id, editor)) = &self.queue_editor else {
+            return;
+        };
+        if editor.read(cx).is_composing() {
+            return;
+        }
+        let text: SharedString = editor.read(cx).value().to_owned().into();
+        let Some(entry) = self.queue.iter_mut().find(|entry| entry.id == *id) else {
+            self.queue_editor = None;
+            return;
+        };
+        if text.trim().is_empty() && entry.images.is_empty() {
+            return;
+        }
+        entry.submission.references = self
+            .queue_editor_references
+            .iter()
+            .filter(|reference| reference.is_present(&text))
+            .cloned()
+            .collect();
+        entry.submission.text = text;
+        self.queue_editor = None;
+        self.queue_editor_references.clear();
+        self.queue_editor_subscription = None;
+        if !self.busy {
+            self.submit_next_queued(cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_queue_edit(&mut self, cx: &mut Context<Self>) {
+        self.queue_editor = None;
+        self.queue_editor_references.clear();
+        self.queue_editor_subscription = None;
+        if !self.busy {
+            self.submit_next_queued(cx);
+        }
+        cx.notify();
+    }
+
     fn queue_remove(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.queue.len() {
             let removed = self.queue.remove(index);
+            let editing = self
+                .queue_editor
+                .as_ref()
+                .is_some_and(|(id, _)| *id == removed.id);
+            if editing {
+                self.queue_editor = None;
+                self.queue_editor_references.clear();
+                self.queue_editor_subscription = None;
+            }
             if self.managed_queue {
                 cx.emit(ComposerEvent::QueueRemoved(removed.id));
+            }
+            if editing && !self.busy {
+                self.submit_next_queued(cx);
             }
             cx.notify();
         }
@@ -1166,6 +1277,9 @@ impl Render for Composer {
         let theme = self.theme;
         self.editor
             .update(cx, |editor, cx| editor.set_theme(theme, cx));
+        if let Some((_, editor)) = &self.queue_editor {
+            editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
+        }
         let p = theme.palette();
         let dark = theme.is_dark();
         let sendable = self.sendable(cx);
@@ -1500,9 +1614,29 @@ impl Render for Composer {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .on_action(cx.listener(|this, _: &Submit, _, cx| this.submit(cx)))
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                if this
+                    .queue_editor
+                    .as_ref()
+                    .is_some_and(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+                {
+                    this.save_queue_edit(cx);
+                } else {
+                    this.submit(cx);
+                }
+            }))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
+                    if this
+                        .queue_editor
+                        .as_ref()
+                        .is_some_and(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+                    {
+                        this.cancel_queue_edit(cx);
+                        window.focus(&this.editor.focus_handle(cx), cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     let mut closed = this.context_open;
                     this.context_open = false;
                     if this.open_chip.take().is_some() {
@@ -1538,17 +1672,62 @@ impl Render for Composer {
                         .child(Icon::Grip.render(14.)),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(13.))
-                        .text_color(rgb(p.text))
-                        .child(if let Some(label) = &submission.label {
-                            format!("排队 {} · {label} · {}", index + 1, submission.text)
-                        } else {
-                            submission.text.to_string()
-                        }),
+                    if let Some((_, editor)) = self
+                        .queue_editor
+                        .as_ref()
+                        .filter(|(id, _)| *id == submission.id)
+                    {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("queue-editor", submission.id))
+                                    .max_h(px(140.))
+                                    .overflow_y_scroll()
+                                    .child(editor.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        super::Button::new("保存到队列")
+                                            .size(super::ButtonSize::Mini)
+                                            .theme(theme)
+                                            .render()
+                                            .debug_selector(|| "composer-queue-edit-save".into())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.save_queue_edit(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        super::Button::new("取消编辑")
+                                            .size(super::ButtonSize::Mini)
+                                            .kind(super::ButtonKind::Plain)
+                                            .theme(theme)
+                                            .render()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_queue_edit(cx)
+                                            })),
+                                    ),
+                            )
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .text_color(rgb(p.text))
+                            .child(if let Some(label) = &submission.label {
+                                format!("排队 {} · {label} · {}", index + 1, submission.text)
+                            } else {
+                                submission.text.to_string()
+                            })
+                    },
                 )
                 .when(!self.managed_queue, |row| {
                     row.child(
@@ -1580,7 +1759,7 @@ impl Render for Composer {
                             .child("立即"),
                     )
                 })
-                .when(!self.managed_queue, |row| {
+                .when(self.queue_editor.is_none(), |row| {
                     row.child(
                         icon_action(
                             SharedString::from(format!("glass-composer-queue-edit-{index}")),
@@ -1588,13 +1767,24 @@ impl Render for Composer {
                             p,
                             dark,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.queue_edit(index, cx);
-                        })),
+                        .debug_selector(move || format!("composer-queue-edit-{}", submission.id))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.queue_edit(index, cx);
+                                if let Some((_, editor)) = &this.queue_editor {
+                                    window.focus(&editor.focus_handle(cx), cx);
+                                }
+                            },
+                        )),
                     )
                 })
                 .when(
-                    self.managed_queue && self.busy && submission.images.is_empty(),
+                    self.managed_queue
+                        && self.busy
+                        && self
+                            .queue_editor
+                            .as_ref()
+                            .is_none_or(|(id, _)| *id != submission.id),
                     |row| {
                         let id = submission.id;
                         let submission = submission.submission.clone();
@@ -2104,6 +2294,146 @@ fn icon_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn pasted_text_survives_draft_restore_and_managed_queue_edit(cx: &mut gpui::TestAppContext) {
+        cx.update(super::super::bind_prompt_editor_keys);
+        let (composer, window) =
+            cx.add_window_view(|_, cx| Composer::new("Message", cx).managed_queue(true));
+        let content = "完整原文 including ``` fences\n".repeat(25);
+        window.update(|window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(content.clone()));
+            window.focus(&composer.focus_handle(cx), cx);
+        });
+        window.simulate_keystrokes("ctrl-v");
+        window.run_until_parked();
+        composer.update(window, |composer, cx| {
+            assert_eq!(composer.references.len(), 1);
+            let draft = composer.value(cx).to_owned();
+            let refs = composer.references.clone();
+            assert!(!draft.contains("完整原文"));
+            composer.set_draft(draft, Vec::new(), cx);
+            composer.set_references(refs, cx);
+            composer.set_busy(true, cx);
+            composer.submit(cx);
+            assert!(
+                composer.queue[0]
+                    .submission
+                    .prompt_text()
+                    .contains(&content)
+            );
+            composer.set_value("unsent draft", cx);
+            composer.queue_edit(0, cx);
+        });
+        window.update(|window, cx| {
+            let editor = composer.read(cx).queue_editor.as_ref().unwrap().1.clone();
+            window.focus(&editor.focus_handle(cx), cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("第二份原文\n".repeat(25)));
+        });
+        window.simulate_keystrokes("ctrl-v");
+        window.run_until_parked();
+        composer.update(window, |composer, cx| {
+            composer.save_queue_edit(cx);
+            assert_eq!(composer.queue[0].submission.references.len(), 2);
+            let prompt = composer.queue[0].submission.prompt_text();
+            assert!(prompt.contains(&content));
+            assert!(prompt.contains(&"第二份原文\n".repeat(25)));
+            assert_eq!(composer.value(cx), "unsent draft");
+            composer.queue_edit(0, cx);
+            composer
+                .queue_editor
+                .as_ref()
+                .unwrap()
+                .1
+                .update(cx, |editor, cx| editor.set_value("remove references", cx));
+            composer.save_queue_edit(cx);
+            assert!(composer.queue[0].submission.references.is_empty());
+        });
+    }
+    #[gpui::test]
+    fn managed_queue_edit_preserves_draft_attachments_and_dispatch_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        let (composer, window) =
+            cx.add_window_view(|_, cx| Composer::new("Message", cx).managed_queue(true));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let events = sent.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::QueueSubmitted { id, submission } = event {
+                    events.borrow_mut().push((*id, submission.clone()));
+                }
+            })
+        });
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        let mut reference = super::super::ComposerReference::file("/project/main.rs", false);
+        reference.token = "@main.rs".into();
+        composer.update(window, |composer, cx| {
+            composer.set_busy(true, cx);
+            composer.set_draft(
+                format!("original {}", reference.token),
+                vec![image.clone()],
+                cx,
+            );
+            composer.set_references(vec![reference.clone()], cx);
+            composer.submit(cx);
+            composer.set_value("keep my unsent draft", cx);
+        });
+        window.run_until_parked();
+        let edit = window.debug_bounds("composer-queue-edit-1").unwrap();
+        window.simulate_click(edit.center(), Default::default());
+        composer.update(window, |composer, cx| {
+            assert_eq!(composer.queue_len(), 1);
+            assert_eq!(composer.value(cx), "keep my unsent draft");
+            let editor = composer.queue_editor.as_ref().unwrap().1.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_value(format!("edited {}", reference.token), cx)
+            });
+            composer.set_busy(false, cx);
+            assert_eq!(composer.queue_len(), 1, "editing must hold the FIFO head");
+        });
+        let save = window.debug_bounds("composer-queue-edit-save").unwrap();
+        window.simulate_click(save.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(sent.borrow().len(), 1);
+        let sent = sent.borrow();
+        assert_eq!(sent[0].0, 1);
+        assert_eq!(
+            sent[0].1.text.as_ref(),
+            format!("edited {}", reference.token)
+        );
+        assert_eq!(sent[0].1.images, vec![image]);
+        assert_eq!(sent[0].1.references[0].path, reference.path);
+        composer.read_with(window, |composer, cx| {
+            assert_eq!(composer.value(cx), "keep my unsent draft");
+            assert!(composer.queue_editor.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_managed_queue_edit_keeps_original_text_and_order(cx: &mut gpui::TestAppContext) {
+        let (composer, window) =
+            cx.add_window_view(|_, cx| Composer::new("Message", cx).managed_queue(true));
+        composer.update(window, |composer, cx| {
+            composer.set_busy(true, cx);
+            for text in ["first", "second"] {
+                composer.set_value(text, cx);
+                composer.submit(cx);
+            }
+            composer.queue_edit(0, cx);
+            composer
+                .queue_editor
+                .as_ref()
+                .unwrap()
+                .1
+                .update(cx, |editor, cx| editor.set_value("unsaved", cx));
+            composer.cancel_queue_edit(cx);
+            assert_eq!(composer.queue[0].text.as_ref(), "first");
+            assert_eq!(composer.queue[1].text.as_ref(), "second");
+            assert_eq!(composer.queue[0].id, 1);
+            assert!(composer.queue_editor.is_none());
+        });
+    }
 
     #[gpui::test]
     fn structured_references_stay_compact_restore_and_submit_with_exact_context(
@@ -2259,6 +2589,46 @@ mod tests {
             assert_eq!(composer.queue_len(), 0);
             assert_eq!(composer.value(cx).as_ref(), "keep this unsent draft");
         });
+    }
+
+    #[gpui::test]
+    fn managed_queue_offers_steering_for_image_submissions(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let (composer, window) =
+            cx.add_window_view(|_, cx| Composer::new("Message", cx).managed_queue(true));
+        let steered = Rc::new(RefCell::new(Vec::new()));
+        let events = steered.clone();
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event, _| {
+                if let ComposerEvent::QueueSteerRequested { id, submission } = event {
+                    events.borrow_mut().push((
+                        *id,
+                        submission.text.to_string(),
+                        submission.images.len(),
+                    ));
+                }
+            })
+        });
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        composer.update(window, |composer, cx| {
+            composer.set_busy(true, cx);
+            composer.set_draft("看这张图", vec![image], cx);
+        });
+        window.run_until_parked();
+        composer.update(window, |composer, cx| composer.submit(cx));
+        let id = composer.read_with(window, |composer, _| composer.queue[0].id);
+        // 带图消息同样出现引导按钮，点击携带原文与图片数量。
+        let selector: &'static str =
+            Box::leak(format!("composer-queue-steer-{id}").into_boxed_str());
+        let button = window
+            .debug_bounds(selector)
+            .expect("image submissions must expose the steer control");
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(
+            *steered.borrow(),
+            vec![(id, "看这张图".to_string(), 1usize)]
+        );
+        composer.read_with(window, |composer, _| assert_eq!(composer.queue_len(), 1));
     }
 
     #[gpui::test]

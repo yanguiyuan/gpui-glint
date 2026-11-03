@@ -1134,6 +1134,41 @@ mod tests {
     }
 
     #[gpui::test]
+    fn every_overview_goal_and_experience_arrow_opens_its_own_memory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (dir, host, window, partner) = fixture(cx);
+        let db = database::open(&dir.path().join("sessions.json")).unwrap();
+        let mut targets = Vec::new();
+        for (kind, selector) in [
+            ("goal", "partner-goal-open"),
+            ("fact", "partner-experience-open"),
+        ] {
+            for index in 0..3 {
+                let id = Uuid::new_v4();
+                db.execute(
+                    "INSERT INTO partner_memories(id,partner_id,kind,title,summary,content,touched_at) VALUES(?1,?2,?3,?4,'summary','content',?5)",
+                    rusqlite::params![id.to_string(), partner.to_string(), kind, format!("{kind} {index}"), chrono::Utc::now().timestamp()],
+                ).unwrap();
+                let selector: &'static str = Box::leak(format!("{selector}-{id}").into_boxed_str());
+                targets.push((id, selector));
+            }
+        }
+        window.simulate_resize(size(px(1440.), px(2400.)));
+        for (id, selector) in targets {
+            host.update(window, |h, cx| h.partner_tab(Tab::Overview, cx));
+            window.run_until_parked();
+            let arrow = window.debug_bounds(selector).expect("overview arrow");
+            window.simulate_click(arrow.center(), gpui::Modifiers::default());
+            window.run_until_parked();
+            host.read_with(window, |h, _| {
+                assert!(h.partners_ui.tab == Tab::Memories);
+                assert_eq!(h.partners_ui.expanded, Some(id));
+            });
+        }
+    }
+
+    #[gpui::test]
     fn topbar_renders_avatar_separately_from_partner_name(cx: &mut gpui::TestAppContext) {
         let (dir, host, window, id) = fixture(cx);
         let image = dir.path().join("avatar.png");

@@ -128,6 +128,7 @@ struct Snapshot {
 
 #[derive(Clone, PartialEq)]
 struct LineCacheKey {
+    code_font: SharedString,
     content: SharedString,
     revision: u64,
     language: SharedString,
@@ -2730,9 +2731,9 @@ impl CodeCard {
             let handle = self.viewport_scroll.0.borrow().base_handle.clone();
             let offset = handle.offset();
             let next = (offset.y + delta.y).clamp(-handle.max_offset().y, px(0.));
-            handle.set_offset(point(offset.x, next));
-            cx.stop_propagation();
             if next != offset.y {
+                handle.set_offset(point(offset.x, next));
+                cx.stop_propagation();
                 cx.notify();
             }
         }
@@ -2746,9 +2747,10 @@ impl CodeCard {
         let refs = self.resolved_references();
         let reference_theme = self.reference_theme();
         let mut font = window.text_style().font();
-        font.family = "Menlo".into();
+        font.family = crate::code_font::family();
         let font_size = px(13.);
         let key = LineCacheKey {
+            code_font: crate::code_font::family(),
             content: self.content.clone(),
             revision: self.layout_revision,
             language: self.language.clone(),
@@ -2934,7 +2936,7 @@ impl CodeCard {
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
-                                    .font_family("Menlo")
+                                    .font_family(crate::code_font::family())
                                     .overflow_hidden()
                                     .pr(px(if folding { 5. } else { 9. }))
                                     .border_r_1()
@@ -3182,9 +3184,10 @@ impl Render for CodeCard {
         self.last_lines.clear();
         let mut font = window.text_style().font();
         if !self.prose {
-            font.family = "Menlo".into();
+            font.family = crate::code_font::family();
         }
         let key = LineCacheKey {
+            code_font: crate::code_font::family(),
             content: self.content.clone(),
             revision: self.layout_revision,
             language: self.language.clone(),
@@ -4344,6 +4347,37 @@ mod tests {
     }
 
     #[gpui::test]
+    fn viewport_wheel_at_vertical_edges_reaches_parent_scroll(cx: &mut gpui::TestAppContext) {
+        struct Nested {
+            editor: Entity<CodeCard>,
+            scroll: ScrollHandle,
+        }
+        impl Render for Nested {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().id("outer-scroll").h(px(300.)).w(px(400.)).overflow_y_scroll().track_scroll(&self.scroll)
+                    .child(div().flex().flex_col()
+                        .child(div().h(px(500.)).flex_shrink_0())
+                        .child(div().h(px(180.)).flex_shrink_0().child(self.editor.clone()))
+                        .child(div().h(px(500.)).flex_shrink_0()))
+            }
+        }
+        let (host, window) = cx.add_window_view(|_, cx| Nested {
+            editor: cx.new(|cx| CodeCard::new(cx, "javascript", "const value = 1;\n".repeat(9)).show_header(false).read_only(true).viewport()),
+            scroll: ScrollHandle::new(),
+        });
+        host.update(window, |host, cx| { host.scroll.set_offset(point(px(0.), px(-450.))); cx.notify(); });
+        window.run_until_parked();
+        let editor = host.read_with(window, |host, _| host.editor.clone());
+        let initial = host.read_with(window, |host, _| host.scroll.offset().y);
+        let viewport = editor.read_with(window, |editor, _| editor.viewport_scroll.0.borrow().base_handle.bounds());
+        for _ in 0..3 {
+            window.simulate_event(gpui::ScrollWheelEvent { position: viewport.center(), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))), ..Default::default() });
+            window.run_until_parked();
+        }
+        assert!(host.read_with(window, |host, _| host.scroll.offset().y) < initial-px(10.), "an exhausted code viewport must not trap the parent scroll");
+    }
+
+    #[gpui::test]
     fn short_json_long_line_scrolls_with_shift_wheel_and_draggable_bar(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4573,6 +4607,23 @@ mod tests {
         });
         assert!(parent_scroll.offset().y < px(0.));
         editor.update(window, |editor, _| assert_eq!(editor.scroll.offset().x, x));
+    }
+
+    #[gpui::test]
+    #[ignore = "Changes the application-wide code font; run in isolation"]
+    fn changing_code_font_invalidates_viewport_layout_cache(cx: &mut gpui::TestAppContext) {
+        let (card, window) = cx.add_window_view(|_, cx| {
+            CodeCard::new(cx, "rust", "fn main() {}\n").read_only(true).viewport()
+        });
+        window.run_until_parked();
+        let original = crate::code_font::family();
+        crate::code_font::set_family(Some("Consolas"));
+        window.update(|_, cx| cx.refresh_windows());
+        window.run_until_parked();
+        card.read_with(window, |card, _| {
+            assert_eq!(card.viewport_cache.as_ref().unwrap().key.font.family.as_ref(), "Consolas");
+        });
+        crate::code_font::set_family(Some(&original));
     }
 
     #[gpui::test]

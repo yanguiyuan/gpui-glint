@@ -73,6 +73,7 @@ impl From<&gpui::Image> for PastedImage {
 /// Events emitted by [`PromptEditor`] for paste content it does not edit as text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptEditorEvent {
+    TextAttached(super::ComposerReference),
     /// One or more images were pasted; the editor text is left untouched.
     ImagePasted(Vec<PastedImage>),
     PasteFailed(SharedString),
@@ -175,6 +176,10 @@ pub fn bind_prompt_editor_keys(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, Some("GlassPromptEditor")),
         KeyBinding::new("cmd-x", Cut, Some("GlassPromptEditor")),
         KeyBinding::new("cmd-c", Copy, Some("GlassPromptEditor")),
+        KeyBinding::new("ctrl-a", SelectAll, Some("GlassPromptEditor")),
+        KeyBinding::new("ctrl-v", Paste, Some("GlassPromptEditor")),
+        KeyBinding::new("ctrl-x", Cut, Some("GlassPromptEditor")),
+        KeyBinding::new("ctrl-c", Copy, Some("GlassPromptEditor")),
     ]);
 }
 
@@ -205,6 +210,7 @@ pub struct PromptEditor {
     reference_hover_task: Option<gpui::Task<()>>,
     reference_close_task: Option<gpui::Task<()>>,
     paste_task: Option<gpui::Task<()>>,
+    attach_long_pastes: bool,
 }
 
 pub(crate) struct EditorLine {
@@ -214,6 +220,11 @@ pub(crate) struct EditorLine {
 }
 
 impl PromptEditor {
+    /// Only task composers opt into turning large clipboard text into references.
+    pub fn attach_long_pastes(mut self, enabled: bool) -> Self {
+        self.attach_long_pastes = enabled;
+        self
+    }
     pub fn theme(mut self, theme: ThemePreset) -> Self {
         self.theme = theme;
         self
@@ -379,6 +390,7 @@ impl PromptEditor {
             reference_hover_task: None,
             reference_close_task: None,
             paste_task: None,
+            attach_long_pastes: false,
         }
     }
 
@@ -752,7 +764,7 @@ impl PromptEditor {
         });
         if !has_images {
             if let Some(text) = item.text() {
-                self.replace_selection(&text.replace("\r\n", "\n").replace('\r', "\n"), cx);
+                self.paste_text(&text, cx);
             }
             return;
         }
@@ -767,11 +779,52 @@ impl PromptEditor {
                 Err(error) => cx.emit(PromptEditorEvent::PasteFailed(error.into())),
                 _ => {
                     if let Some(text) = fallback_text {
-                        this.replace_selection(&text.replace("\r\n", "\n").replace('\r', "\n"), cx);
+                        this.paste_text(&text, cx);
                     }
                 }
             });
         }));
+    }
+
+    fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if !self.attach_long_pastes || (text.chars().count() <= 2000 && text.lines().count() <= 20)
+        {
+            self.replace_selection(&text, cx);
+            return;
+        }
+        let mut number = 1;
+        let reference = loop {
+            let mut reference =
+                super::ComposerReference::pasted_text(format!("粘贴文本-{number}.txt"), &text);
+            reference.token = reference.label();
+            if !self.content.contains(&reference.token)
+                && !self
+                    .reference_previews
+                    .iter()
+                    .any(|r| r.token == reference.token)
+            {
+                break reference;
+            }
+            number += 1;
+        };
+        let prefix = if self.content[..self.selected_range.start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            " "
+        } else {
+            ""
+        };
+        self.replace_selection(&format!("{prefix}{} ", reference.token), cx);
+        self.reference_styles.push((
+            reference.token.clone().into(),
+            reference.icon(),
+            self.theme.palette().accent,
+        ));
+        self.reference_previews.push(reference.clone());
+        cx.emit(PromptEditorEvent::TextAttached(reference));
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1593,6 +1646,56 @@ fn mention_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+    #[gpui::test]
+    fn long_clipboard_text_is_opt_in_and_replaces_only_the_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (editor, window) =
+            cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message").attach_long_pastes(true));
+        let full = "中文`json`\n".repeat(30);
+        window.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_value("before selected after", cx);
+                editor.selected_range = 7..15;
+                cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+                editor.paste(&Paste, window, cx);
+                assert_eq!(editor.value(), "before @粘贴文本-1.txt  after");
+                assert_eq!(
+                    editor.reference_previews[0].excerpt.as_deref(),
+                    Some(full.as_str())
+                );
+                assert!(editor.reference_previews[0].preview_truncated);
+                editor.paste(&Paste, window, cx);
+                assert!(editor.value().contains("@粘贴文本-2.txt"));
+                assert_eq!(editor.reference_previews.len(), 2);
+            });
+        });
+        let plain = cx.new(|cx| PromptEditor::new(cx, "plain"));
+        plain.update(cx, |editor, cx| {
+            editor.paste_text(&full, cx);
+            assert_eq!(editor.value(), full);
+            assert!(editor.reference_previews.is_empty());
+        });
+    }
+    #[gpui::test]
+    fn paste_attachment_threshold_counts_characters_and_lines(cx: &mut gpui::TestAppContext) {
+        for (text, attached) in [
+            ("中".repeat(2000), false),
+            ("中".repeat(2001), true),
+            ("行\n".repeat(20), false),
+            ("行\n".repeat(21), true),
+        ] {
+            let editor = cx.new(|cx| PromptEditor::new(cx, "Message").attach_long_pastes(true));
+            editor.update(cx, |editor, cx| {
+                editor.paste_text(&text, cx);
+                assert_eq!(!editor.reference_previews.is_empty(), attached);
+                if !attached {
+                    assert_eq!(editor.value(), text);
+                }
+            });
+        }
+    }
 
     #[gpui::test]
     fn reference_hover_is_bounded_fades_long_content_and_preserves_text(
@@ -1680,6 +1783,63 @@ mod tests {
         editor.read_with(cx, |editor, _| {
             assert_eq!(editor.value(), "another conversation")
         });
+    }
+
+    #[gpui::test]
+    fn clipboard_shortcuts_support_cmd_and_ctrl(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_prompt_editor_keys);
+        for modifier in ["cmd", "ctrl"] {
+            let (editor, window) = cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message"));
+            window.update(|window, cx| {
+                editor.update(cx, |editor, cx| editor.set_value("original", cx));
+                cx.write_to_clipboard(ClipboardItem::new_string("中文\r\nnext".into()));
+                window.focus(&editor.read(cx).focus_handle(cx), cx);
+            });
+            window.simulate_keystrokes(&format!("{modifier}-a {modifier}-v"));
+            editor.read_with(window, |editor, _| assert_eq!(editor.value(), "中文\nnext"));
+            window.simulate_keystrokes(&format!("{modifier}-a {modifier}-c"));
+            assert_eq!(
+                window.read_from_clipboard().unwrap().text().unwrap(),
+                "中文\nnext"
+            );
+            window.simulate_keystrokes(&format!("{modifier}-x"));
+            editor.read_with(window, |editor, _| assert_eq!(editor.value(), ""));
+            assert_eq!(
+                window.read_from_clipboard().unwrap().text().unwrap(),
+                "中文\nnext"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn image_paste_shortcuts_emit_attachments_without_changing_text(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(bind_prompt_editor_keys);
+        for modifier in ["cmd", "ctrl"] {
+            let (editor, window) = cx.add_window_view(|_, cx| PromptEditor::new(cx, "Message"));
+            let images = Rc::new(RefCell::new(Vec::new()));
+            let received = images.clone();
+            let _subscription = window.update(|window, cx| {
+                editor.update(cx, |editor, cx| editor.set_value("keep this", cx));
+                window.focus(&editor.read(cx).focus_handle(cx), cx);
+                cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                    ImageFormat::Png,
+                    vec![1, 2, 3],
+                )));
+                cx.subscribe(&editor, move |_, event: &PromptEditorEvent, _| {
+                    if let PromptEditorEvent::ImagePasted(images) = event {
+                        received.borrow_mut().extend(images.clone());
+                    }
+                })
+            });
+            window.simulate_keystrokes(&format!("{modifier}-v"));
+            window.run_until_parked();
+            assert_eq!(
+                &*images.borrow(),
+                &[PastedImage::new(ImageFormat::Png, vec![1, 2, 3])]
+            );
+            editor.read_with(window, |editor, _| assert_eq!(editor.value(), "keep this"));
+        }
     }
 
     #[test]

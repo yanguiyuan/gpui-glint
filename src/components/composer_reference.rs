@@ -14,6 +14,12 @@ pub struct ComposerReference {
     pub preview: Option<String>,
     #[serde(default)]
     pub preview_truncated: bool,
+    /// Clipboard content is carried in full, rather than read from a project path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_attachment: bool,
+    /// Merge-conflict snapshots get a dedicated diff icon and attachment wording.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub diff_attachment: bool,
 }
 impl ComposerReference {
     pub fn file(path: impl Into<String>, directory: bool) -> Self {
@@ -26,7 +32,23 @@ impl ComposerReference {
             excerpt: None,
             preview: None,
             preview_truncated: false,
+            text_attachment: false,
+            diff_attachment: false,
         }
+    }
+    pub fn pasted_text(name: impl Into<String>, text: &str) -> Self {
+        let mut reference = Self::file(name, false);
+        reference.text_attachment = true;
+        reference.excerpt = Some(text.to_owned());
+        reference.set_preview(text);
+        reference
+    }
+    /// A merge-conflict file snapshot: shown as its own highlighted diff
+    /// reference with a dedicated icon instead of inline untrusted content.
+    pub fn conflict_snapshot(name: impl Into<String>, text: &str) -> Self {
+        let mut reference = Self::pasted_text(name, text);
+        reference.diff_attachment = true;
+        reference
     }
     pub fn selection(path: impl Into<String>, start: usize, end: usize, text: &str) -> Self {
         let mut reference = Self::file(path, false);
@@ -59,6 +81,8 @@ impl ComposerReference {
     pub fn icon(&self) -> Icon {
         if self.directory {
             Icon::Folder
+        } else if self.diff_attachment {
+            Icon::GitConflict
         } else if self.excerpt.is_some() {
             Icon::Code
         } else if self.start_line.is_some() {
@@ -110,7 +134,14 @@ impl ComposerReference {
                     .max(2)
                     + 1,
             );
-            format!("文件引用：{}{}\n{fence}\n{text}\n{fence}", self.path, range)
+            let kind = if self.diff_attachment {
+                "冲突文件快照"
+            } else if self.text_attachment {
+                "粘贴文本附件"
+            } else {
+                "文件引用"
+            };
+            format!("{kind}：{}{}\n{fence}\n{text}\n{fence}", self.path, range)
         } else {
             format!(
                 "{}引用：{}{}；请使用文件工具按需读取，不要假定已获得其内容。",
@@ -175,5 +206,32 @@ mod tests {
             serde_json::from_value::<ComposerReference>(value).unwrap(),
             file
         );
+    }
+    #[test]
+    fn conflict_snapshots_use_a_dedicated_icon_and_full_model_payload() {
+        let content = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n".repeat(10);
+        let mut reference =
+            ComposerReference::conflict_snapshot("冲突快照-handler.go.txt", &content);
+        assert!(reference.text_attachment && reference.diff_attachment);
+        assert_eq!(reference.icon(), Icon::GitConflict);
+        assert!(
+            reference
+                .prompt()
+                .starts_with("冲突文件快照：冲突快照-handler.go.txt\n")
+        );
+        assert!(reference.prompt().contains("<<<<<<< HEAD"));
+        // The fenced payload grows when the snapshot itself contains backticks.
+        assert!(reference.prompt().contains("```"));
+        reference.token = reference.label();
+        assert_eq!(reference.token, "@冲突快照-handler.go.txt");
+        assert!(reference.is_present(&format!("请解决：\n{}", reference.token)));
+        // Drafts saved before the dedicated diff flag existed stay readable and
+        // fall back to the plain pasted-text treatment.
+        let mut value = serde_json::to_value(&reference).unwrap();
+        value.as_object_mut().unwrap().remove("diff_attachment");
+        let old = serde_json::from_value::<ComposerReference>(value).unwrap();
+        assert!(!old.diff_attachment && old.text_attachment);
+        assert_eq!(old.excerpt, reference.excerpt);
+        assert_eq!(old.icon(), Icon::Code);
     }
 }

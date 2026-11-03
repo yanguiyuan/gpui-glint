@@ -437,7 +437,9 @@ impl StreamCompletion {
                         self.order.push(StreamPart::Tool(index));
                     }
                     let target = self.calls.entry(index).or_insert_with(|| serde_json::json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
-                    if let Some(id) = call["id"].as_str() {
+                    // Some providers send empty IDs on subsequent argument deltas.
+                    // Preserve the ID already received for this call index.
+                    if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
                         target["id"] = id.into();
                     }
                     for field in ["name", "arguments"] {
@@ -581,6 +583,54 @@ pub fn empty_reply_error(reason: Option<&str>, thinking: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_ids_survive_empty_argument_delta_ids() {
+        for id in [None, Some(Value::Null), Some(serde_json::json!(""))] {
+            let mut stream = StreamCompletion::default();
+            let mut delta = serde_json::json!({"index":0,"function":{"arguments":"{\"name\":\"kdev\"}"}});
+            if let Some(id) = id {
+                delta["id"] = id;
+            }
+            for event in [
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-123","function":{"name":"skill_read","arguments":""}}]}}]}),
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[delta]}}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            ] {
+                stream
+                    .push(format!("data: {event}\n\n").as_bytes(), 10)
+                    .unwrap();
+            }
+            let reply = stream.finish(20).unwrap();
+            assert_eq!(reply.tool_calls.len(), 1);
+            assert_eq!(reply.tool_calls[0].id, "call-123");
+            assert_eq!(reply.tool_calls[0].name, "skill_read");
+            assert_eq!(
+                reply.tool_calls[0].arguments,
+                serde_json::json!({"name":"kdev"})
+            );
+            assert!(
+                matches!(&reply.blocks[..], [ContentBlock::ToolCall(call)] if call.id == "call-123")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_calls_without_any_id_are_still_rejected() {
+        let mut stream = StreamCompletion::default();
+        for event in [
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"skill_read","arguments":"{\"name\":\"kdev\"}"}}]}}]}),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ] {
+            stream
+                .push(format!("data: {event}\n\n").as_bytes(), 10)
+                .unwrap();
+        }
+        assert_eq!(
+            stream.finish(20).unwrap_err(),
+            "Provider 工具调用缺少 ID 或名称"
+        );
+    }
 
     #[test]
     fn empty_reasoning_deltas_do_not_create_blocks_around_tools() {

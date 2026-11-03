@@ -92,7 +92,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
-    pub steering: Option<async_channel::Receiver<String>>,
+    pub steering: Option<async_channel::Receiver<crate::provider::Steering>>,
     pub todos: crate::todo::Store,
     pub subagents: crate::subagent::Registry,
     pub delegation: crate::subagent::Delegation,
@@ -113,7 +113,7 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    pub fn take_steering(&self) -> Vec<String> {
+    pub fn take_steering(&self) -> Vec<crate::provider::Steering> {
         let mut messages = Vec::new();
         if let Some(receiver) = &self.steering {
             while let Ok(message) = receiver.try_recv() {
@@ -217,7 +217,7 @@ pub fn definitions(anthropic: bool) -> Value {
         ),
         definition(
             "run_command",
-            "Run a program with argv as the current user. Prefer foreground execution: omit background or set false to wait for completion in this one tool call, with live output still visible in the UI. Use this for builds, tests, installs and scripts; set timeout_seconds to 300 or 600 for slow builds instead of background polling. cwd is a working directory, NOT a process sandbox. Subject to selected approval mode. timeout_seconds is 1..86400 (default 60, or 3600 with background=true). Only set background=true for long-lived services or when doing independent work while the command runs; it returns a run_id immediately. running means launched, not completed. Use command_poll with wait_ms=5000 in this same conversation to confirm completion before claiming success, or command_stop to cancel. Avoid repeated immediate polling. Results have status, exit_code, signal, stdout/stderr head+tail, truncation flags and private log paths. A nonzero exit is failed. Use program+args rather than shell syntax.",
+            "Run a program with argv as the current user. Prefer foreground execution: omit background or set false to wait for completion in this one tool call, with live output still visible in the UI. Use this for builds, tests, installs and scripts; set timeout_seconds to 300 or 600 for slow builds instead of background polling. cwd is a working directory, NOT a process sandbox. Subject to selected approval mode. timeout_seconds is 1..86400 (default 60, or 3600 with background=true). Only set background=true for long-lived services or when doing independent work while the command runs; it returns a run_id immediately. running means launched, not completed. Use command_poll with wait_ms=5000 in this same conversation to confirm completion before claiming success, or command_stop to cancel. Avoid repeated immediate polling. Results have status, exit_code, signal, stdout/stderr head+tail, truncation flags and private log paths. A nonzero exit is failed. failure_kind distinguishes spawn_failed (no process started), nonzero_exit, timeout, cancelled and io_error; environment_unavailable flags launcher or environment failures. resolved_program and retry_count explain local executable resolution. Do not retry nonzero exits blindly: the command may already have changed state. Windows x64 supplies bundled ripgrep, including to child shell PATH. Use program+args rather than shell syntax.",
             json!({"program":string(),"args":{"type":"array","items":string()},"cwd":string(),"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"background":{"type":"boolean","default":false,"description":"Prefer false (default): wait for completion with live output. True is only for long-lived services or independent concurrent work."}}),
             &["program", "args"],
         ),

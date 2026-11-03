@@ -19,6 +19,12 @@ use tokio::{
 };
 const WINDOW: usize = 32 * 1024;
 const LOG_LIMIT: u64 = 32 * 1024 * 1024;
+
+fn environment_error(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    ["shim: could not create process", "untrusted mount point", "the path cannot be traversed"]
+        .iter().any(|message| text.contains(message))
+}
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Scope {
     anchor: PathBuf,
@@ -52,6 +58,14 @@ pub struct ResultData {
     pub stderr_log: PathBuf,
     pub error: Option<String>,
     pub remote_state: Option<String>,
+    #[serde(default)]
+    pub failure_kind: Option<String>,
+    #[serde(default)]
+    pub environment_unavailable: bool,
+    #[serde(default)]
+    pub resolved_program: Option<PathBuf>,
+    #[serde(default)]
+    pub retry_count: u8,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Stored {
@@ -94,15 +108,35 @@ struct State {
 }
 struct Run {
     scope: Scope,
+    call_id: Option<String>,
     state: Mutex<State>,
     cancel: watch::Sender<bool>,
     done: Notify,
     finished: AtomicBool,
+    manual_cancel: AtomicBool,
     started: Instant,
 }
 fn registry() -> &'static Mutex<HashMap<uuid::Uuid, Arc<Run>>> {
     static RUNS: OnceLock<Mutex<HashMap<uuid::Uuid, Arc<Run>>>> = OnceLock::new();
     RUNS.get_or_init(Default::default)
+}
+
+/// UI cancellation is scoped to the conversation and the exact tool call.
+pub fn cancel_call(anchor: &Path, session: uuid::Uuid, call_id: &str) -> bool {
+    let runs = registry().lock().unwrap();
+    let mut matching = runs.values().filter(|run| run.scope.anchor == anchor
+        && run.scope.session == Some(session) && run.call_id.as_deref() == Some(call_id)
+        && !run.finished.load(Ordering::Acquire));
+    let Some(run) = matching.next() else { return false; };
+    if matching.next().is_some() { return false; }
+    run.manual_cancel.store(true, Ordering::Release);
+    run.cancel.send(true).is_ok()
+}
+
+pub fn call_cancelling(anchor: &Path, session: uuid::Uuid, call_id: &str) -> bool {
+    registry().lock().unwrap().values().any(|run| run.scope.anchor == anchor
+        && run.scope.session == Some(session) && run.call_id.as_deref() == Some(call_id)
+        && *run.cancel.borrow())
 }
 fn store(scope: &Scope, result: &ResultData) -> Result<(), String> {
     database::save_command_run(
@@ -322,14 +356,24 @@ async fn worker(
     let started = run.started;
     let _publisher = publisher(run.clone(), events.clone());
     let remote = ssh_project::is_remote(&cwd);
+    let mut spawn_attempted = false;
+    let mut spawned = false;
     let work = async {
         if *cancel.borrow() {
             return Err("启动前已取消".to_string());
         }
+        let target = if remote {
+            PathBuf::from(&program)
+        } else {
+            crate::executable::resolve(&program, &cwd)
+        };
+        if !remote {
+            run.state.lock().unwrap().result.resolved_program = Some(target.clone());
+        }
         let mut command = if remote {
             ssh_project::Remote::from_path(&cwd)?.managed_run(&program, &args)
         } else {
-            let mut c = crate::child_process::async_command(&program);
+            let mut c = crate::child_process::async_command(&target);
             c.args(&args).current_dir(&cwd);
             c
         };
@@ -356,7 +400,47 @@ async fn worker(
             }
         }
         command.env("NO_COLOR", "1").env("TERM", "dumb");
-        let mut child = command.spawn().map_err(|e| format!("无法运行命令：{e}"))?;
+        if !remote {
+            if let Some(rg) = crate::executable::bundled_rg() {
+                let paths = std::iter::once(rg.parent().unwrap().to_owned()).chain(
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+                ).collect::<Vec<_>>();
+                if let Ok(path) = std::env::join_paths(paths) {
+                    command.env("PATH", path);
+                }
+            }
+        }
+        spawn_attempted = true;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(first) if !remote => {
+                // A failed spawn has no command effects. Retry only if a fresh
+                // resolution finds a different executable; never replay an exit.
+                let retry = crate::executable::resolve(&program, &cwd);
+                if retry == target || *cancel.borrow() {
+                    return Err(format!("无法启动命令：{first}"));
+                }
+                let mut fallback = crate::child_process::async_command(&retry);
+                fallback.args(&args).current_dir(&cwd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped()).kill_on_drop(true);
+                #[cfg(unix)]
+                fallback.process_group(0);
+                // Reuse the exact sanitized environment of the first attempt.
+                for (key, value) in command.as_std().get_envs() {
+                    if let Some(value) = value { fallback.env(key, value); }
+                    else { fallback.env_remove(key); }
+                }
+                let mut state = run.state.lock().unwrap();
+                state.result.retry_count = 1;
+                state.result.resolved_program = Some(retry);
+                drop(state);
+                fallback.spawn().map_err(|e| format!("无法启动命令：{e}（首次错误：{first}）"))?
+            }
+            Err(error) => return Err(format!("无法启动命令：{error}")),
+        };
+        spawned = true;
         let group = Group {
             pid: child.id().ok_or("命令未获得进程 ID")?,
         };
@@ -422,6 +506,19 @@ async fn worker(
                 Some("SSH 连接已关闭；远程停止结果未确认，请核对远端状态".into());
         }
         state.result.error = error;
+        if reason == Some("cancelled") && run.manual_cancel.load(Ordering::Acquire) {
+            state.result.error = Some("用户手动终止了此命令；不要自动重试。".into());
+        }
+        state.result.failure_kind = match state.result.status.as_str() {
+            "timed_out" => Some("timeout".into()),
+            "cancelled" => Some("cancelled".into()),
+            "failed" if state.result.exit_code.is_some_and(|code| code != 0) => Some("nonzero_exit".into()),
+            "failed" => Some("io_error".into()),
+            _ => None,
+        };
+        if state.result.status == "failed" {
+            state.result.environment_unavailable = environment_error(&state.buffers[1].text());
+        }
         Ok::<(), String>(())
     }
     .await;
@@ -434,7 +531,17 @@ async fn worker(
                 "failed"
             }
             .into();
-            state.result.error = Some(error);
+            state.result.error = Some(if run.manual_cancel.load(Ordering::Acquire) {
+                "用户手动终止了此命令；不要自动重试。".into()
+            } else { error });
+            state.result.failure_kind = Some(if *cancel.borrow() {
+                "cancelled"
+            } else if spawn_attempted && !spawned {
+                "spawn_failed"
+            } else {
+                "io_error"
+            }.into());
+            state.result.environment_unavailable = spawn_attempted && !spawned;
         }
         state.result.stdout = state.buffers[0].text();
         state.result.stderr = state.buffers[1].text();
@@ -523,6 +630,7 @@ async fn start(
     let (cancel, receiver) = watch::channel(false);
     let run = Arc::new(Run {
         scope,
+        call_id: events.as_ref().map(|(call_id, _)| call_id.clone()),
         state: Mutex::new(State {
             result: ResultData {
                 run_id: id,
@@ -539,6 +647,10 @@ async fn start(
                 stderr_log: directory.join("stderr.log"),
                 error: None,
                 remote_state: None,
+                failure_kind: None,
+                environment_unavailable: false,
+                resolved_program: None,
+                retry_count: 0,
             },
             buffers: Default::default(),
             dirty: false,
@@ -546,6 +658,7 @@ async fn start(
         cancel,
         done: Notify::new(),
         finished: AtomicBool::new(false),
+        manual_cancel: AtomicBool::new(false),
         started: Instant::now(),
     });
     let scope = run.scope.clone();
@@ -591,6 +704,7 @@ async fn start(
                 let mut state = owned.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.result.status = "failed".into();
                 state.result.error = Some("命令工作任务意外中断，请核对日志和实际执行结果".into());
+                state.result.failure_kind = Some("io_error".into());
             }
             let scope = owned.scope.clone();
             let result = snapshot(&owned);
@@ -829,13 +943,16 @@ pub async fn internal(
         events.map(|(id, sender)| (id.into(), sender.clone())),
     )
     .await?;
-    if program == "rg" && result.exit_code == Some(1) {
+    if (program == "rg" || program == "rg.exe") && result.exit_code == Some(1)
+        && result.stderr.trim().is_empty() && result.error.is_none() && !result.environment_unavailable
+        && result.failure_kind.as_deref() == Some("nonzero_exit") {
         return Ok(String::new());
     }
     if result.status != "completed" {
         return Err(format!(
-            "exit: {:?}\n{}\n{}",
-            result.exit_code, result.stdout, result.stderr
+            "exit: {:?}; failure_kind: {}\n{}\n{}\n{}",
+            result.exit_code, result.failure_kind.as_deref().unwrap_or("unknown"),
+            result.stdout, result.stderr, result.error.as_deref().unwrap_or("")
         ));
     }
     Ok(format!(
@@ -849,6 +966,71 @@ pub async fn internal(
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manual_stop_cancels_only_the_selected_call_and_preserves_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = Scope { anchor: temp.path().join("sessions.json"), root: Some(temp.path().into()), partner: None, session: Some(uuid::Uuid::new_v4()) };
+        let (events, _) = async_channel::unbounded();
+        let first = start(scope.clone(), temp.path().into(), "powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "[Console]::WriteLine('before stop'); [IO.File]::WriteAllText('ready.txt','ready'); Start-Sleep -Seconds 30".into()], 60, Some(("first-call".into(), events.clone()))).await.unwrap();
+        let other = start(scope.clone(), temp.path().into(), "powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "Start-Sleep -Seconds 30".into()], 60, Some(("other-call".into(), events))).await.unwrap();
+        let deadline = Instant::now()+Duration::from_secs(15);
+        while !temp.path().join("ready.txt").exists() {
+            assert!(Instant::now()<deadline, "test command did not start");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(!cancel_call(&scope.anchor, uuid::Uuid::new_v4(), "first-call"));
+        assert!(cancel_call(&scope.anchor, scope.session.unwrap(), "first-call"));
+        tokio::time::timeout(Duration::from_secs(10), wait(&first)).await.unwrap();
+        let result = snapshot(&first);
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.failure_kind.as_deref(), Some("cancelled"));
+        assert!(result.error.as_deref().unwrap().contains("用户手动终止"));
+        assert!(result.stdout.contains("before stop"));
+        assert!(!other.finished.load(Ordering::Acquire), "unrelated command must stay alive");
+        other.cancel.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait(&other)).await.unwrap();
+    }
+
+    async fn local(root: &Path, program: &str, args: &[&str], timeout: u64) -> ResultData {
+        foreground_scope(
+            Scope { anchor: PathBuf::new(), root: Some(root.into()), partner: None, session: None },
+            root.into(), program.into(), args.iter().map(|arg| (*arg).into()).collect(),
+            timeout, false, None,
+        ).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_exit_timeout_and_environment_failures_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = local(temp.path(), "glint-nonexistent-executable-82793.exe", &[], 5).await;
+        assert_eq!(missing.failure_kind.as_deref(), Some("spawn_failed"));
+        assert_eq!(missing.exit_code, None);
+        assert!(missing.environment_unavailable);
+        let failed = local(temp.path(), "cmd.exe", &["/D", "/C", "echo failed 1>&2 & exit /b 7"], 5).await;
+        assert_eq!(failed.failure_kind.as_deref(), Some("nonzero_exit"));
+        assert_eq!(failed.exit_code, Some(7));
+        assert!(!failed.environment_unavailable);
+        assert_eq!(failed.retry_count, 0);
+        let environment = local(temp.path(), "cmd.exe", &["/D", "/C", "echo Shim: Could not create process 1>&2 & exit /b 1"], 5).await;
+        assert!(environment.environment_unavailable);
+        assert_eq!(environment.retry_count, 0, "never replay a command based on stderr text");
+        let timeout = local(temp.path(), "powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"], 1).await;
+        assert_eq!(timeout.failure_kind.as_deref(), Some("timeout"));
+        assert_eq!(timeout.status, "timed_out");
+    }
+
+    #[tokio::test]
+    #[cfg(target_arch = "x86_64")]
+    async fn bundled_search_handles_matches_and_empty_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "hello").unwrap();
+        assert!(internal(temp.path(), "rg", &["hello".into(), "file.txt".into()], None).await.unwrap().contains("hello"));
+        assert_eq!(internal(temp.path(), "rg", &["absent".into(), "file.txt".into()], None).await.unwrap(), "");
+        let shell = local(temp.path(), "cmd.exe", &["/D", "/C", "rg --version"], 5).await;
+        assert_eq!(shell.status, "completed");
+        assert!(shell.stdout.starts_with("ripgrep 15.1.0"));
+    }
     #[tokio::test]
     async fn managed_command_runs_without_a_console_and_keeps_both_output_streams() {
         let root = tempfile::tempdir().unwrap();

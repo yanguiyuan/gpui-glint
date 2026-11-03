@@ -399,7 +399,7 @@ impl RichText {
                             })
                         }
                         Format::Code => {
-                            run.font.family = "Menlo".into();
+                            run.font.family = crate::code_font::family();
                         }
                         Format::Link(_) => {
                             run.color = gpui::rgb_to_hsla(rgb(0x007aff));

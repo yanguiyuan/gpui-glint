@@ -436,6 +436,21 @@ pub fn user_content(
     json!(parts)
 }
 
+/// A prompt injected into a running generation through the 引导 control:
+/// text plus any images the queued submission carried.
+#[derive(Clone, Debug)]
+pub struct Steering {
+    pub text: String,
+    pub images: Vec<crate::model::MessageImage>,
+}
+
+impl Steering {
+    /// The JSON user turn for this payload under `protocol`.
+    pub fn turn(&self, protocol: Protocol) -> Value {
+        json!({"role": "user", "content": user_content(&self.text, &self.images, protocol)})
+    }
+}
+
 static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
 pub fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
@@ -532,7 +547,7 @@ async fn complete(
                 context
                     .take_steering()
                     .into_iter()
-                    .map(|text| json!({"role":"user","content":text})),
+                    .map(|steering| steering.turn(config.protocol)),
             );
         }
         if let Some(recalled) = context
@@ -600,7 +615,7 @@ async fn complete(
                 messages.extend(
                     steering
                         .into_iter()
-                        .map(|text| json!({"role":"user","content":text})),
+                        .map(|steering| steering.turn(config.protocol)),
                 );
                 continue;
             }
@@ -1459,7 +1474,10 @@ mod tests {
                         );
                         if round == 0 && deliver_recall {
                             steering_sender
-                                .try_send("steering-sentinel".into())
+                                .try_send(Steering {
+                                    text: "steering-sentinel".into(),
+                                    images: Vec::new(),
+                                })
                                 .unwrap();
                             // Recall cannot start/finish before the main request:
                             // release it only once the server has seen round one.
@@ -1764,6 +1782,34 @@ mod tests {
         assert_eq!(
             user_content("纯文本", &[], Protocol::OpenAi),
             json!("纯文本")
+        );
+    }
+
+    #[test]
+    fn steering_turns_carry_images_through_user_content() {
+        use crate::model::MessageImage;
+        let text_only = Steering {
+            text: "执行中补充".into(),
+            images: Vec::new(),
+        };
+        assert_eq!(
+            text_only.turn(Protocol::OpenAi),
+            json!({"role":"user","content":"执行中补充"})
+        );
+        let with_image = Steering {
+            text: "看图".into(),
+            images: vec![MessageImage {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+                file: None,
+            }],
+        };
+        assert_eq!(
+            with_image.turn(Protocol::Anthropic),
+            json!({"role":"user","content":[
+                {"type":"text","text":"看图"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ]})
         );
     }
 

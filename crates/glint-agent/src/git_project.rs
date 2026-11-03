@@ -2,12 +2,95 @@
 use gpui_glint::components::{
     DiffLine, GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraphData, diff_lines,
 };
-use std::{path::Path, process::Output};
+use std::{
+    path::{Path, PathBuf},
+    process::Output,
+};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    pub locked: Option<String>,
+    pub prunable: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BranchSelection {
+    Switched,
+    Worktree(PathBuf),
+}
+
+fn git_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    if crate::ssh_project::is_remote(root) {
+        let mut remote = crate::ssh_project::Remote::from_path(root)?;
+        remote.directory = path.into();
+        Ok(remote.uri())
+    } else {
+        let path = PathBuf::from(path);
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        #[cfg(windows)]
+        {
+            let text = path.to_string_lossy();
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return Ok(PathBuf::from(format!(r"\\{unc}")));
+            }
+            if let Some(dos) = text.strip_prefix(r"\\?\") {
+                return Ok(PathBuf::from(dos));
+            }
+        }
+        Ok(path)
+    }
+}
+
+fn parse_worktrees(root: &Path, bytes: &[u8]) -> Result<Vec<Worktree>, String> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for field in bytes.split(|byte| *byte == 0) {
+        let field = std::str::from_utf8(field).map_err(|_| "Git worktree 信息包含无效 UTF-8")?;
+        if field.is_empty() {
+            if let Some(tree) = current.take() {
+                worktrees.push(tree);
+            }
+            continue;
+        }
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        if key == "worktree" {
+            if let Some(tree) = current.take() {
+                worktrees.push(tree);
+            }
+            current = Some(Worktree {
+                path: git_path(root, value)?,
+                ..Default::default()
+            });
+        } else if let Some(tree) = &mut current {
+            match key {
+                "HEAD" => tree.head = value.into(),
+                "branch" => tree.branch = Some(value.into()),
+                "detached" => tree.detached = true,
+                "bare" => tree.bare = true,
+                "locked" => tree.locked = Some(value.into()),
+                "prunable" => tree.prunable = Some(value.into()),
+                _ => {}
+            }
+        }
+    }
+    if let Some(tree) = current {
+        worktrees.push(tree);
+    }
+    Ok(worktrees)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repository {
     pub current: String,
     pub branches: Vec<String>,
+    pub worktree: PathBuf,
+    pub common_dir: PathBuf,
+    pub worktrees: Vec<Worktree>,
 }
 
 async fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
@@ -52,7 +135,24 @@ pub async fn repository(root: &Path) -> Result<Option<Repository>, String> {
     if !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim() != "true" {
         return Ok(None);
     }
-    let symbolic = run(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    let (symbolic, branches, top, common, output) = tokio::try_join!(
+        run(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        run(
+            root,
+            &[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname:strip=2)",
+                "refs/heads/"
+            ]
+        ),
+        run(root, &["rev-parse", "--show-toplevel"]),
+        run(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        ),
+        run(root, &["worktree", "list", "--porcelain", "-z"]),
+    )?;
     let current = if symbolic.status.success() {
         text(symbolic)?
     } else {
@@ -61,22 +161,72 @@ pub async fn repository(root: &Path) -> Result<Option<Repository>, String> {
             text(run(root, &["rev-parse", "--short", "HEAD"]).await?)?
         )
     };
-    let branches = text(
-        run(
-            root,
-            &[
-                "for-each-ref",
-                "--sort=refname",
-                "--format=%(refname:strip=2)",
-                "refs/heads/",
-            ],
-        )
-        .await?,
-    )?
-    .lines()
-    .map(str::to_owned)
-    .collect();
-    Ok(Some(Repository { current, branches }))
+    let branches = text(branches)?.lines().map(str::to_owned).collect();
+    let worktree = git_path(root, &text(top)?)?;
+    let common_dir = git_path(root, &text(common)?)?;
+    if !output.status.success() {
+        return Err(text(output).unwrap_err());
+    }
+    let worktrees = parse_worktrees(root, &output.stdout)?;
+    Ok(Some(Repository {
+        current,
+        branches,
+        worktree,
+        common_dir,
+        worktrees,
+    }))
+}
+
+/// Recheck occupancy at click time; navigating never checks out another copy.
+pub async fn select_worktree(root: &Path, path: &Path) -> Result<BranchSelection, String> {
+    let repo = repository(root).await?.ok_or("当前项目不是 Git 工作区")?;
+    let tree = repo
+        .worktrees
+        .iter()
+        .find(|tree| tree.path == path && !tree.bare)
+        .ok_or("该 worktree 已不属于当前仓库，请刷新后重试")?;
+    let target = repository(&tree.path)
+        .await
+        .map_err(|error| format!("无法打开 worktree {}：{error}", tree.path.display()))?
+        .ok_or_else(|| format!("worktree 目录不可用：{}", tree.path.display()))?;
+    if target.common_dir != repo.common_dir {
+        return Err("worktree 已变更为其他仓库，请刷新后重试".into());
+    }
+    Ok(BranchSelection::Worktree(tree.path.clone()))
+}
+
+pub async fn select_branch(
+    root: &Path,
+    branch: &str,
+    expected_worktree: Option<&Path>,
+) -> Result<BranchSelection, String> {
+    let repo = repository(root).await?.ok_or("当前项目不是 Git 工作区")?;
+    if !repo.branches.iter().any(|name| name == branch) {
+        return Err("该本地分支已不存在".into());
+    }
+    let reference = format!("refs/heads/{branch}");
+    let occupied = repo
+        .worktrees
+        .iter()
+        .find(|tree| tree.branch.as_deref() == Some(&reference) && tree.path != repo.worktree);
+    if occupied.map(|tree| tree.path.as_path()) != expected_worktree {
+        return Err("分支的 worktree 占用已变化，请刷新后重试".into());
+    }
+    if repo.current == branch {
+        return Ok(BranchSelection::Switched);
+    }
+    if let Some(tree) = occupied {
+        let target = repository(&tree.path)
+            .await
+            .map_err(|error| format!("无法打开 worktree {}：{error}", tree.path.display()))?
+            .ok_or_else(|| format!("worktree 目录不可用：{}", tree.path.display()))?;
+        if target.common_dir != repo.common_dir || target.current != branch {
+            return Err("worktree 状态已变化，请刷新后重试".into());
+        }
+        return Ok(BranchSelection::Worktree(tree.path.clone()));
+    }
+    text(run(root, &["switch", "--no-guess", "--", branch]).await?)?;
+    Ok(BranchSelection::Switched)
 }
 
 pub async fn switch(root: &Path, branch: &str) -> Result<(), String> {
@@ -315,6 +465,108 @@ pub async fn file_diff(root: &Path, id: &str, path: &str) -> Result<Vec<DiffLine
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_porcelain_preserves_paths_and_state_flags() {
+        let trees = parse_worktrees(Path::new("."), b"worktree /tmp/main\0HEAD abc\0branch refs/heads/main\0\0worktree /tmp/space \xe4\xb8\xad\xe6\x96\x87\nline\0HEAD def\0detached\0locked maintenance\0prunable missing directory\0\0worktree /tmp/bare\0bare\0\0").unwrap();
+        assert_eq!(trees.len(), 3);
+        assert_eq!(trees[0].branch.as_deref(), Some("refs/heads/main"));
+        assert_eq!(trees[1].path, PathBuf::from("/tmp/space 中文\nline"));
+        assert!(trees[1].detached);
+        assert_eq!(trees[1].locked.as_deref(), Some("maintenance"));
+        assert_eq!(trees[1].prunable.as_deref(), Some("missing directory"));
+        assert!(trees[2].bare);
+        let remote = parse_worktrees(
+            Path::new("ssh://user@example.test:2222/repo"),
+            b"worktree /other/worktree\0branch refs/heads/feature\0\0",
+        )
+        .unwrap();
+        assert!(crate::ssh_project::is_remote(&remote[0].path));
+        assert_eq!(
+            crate::ssh_project::Remote::from_path(&remote[0].path)
+                .unwrap()
+                .directory,
+            "/other/worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn occupied_branches_open_worktrees_and_stale_occupancy_never_switches() {
+        let main = init();
+        commit(main.path(), "base");
+        let parent = tempfile::tempdir().unwrap();
+        let linked = parent.path().join("linked 中文 spaces");
+        git(
+            main.path(),
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "keep",
+                linked.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(main.path().join("draft.txt"), "main-only").unwrap();
+        std::fs::write(linked.join("draft.txt"), "linked-only").unwrap();
+        let repo = repository(main.path()).await.unwrap().unwrap();
+        let tree = repo
+            .worktrees
+            .iter()
+            .find(|tree| tree.branch.as_deref() == Some("refs/heads/feature"))
+            .unwrap();
+        assert!(tree.locked.is_some());
+        assert_eq!(
+            select_branch(main.path(), "feature", Some(&tree.path))
+                .await
+                .unwrap(),
+            BranchSelection::Worktree(tree.path.clone())
+        );
+        assert_eq!(
+            select_worktree(main.path(), &tree.path).await.unwrap(),
+            BranchSelection::Worktree(tree.path.clone())
+        );
+        assert!(select_worktree(main.path(), parent.path()).await.is_err());
+        assert_eq!(
+            git(main.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "master"
+        );
+        assert_eq!(
+            std::fs::read_to_string(linked.join("draft.txt")).unwrap(),
+            "linked-only"
+        );
+        assert!(
+            select_branch(main.path(), "feature", None)
+                .await
+                .unwrap_err()
+                .contains("占用已变化")
+        );
+        assert_eq!(
+            git(main.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "master"
+        );
+        git(main.path(), &["branch", "free"]);
+        assert!(
+            select_branch(main.path(), "free", Some(&tree.path))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            git(main.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "master"
+        );
+        assert_eq!(
+            select_branch(main.path(), "free", None).await.unwrap(),
+            BranchSelection::Switched
+        );
+        assert_eq!(
+            git(main.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "free"
+        );
+    }
     fn git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .current_dir(root)
@@ -477,13 +729,13 @@ mod tests {
             "linked"
         );
         git(root, &["checkout", "--detach"]);
-        assert!(
-            repository(root)
+        let detached = repository(root).await.unwrap().unwrap();
+        assert!(detached.current.starts_with("分离 HEAD"));
+        assert_eq!(
+            select_worktree(&worktree, &detached.worktree)
                 .await
-                .unwrap()
-                .unwrap()
-                .current
-                .starts_with("分离 HEAD")
+                .unwrap(),
+            BranchSelection::Worktree(detached.worktree)
         );
         assert!(
             !graph(root, "master".into())

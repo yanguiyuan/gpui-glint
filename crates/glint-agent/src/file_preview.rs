@@ -578,6 +578,17 @@ impl State {
                 cx.notify();
             }
             FilePreviewEvent::QuoteRequested { path, selection } => {
+                if this.file_preview.target.is_none() {
+                    // A pasted attachment is virtual; selected text must travel inline too.
+                    let mut reference = gpui_glint::components::ComposerReference::pasted_text(
+                        path,
+                        &selection.text,
+                    );
+                    reference.start_line = Some(selection.start_line);
+                    reference.end_line = Some(selection.end_line);
+                    this.quote_reference(reference, cx);
+                    return;
+                }
                 let path = if let Some(root) = this
                     .file_preview
                     .target
@@ -731,17 +742,23 @@ impl AgentWorkspace {
         selection: &gpui_glint::components::CodeSelection,
         cx: &mut Context<Self>,
     ) {
-        self.composer.update(cx, |composer, cx| {
-            composer.add_reference(
-                gpui_glint::components::ComposerReference::selection(
-                    path,
-                    selection.start_line,
-                    selection.end_line,
-                    &selection.text,
-                ),
-                cx,
-            )
-        });
+        self.quote_reference(
+            gpui_glint::components::ComposerReference::selection(
+                path,
+                selection.start_line,
+                selection.end_line,
+                &selection.text,
+            ),
+            cx,
+        );
+    }
+    fn quote_reference(
+        &mut self,
+        reference: gpui_glint::components::ComposerReference,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer
+            .update(cx, |composer, cx| composer.add_reference(reference, cx));
         self.capture_draft(cx);
         self.save_draft(cx);
         let focus = self.composer.focus_handle(cx);
@@ -751,6 +768,50 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub fn preview_link(&mut self, link: &str, origin: &Option<PathBuf>, cx: &mut Context<Self>) {
+        if let Some(location) = link.strip_prefix("glint-paste://") {
+            let parts: Vec<_> = location.split('/').collect();
+            if parts.len() != 3 {
+                return;
+            }
+            let (Ok(session), Ok(message), Ok(attachment)) = (
+                uuid::Uuid::parse_str(parts[0]),
+                parts[1].parse::<usize>(),
+                parts[2].parse::<usize>(),
+            ) else {
+                return;
+            };
+            if session != self.history.active || &self.history.active().project != origin {
+                return;
+            }
+            let Some(reference) = self
+                .history
+                .active()
+                .messages
+                .get(message)
+                .and_then(|m| m.display.as_ref())
+                .and_then(|d| d.attachments.get(attachment))
+                .cloned()
+            else {
+                return;
+            };
+            let Some(content) = reference.excerpt else {
+                return;
+            };
+            self.terminal_ui.open = false;
+            self.edits_ui.open = false;
+            self.git_ui.open = false;
+            self.file_preview.open = true;
+            self.file_preview.expanded = false;
+            self.file_preview.revision += 1;
+            self.file_preview.task = None;
+            self.file_preview.target = None;
+            self.file_preview.view.update(cx, |view, cx| {
+                view.set_theme(self.theme, cx);
+                view.set_file(reference.path, None, "text".into(), content, cx);
+            });
+            cx.notify();
+            return;
+        }
         if let Some(target) = Target::decode(link) {
             if &target.root == origin {
                 self.open_file_preview(target, cx);
@@ -772,7 +833,33 @@ impl AgentWorkspace {
     fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {
         self.open_file_preview_mode(target, false, cx);
     }
+    pub(super) fn open_project_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.history.active().project.clone() else {
+            return;
+        };
+        let path = if ssh_project::is_remote(&root) {
+            match ssh_project::Remote::from_path(&root) {
+                Ok(remote) => remote.directory,
+                Err(_) => return,
+            }
+        } else {
+            root.to_string_lossy().into_owned()
+        };
+        self.page = crate::Page::Chat;
+        self.git_ui.open = false;
+        self.file_preview.expanded = false;
+        self.right_sidebar_width = self.right_sidebar_width.max(400.);
+        self.open_file_preview(
+            Target {
+                root: Some(root),
+                path,
+                line: None,
+            },
+            cx,
+        );
+    }
     fn open_file_preview_mode(&mut self, target: Target, rendered: bool, cx: &mut Context<Self>) {
+        self.terminal_ui.open = false;
         self.file_preview.open = true;
         self.edits_ui.open = false;
         self.file_preview.revision += 1;
@@ -862,6 +949,72 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn pasted_attachment_links_open_without_reading_a_project_file(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        host.update(window, |host, cx| {
+            let id = host.history.active;
+            let content = "原始附件\n".repeat(30);
+            let mut reference =
+                gpui_glint::components::ComposerReference::pasted_text("粘贴文本-1.txt", &content);
+            reference.token = reference.label();
+            host.history
+                .active_mut()
+                .push(crate::model::Role::User, content);
+            host.history.active_mut().messages[0].display = Some(crate::model::MessageDisplay {
+                text: reference.token.clone(),
+                attachments: vec![reference],
+            });
+            host.preview_link(&format!("glint-paste://{id}/0/0"), &None, cx);
+            assert!(host.file_preview.open);
+            assert!(host.file_preview.target.is_none());
+            assert!(host.file_preview.task.is_none());
+            host.file_preview.open = false;
+            for link in [
+                format!("glint-paste://{}/0/0", uuid::Uuid::new_v4()),
+                format!("glint-paste://{id}/0/999"),
+                "glint-paste://invalid".into(),
+            ] {
+                host.preview_link(&link, &None, cx);
+                assert!(!host.file_preview.open);
+            }
+        });
+    }
+    #[gpui::test]
+    fn command_opens_project_root_in_preview_sidebar(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.history.active_mut().project = Some(dir.path().into());
+                host.file_preview.expanded = true;
+                host.edits_ui.open = true;
+                host.git_ui.open = true;
+                host.commands.pending = Some("project-files".into());
+                host.execute_pending_command(window, cx);
+                let target = host.file_preview.target.as_ref().unwrap();
+                assert_eq!(target.root.as_deref(), Some(dir.path()));
+                assert_eq!(target.path, dir.path().to_string_lossy());
+                assert!(host.file_preview.open && !host.file_preview.expanded);
+                assert!(!host.edits_ui.open && !host.git_ui.open && !host.terminal_ui.open);
+            })
+        });
+    }
     fn rendered(source: &str) -> String {
         Parser::new(source)
             .filter_map(|e| match e {

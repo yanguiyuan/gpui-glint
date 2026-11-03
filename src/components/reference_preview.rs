@@ -43,7 +43,7 @@ pub(super) fn reference_preview(
         .relative()
         .max_h(px(180.))
         .overflow_hidden()
-        .font_family("Menlo")
+        .font_family(crate::code_font::family())
         .text_size(px(12.))
         .line_height(px(18.))
         .child(text.to_owned());

@@ -1,6 +1,8 @@
 use super::*;
 use crate::edits::Change;
-use gpui_glint::components::{DiffCard, DiffCardEvent};
+use gpui_glint::components::{
+    ChainScroll, CodeCard, CodeCardEvent, DiffCard, DiffCardEvent, DiffColors,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -8,9 +10,26 @@ use std::{
     rc::Rc,
 };
 
+type ListLink = Rc<RefCell<Option<(gpui::ListState, usize)>>>;
+struct VirtualFiles {
+    files: Rc<Vec<Change>>,
+    scope: String,
+    state: gpui::ListState,
+    expanded: bool,
+}
+fn watch_row<V: 'static>(view: &Entity<V>, link: ListLink, cx: &mut Context<AgentWorkspace>) {
+    cx.observe(view, move |_, _, cx| {
+        if let Some((list, index)) = &*link.borrow() {
+            if *index < list.item_count() { list.remeasure_items(*index..*index + 1); }
+            cx.notify();
+        }
+    }).detach();
+}
+
 #[derive(Default)]
 pub struct State {
     pub open: bool,
+    pub(super) expanded: bool,
     pub selected: Option<PathBuf>,
     pub undo_task: Option<Task<()>>,
     undo_notice: Option<(Uuid, String)>,
@@ -20,9 +39,14 @@ pub struct State {
     workspace_mode: bool,
     workspace_root: Option<PathBuf>,
     workspace_files: Rc<Vec<Change>>,
+    workspace_sources: Rc<HashMap<PathBuf, crate::workspace_diff::Source>>,
+    virtual_files: RefCell<Option<VirtualFiles>>,
     workspace_notes: Vec<String>,
     workspace_error: Option<String>,
     workspace_task: Option<Task<()>>,
+    workspace_stats_task: Option<Task<()>>,
+    workspace_revision: u64,
+    conflicts: Vec<Entity<ConflictView>>,
     file_views: RefCell<HashMap<String, Entity<FileDiff>>>,
     sidebar_scroll: ScrollHandle,
     reveal_revision: u64,
@@ -30,6 +54,16 @@ pub struct State {
 }
 
 impl AgentWorkspace {
+    pub(super) fn open_workspace_diff(&mut self, cx: &mut Context<Self>) {
+        if self.history.active().project.is_none() { return; }
+        self.page = crate::Page::Chat;
+        self.git_ui.open = false;
+        self.terminal_ui.open = false;
+        self.open_edits(None, cx);
+        self.edits_ui.workspace_mode = true;
+        self.right_sidebar_width = self.right_sidebar_width.max(400.);
+        self.refresh_workspace_edits(cx);
+    }
     fn undo_session_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.pending.is_some()
             || self.preparing.is_some()
@@ -180,6 +214,7 @@ impl AgentWorkspace {
 
     pub fn open_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.file_preview.open = false;
+        self.terminal_ui.open = false;
         self.edits_ui.open = true;
         self.edits_ui.workspace_mode = false;
         self.edits_ui.selected = path;
@@ -276,6 +311,92 @@ impl AgentWorkspace {
         )
     }
 
+    fn file_row(&self, file: &Change, scope: &str, link: Option<(gpui::ListState, usize)>, can_undo: bool, reveal: bool, cx: &mut Context<Self>) -> Entity<FileDiff> {
+        let key = format!("{scope}:{}", file.path.display());
+        let mut views = self.edits_ui.file_views.borrow_mut();
+        let view = views.entry(key).or_insert_with(|| {
+            let view = cx.new(|_| FileDiff::new(file.clone(), self.theme));
+            watch_row(&view, view.read(cx).list_link.clone(), cx);
+            view
+        }).clone();
+        drop(views);
+        let workspace = cx.entity().downgrade();
+        view.update(cx, |view, cx| {
+            *view.list_link.borrow_mut() = link;
+            view.set_file(file, self.theme, cx);
+            view.source = if self.edits_ui.workspace_mode { self.edits_ui.workspace_sources.get(&file.path).cloned() } else { None };
+            if view.side_by_side != self.edits_ui.expanded {
+                view.side_by_side = self.edits_ui.expanded;
+                if let Some(card) = &view.card { card.update(cx, |card, cx| card.set_side_by_side(view.side_by_side, cx)); }
+                cx.notify();
+            }
+            view.workspace = Some(workspace);
+            if view.undo_visible != !self.edits_ui.workspace_mode || view.undo_enabled != can_undo {
+                view.undo_visible = !self.edits_ui.workspace_mode;
+                view.undo_enabled = can_undo;
+                cx.notify();
+            }
+            if reveal { view.reveal(self.edits_ui.reveal_revision, cx); }
+        });
+        view
+    }
+
+    fn virtual_workspace_files(&self, files: Rc<Vec<Change>>, scope: String, cx: &mut Context<Self>) -> gpui::List {
+        let conflicts = self.edits_ui.conflicts.clone();
+        let notes = self.edits_ui.workspace_notes.clone();
+        let prefix = if conflicts.is_empty() { 0 } else { conflicts.len() + 1 };
+        let count = prefix + files.len() + notes.len();
+        let mut cached = self.edits_ui.virtual_files.borrow_mut();
+        if let Some(cache) = cached.as_mut() {
+            if cache.scope == scope && !Rc::ptr_eq(&cache.files, &files) && cache.state.item_count() == count
+                && cache.files.len() == files.len() && cache.files.iter().zip(files.iter()).all(|(a,b)| a.id == b.id) {
+                // Background statistics must not reset scroll position or disclosures.
+                cache.files = files.clone();
+            }
+        }
+        if cached.as_ref().is_none_or(|cache| cache.scope != scope || !Rc::ptr_eq(&cache.files, &files)) {
+            let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
+            state.reset_with_uniform_height(count, px(49.));
+            *cached = Some(VirtualFiles { files: files.clone(), scope: scope.clone(), state, expanded: self.edits_ui.expanded });
+        }
+        let cached = cached.as_mut().unwrap();
+        if cached.expanded != self.edits_ui.expanded {
+            cached.expanded = self.edits_ui.expanded;
+            cached.state.remeasure();
+        }
+        let state = cached.state.clone();
+        let link_state = state.clone();
+        let weak = cx.entity().downgrade();
+        gpui::list(state, move |index, _, cx| {
+            weak.update(cx, |this, cx| {
+                if prefix > 0 && index == 0 {
+                    return div().px_3().py_2().flex().items_center().gap_1()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(Icon::GitConflict.render(13.))
+                        .child(format!("待解决冲突 · {}", conflicts.len()))
+                        .into_any_element();
+                }
+                if index < prefix {
+                    let view = &conflicts[index - 1];
+                    view.update(cx, |view, cx| {
+                        *view.list_link.borrow_mut() = Some((link_state.clone(), index));
+                        if view.theme != this.theme {
+                            view.theme = this.theme;
+                            view.editor.update(cx, |editor, cx| editor.set_theme(this.theme, cx));
+                            cx.notify();
+                        }
+                    });
+                    return view.clone().into_any_element();
+                }
+                if let Some(file) = files.get(index - prefix) {
+                    return this.file_row(file, &scope, Some((link_state.clone(), index)), false, false, cx).into_any_element();
+                }
+                div().px_3().text_size(px(11.)).text_color(rgb(this.theme.palette().text_muted))
+                    .child(notes.get(index - prefix - files.len()).cloned().unwrap_or_default()).into_any_element()
+            }).unwrap_or_else(|_| div().into_any_element())
+        }).flex_1().min_h_0().w_full()
+    }
+
     pub fn edits_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let workspace_mode = self.edits_ui.workspace_mode;
@@ -297,7 +418,6 @@ impl AgentWorkspace {
                 .position(|file| Some(&file.path) == self.edits_ui.selected.as_ref())
         };
         let workspace = cx.entity();
-        let undo_workspace = workspace.downgrade();
         let mut list = div()
             .on_children_prepainted(move |_, _, cx| {
                 workspace.update(cx, |this, cx| {
@@ -326,35 +446,43 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
+        let virtualized = workspace_mode && files.len() > 128;
+        if virtualized {
+            list = div().id("edited-files-scroll").flex_1().min_h_0().flex().flex_col()
+                .child(self.virtual_workspace_files(files.clone(), scope.clone(), cx));
+        }
+        if !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
+            for view in &self.edits_ui.conflicts {
+                view.update(cx, |view, cx| {
+                    view.list_link.borrow_mut().take();
+                    if view.theme != self.theme {
+                        view.theme = self.theme;
+                        view.editor.update(cx, |editor, cx| editor.set_theme(self.theme, cx));
+                        cx.notify();
+                    }
+                });
+            }
+            list = list.child(div().px_3().py_2().flex().items_center().gap_1()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(Icon::GitConflict.render(13.))
+                .child(format!("待解决冲突 · {}", self.edits_ui.conflicts.len())))
+                .children(self.edits_ui.conflicts.iter().cloned());
+        }
         let can_undo = !workspace_mode
             && self.pending.is_none()
             && self.preparing.is_none()
             && self.edits_ui.undo_task.is_none()
             && self.queued_requests.is_empty();
-        let mut views = self.edits_ui.file_views.borrow_mut();
-        for (index, file) in files.iter().enumerate() {
-            let key = format!("{scope}:{}", file.path.display());
-            let view = views
-                .entry(key)
-                .or_insert_with(|| cx.new(|_| FileDiff::new(file.clone(), self.theme)));
-            view.update(cx, |view, cx| {
-                view.set_file(file, self.theme, cx);
-                view.workspace = Some(undo_workspace.clone());
-                if view.undo_visible != !workspace_mode || view.undo_enabled != can_undo {
-                    view.undo_visible = !workspace_mode;
-                    view.undo_enabled = can_undo;
-                    cx.notify();
-                }
-                if reveal_index == Some(index) {
-                    view.reveal(self.edits_ui.reveal_revision, cx);
-                }
-            });
-            list = list.child(view.clone());
+        if !virtualized {
+            for (index, file) in files.iter().enumerate() {
+                let view = self.file_row(file, &scope, None, can_undo, reveal_index == Some(index), cx);
+                list = list.child(view);
+            }
         }
-        drop(views);
         let source_weak = cx.entity().downgrade();
         let mut body = div()
-            .w(px(self.right_sidebar_width))
+            .when(self.edits_ui.expanded, |body| body.w_full())
+            .when(!self.edits_ui.expanded, |body| body.w(px(self.right_sidebar_width)))
             .flex_shrink_0()
             .h_full()
             .min_h_0()
@@ -379,7 +507,7 @@ impl AgentWorkspace {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("文件变更 · {}", files.len())),
+                            .child(if workspace_mode && self.edits_ui.workspace_task.is_some() && files.is_empty() { "文件变更 · 读取中".into() } else { format!("文件变更 · {}", files.len() + if workspace_mode && root_matches { self.edits_ui.conflicts.len() } else { 0 }) }),
                     )
                     .when(!workspace_mode, |header| {
                         header.child(
@@ -394,6 +522,16 @@ impl AgentWorkspace {
                                 ),
                         )
                     })
+                    .child(
+                        IconButton::new(if self.edits_ui.expanded { Icon::Collapse } else { Icon::Expand },
+                            if self.edits_ui.expanded { "恢复侧栏 Diff" } else { "展开 Diff，左右对照" })
+                            .plain().theme(self.theme).render()
+                            .debug_selector(|| "edits-panel-expand".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.edits_ui.expanded = !this.edits_ui.expanded;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("关闭")
                             .icon(Icon::Close)
@@ -462,7 +600,9 @@ impl AgentWorkspace {
             let status = if !root_matches {
                 Some("项目已切换，请刷新工作区变更。".to_owned())
             } else if self.edits_ui.workspace_task.is_some() {
-                Some("正在读取 Git 工作区…".to_owned())
+                Some("正在读取 Git 工作区文件清单…".to_owned())
+            } else if self.edits_ui.workspace_stats_task.is_some() {
+                Some("文件清单已就绪，正在后台统计改动行数…".to_owned())
             } else {
                 self.edits_ui.workspace_error.clone()
             };
@@ -475,7 +615,7 @@ impl AgentWorkspace {
                         .child(status),
                 );
             }
-            if root_matches {
+            if root_matches && !virtualized {
                 for note in &self.edits_ui.workspace_notes {
                     list = list.child(
                         div()
@@ -487,7 +627,7 @@ impl AgentWorkspace {
                 }
             }
         }
-        if files.is_empty() {
+        if files.is_empty() && (!workspace_mode || self.edits_ui.conflicts.is_empty() && self.edits_ui.workspace_task.is_none() && self.edits_ui.workspace_error.is_none()) {
             list = list.child(
                 div()
                     .p_4()
@@ -514,9 +654,20 @@ impl AgentWorkspace {
     }
 
     fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
+        self.edits_ui.workspace_revision += 1;
+        let revision = self.edits_ui.workspace_revision;
+        self.edits_ui.workspace_stats_task = None;
         let root = self.history.active().project.clone();
+        if self.edits_ui.workspace_root != root {
+            self.edits_ui.conflicts.clear();
+            self.edits_ui.file_views.borrow_mut().retain(|key, _| !key.starts_with("workspace:"));
+        }
         self.edits_ui.workspace_root = root.clone();
         self.edits_ui.workspace_error = None;
+        self.edits_ui.workspace_files = Rc::new(Vec::new());
+        self.edits_ui.workspace_sources = Rc::new(HashMap::new());
+        self.edits_ui.virtual_files.borrow_mut().take();
+        self.edits_ui.workspace_notes.clear();
         let Some(root) = root else {
             self.edits_ui.workspace_files = Rc::new(Vec::new());
             self.edits_ui.workspace_notes.clear();
@@ -525,27 +676,49 @@ impl AgentWorkspace {
             cx.notify();
             return;
         };
+        let requested_root = root.clone();
         let work = cx.background_executor().spawn(async move {
             if crate::ssh_project::is_remote(&root) {
                 provider::Job::start(async move { edits::remote_workspace_changes(&root).await })?
                     .result()
-                    .await
+                    .await.map(|(files, notes)| (files, notes, Vec::new(), HashMap::new(), None))
             } else {
-                edits::workspace_changes(&root)
+                let inventory = crate::workspace_diff::inventory(&root)?;
+                let (conflicts, notes) = if inventory.has_conflicts { crate::merge_conflicts::load(&root)? } else { (Vec::new(), Vec::new()) };
+                Ok((inventory.files, notes, conflicts, inventory.sources, Some((inventory.root, inventory.head))))
             }
         });
         self.edits_ui.workspace_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
+                if this.history.active().project.as_ref() != Some(&requested_root)
+                    || this.edits_ui.workspace_root.as_ref() != Some(&requested_root)
+                    || this.edits_ui.workspace_revision != revision { return; }
                 if let Some(task) = this.edits_ui.workspace_task.take() {
                     task.detach();
                 }
                 match result {
-                    Ok((files, notes)) => {
+                    Ok((files, notes, conflicts, sources, statistics)) => {
+                        let valid: std::collections::HashSet<_> = files.iter().map(|file| file.path.clone()).collect();
+                        this.edits_ui.file_views.borrow_mut().retain(|key, view| !key.starts_with("workspace:") || valid.contains(&view.read(cx).file.path));
                         this.edits_ui.workspace_files = Rc::new(files);
+                        this.edits_ui.workspace_sources = Rc::new(sources);
                         this.edits_ui.workspace_notes = notes;
+                        let workspace = cx.entity().downgrade();
+                        this.edits_ui.conflicts = conflicts.into_iter().map(|file| {
+                            this.edits_ui.conflicts.iter().find(|view| view.read(cx).file == file).cloned()
+                                .unwrap_or_else(|| {
+                                    let view = cx.new(|cx| ConflictView::new(file, requested_root.clone(), workspace.clone(), this.theme, cx));
+                                    watch_row(&view, view.read(cx).list_link.clone(), cx);
+                                    view
+                                })
+                        }).collect();
+                        if let Some((root, head)) = statistics {
+                            this.start_workspace_statistics(root, head, revision, cx);
+                        }
                     }
                     Err(error) => {
+                        this.edits_ui.conflicts.clear();
                         this.edits_ui.workspace_files = Rc::new(Vec::new());
                         this.edits_ui.workspace_notes.clear();
                         this.edits_ui.workspace_error = Some(error);
@@ -556,17 +729,608 @@ impl AgentWorkspace {
         }));
         cx.notify();
     }
+
+    fn start_workspace_statistics(&mut self, root: PathBuf, head: Option<String>, revision: u64, cx: &mut Context<Self>) {
+        if self.edits_ui.workspace_files.is_empty() { return; }
+        let work = cx.background_executor().spawn(async move { crate::workspace_diff::statistics(&root, head.as_deref()) });
+        self.edits_ui.workspace_stats_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.edits_ui.workspace_revision != revision || this.history.active().project != this.edits_ui.workspace_root { return; }
+                if let Some(task) = this.edits_ui.workspace_stats_task.take() { task.detach(); }
+                match result {
+                    Ok(counts) => crate::workspace_diff::apply_statistics(Rc::make_mut(&mut this.edits_ui.workspace_files).as_mut_slice(), Rc::make_mut(&mut this.edits_ui.workspace_sources), &counts),
+                    Err(error) => this.edits_ui.workspace_error = Some(format!("行数统计失败，可展开文件按需查看：{error}")),
+                }
+                cx.notify();
+            });
+        }));
+    }
+}
+
+/// Drafts stay in memory until the user explicitly saves and stages the file.
+struct ConflictView {
+    list_link: ListLink,
+    file: crate::merge_conflicts::Conflict,
+    project: PathBuf,
+    workspace: gpui::WeakEntity<AgentWorkspace>,
+    theme: ThemePreset,
+    language: &'static str,
+    expanded: bool,
+    /// Conflict hunks in the pristine file, shown in the collapsed badge.
+    count: usize,
+    /// Editable merged result with line numbers and syntax highlighting.
+    editor: Entity<CodeCard>,
+    /// Scroll chain for the capped merge-result viewport inside the list.
+    result_scroll: gpui::ScrollHandle,
+    /// Read-only highlighted previews keyed by (hunk index, side).
+    sides: RefCell<HashMap<(usize, usize), Entity<CodeCard>>>,
+    notice: Option<String>,
+    task: Option<Task<()>>,
+}
+
+/// Build the conflict request: instruction text plus the file snapshot as a
+/// separate reference attachment, so history shows a compact highlighted diff
+/// reference with its own icon instead of an inline JSON blob.
+pub(crate) fn conflict_submission(
+    file: &crate::merge_conflicts::Conflict,
+) -> gpui_glint::components::ComposerSubmission {
+    let (mut text, snapshot) = crate::merge_conflicts::agent_request(file);
+    let mut references = Vec::new();
+    if let Some((name, content)) = snapshot {
+        let mut reference =
+            gpui_glint::components::ComposerReference::conflict_snapshot(name, &content);
+        reference.token = reference.label();
+        text.push('\n');
+        text.push_str(&reference.token);
+        references.push(reference);
+    }
+    gpui_glint::components::ComposerSubmission {
+        text: text.into(),
+        references,
+        images: Vec::new(),
+    }
+}
+
+impl ConflictView {
+    fn ask_agent(&mut self, cx: &mut Context<Self>) {
+        if self.task.is_some() {
+            return;
+        }
+        if self.editor.read(cx).content() != self.file.original {
+            self.notice =
+                Some("存在未保存的合并草稿，请先保存或重置草稿，避免 Agent 覆盖手动修改。".into());
+            self.expanded = true;
+            cx.notify();
+            return;
+        }
+        let submission = conflict_submission(&self.file);
+        let result = self
+            .workspace
+            .update(cx, |workspace, cx| -> Result<(), String> {
+                if workspace.history.active().project.as_ref() != Some(&self.project) {
+                    return Err("项目已切换，请回到原项目后重试".into());
+                }
+                if workspace.pending.is_some()
+                    || workspace.preparing.is_some()
+                    || workspace.edits_ui.undo_task.is_some()
+                    || !workspace.queued_requests.is_empty()
+                {
+                    return Err("Agent 正在处理任务，请完成当前任务后重试".into());
+                }
+                if !workspace.active_model_enabled() {
+                    return Err("请先连接并启用一个 Agent 模型".into());
+                }
+                workspace.send_to(
+                    workspace.history.active,
+                    submission,
+                    workspace.provider.clone(),
+                    false,
+                    cx,
+                );
+                if workspace.preparing.is_none() && workspace.pending.is_none() {
+                    return Err(workspace
+                        .provider_error
+                        .clone()
+                        .unwrap_or_else(|| "Agent 请求未启动，请检查当前模型配置".into()));
+                }
+                workspace.page = crate::Page::Chat;
+                workspace.edits_ui.expanded = false;
+                cx.notify();
+                Ok(())
+            });
+        self.notice = Some(match result {
+            Ok(Ok(())) => "已请求 Agent 解决此文件；完成后刷新工作区审阅。".into(),
+            Ok(Err(error)) => error,
+            Err(_) => "会话已关闭".into(),
+        });
+        self.expanded = true;
+        cx.notify();
+    }
+
+    fn new(
+        file: crate::merge_conflicts::Conflict,
+        project: PathBuf,
+        workspace: gpui::WeakEntity<AgentWorkspace>,
+        theme: ThemePreset,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let count = crate::merge_conflicts::hunks(&file.original)
+            .map(|hunks| hunks.len())
+            .unwrap_or(0);
+        let language = crate::edits::language(&file.path);
+        let editor = cx.new(|cx| {
+            CodeCard::new(cx, language, file.original.clone())
+                .theme(theme)
+                .show_header(false)
+        });
+        cx.subscribe(&editor, |_, _, event: &CodeCardEvent, cx| {
+            if matches!(event, CodeCardEvent::Changed(_)) {
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            list_link: Default::default(),
+            file,
+            project,
+            workspace,
+            theme,
+            language,
+            expanded: false,
+            count,
+            editor,
+            result_scroll: gpui::ScrollHandle::new(),
+            sides: Default::default(),
+            notice: None,
+            task: None,
+        }
+    }
+
+    fn choose(&mut self, index: usize, choice: usize, cx: &mut Context<Self>) {
+        if self.task.is_some() {
+            return;
+        }
+        let text = self.editor.read(cx).content().to_owned();
+        if let Ok(hunks) = crate::merge_conflicts::hunks(&text) {
+            if let Some(hunk) = hunks.get(index) {
+                let replacement = match choice {
+                    0 => hunk.ours.clone(),
+                    1 => hunk.theirs.clone(),
+                    _ => format!("{}{}", hunk.ours, hunk.theirs),
+                };
+                let mut result = text;
+                result.replace_range(hunk.range.clone(), &replacement);
+                self.editor
+                    .update(cx, |editor, cx| editor.set_content(result, cx));
+                self.notice = None;
+                cx.notify();
+            }
+        }
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        if self.task.is_some() {
+            return;
+        }
+        let file = self.file.clone();
+        let result = self.editor.read(cx).content().to_owned();
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::merge_conflicts::save(&file, &result) });
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.task.take() {
+                    task.detach();
+                }
+                match result {
+                    Ok(()) => {
+                        this.notice = Some("已保存并暂存，冲突已解决".into());
+                        let _ = this.workspace.update(cx, |workspace, cx| {
+                            if workspace.history.active().project.as_ref() == Some(&this.project)
+                                && workspace
+                                    .edits_ui
+                                    .conflicts
+                                    .iter()
+                                    .any(|view| view.entity_id() == weak.entity_id())
+                            {
+                                workspace.refresh_workspace_edits(cx);
+                                workspace
+                                    .file_preview
+                                    .paths
+                                    .invalidate(&Some(this.project.clone()), None);
+                            }
+                        });
+                    }
+                    Err(error) => this.notice = Some(error),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// One conflict hunk: header with adopt actions, then highlighted side previews.
+    fn hunk_card(
+        &self,
+        index: usize,
+        hunk: &crate::merge_conflicts::Hunk,
+        colors: &DiffColors,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = self.theme.palette();
+        let mut actions = div().flex().flex_wrap().gap_1();
+        for (choice, label) in ["采用当前侧", "采用传入侧", "保留双方"]
+            .into_iter()
+            .enumerate()
+        {
+            actions = actions.child(
+                Button::new(label)
+                    .kind(ButtonKind::Plain)
+                    .theme(self.theme)
+                    .when(busy, |button| button.disabled())
+                    .render()
+                    .debug_selector(move || format!("merge-choice:{index}:{choice}"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, choice, cx))),
+            );
+        }
+        div()
+            .debug_selector(move || format!("merge-hunk:{index}"))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.panel))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("冲突 {}", index + 1)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!(
+                                "当前 {} 行 · 传入 {} 行",
+                                hunk.ours.lines().count(),
+                                hunk.theirs.lines().count()
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(actions),
+            )
+            .child(self.side_section(
+                index,
+                0,
+                "当前侧",
+                "ours",
+                &hunk.ours,
+                colors.deleted_marker,
+                cx,
+            ))
+            .child(self.side_section(
+                index,
+                1,
+                "传入侧",
+                "theirs",
+                &hunk.theirs,
+                colors.added_marker,
+                cx,
+            ))
+    }
+
+    /// One side of a hunk: colored label row plus a syntax-highlighted preview
+    /// with a matching gutter stripe, mirroring diff row semantics.
+    fn side_section(
+        &self,
+        index: usize,
+        side: usize,
+        label: &str,
+        hint: &str,
+        source: &str,
+        marker: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = self.theme.palette();
+        div()
+            .debug_selector(move || format!("merge-side:{index}:{side}"))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(7.)).rounded_full().bg(rgb(marker)))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("{label}（{hint}）")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .overflow_hidden()
+                    .child(div().w(px(3.)).flex_shrink_0().bg(rgb(marker)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.side_preview(index, side, source, cx)),
+                    ),
+            )
+    }
+
+    /// Cached read-only highlighted preview for one hunk side.
+    fn side_preview(
+        &self,
+        index: usize,
+        side: usize,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<CodeCard> {
+        let cached = self.sides.borrow_mut().get(&(index, side)).cloned();
+        if let Some(card) = cached {
+            if card.read(cx).content() != text {
+                card.update(cx, |card, cx| card.sync_content(text, cx));
+            }
+            return card;
+        }
+        let card = cx.new(|cx| {
+            CodeCard::new(cx, self.language, text)
+                .theme(self.theme)
+                .show_header(false)
+                .read_only(true)
+        });
+        self.sides.borrow_mut().insert((index, side), card.clone());
+        card
+    }
+
+    /// Styled single-line status message.
+    fn notice_banner(&self, notice: String) -> gpui::AnyElement {
+        let p = self.theme.palette();
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .bg(rgb(p.surface_subtle))
+            .text_size(px(12.))
+            .child(notice)
+            .into_any_element()
+    }
+}
+
+impl Render for ConflictView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.theme.palette();
+        let colors = if self.theme.is_dark() {
+            DiffColors::DARK
+        } else {
+            DiffColors::LIGHT
+        };
+        let busy = self.task.is_some();
+        let badge = if self.count > 0 {
+            format!("冲突 · {}", self.count)
+        } else {
+            "冲突".to_owned()
+        };
+        let mut row = div()
+            .w_full()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("conflict-disclosure")
+                    .debug_selector(|| "merge-conflict-disclosure".into())
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(
+                        if self.expanded {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        }
+                        .render(13.),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .child(self.file.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .bg(rgb(colors.deleted_row))
+                            .text_size(px(11.))
+                            .text_color(rgb(colors.deleted_marker))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(Icon::GitConflict.render(11.))
+                            .child(badge),
+                    )
+                    .child(
+                        IconButton::new(Icon::Sparkles, "让 Agent 解决此文件冲突")
+                            .plain()
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "agent-resolve-conflict".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.ask_agent(cx);
+                            })),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    })),
+            );
+        if self.expanded {
+            if let Some(reason) = &self.file.limitation {
+                let notice = self.notice.clone();
+                return row.child(
+                    div()
+                        .px_3()
+                        .pb_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(p.text_muted))
+                        .child(reason.clone())
+                        .child(div().child("可点击星芒图标让 Agent 按需读取并解决冲突。"))
+                        .when_some(notice, |content, notice| {
+                            content.child(self.notice_banner(notice))
+                        }),
+                );
+            }
+            let text = self.editor.read(cx).content().to_owned();
+            let mut content = div().px_3().pb_3().flex().flex_col().gap_2()
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("当前侧 / 传入侧对应 Git ours / theirs；rebase 时当前侧通常为变基目标。保存会暂存此文件，外部文件变化后刷新会重新读取。"));
+            match crate::merge_conflicts::hunks(&text) {
+                Ok(hunks) => {
+                    self.sides
+                        .borrow_mut()
+                        .retain(|(hunk, _), _| *hunk < hunks.len());
+                    if hunks.is_empty() {
+                        content = content.child(
+                            div()
+                                .debug_selector(|| "merge-resolved".into())
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(8.))
+                                .bg(rgb(colors.added_row))
+                                .text_size(px(12.))
+                                .text_color(rgb(colors.added_marker))
+                                .child(Icon::CheckCircle.render(13.))
+                                .child("已无冲突标记，检查无误后保存并标记已解决。"),
+                        );
+                    } else {
+                        for (index, hunk) in hunks.iter().enumerate() {
+                            content = content.child(self.hunk_card(index, hunk, &colors, busy, cx));
+                        }
+                    }
+                }
+                Err(error) => content = content.child(self.notice_banner(error)),
+            }
+            let dirty = !busy && text != self.file.original;
+            let mut result_header = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("合并结果"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("可直接编辑，保存会暂存此文件"),
+                );
+            if dirty {
+                result_header = result_header.child(div().flex_1()).child(
+                    Button::new("重置草稿")
+                        .kind(ButtonKind::Plain)
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "reset-merge-draft".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.editor.update(cx, |editor, cx| {
+                                editor.set_content(this.file.original.clone(), cx)
+                            });
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                );
+            }
+            content = content
+                .child(result_header)
+                .when(!busy, |content| {
+                    content.child(
+                        div()
+                            .debug_selector(|| "merge-result-editor".into())
+                            .max_h(px(360.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .id("merge-result-scroll")
+                            .overflow_y_scroll()
+                            .track_scroll(&self.result_scroll)
+                            .chain_scroll_y(&self.result_scroll)
+                            .child(self.editor.clone()),
+                    )
+                })
+                .child(
+                    Button::new(if busy {
+                        "正在保存…"
+                    } else {
+                        "保存并标记已解决"
+                    })
+                    .theme(self.theme)
+                    .when(busy, |button| button.disabled())
+                    .render()
+                    .debug_selector(|| "save-merge-conflict".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                );
+            if let Some(notice) = self.notice.clone() {
+                content = content.child(self.notice_banner(notice));
+            }
+            row = row.child(content);
+        }
+        row
+    }
 }
 
 /// Each file owns its disclosure state. Closed files never construct a diff;
 /// opening another file leaves all existing disclosures and scroll positions intact.
 struct FileDiff {
+    list_link: ListLink,
+    source: Option<crate::workspace_diff::Source>,
+    loaded: Option<Change>,
+    load_task: Option<Task<()>>,
+    load_error: Option<String>,
     workspace: Option<gpui::WeakEntity<AgentWorkspace>>,
     undo_visible: bool,
     undo_enabled: bool,
     file: Change,
     theme: ThemePreset,
     expanded: bool,
+    side_by_side: bool,
     card: Option<Entity<DiffCard>>,
     reveal_revision: u64,
 }
@@ -574,12 +1338,18 @@ struct FileDiff {
 impl FileDiff {
     fn new(file: Change, theme: ThemePreset) -> Self {
         Self {
+            list_link: Default::default(),
+            source: None,
+            loaded: None,
+            load_task: None,
+            load_error: None,
             workspace: None,
             undo_visible: false,
             undo_enabled: false,
             file,
             theme,
             expanded: false,
+            side_by_side: false,
             card: None,
             reveal_revision: 0,
         }
@@ -588,13 +1358,14 @@ impl FileDiff {
     fn set_file(&mut self, file: &Change, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.file.id != file.id {
             self.file = file.clone();
-            if self.expanded {
-                if let Some(card) = &self.card {
-                    card.update(cx, |card, cx| card.set_lines(file.lines(), cx));
-                }
-            } else {
-                self.card = None;
-            }
+            self.card = None;
+            self.loaded = None;
+            self.load_error = None;
+            self.load_task = None;
+            cx.notify();
+        } else if self.file.added != file.added || self.file.removed != file.removed {
+            self.file.added = file.added;
+            self.file.removed = file.removed;
             cx.notify();
         }
         if self.theme != theme {
@@ -613,15 +1384,67 @@ impl FileDiff {
             cx.notify();
         }
     }
+
+    fn load_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.source.clone() else { return; };
+        let id = self.file.id;
+        let work = cx.background_executor().spawn(async move { crate::workspace_diff::load(&source) });
+        self.load_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.file.id != id { return; }
+                if let Some(task) = this.load_task.take() { task.detach(); }
+                match result {
+                    Ok(change) => this.loaded = Some(change),
+                    Err(error) => this.load_error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
+    }
 }
 
 impl Render for FileDiff {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
+        if self.expanded && self.source.is_some() && self.loaded.is_none() && self.load_task.is_none() && self.load_error.is_none() {
+            self.load_diff(cx);
+        }
         let selector = format!("edit-file:{}", self.file.label);
         let path = self.file.path.clone();
         let undo_selector = format!("undo-file:{}", path.display());
         let workspace = self.workspace.clone();
+        let card = if self.expanded && self.load_task.is_none() && self.load_error.is_none() {
+            Some(
+                self.card
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| {
+                            DiffCard::from_lines(
+                                cx,
+                                edits::language(&self.file.path),
+                                self.loaded.as_ref().unwrap_or(&self.file).lines(),
+                            )
+                            .side_by_side(self.side_by_side)
+                            .header_visible(false)
+                            .theme(self.theme)
+                        })
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let whitespace = card
+            .as_ref()
+            .map(|card| {
+                let card = card.read(cx);
+                (
+                    card.whitespace_changed_pairs(),
+                    card.hide_whitespace_enabled(),
+                )
+            })
+            .filter(|(count, _)| *count > 0);
+        let whitespace_selector = format!("whitespace-toggle:{}", self.file.label);
         let mut row = div()
             .w_full()
             .flex_shrink_0()
@@ -662,7 +1485,44 @@ impl Render for FileDiff {
                             .text_size(px(12.))
                             .child(self.file.label.clone()),
                     )
-                    .child(counts(self.file.added, self.file.removed))
+                    .child(if let Some(loaded) = &self.loaded {
+                        counts(loaded.added, loaded.removed)
+                    } else if self.source.as_ref().is_some_and(|source| source.stats.is_none()) {
+                        div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("按需预览")
+                    } else { counts(self.file.added, self.file.removed) })
+                    .when_some(whitespace, |header, (count, hidden)| {
+                        header.child(
+                            div()
+                                .id("file-whitespace-toggle")
+                                .debug_selector(move || whitespace_selector.clone())
+                                .h(px(20.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(rgb(if hidden { p.accent } else { p.border }))
+                                .text_size(px(11.))
+                                .text_color(rgb(if hidden { p.accent } else { p.text_muted }))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(rgb(p.accent)))
+                                .child(if hidden {
+                                    format!("显示空白 {count}")
+                                } else {
+                                    format!("隐藏空白 {count}")
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(card) = &this.card {
+                                        let enabled = card.read(cx).hide_whitespace_enabled();
+                                        card.update(cx, |card, cx| {
+                                            card.set_hide_whitespace(!enabled, cx)
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(self.undo_visible, |header| {
                         header.child(
                             Button::new("撤销")
@@ -683,18 +1543,26 @@ impl Render for FileDiff {
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.expanded = !this.expanded;
+                        if !this.expanded {
+                            this.card = None;
+                            this.loaded = None;
+                            this.load_task = None;
+                            this.load_error = None;
+                        }
                         cx.notify();
                     })),
             );
         if self.expanded {
-            let card = self.card.get_or_insert_with(|| {
-                cx.new(|cx| {
-                    DiffCard::from_lines(cx, edits::language(&self.file.path), self.file.lines())
-                        .header_visible(false)
-                        .theme(self.theme)
-                })
-            });
-            row = row.child(div().px_2().pb_2().child(card.clone()));
+            if self.load_task.is_some() {
+                return row.child(div().px_3().py_2().text_color(rgb(p.text_muted)).child("正在加载此文件的 Diff…"));
+            }
+            if let Some(error) = &self.load_error {
+                return row.child(div().px_3().py_2().text_size(px(12.)).text_color(rgb(p.text_muted)).child(error.clone())
+                    .child(Button::new("重试").kind(ButtonKind::Plain).theme(self.theme).render()
+                        .on_click(cx.listener(|this, _, _, cx| { this.load_error = None; cx.notify(); }))));
+            }
+            let card = card.expect("diff card is ready when expanded without load errors");
+            row = row.child(div().px_2().pb_2().child(card));
         }
         row
     }
@@ -824,6 +1692,296 @@ impl Render for Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_requests_attach_the_snapshot_as_a_highlighted_diff_reference() {
+        let repo = crate::merge_conflicts::tests::conflicted();
+        let file = crate::merge_conflicts::load(repo.path())
+            .unwrap()
+            .0
+            .remove(0);
+        let submission = conflict_submission(&file);
+        let reference = &submission.references[0];
+        assert_eq!(reference.icon(), gpui_glint::components::Icon::GitConflict);
+        assert!(submission.text.ends_with(&reference.token));
+        // History keeps the compact token; the raw snapshot is not inlined.
+        let display = crate::model::MessageDisplay::from_submission(&submission).unwrap();
+        assert_eq!(display.attachments.len(), 1);
+        assert_eq!(
+            display.attachments[0].excerpt.as_deref(),
+            Some(file.original.as_str())
+        );
+        assert!(!display.text.contains("<<<<<<<"));
+        let markdown = display.markdown(uuid::Uuid::new_v4(), 0);
+        assert!(markdown.contains("glint-paste://"));
+        assert!(!markdown.contains("<<<<<<<"));
+        // The model still receives the full snapshot through the reference prompt.
+        let prompt = submission.prompt_text();
+        assert!(prompt.contains("冲突文件快照"));
+        assert!(prompt.contains(&file.original));
+    }
+
+    #[gpui::test]
+    fn thousands_of_workspace_files_only_render_visible_rows_and_load_disclosed_diff(cx: &mut gpui::TestAppContext) {
+        let repo = crate::workspace_diff::tests::many_files(3089);
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let started = std::time::Instant::now();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.edits_ui.open = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.expanded = true;
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let initial = started.elapsed();
+        let list = host.read_with(window, |host, cx| {
+            let views = host.edits_ui.file_views.borrow();
+            assert!(views.len() < 64, "created {} views", views.len());
+            assert!(views.values().all(|view| view.read(cx).loaded.is_none() && view.read(cx).load_task.is_none()));
+            host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.clone()
+        });
+        host.update(window, |_, cx| { list.scroll_to_reveal_item(2500); cx.notify(); });
+        window.run_until_parked();
+        let row = window.debug_bounds("edit-file:vendor/2500.rs").unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            let views = host.edits_ui.file_views.borrow();
+            assert!(views.len() < 96);
+            let open = views.values().find(|view| view.read(cx).file.label == "vendor/2500.rs").unwrap().read(cx);
+            assert!(open.expanded && open.card.is_some() && open.loaded.is_some(), "{:?}", open.load_error);
+        });
+        assert!(window.debug_bounds("edit-file:vendor/2501.rs").unwrap().top() > row.top() + px(70.));
+        // Adding statistics changes neither list identity nor scroll position.
+        host.update(window, |host, cx| {
+            let files = Rc::make_mut(&mut host.edits_ui.workspace_files);
+            files[2500].added = 1;
+            cx.notify();
+        });
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            let list_after = host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.logical_scroll_top();
+            assert!(list_after.item_ix > 2400);
+        });
+        host.update(window, |_, cx| { list.scroll_to_end(); cx.notify(); });
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:vendor/3088.rs").is_some());
+        eprintln!("3089 files: first visible frame={initial:?}; only visible file views created; one Diff loaded on disclosure");
+    }
+
+    #[gpui::test]
+    fn diff_panel_expands_and_restores_sidebar_with_existing_file_disclosures(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.edits_ui.open = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_files = Rc::new(vec![change("first.rs", "new\n")]);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let file = window.debug_bounds("edit-file:first.rs").unwrap();
+        window.simulate_click(file.center(), Default::default());
+        window.run_until_parked();
+        for expanded in [true, false] {
+            let button = window.debug_bounds("edits-panel-expand").unwrap();
+            window.simulate_click(button.center(), Default::default());
+            window.run_until_parked();
+            host.read_with(window, |host, cx| {
+                assert_eq!(host.edits_ui.expanded, expanded);
+                let views = host.edits_ui.file_views.borrow();
+                let view = views.values().next().unwrap().read(cx);
+                assert!(view.expanded && view.card.is_some());
+                assert_eq!(view.side_by_side, expanded);
+            });
+            let width = window
+                .debug_bounds("glass-diff-card-body")
+                .unwrap()
+                .size
+                .width;
+            assert_eq!(width > px(700.), expanded);
+        }
+    }
+
+    #[gpui::test]
+    fn workspace_file_rows_expose_whitespace_toggle_and_hide_pairs(cx: &mut gpui::TestAppContext) {
+        let change: Change = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "path": "fmt.rs", "label": "fmt.rs",
+            "before": "alpha = 1;\nbeta = 2;\n",
+            "after": "alpha =  1;\ngamma = 3;\n",
+            "added": 2, "removed": 2
+        }))
+        .unwrap();
+        let (stack, window) = cx.add_window_view(|_, cx| {
+            FileStack(vec![
+                cx.new(|_| FileDiff::new(change, ThemePreset::default())),
+            ])
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        // No pill before disclosure: the card and its pair scan do not exist yet.
+        assert!(window.debug_bounds("whitespace-toggle:fmt.rs").is_none());
+        let row = window.debug_bounds("edit-file:fmt.rs").unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        let pill = window.debug_bounds("whitespace-toggle:fmt.rs").unwrap();
+        window.simulate_click(pill.center(), Default::default());
+        window.run_until_parked();
+        stack.read_with(window, |stack, cx| {
+            let view = stack.0[0].read(cx);
+            assert!(view.expanded);
+            let card = view.card.as_ref().unwrap().read(cx);
+            assert_eq!(card.whitespace_changed_pairs(), 1);
+            assert!(card.hide_whitespace_enabled());
+        });
+        // The pill click must not collapse the disclosure.
+        assert!(window.debug_bounds("glass-diff-card-body").is_some());
+    }
+
+    #[gpui::test]
+    fn conflict_choices_edit_a_draft_before_explicit_save(cx: &mut gpui::TestAppContext) {
+        let repo = crate::merge_conflicts::tests::conflicted();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(data.path().join("sessions.json"), cx)
+        });
+        host.update(window, |host, cx| host.composer.update(cx, |composer, cx| composer.set_value("保留输入框草稿", cx)));
+        let file = crate::merge_conflicts::load(repo.path())
+            .unwrap()
+            .0
+            .remove(0);
+        let original = file.original.clone();
+        let path = file.path.clone();
+        let (view, window) = window.add_window_view(|_, cx| {
+            ConflictView::new(
+                file,
+                repo.path().into(),
+                host.downgrade(),
+                ThemePreset::default(),
+                cx,
+            )
+        });
+        window.simulate_resize(size(px(700.), px(900.)));
+        window.run_until_parked();
+        let agent = window.debug_bounds("agent-resolve-conflict").unwrap();
+        window.simulate_click(agent.center(), Default::default());
+        window.run_until_parked();
+        view.read_with(window, |view, _| {
+            assert!(view.expanded);
+            assert!(view.notice.as_deref().unwrap().contains("项目已切换"));
+        });
+        host.read_with(window, |host, cx| assert_eq!(host.composer.read(cx).value(cx), "保留输入框草稿"));
+        let button = window.debug_bounds("merge-choice:0:2").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        view.read_with(window, |view, cx| {
+            assert_eq!(view.editor.read(cx).content(), "ours\ntheirs\n")
+        });
+        view.update(window, |view, cx| {
+            view.ask_agent(cx);
+            assert!(view.notice.as_deref().unwrap().contains("未保存"));
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let button = window.debug_bounds("save-merge-conflict").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "ours\ntheirs\n");
+        assert!(
+            crate::merge_conflicts::load(repo.path())
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn conflict_card_renders_highlighted_side_previews(cx: &mut gpui::TestAppContext) {
+        let repo = crate::merge_conflicts::tests::conflicted();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(data.path().join("sessions.json"), cx)
+        });
+        let file = crate::merge_conflicts::load(repo.path())
+            .unwrap()
+            .0
+            .remove(0);
+        let (view, window) = window.add_window_view(|_, cx| {
+            ConflictView::new(
+                file,
+                repo.path().into(),
+                host.downgrade(),
+                ThemePreset::default(),
+                cx,
+            )
+        });
+        window.simulate_resize(size(px(700.), px(900.)));
+        window.run_until_parked();
+        view.update(window, |view, cx| {
+            view.expanded = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("merge-side:0:0").is_some());
+        assert!(window.debug_bounds("merge-side:0:1").is_some());
+        assert!(window.debug_bounds("merge-result-editor").is_some());
+        view.read_with(window, |view, cx| {
+            assert_eq!(view.count, 1);
+            let sides = view.sides.borrow();
+            assert_eq!(sides.get(&(0, 0)).unwrap().read(cx).content(), "ours\n");
+            assert_eq!(sides.get(&(0, 1)).unwrap().read(cx).content(), "theirs\n");
+        });
+        let button = window.debug_bounds("merge-choice:0:0").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        view.read_with(window, |view, cx| {
+            assert_eq!(view.editor.read(cx).content(), "ours\n");
+            assert!(view.sides.borrow().is_empty());
+        });
+        assert!(window.debug_bounds("merge-resolved").is_some());
+    }
+
+    #[gpui::test]
+    fn command_opens_project_workspace_diff_instead_of_session_changes(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        window.update(|window, cx| host.update(cx, |host, cx| {
+            host.history.active_mut().project = Some(dir.path().into());
+            host.git_ui.open = true;
+            host.file_preview.open = true;
+            host.edits_ui.selected = Some(dir.path().join("old.txt"));
+            host.commands.pending = Some("workspace-diff".into());
+            host.execute_pending_command(window, cx);
+            assert!(host.edits_ui.open && host.edits_ui.workspace_mode);
+            assert_eq!(host.edits_ui.workspace_root.as_deref(), Some(dir.path()));
+            assert!(host.edits_ui.selected.is_none());
+            assert!(!host.git_ui.open && !host.file_preview.open && !host.terminal_ui.open);
+        }));
+    }
 
     fn change(name: &str, content: &str) -> Change {
         serde_json::from_value(serde_json::json!({

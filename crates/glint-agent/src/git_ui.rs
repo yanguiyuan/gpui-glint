@@ -1,4 +1,5 @@
 use super::*;
+use gpui::AnimationExt as _;
 use gpui_glint::components::{DiffCard, GitGraph, GitGraphEvent, Toast, ToastHost, ToastKind};
 use std::time::{Duration, Instant};
 
@@ -154,14 +155,22 @@ impl AgentWorkspace {
             .rounded(px(8.))
             .text_color(rgb(p.text_muted))
             .hover(|s| s.bg(rgb(p.border)))
-            .child(
-                if self.git_ui.switching {
-                    Icon::Spinner
-                } else {
-                    Icon::GitBranch
-                }
-                .render(15.),
-            )
+            .child(if self.git_ui.switching {
+                Icon::Spinner
+                    .render(15.)
+                    .with_animation(
+                        "git-branch-switch-spinner",
+                        gpui::Animation::new(Duration::from_millis(900)).repeat(),
+                        |spinner, delta| {
+                            spinner.with_transformation(gpui::Transformation::rotate(
+                                gpui::radians(std::f32::consts::TAU * delta),
+                            ))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                Icon::GitBranch.render(15.).into_any_element()
+            })
             .child(div().max_w(px(200.)).truncate().child(repo.current.clone()))
             .child(Icon::ChevronDown.render(12.));
         let mut content = div()
@@ -173,15 +182,46 @@ impl AgentWorkspace {
             .gap_1();
         for branch in &repo.branches {
             let branch = branch.clone();
+            let reference = format!("refs/heads/{branch}");
+            let worktree = repo.worktrees.iter().find(|tree| {
+                tree.branch.as_deref() == Some(reference.as_str()) && tree.path != repo.worktree
+            });
             content = content.child(
                 div()
                     .id(SharedString::from(format!("switch-branch:{branch}")))
                     .p_2()
                     .rounded(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(p.surface_subtle)))
                     .when(branch == repo.current, |d| d.text_color(rgb(p.accent)))
                     .child(branch.clone())
+                    .when_some(worktree, |row, tree| {
+                        let state = if tree.prunable.is_some() {
+                            "worktree 目录可能不可用"
+                        } else if tree.locked.is_some() {
+                            "打开 worktree（已锁定）"
+                        } else {
+                            "打开 worktree"
+                        };
+                        row.child(
+                            div()
+                                .max_w(px(250.))
+                                .truncate()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(format!("{state} · {}", ssh_project::label(&tree.path))),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(250.))
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(tree.path.to_string_lossy().into_owned()),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.switch_git_branch(branch.clone(), cx)
                     })),
@@ -189,6 +229,53 @@ impl AgentWorkspace {
         }
         if repo.branches.is_empty() {
             content = content.child(div().p_2().child("尚无本地分支提交"));
+        }
+        if repo.worktrees.len() > 1 {
+            content = content.child(
+                div()
+                    .p_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child("工作目录"),
+            );
+            for tree in repo.worktrees.iter().filter(|tree| !tree.bare) {
+                let path = tree.path.clone();
+                let current = path == repo.worktree;
+                let label = tree
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                    .unwrap_or("分离 HEAD");
+                content = content.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "open-worktree:{}",
+                            path.display()
+                        )))
+                        .p_2()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(p.surface_subtle)))
+                        .when(current, |row| row.text_color(rgb(p.accent)))
+                        .child(format!(
+                            "{} · {label}{}",
+                            ssh_project::label(&path),
+                            if current { "（当前）" } else { "" }
+                        ))
+                        .child(
+                            div()
+                                .max_w(px(250.))
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(path.to_string_lossy().into_owned()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !current {
+                                this.open_git_worktree(path.clone(), cx);
+                            }
+                        })),
+                );
+            }
         }
         content = content.child(
             Button::new("查看 GitGraph")
@@ -239,14 +326,51 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
-        let job =
-            match provider::Job::start(async move { git_project::switch(&root, &branch).await }) {
-                Ok(job) => job,
-                Err(error) => {
-                    self.git_error("切换分支失败", error, cx);
-                    return;
-                }
-            };
+        let origin_root = root.clone();
+        let reference = format!("refs/heads/{branch}");
+        let expected_worktree = self.git_ui.repository.as_ref().and_then(|repo| {
+            repo.worktrees
+                .iter()
+                .find(|tree| {
+                    tree.branch.as_deref() == Some(reference.as_str()) && tree.path != repo.worktree
+                })
+                .map(|tree| tree.path.clone())
+        });
+        let job = match provider::Job::start(async move {
+            git_project::select_branch(&root, &branch, expected_worktree.as_deref()).await
+        }) {
+            Ok(job) => job,
+            Err(error) => {
+                self.git_error("切换分支失败", error, cx);
+                return;
+            }
+        };
+        self.await_git_selection(job, origin_root, cx);
+    }
+
+    fn open_git_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.git_ui.switching {
+            return;
+        }
+        let Some(root) = self.history.active().project.clone() else {
+            return;
+        };
+        let origin_root = root.clone();
+        match provider::Job::start(async move { git_project::select_worktree(&root, &path).await })
+        {
+            Ok(job) => self.await_git_selection(job, origin_root, cx),
+            Err(error) => self.git_error("打开 worktree 失败", error, cx),
+        }
+    }
+
+    fn await_git_selection(
+        &mut self,
+        job: provider::Job<git_project::BranchSelection>,
+        origin_root: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let origin = self.history.active().id;
+        self.git_ui.picker_open = false;
         self.git_ui.switching = true;
         // Invalidate reads started before the mutation.
         self.git_ui.revision += 1;
@@ -256,8 +380,21 @@ impl AgentWorkspace {
             let result = job.result().await;
             let _ = weak.update(cx, |this, cx| {
                 this.git_ui.switching = false;
-                if let Err(error) = result {
-                    this.git_error("切换分支失败", error, cx);
+                // A late result must never move a different conversation.
+                if this.history.active().id != origin
+                    || this.history.active().project.as_ref() != Some(&origin_root)
+                {
+                    this.refresh_git_repository(true, cx);
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(git_project::BranchSelection::Worktree(path)) => {
+                        this.open_worktree_session(path, cx);
+                        return;
+                    }
+                    Ok(git_project::BranchSelection::Switched) => {}
+                    Err(error) => this.git_error("切换分支失败", error, cx),
                 }
                 this.refresh_git_repository(true, cx);
                 if this.git_ui.open {
@@ -270,7 +407,36 @@ impl AgentWorkspace {
         .detach();
         cx.notify();
     }
+
+    fn open_worktree_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Preserve the source session even when it has only a draft/attachments.
+        let partner = self.history.active().partner_id;
+        let existing = self
+            .history
+            .sessions
+            .iter()
+            .find(|session| {
+                session.project.as_ref() == Some(&path) && session.partner_id == partner
+            })
+            .map(|session| session.id);
+        let id = existing.unwrap_or_else(|| {
+            let mut session = model::Session::new();
+            session.project = Some(path.clone());
+            session.partner_id = partner;
+            let id = session.id;
+            self.history.sessions.insert(0, session);
+            id
+        });
+        if !self.history.projects.contains(&path) {
+            self.history.projects.push(path);
+        }
+        self.switch(id, cx);
+        self.git_ui.open = false;
+        self.edits_ui.open = false;
+        self.refresh_git_repository(true, cx);
+    }
     pub(crate) fn open_git_graph(&mut self, cx: &mut Context<Self>) {
+        self.terminal_ui.open = false;
         self.back_from_git_diff(cx);
         self.page = crate::Page::Chat;
         self.file_preview.open = false;
@@ -460,7 +626,11 @@ impl AgentWorkspace {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().truncate().child(gpui_glint::paths::display_path(&diff.path)))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(gpui_glint::paths::display_path(&diff.path)),
+                            )
                             .child(
                                 div()
                                     .text_size(px(10.))
@@ -502,6 +672,61 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn worktree_navigation_keeps_source_drafts_and_reuses_target_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        host.update(window, |host, cx| {
+            host.history.active_mut().project = Some(source.clone());
+            let source_id = host.history.active;
+            host.composer.update(cx, |composer, cx| {
+                composer.set_draft(
+                    "source draft",
+                    vec![gpui_glint::components::PastedImage::new(
+                        gpui::ImageFormat::Png,
+                        vec![1, 2, 3],
+                    )],
+                    cx,
+                )
+            });
+            host.open_worktree_session(target.clone(), cx);
+            let target_id = host.history.active;
+            assert_ne!(source_id, target_id);
+            assert_eq!(host.history.active().project.as_ref(), Some(&target));
+            let old = host
+                .history
+                .sessions
+                .iter()
+                .find(|session| session.id == source_id)
+                .unwrap();
+            assert_eq!(old.project.as_ref(), Some(&source));
+            assert_eq!(old.draft, "source draft");
+            assert_eq!(old.draft_images.len(), 1);
+            host.composer
+                .update(cx, |composer, cx| composer.set_value("target draft", cx));
+            host.open_worktree_session(source.clone(), cx);
+            assert_eq!(host.history.active, source_id);
+            assert_eq!(host.composer.read(cx).value(cx), "source draft");
+            assert_eq!(host.composer.read(cx).attachments().len(), 1);
+            host.open_worktree_session(target.clone(), cx);
+            assert_eq!(host.history.active, target_id);
+            assert_eq!(host.composer.read(cx).value(cx), "target draft");
+        });
+    }
     #[gpui::test]
     fn back_from_commit_diff_restores_existing_graph_and_details(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
