@@ -30,6 +30,7 @@ pub struct Workbench {
     pub(super) workspace: crate::workspace_service::ApiWorkspace,
     pub(super) page: crate::Page,
     pub(super) host_shell: Option<gpui_glint::components::ShellRenderer>,
+    pub(super) host_plugin_panel: Option<gpui::AnyView>,
     pub(super) request_editors: HashMap<String, request_window::SharedRequest>,
     pub(super) request_binding: Option<request_window::Binding>,
     pub(super) directory_settings: Option<Entity<directory_ui::DirectorySettings>>,
@@ -87,6 +88,7 @@ pub struct Workbench {
     pub(super) plugin_catalog: Vec<gpui_glint::plugins::Plugin>,
     pub(super) plugin_environment_settings: super::plugin_ui::EnvironmentSettingsCache,
     pub(super) disabled_plugins: HashSet<String>,
+    pub(super) approved_agent_plugins: HashSet<String>,
     pub(super) plugin_errors: Vec<String>,
     pub(super) registry_name: Entity<TextEntry>,
     pub(super) registry_url: Entity<TextEntry>,
@@ -112,6 +114,8 @@ pub struct Workbench {
     pub(super) show_activity: bool,
 
     pub(super) plugin_manager_tab: usize,
+    pub(super) selected_plugin_detail: Option<String>,
+    pub(super) host_plugin_detail: bool,
     pub(super) editing_environment: usize,
     pub(super) editing_variable_collection: Option<String>,
     pub(super) revealed_variables: HashSet<(usize, u64)>,
@@ -632,6 +636,9 @@ impl Workbench {
         let sent_requests = data.previews;
         let (plugin_catalog, plugin_errors) = plugins::catalog();
         let disabled_plugins = storage.disabled_plugins().expect("无法读取插件启用状态");
+        let approved_agent_plugins = storage
+            .approved_agent_plugins()
+            .expect("无法读取 Agent 插件授权");
         let available_plugins = plugin_catalog
             .iter()
             .filter(|p| !disabled_plugins.contains(&p.family_identity()))
@@ -723,6 +730,7 @@ impl Workbench {
             request_binding: None,
             toasts: cx.new(|_| ToastHost::new()),
             host_shell: None,
+            host_plugin_panel: None,
             page: crate::Page::Requests,
             update_state: update_ui::UpdateState::Idle,
             update_task: None,
@@ -785,6 +793,7 @@ impl Workbench {
             plugin_catalog,
             plugin_environment_settings: Default::default(),
             disabled_plugins,
+            approved_agent_plugins,
             plugin_errors,
             registry_name,
             registry_url,
@@ -807,6 +816,8 @@ impl Workbench {
             show_activity: false,
 
             plugin_manager_tab: 0,
+            selected_plugin_detail: None,
+            host_plugin_detail: false,
             editing_variable_collection: None,
             editing_environment: 0,
             revealed_variables: HashSet::new(),

@@ -5,6 +5,8 @@
 
 mod api_tools;
 mod app_icon;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod desktop_adapter;
 mod navigation;
 
 use gpui::{
@@ -59,7 +61,8 @@ impl Workbench {
         let api = cx.new(|cx| {
             glint_api::Workbench::hosted_with_vault(shell.clone(), Some(vault.clone()), cx)
         });
-        let (tools, api_tools_task) = api_tools::ApiTools::connect(&api, cx);
+        let (tools, api_tools_task, plugin_catalog_subscription) =
+            api_tools::ApiTools::connect(&api, cx);
         let agent = cx.new(|cx| {
             let mut agent = glint_agent::AgentWorkspace::hosted_with_vault(
                 shell.clone(),
@@ -73,7 +76,27 @@ impl Workbench {
             }));
             agent
         });
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            let api_owner = api.downgrade();
+            let panel = cx.new(|cx| {
+                desktop_adapter::Panel::new(
+                    agent.clone(),
+                    (
+                        include_bytes!("../adapters/dsh-pet/adapter.json"),
+                        include_bytes!("../adapters/dsh-pet/bootstrap.cjs"),
+                    ),
+                    move |open, cx| {
+                        let _ =
+                            api_owner.update(cx, |api, cx| api.set_host_plugin_detail(open, cx));
+                    },
+                    cx,
+                )
+            });
+            api.update(cx, |api, _| api.set_host_plugin_panel(panel.into()));
+        }
         let subscriptions = vec![
+            plugin_catalog_subscription,
             cx.subscribe_in(
                 &vault,
                 window,

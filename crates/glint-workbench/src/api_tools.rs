@@ -4,7 +4,7 @@ use gpui::{Context, Entity, Task};
 use serde_json::Value;
 use std::{
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -48,14 +48,23 @@ impl Invocation {
 pub struct ApiTools {
     sender: async_channel::Sender<Invocation>,
     timeout: Duration,
+    plugin_catalog: Arc<RwLock<Vec<Value>>>,
 }
 
 impl ApiTools {
     pub fn connect(
         api: &Entity<glint_api::Workbench>,
         cx: &mut Context<super::Workbench>,
-    ) -> (Arc<dyn HostTools>, Task<()>) {
+    ) -> (Arc<dyn HostTools>, Task<()>, gpui::Subscription) {
         let (sender, receiver) = async_channel::bounded::<Invocation>(32);
+        let plugin_catalog = Arc::new(RwLock::new(api.read(cx).agent_plugin_tool_catalog()));
+        let snapshot = plugin_catalog.clone();
+        let subscription = cx.observe(api, move |_, api, cx| {
+            let catalog = api.read(cx).agent_plugin_tool_catalog();
+            if let Ok(mut snapshot) = snapshot.write() {
+                *snapshot = catalog;
+            }
+        });
         let api = api.downgrade();
         let task = cx.spawn(async move |_, cx| {
             while let Ok(call) = receiver.recv().await {
@@ -65,6 +74,28 @@ impl ApiTools {
                         let _ = call
                             .reply
                             .try_send(Err("API 工具排队超时，未开始执行".into()));
+                    }
+                    continue;
+                }
+                if call.name.starts_with("plugin_") {
+                    let job = api
+                        .read_with(cx, |api, _| {
+                            api.prepare_agent_plugin_tool(&call.name, call.arguments)
+                        })
+                        .unwrap_or_else(|_| Err("API 工作区已关闭".into()));
+                    let reply = call.reply;
+                    match job {
+                        Ok(job) => cx
+                            .background_executor()
+                            .spawn(async move {
+                                if !reply.is_closed() && Instant::now() < call.deadline {
+                                    let _ = reply.try_send(job());
+                                }
+                            })
+                            .detach(),
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                        }
                     }
                     continue;
                 }
@@ -80,15 +111,21 @@ impl ApiTools {
             Arc::new(Self {
                 sender,
                 timeout: TIMEOUT,
+                plugin_catalog,
             }),
             task,
+            subscription,
         )
     }
 }
 
 impl HostTools for ApiTools {
     fn catalog(&self) -> Vec<Value> {
-        glint_api::Workbench::tool_catalog()
+        let mut tools = glint_api::Workbench::tool_catalog();
+        if let Ok(plugin_catalog) = self.plugin_catalog.read() {
+            tools.extend(plugin_catalog.iter().cloned());
+        }
+        tools
     }
 
     fn call(&self, id: String, name: String, arguments: Value) -> HostToolFuture {
@@ -139,6 +176,7 @@ mod tests {
         let tools = ApiTools {
             sender,
             timeout: TIMEOUT,
+            plugin_catalog: Default::default(),
         };
         let first = tokio::spawn(tools.call(
             "first".into(),
@@ -181,6 +219,7 @@ mod tests {
         let tools = ApiTools {
             sender,
             timeout: Duration::from_millis(100),
+            plugin_catalog: Default::default(),
         };
         let queued = tokio::spawn(tools.call(
             "queued".into(),

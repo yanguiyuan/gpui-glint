@@ -71,4 +71,37 @@ Keep an inert `main.js` (an empty file or comment) for the existing plugin-packa
 
 Custom presets use the same local plugin directory, refresh operation, signed registry packages and installation flow as request actions. Publishing a preset never embeds developer credentials.
 
+## Agent tools in Glint Workbench
+
+A Glint plugin can declare an `agent.tool` contribution. Install it through the existing local directory or registry, then choose **授权 Agent 调用此版本的工具** on its card in **插件管理**. Enabled, approved tools appear in the Agent's tool list when it starts a new turn. Workbench checks the installed version and content again before invoking a tool.
+
+```json
+{
+  "id": "word-count",
+  "kind": "agent.tool",
+  "title": "Count words",
+  "hook": "agent.word-count",
+  "data": {
+    "description": "Count whitespace-separated words in the supplied text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": { "text": { "type": "string" } },
+      "required": ["text"]
+    }
+  }
+}
+```
+
+Add `agent.word-count` to the manifest's `hooks` and register the handler in `main.js`. The schema describes the arguments to the model. The handler validates the fields it uses.
+
+```js
+glint.on("agent.word-count", (args) => {
+  if (typeof args.text !== "string") return { error: "text must be a string" };
+  const text = args.text.trim();
+  return { words: text ? text.split(/\s+/).length : 0 };
+});
+```
+
+Agent tools receive the argument object and return JSON through the isolated plugin worker. They run with zero host capabilities, including when the same plugin declares permissions for API request hooks. Changing the package content or version requires a new approval.
+
 The independent bundled `crates/glint-api/plugins/feishu-oauth` preset uses Feishu's authorization endpoint `https://accounts.feishu.cn/open-apis/authen/v1/authorize` and v3 Token endpoint `https://accounts.feishu.cn/oauth/v3/token`, body client credentials, PKCE off, space-separated scopes, and `rolling_refresh_expiry: true`. Its default `offline_access` scope requires enabling the corresponding permission in the Feishu app; add the user permissions needed for your APIs and register the callback URL. See Feishu's [authorization code](https://open.feishu.cn/document/authentication-management/access-token/obtain-oauth-code) and [v3 Token](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3) documentation.

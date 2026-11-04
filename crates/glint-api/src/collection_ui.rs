@@ -10,9 +10,6 @@ impl Workbench {
         if self.page == crate::Page::Mcp {
             return self.mcp_history_sidebar(cx);
         }
-        if self.page == crate::Page::Plugins {
-            return self.plugin_sidebar(cx);
-        }
         let p = self.theme.palette();
         let mut tree = div()
             .id("request-tree")

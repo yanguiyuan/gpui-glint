@@ -257,6 +257,36 @@ impl Store {
             .join("glint-api/workspace.sqlite3");
         Ok(path)
     }
+
+    pub(crate) fn approved_agent_plugins(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT fingerprint FROM agent_plugin_approvals")
+            .map_err(|e| e.to_string())?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn set_agent_plugin_approved(
+        &self,
+        fingerprint: &str,
+        approved: bool,
+    ) -> Result<(), String> {
+        let sql = if approved {
+            "INSERT OR IGNORE INTO agent_plugin_approvals(fingerprint) VALUES(?1)"
+        } else {
+            "DELETE FROM agent_plugin_approvals WHERE fingerprint=?1"
+        };
+        self.connection
+            .execute(sql, [fingerprint])
+            .map(|_| ())
+            .map_err(|e| format!("无法保存 Agent 插件授权：{e}"))
+    }
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -285,7 +315,8 @@ impl Store {
         }
         connection
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS disabled_plugins (family TEXT PRIMARY KEY NOT NULL);",
+                "CREATE TABLE IF NOT EXISTS disabled_plugins (family TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE IF NOT EXISTS agent_plugin_approvals (fingerprint TEXT PRIMARY KEY NOT NULL);",
             )
             .map_err(|e| e.to_string())?;
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL); COMMIT;").map_err(|e| e.to_string())?;

@@ -14,6 +14,54 @@ use wait_timeout::ChildExt;
 pub const HOOK: &str = "request.before-send";
 pub const EVENT_DECODE: &str = "websocket.message.decode";
 pub const OAUTH_PRESET: &str = "oauth.preset";
+pub const AGENT_TOOL: &str = "agent.tool";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentTool {
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+}
+
+impl AgentTool {
+    pub(crate) fn parse(
+        contribution: &gpui_glint::plugins::Contribution,
+    ) -> Result<Self, PluginError> {
+        let invalid = || PluginError("Invalid Agent tool configuration".into());
+        let tool: Self = serde_json::from_value(contribution.data.clone().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        if contribution.hook.is_empty()
+            || tool.description.trim().is_empty()
+            || tool.description.len() > 1024
+            || tool.input_schema.get("type").and_then(Value::as_str) != Some("object")
+            || tool
+                .input_schema
+                .get("properties")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid());
+        }
+        Ok(tool)
+    }
+
+    pub(crate) fn name(id: &str, fingerprint: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hash = format!(
+            "{:x}",
+            Sha256::new()
+                .chain_update(fingerprint)
+                .chain_update(id)
+                .finalize()
+        );
+        let label: String = id
+            .chars()
+            .take(24)
+            .map(|ch| if ch == '.' { '_' } else { ch })
+            .collect();
+        format!("plugin_{label}_{}", &hash[..24])
+    }
+}
 const MAX_JOB: u64 = 12 * 1024 * 1024;
 const MAX_OUTPUT: u64 = 64 * 1024;
 fn output_limit(job: &Job) -> u64 {
@@ -130,18 +178,22 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
         .contributions
         .iter()
         .any(|c| c.kind == EVENT_DECODE);
+    let agent_tools = manifest.contributions.iter().any(|c| c.kind == AGENT_TOOL);
     if (events && !manifest.capabilities.contains("event.read"))
         || (actions && !manifest.capabilities.contains("request.read"))
         || (manifest.contributions.is_empty() && manifest.hooks != BTreeSet::from([HOOK.into()]))
         || (!actions
             && !events
-            && (!manifest.hooks.is_empty() || !manifest.capabilities.is_empty()))
+            && ((!agent_tools && !manifest.hooks.is_empty()) || !manifest.capabilities.is_empty()))
     {
         return Err(PluginError("Unsupported API plugin extension".into()));
     }
     for contribution in &manifest.contributions {
         match contribution.kind.as_str() {
             HOOK | EVENT_DECODE if !contribution.hook.is_empty() && contribution.data.is_none() => {
+            }
+            AGENT_TOOL => {
+                AgentTool::parse(contribution)?;
             }
             OAUTH_PRESET if contribution.hook.is_empty() => {
                 let preset: OAuthPreset = serde_json::from_value(
@@ -299,6 +351,27 @@ pub fn test_oauth_config() -> super::oauth::Config {
 }
 pub fn run_job(job: Job) -> Result<Value, String> {
     validate(&job.plugin).map_err(|e| e.to_string())?;
+    if let Some(tool) = job
+        .plugin
+        .manifest
+        .contributions
+        .iter()
+        .find(|c| c.id == job.action_id && c.kind == AGENT_TOOL)
+    {
+        if !job.request.is_object() {
+            return Err("Agent 插件工具参数必须为 JSON 对象".into());
+        }
+        let mut runtime = PluginRuntime::activate(
+            &job.plugin,
+            HostRegistry::default(),
+            BTreeSet::new(),
+            Limits::default(),
+        )
+        .map_err(|e| format!("无法初始化 Agent 插件：{e}"))?;
+        return runtime
+            .invoke(&tool.hook, &job.request)
+            .map_err(|e| format!("Agent 插件工具执行失败：{e}"));
+    }
     let event_hook = job
         .plugin
         .manifest
@@ -414,7 +487,7 @@ impl Drop for ChildGuard {
     }
 }
 /// Wall-clock watchdog covers parsing, regex and host calls, unlike VM loop limits.
-fn isolated(job: &Job) -> Result<Value, String> {
+pub(super) fn isolated(job: &Job) -> Result<Value, String> {
     let executable = std::env::current_exe().map_err(|_| "无法定位插件执行器")?;
     isolated_at(job, &executable, Duration::from_secs(3))
 }

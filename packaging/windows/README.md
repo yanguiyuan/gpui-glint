@@ -15,6 +15,8 @@ make win-installer PRODUCT=workbench
 
 `PRODUCT` defaults to `workbench`.
 
+The build script finds the installed Visual Studio C++ toolchain and initializes the x64 MSVC and Windows SDK environment before launching Cargo. Run the same Make target from Git Bash, PowerShell, or an IDE terminal.
+
 `-Version` must match the selected crate's version. `-IsccPath` and the Makefile `VERSION`, `ISCC`, `POWERSHELL` overrides remain supported. Release builds retain static MSVC runtime linking, Microsoft WebView2 signature verification and SHA-256 checksums.
 
 WebView2 downloads enable TLS 1.2 for Windows PowerShell, retry up to three times (using `curl.exe` after the first failure when available), and cache only files with a valid Microsoft signature. Invalid or incomplete cached files are downloaded again. Dependency checks run before the Rust build.

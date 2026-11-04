@@ -93,6 +93,10 @@ impl AgentWorkspace {
     pub fn host_theme(&self) -> ThemePreset {
         self.theme
     }
+
+    pub fn active_session_busy(&self) -> bool {
+        self.active_run().busy()
+    }
 }
 
 #[cfg(test)]

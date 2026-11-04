@@ -19,6 +19,7 @@ mod icon;
 mod inputs;
 mod json_folding;
 mod layout;
+mod plugin_card;
 pub use calendar::{Calendar, CalendarEvent};
 mod mermaid;
 mod popover;
@@ -53,6 +54,9 @@ pub use inputs::{
 };
 pub use layout::{AppLayout, ShellRenderer, WorkspaceSlots, window_drag_region};
 pub use mermaid::{MermaidDiagram, MermaidEvent, MermaidSvg, render_mermaid};
+pub use plugin_card::{
+    plugin_card_details, plugin_details_back, plugin_group, plugin_row, plugin_summary,
+};
 pub use popover::Popover;
 pub use select::{Select, SelectEvent, SelectOption};
 pub use separator::Separator;

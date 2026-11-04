@@ -172,6 +172,15 @@ impl Workbench {
         Self::hosted_with_vault(shell, None, cx)
     }
 
+    pub fn set_host_plugin_detail(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.host_plugin_detail = open;
+        cx.notify();
+    }
+
+    pub fn set_host_plugin_panel(&mut self, panel: gpui::AnyView) {
+        self.host_plugin_panel = Some(panel);
+    }
+
     pub fn hosted_with_vault(
         shell: gpui_glint::components::ShellRenderer,
         vault: Option<Entity<glint_vault::VaultPage>>,

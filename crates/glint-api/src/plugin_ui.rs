@@ -1,5 +1,8 @@
 use super::*;
-use gpui_glint::components::{CountBadge, CountBadgeKind, TagBadge, TagBadgeKind};
+use gpui_glint::components::{
+    CountBadge, CountBadgeKind, TagBadge, TagBadgeKind, plugin_card_details, plugin_details_back,
+    plugin_group, plugin_row, plugin_summary,
+};
 
 pub(super) type EnvironmentSettingsCache =
     std::cell::RefCell<HashMap<(String, String, String), EnvironmentSettings>>;
@@ -948,266 +951,305 @@ impl Workbench {
         (self.plugin_catalog, self.plugin_errors) = plugins::catalog();
         cx.notify();
     }
-    pub(super) fn plugin_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = self.theme.palette();
-        let mut sidebar = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .bg(rgb(p.panel))
-            .child(div().font_weight(FontWeight::MEDIUM).child("插件管理"));
-        for (index, label) in ["已安装插件", "插件源"].into_iter().enumerate() {
-            sidebar = sidebar.child(
-                Button::new(label)
-                    .kind(if self.plugin_manager_tab == index {
-                        ButtonKind::Tinted
-                    } else {
-                        ButtonKind::Plain
-                    })
-                    .theme(self.theme)
-                    .render()
-                    .debug_selector(move || format!("plugin-manager-section-{index}"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.plugin_manager_tab = index;
-                        cx.notify();
-                    })),
-            );
-        }
-        sidebar.child(
-            div()
-                .mt_3()
-                .text_size(px(10.))
-                .text_color(rgb(p.text_muted))
-                .child("插件开关对所有工作区生效；禁用后保留绑定配置。"),
-        )
-    }
     pub(super) fn plugin_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let owner = cx.entity().downgrade();
         let p = self.theme.palette();
         let mut body = div().w_full().flex().flex_col().gap_3();
+        let selected = self.selected_plugin_detail.as_deref().filter(|id| {
+            self.plugin_catalog
+                .iter()
+                .any(|plugin| plugin.identity() == *id)
+        });
+        let showing_detail =
+            self.plugin_manager_tab == 0 && (selected.is_some() || self.host_plugin_detail);
         if self.plugin_manager_tab == 1 {
             body = body.child(self.registry_configuration(cx));
+        } else if self.host_plugin_detail {
+            body = body.children(self.host_plugin_panel.clone());
         } else {
-            body = body
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(format!("已安装 · {} 个版本", self.plugin_catalog.len()))
-                        .child(
-                            Button::new("刷新已安装插件")
-                                .kind(ButtonKind::Plain)
-                                .size(ButtonSize::Small)
-                                .theme(self.theme)
-                                .render()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    (this.plugin_catalog, this.plugin_errors) = plugins::catalog();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.text_muted))
-                        .child(
-                            "请求动作在“前置动作”中启用；事件解密在“WebSocket 消息 → 解密后”中选择；授权预设在 OAuth 2.0 中选择。",
-                        ),
-                );
-            for plugin in &self.plugin_catalog {
-                let id = plugin.identity();
-                let enabled = self.plugin_enabled(plugin);
-                let toggle_id = id.clone();
-                let toggle_owner = cx.entity().downgrade();
-                let uses = self
-                    .workspace
-                    .requests
-                    .iter()
-                    .filter(|r| {
-                        r.draft.plugins.iter().any(|a| a.id == id)
-                            || r.draft.event_decoder.as_ref().is_some_and(|a| a.id == id)
-                    })
-                    .count();
-                let mut card = div()
-                    .id(gpui::SharedString::from(format!("installed-{id}")))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded(px(7.))
-                    .border_1()
-                    .border_color(rgb(p.border))
+            if selected.is_none() {
+                body = body
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
                             .items_center()
-                            .gap_2()
-                            .child(plugin.manifest.name.clone())
-                            .child(metadata_badge(
-                                format!("v{}", plugin.manifest.version),
-                                self.theme,
-                            ))
-                            .child(metadata_badge(origin_label(plugin), self.theme))
-                            .when(
-                                plugin.manifest.contributions.is_empty()
-                                    || plugin.manifest.contributions.iter().any(|c| {
-                                        c.kind == plugins::HOOK || c.kind == plugins::EVENT_DECODE
-                                    }),
-                                |row| {
-                                    row.child(metadata_badge(
-                                        format!("绑定 {uses} 个请求"),
-                                        self.theme,
-                                    ))
-                                },
-                            )
-                            .when(
-                                plugin
-                                    .manifest
-                                    .contributions
-                                    .iter()
-                                    .any(|c| c.kind == plugins::EVENT_DECODE),
-                                |row| row.child(metadata_badge("事件解密", self.theme)),
-                            )
-                            .when(
-                                plugin
-                                    .manifest
-                                    .contributions
-                                    .iter()
-                                    .any(|c| c.kind == plugins::OAUTH_PRESET),
-                                |row| row.child(metadata_badge("授权预设", self.theme)),
-                            )
-                            .child(div().flex_1())
+                            .justify_between()
+                            .child(format!("已安装 · {} 个版本", self.plugin_catalog.len()))
                             .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(if enabled { "已启用" } else { "已禁用" }),
-                            )
-                            .child(
-                                Switch::new("")
-                                    .checked(enabled)
+                                Button::new("刷新已安装插件")
+                                    .kind(ButtonKind::Plain)
+                                    .size(ButtonSize::Small)
                                     .theme(self.theme)
-                                    .on_change(move |enabled, _, cx| {
-                                        let _ = toggle_owner.update(cx, |this, cx| {
-                                            if let Err(error) =
-                                                this.set_plugin_enabled(&toggle_id, enabled, cx)
-                                            {
-                                                this.notice = error.clone();
-                                                this.plugin_errors.push(error);
-                                                cx.notify();
-                                            }
-                                        });
-                                    })
                                     .render()
-                                    .id(format!("plugin-enabled-{id}"))
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("plugin-enabled-{id}")
-                                    }),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        (this.plugin_catalog, this.plugin_errors) =
+                                            plugins::catalog();
+                                        cx.notify();
+                                    })),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child(plugin.manifest.id.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!(
-                                "扩展点：{}",
-                                if plugin.manifest.contributions.is_empty() {
-                                    plugin.manifest.hooks.iter().cloned().collect::<Vec<_>>()
-                                } else {
-                                    plugin
-                                        .manifest
-                                        .contributions
-                                        .iter()
-                                        .map(|c| c.kind.clone())
-                                        .collect::<std::collections::BTreeSet<_>>()
-                                        .into_iter()
-                                        .collect()
-                                }
-                                .join(" · ")
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!(
-                                "权限：{}",
-                                if plugin.manifest.capabilities.is_empty() {
-                                    "无".to_owned()
-                                } else {
-                                    plugin
-                                        .manifest
-                                        .capabilities
-                                        .iter()
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
-                                }
-                            )),
+                            .child("插件开关对所有工作区生效。禁用后保留绑定配置。"),
                     );
-                if let Some(origin) = &plugin.origin {
-                    let origin = origin.clone();
-                    let plugin_id = plugin.manifest.id.clone();
-                    let version = plugin.manifest.version.clone();
-                    card = card.child(
-                        Button::new("卸载此版本")
+            } else {
+                body = body.child(
+                    div().flex().child(
+                        plugin_details_back(self.theme)
+                            .debug_selector(|| "plugin-detail-back".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.selected_plugin_detail = None;
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+            for (kind, label) in [
+                ("内置", "内置插件"),
+                ("本地", "本地插件"),
+                ("远程", "远程插件"),
+            ] {
+                let mut group = plugin_group(label);
+                let mut has_rows = false;
+                for plugin in self
+                    .plugin_catalog
+                    .iter()
+                    .filter(|plugin| origin_label(plugin) == kind)
+                {
+                    let id = plugin.identity();
+                    if selected.is_some_and(|selected| selected != id) {
+                        continue;
+                    }
+                    let enabled = self.plugin_enabled(plugin);
+                    let details_id = id.clone();
+                    let toggle_id = id.clone();
+                    let toggle_owner = cx.entity().downgrade();
+                    let uses = self
+                        .workspace
+                        .requests
+                        .iter()
+                        .filter(|r| {
+                            r.draft.plugins.iter().any(|a| a.id == id)
+                                || r.draft.event_decoder.as_ref().is_some_and(|a| a.id == id)
+                        })
+                        .count();
+                    let mut badges = vec![
+                        gpui::SharedString::from(format!("v{}", plugin.manifest.version)),
+                        origin_label(plugin).into(),
+                    ];
+                    let has_kind = |kind| {
+                        plugin
+                            .manifest
+                            .contributions
+                            .iter()
+                            .any(|item| item.kind == kind)
+                    };
+                    if plugin.manifest.contributions.is_empty()
+                        || has_kind(plugins::HOOK)
+                        || has_kind(plugins::EVENT_DECODE)
+                    {
+                        badges.push(format!("绑定 {uses} 个请求").into());
+                    }
+                    if has_kind(plugins::EVENT_DECODE) {
+                        badges.push("事件解密".into());
+                    }
+                    if has_kind(plugins::OAUTH_PRESET) {
+                        badges.push("授权预设".into());
+                    }
+                    let toggle = Switch::new("")
+                        .checked(enabled)
+                        .theme(self.theme)
+                        .on_change(move |enabled, _, cx| {
+                            let _ = toggle_owner.update(cx, |this, cx| {
+                                if let Err(error) = this.set_plugin_enabled(&toggle_id, enabled, cx)
+                                {
+                                    this.notice = error.clone();
+                                    this.plugin_errors.push(error);
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .render()
+                        .id(format!("plugin-enabled-{id}"))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("plugin-enabled-{id}")
+                        });
+                    let description = if has_kind(plugins::OAUTH_PRESET) {
+                        "在 OAuth 2.0 中选择授权预设"
+                    } else if has_kind(plugins::EVENT_DECODE) {
+                        "解密 WebSocket 事件消息"
+                    } else if has_kind(plugins::AGENT_TOOL) {
+                        "向 Agent 提供可调用工具"
+                    } else {
+                        "在请求发送前执行动作"
+                    };
+                    let summary = plugin_summary(
+                        plugin.manifest.name.clone(),
+                        badges,
+                        description,
+                        self.theme,
+                    );
+                    if selected.is_none() {
+                        has_rows = true;
+                        group = group.child(plugin_row(
+                            summary
+                                .id(format!("installed-{id}"))
+                                .debug_selector(move || format!("plugin-row-{details_id}"))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(p.panel)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.selected_plugin_detail = Some(id.clone());
+                                    cx.notify();
+                                })),
+                            toggle,
+                        ));
+                        continue;
+                    }
+                    let mut card = div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(plugin_row(summary, toggle))
+                        .child(
+                            plugin_card_details(self.theme)
+                                .child(
+                                    div()
+                                        .child(format!("插件 ID  {}", plugin.manifest.id))
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("plugin-details-body-{id}")
+                                        }),
+                                )
+                                .child(div().child(format!(
+                                        "扩展点：{}",
+                                        if plugin.manifest.contributions.is_empty() {
+                                            plugin
+                                                .manifest
+                                                .hooks
+                                                .iter()
+                                                .cloned()
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            plugin
+                                                .manifest
+                                                .contributions
+                                                .iter()
+                                                .map(|c| c.kind.clone())
+                                                .collect::<std::collections::BTreeSet<_>>()
+                                                .into_iter()
+                                                .collect()
+                                        }
+                                        .join(" · ")
+                                    )))
+                                .child(div().child(format!(
+                                    "权限：{}",
+                                    if plugin.manifest.capabilities.is_empty() {
+                                        "无".to_owned()
+                                    } else {
+                                        plugin
+                                            .manifest
+                                            .capabilities
+                                            .iter()
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join(" · ")
+                                    }
+                                ))),
+                        );
+                    let mut actions = div().flex().flex_wrap().items_center().gap_2();
+                    let agent_tool = self.host_shell.is_some()
+                        && plugin
+                            .manifest
+                            .contributions
+                            .iter()
+                            .any(|c| c.kind == plugins::AGENT_TOOL);
+                    if agent_tool {
+                        let fingerprint =
+                            gpui_glint::plugins::Approval::for_plugin(plugin).fingerprint;
+                        let approved = self.approved_agent_plugins.contains(&fingerprint);
+                        actions = actions.child(
+                            Button::new(if approved {
+                                "撤销 Agent 工具授权"
+                            } else {
+                                "授权 Agent 调用此版本的工具"
+                            })
                             .kind(ButtonKind::Plain)
-                            .size(ButtonSize::Mini)
+                            .size(ButtonSize::Small)
                             .theme(self.theme)
                             .render()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let origin = origin.clone();
-                                let plugin_id = plugin_id.clone();
-                                let version = version.clone();
-                                this.registry_operation(
-                                    move || {
-                                        let store = plugins::registry_store()?;
-                                        let record = store
-                                            .installed()?
-                                            .into_iter()
-                                            .find(|r| {
-                                                r.source.id().ok().as_ref()
-                                                    == Some(&origin.source_id)
-                                                    && r.release.sha256 == origin.package_sha256
-                                            })
-                                            .ok_or("找不到已安装版本")?;
-                                        store.uninstall(
-                                            &record.source.name,
-                                            &plugin_id,
-                                            &version,
-                                        )?;
-                                        Ok(vec![])
-                                    },
-                                    true,
-                                    cx,
-                                );
-                            })),
-                    );
-                } else {
-                    card = card.child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .child(if plugins::is_bundled(plugin) {
-                                "内置插件"
-                            } else {
-                                "本地开发插件 · 通过插件目录管理"
-                            }),
-                    );
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if let Err(error) = this.set_agent_tool_approval(
+                                        fingerprint.clone(),
+                                        !approved,
+                                        cx,
+                                    ) {
+                                        this.plugin_errors.push(error);
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                        );
+                    }
+                    if let Some(origin) = &plugin.origin {
+                        let origin = origin.clone();
+                        let plugin_id = plugin.manifest.id.clone();
+                        let version = plugin.manifest.version.clone();
+                        actions = actions.child(
+                            Button::new("卸载此版本")
+                                .kind(ButtonKind::Plain)
+                                .size(ButtonSize::Mini)
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let origin = origin.clone();
+                                    let plugin_id = plugin_id.clone();
+                                    let version = version.clone();
+                                    this.registry_operation(
+                                        move || {
+                                            let store = plugins::registry_store()?;
+                                            let record = store
+                                                .installed()?
+                                                .into_iter()
+                                                .find(|r| {
+                                                    r.source.id().ok().as_ref()
+                                                        == Some(&origin.source_id)
+                                                        && r.release.sha256 == origin.package_sha256
+                                                })
+                                                .ok_or("找不到已安装版本")?;
+                                            store.uninstall(
+                                                &record.source.name,
+                                                &plugin_id,
+                                                &version,
+                                            )?;
+                                            Ok(vec![])
+                                        },
+                                        true,
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                    if agent_tool || plugin.origin.is_some() {
+                        card = card.child(actions);
+                    }
+                    body = body.child(card);
                 }
-                body = body.child(card);
+                if has_rows {
+                    body = body.child(group);
+                }
             }
-            if let Ok(path) = plugins::directory() {
+            if selected.is_none()
+                && let Some(panel) = self.host_plugin_panel.clone()
+            {
+                body = body.child(plugin_group("桌面适配").child(panel));
+            }
+            if selected.is_none()
+                && let Ok(path) = plugins::directory()
+            {
                 body = body.child(
                     div()
                         .text_size(px(10.))
@@ -1230,40 +1272,68 @@ impl Workbench {
             .min_w_0()
             .flex()
             .flex_col()
-            .bg(rgb(p.surface))
-            .child(
-                div()
-                    .h(px(52.))
-                    .flex_shrink_0()
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(rgb(p.border))
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("插件管理"),
-                    )
-                    .child(
-                        Button::new("返回请求")
-                            .kind(ButtonKind::Plain)
-                            .size(ButtonSize::Mini)
+            .when(!showing_detail, |page| {
+                page.child(
+                    div()
+                        .h(px(52.))
+                        .flex_shrink_0()
+                        .px_5()
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .mr_4()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("插件管理"),
+                        )
+                        .child(
+                            SegmentedControl::new([
+                                SegmentOption::new("已安装插件"),
+                                SegmentOption::new("插件源"),
+                            ])
+                            .id("plugin-manager-sections")
+                            .selected(self.plugin_manager_tab)
                             .theme(self.theme)
+                            .on_change(move |index, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.plugin_manager_tab = index;
+                                    this.selected_plugin_detail = None;
+                                    cx.notify();
+                                });
+                            })
                             .render()
-                            .debug_selector(|| "close-plugin-manager".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.page == crate::Page::Plugins {
-                                    this.page = crate::Page::Requests;
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            )
+                            .debug_selector(|| "plugin-manager-sections".into()),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("返回请求")
+                                .kind(ButtonKind::Plain)
+                                .size(ButtonSize::Mini)
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "close-plugin-manager".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.page == crate::Page::Plugins {
+                                        this.page = crate::Page::Requests;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
-                    .id("plugin-manager-scroll")
+                    .id((
+                        "plugin-manager-scroll",
+                        if showing_detail {
+                            2
+                        } else {
+                            self.plugin_manager_tab
+                        },
+                    ))
                     .debug_selector(|| "plugin-manager-scroll".into())
                     .flex_1()
                     .min_h_0()
@@ -1291,12 +1361,34 @@ mod navigation_tests {
             assert!(host.page == crate::Page::Plugins && host.page != crate::Page::Environments)
         });
         assert!(window.debug_bounds("plugin-manager-scroll").is_some());
-        let sources = window.debug_bounds("plugin-manager-section-1").unwrap();
-        window.simulate_click(sources.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds("sidebar-resize-handle").is_none());
+        let toggle = window.debug_bounds("plugin-enabled-com.wps.kso1").unwrap();
+        window.simulate_click(toggle.center(), gpui::Modifiers::default());
+        host.update(window, |host, _| {
+            assert!(host.selected_plugin_detail.is_none())
+        });
+        let details = "plugin-details-body-com.wps.kso1";
+        let row = window.debug_bounds("plugin-row-com.wps.kso1").unwrap();
+        window.simulate_click(row.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds(details).is_some());
+        assert!(window.debug_bounds("plugin-row-com.wps.oauth").is_none());
+        let back = window.debug_bounds("plugin-detail-back").unwrap();
+        window.simulate_click(back.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds(details).is_none());
+        let sections = window.debug_bounds("plugin-manager-sections").unwrap();
+        window.simulate_click(
+            gpui::point(sections.right() - px(16.), sections.center().y),
+            gpui::Modifiers::default(),
+        );
         host.update(window, |host, cx| {
             assert_eq!(host.plugin_manager_tab, 1);
             assert!(host.snapshot(cx).plugins.is_empty());
         });
+        window.simulate_click(
+            gpui::point(sections.left() + px(16.), sections.center().y),
+            gpui::Modifiers::default(),
+        );
+        host.update(window, |host, _| assert_eq!(host.plugin_manager_tab, 0));
         let back = window.debug_bounds("close-plugin-manager").unwrap();
         window.simulate_click(back.center(), gpui::Modifiers::default());
         host.update(window, |host, _| assert!(host.page != crate::Page::Plugins));

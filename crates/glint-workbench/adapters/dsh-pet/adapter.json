@@ -1,0 +1,17 @@
+{
+  "adapter_api": 1,
+  "id": "dsh-pet",
+  "name": "dsh-pet 桌宠",
+  "description": "Windows x64 独立桌面窗口。启用后跟随当前 Agent 会话的工作状态。",
+  "permission": "managed-process",
+  "version": "0.4.1",
+  "url": "https://github.com/PC2005-cloud/dsh-pet/releases/download/v0.4.1/dsh-pet-win-x64.zip",
+  "sha256": "794ceb32a385d5c313c131dcc5437b111521e5bfd0803874a919aeb170c4c3bf",
+  "archive_bytes": 204550855,
+  "archive_root": "dsh-pet-0.4.1-win-x64",
+  "executable": "dsh-pet.exe",
+  "status_path": "/dsh-pet-7340/work-status",
+  "token_header": "x-dsh-pet-token",
+  "busy_body": {"state":"working","task":null},
+  "busy_response": {"state":"working"}
+}

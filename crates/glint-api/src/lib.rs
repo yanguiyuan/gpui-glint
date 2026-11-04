@@ -1,4 +1,5 @@
 mod activity_ui;
+mod agent_plugin_tools;
 mod app_icon;
 mod background_tasks_ui;
 mod collection_tree_ui;

@@ -38,6 +38,23 @@ if ($Plan) {
         Template = Join-Path $PSScriptRoot 'setup.iss'
     }
 }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vcvarsCandidates = @(
+    if ($env:VSINSTALLDIR) { Join-Path $env:VSINSTALLDIR 'VC\Auxiliary\Build\vcvars64.bat' }
+    if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+        $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($LASTEXITCODE -eq 0 -and $vsRoot) { Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat' }
+    }
+    # Some provisioned images have the toolchain on disk without an Installer registration.
+    foreach ($programFiles in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        Resolve-Path "$programFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\vcvars64.bat" -ErrorAction SilentlyContinue |
+            Sort-Object Path -Descending | Select-Object -ExpandProperty Path
+    }
+)
+$vcvars = $vcvarsCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $vcvars) {
+    throw 'MSVC x64 tools not found. Install Visual Studio Build Tools with Desktop development with C++ and a Windows SDK.'
+}
 if (-not $IsccPath) {
     $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
     $candidates = @(
@@ -59,7 +76,9 @@ $previousFlags = $env:RUSTFLAGS
 try {
     # Embed the MSVC runtime so users do not need a separate VC++ installer.
     $env:RUSTFLAGS = "$previousFlags -C target-feature=+crt-static".Trim()
-    cargo build -p $package --release --target x86_64-pc-windows-msvc --locked
+    # Initialize PATH and the SDK in the same child shell that runs Cargo.
+    # Git Bash and Coreutils can otherwise supply a different link.exe.
+    & "$env:SystemRoot\System32\cmd.exe" /d /c "call `"$vcvars`" && cargo build -p $package --release --target x86_64-pc-windows-msvc --locked"
     if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
     Copy-Item "$repo\target\x86_64-pc-windows-msvc\release\$executable" $stage
     Copy-Item (Join-Path $repo $config.Icon) (Join-Path $stage $iconName)

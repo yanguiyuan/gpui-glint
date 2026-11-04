@@ -724,12 +724,18 @@ impl Render for Workbench {
         let shell = if self.request_binding.is_some() {
             content.into_any_element()
         } else {
+            let sidebar_visible = !matches!(self.page, crate::Page::Vault | crate::Page::Plugins);
             let slots = gpui_glint::components::WorkspaceSlots {
                 topbar: self.topbar(cx).into_any_element(),
-                sidebar: self.sidebar(cx).into_any_element(),
+                sidebar: if sidebar_visible {
+                    self.sidebar(cx)
+                } else {
+                    div()
+                }
+                .into_any_element(),
                 content: content.into_any_element(),
                 sidebar_width: self.sidebar_width,
-                sidebar_visible: self.page != crate::Page::Vault,
+                sidebar_visible,
                 sidebar_resize_handle: Some(resize_handle.into_any_element()),
                 theme: self.theme,
             };

@@ -3373,8 +3373,13 @@ dependencies = [
  "gpui-glint",
  "gpui_ce_platform",
  "objc2 0.6.4",
+ "reqwest 0.12.28",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
