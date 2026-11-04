@@ -123,6 +123,9 @@ impl ToolContext {
         messages
     }
     pub fn definitions(&self, anthropic: bool) -> Value {
+        if self.memory.channel_group_member {
+            return serde_json::json!([]);
+        }
         let mut definitions = self.registry.definitions(anthropic);
         if !matches!(self.delegation, crate::subagent::Delegation::Root(_)) {
             definitions.as_array_mut().unwrap().retain(|tool| {
@@ -478,6 +481,9 @@ pub fn execute(
         let started = Instant::now();
         let _ = context.events.send(ToolEvent::Started(call.clone())).await;
         let result = async {
+            if context.memory.channel_group_member {
+                return Err("群聊问答不能调用工具".into());
+            }
             if context.memory.reflection_only
                 && !matches!(
                     call.name.as_str(),

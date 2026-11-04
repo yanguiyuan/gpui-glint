@@ -83,7 +83,8 @@ fn incoming(app: Uuid, event: &Value, data: &Value) -> Result<Option<Incoming>, 
     {
         return Ok(None);
     }
-    // Only human messages addressed to this app; never echo robot/service messages.
+    // WPS routes this application event to the mentioned robot in group chats.
+    // Only human messages should enter the channel queue.
     if data["sender"]["type"] != "user" {
         return Ok(None);
     }
@@ -116,6 +117,7 @@ fn incoming(app: Uuid, event: &Value, data: &Value) -> Result<Option<Incoming>, 
     Ok(Some(Incoming {
         app,
         company: string(&data["company_id"])?,
+        group: data["chat"]["type"] == "group",
         chat: string(&data["chat"]["id"])?,
         message: string(&data["message"]["id"])?,
         sender: string(&data["sender"]["id"])?,
@@ -733,6 +735,10 @@ mod tests {
         let m = incoming(app, &event, &data).unwrap().unwrap();
         assert_eq!(m.text, "你好");
         assert_eq!(m.chat, "chat");
+        data["chat"]["type"] = "group".into();
+        assert!(incoming(app, &event, &data).unwrap().unwrap().group);
+        let ordinary = json!({"topic":"kso.chat.message","operation":"send"});
+        assert!(incoming(app, &ordinary, &data).unwrap().is_none());
         data["sender"]["type"] = "sp".into();
         assert!(incoming(app, &event, &data).unwrap().is_none());
         assert!(

@@ -2244,16 +2244,22 @@ fn utf16_range(text: &str, range: &Range<usize>) -> Range<usize> {
 
 // Use shape_text for rich runs: shape_line merges adjacent fonts with identical decorations.
 #[derive(Clone)]
-enum EditorLine {
+enum EditorLineShape {
     Plain(ShapedLine),
     Rich(std::sync::Arc<gpui::WrappedLine>),
+}
+#[derive(Clone)]
+struct EditorLine {
+    shape: EditorLineShape,
+    source_len: usize,
+    tabs: Vec<(usize, Range<usize>)>,
 }
 impl std::ops::Deref for EditorLine {
     type Target = gpui::LineLayout;
     fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Plain(line) => line,
-            Self::Rich(line) => &line.unwrapped_layout,
+        match &self.shape {
+            EditorLineShape::Plain(line) => line,
+            EditorLineShape::Rich(line) => &line.unwrapped_layout,
         }
     }
 }
@@ -2266,8 +2272,40 @@ impl EditorLine {
         runs: &[TextRun],
         _: Option<usize>,
     ) -> Self {
-        if rich && !text.is_empty() {
-            Self::Rich(std::sync::Arc::new(
+        let source_len = text.len();
+        let mut tabs = Vec::new();
+        let mut display_runs = Vec::new();
+        let text = if text.contains('\t') {
+            const TAB_WIDTH: usize = 4;
+            let mut expanded = String::with_capacity(text.len());
+            let mut column = 0;
+            for (index, ch) in text.char_indices() {
+                if ch == '\t' {
+                    let count = TAB_WIDTH - column % TAB_WIDTH;
+                    let start = expanded.len();
+                    expanded.extend(std::iter::repeat_n(' ', count));
+                    tabs.push((index, start..expanded.len()));
+                    column += count;
+                } else {
+                    expanded.push(ch);
+                    column += 1;
+                }
+            }
+            let mut offset = 0;
+            for run in runs {
+                let start = Self::display_index(&tabs, offset);
+                offset += run.len;
+                let mut display_run = run.clone();
+                display_run.len = Self::display_index(&tabs, offset) - start;
+                display_runs.push(display_run);
+            }
+            expanded.into()
+        } else {
+            text
+        };
+        let runs = if tabs.is_empty() { runs } else { &display_runs };
+        let shape = if rich && !text.is_empty() {
+            EditorLineShape::Rich(std::sync::Arc::new(
                 window
                     .text_system()
                     .shape_text(text, size, runs, None, None)
@@ -2275,14 +2313,43 @@ impl EditorLine {
                     .remove(0),
             ))
         } else {
-            Self::Plain(window.text_system().shape_line(text, size, runs, None))
+            EditorLineShape::Plain(window.text_system().shape_line(text, size, runs, None))
+        };
+        Self {
+            shape,
+            source_len,
+            tabs,
+        }
+    }
+    fn display_index(tabs: &[(usize, Range<usize>)], index: usize) -> usize {
+        let previous = tabs.partition_point(|(source, _)| *source < index);
+        if previous == 0 {
+            index
+        } else {
+            let (source, display) = &tabs[previous - 1];
+            index + (display.end - source - 1)
         }
     }
     fn len(&self) -> usize {
-        match self {
-            Self::Plain(l) => l.len(),
-            Self::Rich(l) => l.len(),
+        self.source_len
+    }
+    fn x_for_index(&self, index: usize) -> Pixels {
+        gpui::LineLayout::x_for_index(self, Self::display_index(&self.tabs, index))
+    }
+    fn closest_index_for_x(&self, x: Pixels) -> usize {
+        let index = gpui::LineLayout::closest_index_for_x(self, x);
+        let previous = self
+            .tabs
+            .partition_point(|(_, display)| display.start <= index);
+        if previous == 0 {
+            return index;
         }
+        let (source, display) = &self.tabs[previous - 1];
+        if index < display.end {
+            let midpoint = (self.x_for_index(*source) + self.x_for_index(source + 1)) / 2.;
+            return source + usize::from(x >= midpoint);
+        }
+        index - (display.end - source - 1)
     }
     fn paint(
         &self,
@@ -2291,9 +2358,13 @@ impl EditorLine {
         window: &mut Window,
         cx: &mut App,
     ) {
-        match self {
-            Self::Plain(l) => l.paint(origin, height, gpui::TextAlign::Left, None, window, cx),
-            Self::Rich(l) => l.paint(origin, height, gpui::TextAlign::default(), None, window, cx),
+        match &self.shape {
+            EditorLineShape::Plain(l) => {
+                l.paint(origin, height, gpui::TextAlign::Left, None, window, cx)
+            }
+            EditorLineShape::Rich(l) => {
+                l.paint(origin, height, gpui::TextAlign::default(), None, window, cx)
+            }
         }
         .unwrap();
     }
@@ -2304,11 +2375,11 @@ impl EditorLine {
         window: &mut Window,
         cx: &mut App,
     ) {
-        match self {
-            Self::Plain(l) => {
+        match &self.shape {
+            EditorLineShape::Plain(l) => {
                 l.paint_background(origin, height, gpui::TextAlign::Left, None, window, cx)
             }
-            Self::Rich(l) => {
+            EditorLineShape::Rich(l) => {
                 l.paint_background(origin, height, gpui::TextAlign::default(), None, window, cx)
             }
         }
@@ -4255,6 +4326,24 @@ mod tests {
         editor.update(window, |editor, _| {
             assert!(editor.collapsed_json.is_empty());
             assert_eq!(editor.viewport_cache.as_ref().unwrap().visible.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn readonly_viewport_renders_tabs_without_changing_source_offsets(cx: &mut gpui::TestAppContext) {
+        let source = "\t \t中文\n        中文";
+        let (editor, window) = cx.add_window_view(|_, cx| {
+            CodeCard::new(cx, "go", source).read_only(true).viewport()
+        });
+        editor.read_with(window, |editor, _| {
+            let cache = editor.viewport_cache.as_ref().unwrap();
+            let tabs = &cache.lines[&0];
+            let spaces = &cache.lines[&1];
+            assert!(tabs.x_for_index(1) > tabs.x_for_index(0));
+            assert_eq!(tabs.x_for_index(3), spaces.x_for_index(8));
+            assert_eq!(tabs.closest_index_for_x(tabs.x_for_index(3)), 3);
+            assert_eq!(tabs.len(), "\t \t中文".len());
+            assert_eq!(editor.content(), source);
         });
     }
 

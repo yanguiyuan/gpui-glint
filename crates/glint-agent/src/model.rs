@@ -100,6 +100,8 @@ struct DraftImageFile {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
+    pub channel_group_member: bool,
+    #[serde(default)]
     pub compaction: Option<crate::compaction::Summary>,
     #[serde(default)]
     pub partner_id: Option<Uuid>,
@@ -132,6 +134,7 @@ impl Session {
     pub fn new() -> Self {
         Self {
             compaction: None,
+            channel_group_member: false,
             partner_id: None,
             partner_goal: None,
             wake_mode: None,

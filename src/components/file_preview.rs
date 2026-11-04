@@ -1,7 +1,7 @@
 //! Reusable read-only file/directory preview. The host supplies data and performs I/O.
 use super::{
     CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, SegmentOption,
-    SegmentedControl,
+    SegmentedControl, TextEntry,
 };
 use crate::paths::display_path;
 use crate::theme::ThemePreset;
@@ -47,11 +47,30 @@ pub struct FilePreview {
     markdown: Option<Entity<DocumentEditor>>,
     markdown_preview: bool,
     scroll: gpui::ScrollHandle,
+    search: Entity<TextEntry>,
+    search_match: Option<(usize, usize)>,
+    _search_subscription: gpui::Subscription,
     subscriptions: Vec<gpui::Subscription>,
 }
 impl EventEmitter<FilePreviewEvent> for FilePreview {}
 impl FilePreview {
-    pub fn new(_: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| TextEntry::new(cx, "搜索代码", "").font_size(12.));
+        let search_subscription = cx.observe(&search, |this, search, cx| {
+            let Page::File(editor) = &this.page else {
+                return;
+            };
+            let query = search.read(cx).value().to_owned();
+            if editor.read(cx).search_query() == query {
+                return;
+            }
+            this.search_match = editor.update(cx, |editor, cx| {
+                editor.set_search_query(query, cx);
+                let count = editor.search_match_count();
+                editor.reveal_search_match(0, cx).then_some((0, count))
+            });
+            cx.notify();
+        });
         Self {
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             html: None,
@@ -65,6 +84,9 @@ impl FilePreview {
             markdown: None,
             markdown_preview: false,
             scroll: Default::default(),
+            search,
+            search_match: None,
+            _search_subscription: search_subscription,
             subscriptions: Vec::new(),
         }
     }
@@ -102,6 +124,8 @@ impl FilePreview {
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
+            self.search
+                .update(cx, |entry, cx| entry.set_theme(theme, cx));
             if let Page::File(editor) = &self.page {
                 editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
             }
@@ -193,7 +217,72 @@ impl FilePreview {
                 }
             }));
         self.page = Page::File(editor);
+        self.search_match = None;
+        self.search.update(cx, |entry, cx| entry.set_value("", cx));
         cx.notify();
+    }
+    fn step_search(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let (Page::File(editor), Some((current, count))) = (&self.page, self.search_match) else {
+            return;
+        };
+        let next = if previous {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        };
+        editor.update(cx, |editor, cx| editor.reveal_search_match(next, cx));
+        self.search_match = Some((next, count));
+        cx.notify();
+    }
+
+    fn search_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let status = self.search_match.map_or_else(
+            || "无匹配".to_owned(),
+            |(index, count)| format!("{} / {count}", index + 1),
+        );
+        div()
+            .debug_selector(|| "file-preview-search".into())
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("file-preview-search-input")
+                    .w(px(180.))
+                    .h(px(28.))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" {
+                            this.step_search(event.keystroke.modifiers.shift, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(self.search.clone()),
+            )
+            .when(!self.search.read(cx).value().is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(self.theme.palette().text_muted))
+                        .child(status),
+                )
+            })
+            .when(self.search_match.is_some(), |row| {
+                row.children(
+                    [
+                        (Icon::ArrowUp, "上一个匹配", true),
+                        (Icon::ChevronDown, "下一个匹配", false),
+                    ]
+                    .map(|(icon, label, previous)| {
+                        IconButton::new(icon, label)
+                            .plain()
+                            .theme(self.theme)
+                            .render()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.step_search(previous, cx)),
+                            )
+                    }),
+                )
+            })
     }
     fn quote(&self, cx: &mut Context<Self>) {
         if let Page::File(editor) = &self.page
@@ -362,6 +451,12 @@ impl Render for FilePreview {
                             .text_size(px(12.))
                             .child(display_path(&self.path)),
                     )
+                    .when(
+                        self.expanded
+                            && !self.markdown_preview
+                            && matches!(self.page, Page::File(_)),
+                        |row| row.child(self.search_controls(cx)),
+                    )
                     .when(self.has_rendered_preview(), |row| {
                         let entity = cx.entity();
                         row.child(
@@ -476,6 +571,50 @@ mod tests {
         window.run_until_parked();
         assert_eq!(*requests.borrow(), vec![true, false]);
     }
+    #[gpui::test]
+    fn expanded_source_search_steps_through_matches_and_resets_for_a_new_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window) = cx.add_window_view(|_, cx| {
+            let mut preview = FilePreview::new(cx);
+            preview.set_file(
+                "main.go".into(),
+                None,
+                "go".into(),
+                "needle\nNeedle".into(),
+                cx,
+            );
+            preview
+        });
+        assert!(window.debug_bounds("file-preview-search").is_none());
+        let entry = view.update(window, |view, cx| {
+            view.set_expanded(true, cx);
+            view.search.clone()
+        });
+        assert!(window.debug_bounds("file-preview-search").is_some());
+        window.update(|window, cx| window.focus(&entry.focus_handle(cx), cx));
+        entry.update(window, |entry, cx| entry.set_value("needle", cx));
+        assert_eq!(
+            view.read_with(window, |view, _| view.search_match),
+            Some((0, 2))
+        );
+        window.simulate_keystrokes("enter");
+        assert_eq!(
+            view.read_with(window, |view, _| view.search_match),
+            Some((1, 2))
+        );
+        window.simulate_keystrokes("shift-enter");
+        assert_eq!(
+            view.read_with(window, |view, _| view.search_match),
+            Some((0, 2))
+        );
+        view.update(window, |view, cx| {
+            view.set_file("other.go".into(), None, "go".into(), "needle".into(), cx);
+            assert!(view.search.read(cx).value().is_empty());
+            assert!(view.search_match.is_none());
+        });
+    }
+
     #[gpui::test]
     fn markdown_preview_is_read_only_and_resets_for_other_files(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

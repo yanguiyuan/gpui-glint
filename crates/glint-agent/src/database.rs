@@ -49,7 +49,7 @@ pub fn open(anchor: &Path) -> Result<Connection, String> {
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    if version > 3 {
+    if version > 4 {
         return Err("数据库版本高于当前应用，请使用较新版本打开".into());
     }
     if version < 2 {
@@ -89,6 +89,12 @@ PRAGMA user_version=2;"#).map_err(|e| e.to_string())?;
         connection
             .execute_batch(crate::partners::SCHEMA)
             .map_err(|e| e.to_string())?;
+    }
+    if version < 4 {
+        connection.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS partner_group_memories(memory_id TEXT PRIMARY KEY REFERENCES partner_memories(id) ON DELETE CASCADE);
+            PRAGMA user_version=4;
+            COMMIT;").map_err(|e| e.to_string())?;
     }
     Ok(connection)
 }

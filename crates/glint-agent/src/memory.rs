@@ -19,6 +19,7 @@ pub struct Repository {
     pub partner: Option<Uuid>,
     pub automatic_goal: bool,
     pub reflection_only: bool,
+    pub channel_group_member: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -209,6 +210,7 @@ impl Repository {
             partner: None,
             automatic_goal: false,
             reflection_only: false,
+            channel_group_member: false,
         }
     }
     pub fn for_partner(&self, partner: Option<Uuid>) -> Self {
@@ -217,6 +219,7 @@ impl Repository {
             partner,
             automatic_goal: self.automatic_goal,
             reflection_only: self.reflection_only,
+            channel_group_member: self.channel_group_member,
         }
     }
     pub fn settings(&self) -> Result<Settings, String> {

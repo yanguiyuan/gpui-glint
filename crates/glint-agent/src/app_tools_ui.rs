@@ -747,16 +747,25 @@ impl AgentWorkspace {
         let signature = tool_signature(record);
         let entry = cache
             .entry(format!("{key}:tool:{}", record.call.id))
-            .or_insert_with(|| ToolPanel {
-                output_panel: None,
-                output_scroll: ScrollHandle::new(),
-                signature: String::new(),
-                theme,
-                panel: cx.new(|_| {
+            .or_insert_with(|| {
+                let panel = cx.new(|_| {
                     CollapsePanel::new("")
                         .icon(tool_presentation(record).icon)
                         .theme(theme)
-                }),
+                });
+                // A tool toggle also changes the layout of the surrounding conversation.
+                cx.subscribe(
+                    &panel,
+                    |_, _, _: &gpui_glint::components::CollapsePanelEvent, cx| cx.notify(),
+                )
+                .detach();
+                ToolPanel {
+                    output_panel: None,
+                    output_scroll: ScrollHandle::new(),
+                    signature: String::new(),
+                    theme,
+                    panel,
+                }
             });
         if entry.signature != signature || entry.theme != theme {
             let presentation = tool_presentation(record);
@@ -971,13 +980,14 @@ impl AgentWorkspace {
                             .id("tool-output")
                             .w_full()
                             .min_w_0()
+                            .flex_shrink_0()
                             .max_h(px(320.))
                             .overflow_y_scroll()
                             .text_size(px(12.))
                             .line_height(px(20.))
                             .font_family("monospace")
                             .text_color(rgb(p.text_muted))
-                            .child(result.clone())
+                            .child(div().w_full().min_w_0().child(result.clone()))
                             .into_any_element()
                     },
                     cx,
@@ -1729,6 +1739,45 @@ mod tests {
             code_mode_output_sections(r#"{"status":"failed","error":"失败原因"}"#)[0].1,
             "失败原因"
         );
+    }
+
+    #[gpui::test]
+    fn expanded_memory_search_keeps_waiting_below_the_live_response(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            host.history.active_mut().push(Role::User, "查询记录".into());
+            let mut memory = tools::rejected(
+                tools::ToolCall {
+                    id: "memory-overlap".into(),
+                    name: "memory_search".into(),
+                    arguments: serde_json::json!({"query": "查询记录"}),
+                },
+                serde_json::json!({"matches": vec!["很长的记忆结果。".repeat(30); 20]}).to_string(),
+            );
+            memory.success = true;
+            host.transcript = vec![generation::ContentBlock::ToolResult(memory)];
+            host.transcript.extend((0..6).map(|_| Thinking("继续查询".into())));
+            host.pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
+            host
+        });
+        window.simulate_resize(size(px(1200.), px(700.)));
+        window.run_until_parked();
+        let panel = host.read_with(window, |host, _| {
+            host.tool_panels.borrow().iter().find(|(key, _)| key.ends_with(":tool:memory-overlap")).unwrap().1.panel.clone()
+        });
+        let before = window.debug_bounds("waiting-for-model").unwrap();
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        window.run_until_parked();
+        let live = window.debug_bounds("live-response").unwrap();
+        let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        assert!(waiting.top() >= live.bottom(), "{waiting:?} overlaps {live:?}");
+        assert!(waiting.top() > before.top(), "waiting row did not move after expansion");
     }
 
     #[gpui::test]

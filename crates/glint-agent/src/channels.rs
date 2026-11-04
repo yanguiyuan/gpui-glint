@@ -23,6 +23,8 @@ pub struct Application {
     pub partner: Uuid,
     pub project: PathBuf,
     pub enabled: bool,
+    #[serde(default)]
+    pub allow_group_members: bool,
 }
 #[derive(Clone)]
 pub struct Repository(pub PathBuf);
@@ -33,12 +35,14 @@ pub struct Incoming {
     pub chat: String,
     pub message: String,
     pub sender: String,
+    pub group: bool,
     pub text: String,
 }
 pub struct Job {
     pub row: i64,
     pub app: Application,
     pub session: Uuid,
+    pub group_member: bool,
     pub text: String,
 }
 impl Repository {
@@ -60,6 +64,15 @@ impl Repository {
             CREATE TABLE IF NOT EXISTS owners(app TEXT PRIMARY KEY,company TEXT NOT NULL,sender TEXT NOT NULL,chat TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversations(app TEXT,partner TEXT,project TEXT,company TEXT,chat TEXT,sender TEXT NOT NULL,session TEXT NOT NULL,PRIMARY KEY(app,partner,project,company,chat,sender));
             CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY,app TEXT NOT NULL,company TEXT NOT NULL,chat TEXT NOT NULL,message TEXT NOT NULL,sender TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',session TEXT,error TEXT,UNIQUE(app,company,chat,message));
+            CREATE TABLE IF NOT EXISTS group_inbox(id INTEGER PRIMARY KEY REFERENCES inbox(id) ON DELETE CASCADE);
+            CREATE VIEW IF NOT EXISTS authorized_inbox AS
+                SELECT inbox.id FROM inbox JOIN owners ON owners.app=inbox.app AND owners.company=inbox.company
+                JOIN applications ON applications.id=inbox.app
+                LEFT JOIN group_inbox ON group_inbox.id=inbox.id
+                WHERE json_extract(applications.payload,'$.enabled')=1 AND (
+                    (group_inbox.id IS NULL AND owners.sender=inbox.sender) OR
+                    (group_inbox.id IS NOT NULL AND json_extract(applications.payload,'$.allow_group_members')=1)
+                );
             CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY,inbox INTEGER NOT NULL,app TEXT NOT NULL,chat TEXT NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',error TEXT);
             CREATE TABLE IF NOT EXISTS reactions(inbox INTEGER NOT NULL,stage TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',error TEXT,PRIMARY KEY(inbox,stage));
             CREATE INDEX IF NOT EXISTS inbox_pending ON inbox(state,id);
@@ -149,6 +162,14 @@ impl Repository {
             }
         }
         tx.execute("INSERT INTO applications VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![app.id.to_string(),serde_json::to_string(app).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        if !app.allow_group_members || apps.iter().any(|old| {
+            old.id == app.id && (old.partner != app.partner || old.project != app.project)
+        }) {
+            let id = app.id.to_string();
+            tx.execute("UPDATE inbox SET state='failed',error='群聊使用已关闭' WHERE app=?1 AND state IN ('queued','running') AND id IN (SELECT id FROM group_inbox)", [&id]).map_err(|e|e.to_string())?;
+            tx.execute("UPDATE outbox SET state='cancelled',error='群聊使用已关闭' WHERE app=?1 AND state IN ('queued','failed') AND inbox IN (SELECT id FROM group_inbox)", [&id]).map_err(|e|e.to_string())?;
+            tx.execute("DELETE FROM reactions WHERE state='queued' AND inbox IN (SELECT inbox.id FROM inbox JOIN group_inbox USING(id) WHERE inbox.app=?1)", [&id]).map_err(|e|e.to_string())?;
+        }
         if let Some(secret) = secret {
             tx.execute("INSERT INTO application_secrets(app,secret) VALUES(?1,?2) ON CONFLICT(app) DO UPDATE SET secret=excluded.secret",params![app.id.to_string(),secret]).map_err(|e|e.to_string())?;
         }
@@ -179,6 +200,7 @@ impl Repository {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        let mut group_member = false;
         match owner {
             None if m.text.trim().trim_end_matches(['。', '!', '！', '.']) == "我是你的主人" =>
             {
@@ -189,10 +211,16 @@ impl Repository {
                 .map_err(|e| e.to_string())?;
             }
             Some((company, sender)) if company == m.company && sender == m.sender => {}
-            _ => return Ok(()), // ACK ignored messages; no model or response to other senders.
+            Some((company, _)) if company == m.company && m.group && current.allow_group_members => {
+                group_member = true;
+            }
+            _ => return Ok(()),
         }
         let inserted=tx.execute("INSERT OR IGNORE INTO inbox(app,company,chat,message,sender,text) VALUES(?1,?2,?3,?4,?5,?6)",params![m.app.to_string(),m.company,m.chat,m.message,m.sender,m.text]).map_err(|e|e.to_string())?;
         if inserted > 0 {
+            if group_member {
+                tx.execute("INSERT INTO group_inbox VALUES(last_insert_rowid())", []).map_err(|e|e.to_string())?;
+            }
             tx.execute(
                 "INSERT INTO reactions(inbox,stage) VALUES(last_insert_rowid(),'received')",
                 [],
@@ -223,7 +251,7 @@ impl Repository {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let config: Application = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+        let mut config: Application = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
         let running: i64 = tx
             .query_row(
                 "SELECT count(*) FROM inbox WHERE app=?1 AND state='running'",
@@ -241,6 +269,10 @@ impl Repository {
             [app.to_string()],
         )
         .map_err(|e| e.to_string())?;
+        config.allow_group_members = false;
+        tx.execute("UPDATE applications SET payload=?2 WHERE id=?1",params![app.to_string(),serde_json::to_string(&config).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE outbox SET state='cancelled',error='主人绑定已解除' WHERE app=?1 AND state IN ('queued','failed') AND inbox IN (SELECT id FROM group_inbox)",[app.to_string()]).map_err(|e|e.to_string())?;
+        tx.execute("DELETE FROM reactions WHERE state='queued' AND inbox IN (SELECT inbox.id FROM inbox JOIN group_inbox USING(id) WHERE inbox.app=?1)",[app.to_string()]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM owners WHERE app=?1", [app.to_string()])
             .map_err(|e| e.to_string())?;
         tx.execute("UPDATE inbox SET state='failed',error='主人绑定已解除' WHERE app=?1 AND state='queued'",[app.to_string()]).map_err(|e|e.to_string())?;
@@ -258,9 +290,9 @@ impl Repository {
             .map_err(|e| e.to_string())?;
         let apps = self.applications()?;
         for app in apps.into_iter().filter(|a| a.enabled) {
-            let row:Option<(i64,String,String,String,String)>=tx.query_row("SELECT id,company,chat,text,sender FROM inbox WHERE app=?1 AND state='queued' AND EXISTS(SELECT 1 FROM owners WHERE owners.app=inbox.app AND owners.company=inbox.company AND owners.sender=inbox.sender) ORDER BY id LIMIT 1",[app.id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
-            if let Some((row, company, chat, text, sender)) = row {
-                let owner = app.partner.to_string();
+            let row:Option<(i64,String,String,String,String,bool)>=tx.query_row("SELECT id,company,chat,text,sender,id IN (SELECT id FROM group_inbox) FROM inbox WHERE app=?1 AND state='queued' AND id IN (SELECT id FROM authorized_inbox) ORDER BY id LIMIT 1",[app.id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
+            if let Some((row, company, chat, text, sender, group_member)) = row {
+                let owner = if group_member { format!("group:{}", app.partner) } else { app.partner.to_string() };
                 let project = app.project.to_string_lossy();
                 let app_id = app.id.to_string();
                 let session:Option<String>=tx.query_row("SELECT session FROM conversations WHERE app=?1 AND partner=?2 AND project=?3 AND company=?4 AND chat=?5 AND sender=?6",params![app_id,owner,project,company,chat,sender],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -291,6 +323,7 @@ impl Repository {
                     row,
                     app,
                     session,
+                    group_member,
                     text,
                 }));
             }
@@ -299,7 +332,24 @@ impl Repository {
     }
     pub fn finish(&self, row: i64, result: Result<&str, &str>) -> Result<(), String> {
         let mut db = self.open()?;
-        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let revoked_group: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_inbox WHERE id=?1 AND id NOT IN (SELECT id FROM authorized_inbox))",
+            [row], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if revoked_group {
+            tx.execute("UPDATE inbox SET state='failed',error='群聊使用已关闭' WHERE id=?1 AND state='running'", [row]).map_err(|e| e.to_string())?;
+            return tx.commit().map_err(|e| e.to_string());
+        }
+        let cancelled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox JOIN group_inbox USING(id) WHERE id=?1 AND state!='running')",
+            [row], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if cancelled {
+            return Ok(());
+        }
         match result {
             Ok(reply) => {
                 let (app, chat): (String, String) = tx
@@ -335,7 +385,7 @@ impl Repository {
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let row=tx.query_row("SELECT o.id,o.chat,o.text FROM outbox o WHERE o.app=?1 AND o.state='queued' AND EXISTS(SELECT 1 FROM owners JOIN inbox ON inbox.id=o.inbox WHERE owners.app=o.app AND owners.company=inbox.company AND owners.sender=inbox.sender) AND NOT EXISTS(SELECT 1 FROM outbox earlier WHERE earlier.inbox=o.inbox AND earlier.id<o.id AND earlier.state!='sent') ORDER BY o.id LIMIT 1",[app.to_string()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional().map_err(|e|e.to_string())?;
+        let row=tx.query_row("SELECT o.id,o.chat,o.text FROM outbox o WHERE o.app=?1 AND o.state='queued' AND o.inbox IN (SELECT id FROM authorized_inbox) AND NOT EXISTS(SELECT 1 FROM outbox earlier WHERE earlier.inbox=o.inbox AND earlier.id<o.id AND earlier.state!='sent') ORDER BY o.id LIMIT 1",[app.to_string()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional().map_err(|e|e.to_string())?;
         if let Some((id, _, _)) = &row {
             tx.execute("UPDATE outbox SET state='sending' WHERE id=?1", [id])
                 .map_err(|e| e.to_string())?;
@@ -356,7 +406,7 @@ impl Repository {
         tx.commit().map_err(|e| e.to_string())
     }
     fn reaction(&self, app: Uuid) -> Result<Option<(i64, String, String, String)>, String> {
-        self.open()?.query_row("SELECT i.id,i.chat,i.message,r.stage FROM reactions r JOIN inbox i ON i.id=r.inbox JOIN owners own ON own.app=i.app AND own.company=i.company AND own.sender=i.sender WHERE i.app=?1 AND r.state='queued' ORDER BY r.rowid LIMIT 1",[app.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())
+        self.open()?.query_row("SELECT i.id,i.chat,i.message,r.stage FROM reactions r JOIN inbox i ON i.id=r.inbox JOIN authorized_inbox allowed ON allowed.id=i.id WHERE i.app=?1 AND r.state='queued' ORDER BY r.rowid LIMIT 1",[app.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e|e.to_string())
     }
     fn reacted(&self, row: i64, stage: &str, result: Result<(), String>) -> Result<(), String> {
         self.open()?
@@ -406,7 +456,7 @@ impl Repository {
         if self.owner(app)?.is_none() {
             return Err("请先绑定主人，再重试发送".into());
         }
-        self.open()?.execute("UPDATE outbox SET state='queued',error=NULL WHERE app=?1 AND state='failed' AND EXISTS(SELECT 1 FROM owners JOIN inbox ON inbox.id=outbox.inbox WHERE owners.app=outbox.app AND owners.company=inbox.company AND owners.sender=inbox.sender)",[app.to_string()]).map_err(|e|e.to_string())?;
+        self.open()?.execute("UPDATE outbox SET state='queued',error=NULL WHERE app=?1 AND state='failed' AND inbox IN (SELECT id FROM authorized_inbox)",[app.to_string()]).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub fn summary(&self, app: Uuid) -> Result<String, String> {
@@ -520,6 +570,7 @@ mod tests {
             partner: Uuid::new_v4(),
             project: dir.path().canonicalize().unwrap(),
             enabled: true,
+            allow_group_members: false,
         };
         repo.save(&app).unwrap();
         repo.open()
@@ -538,9 +589,53 @@ mod tests {
             chat: "chat-a".into(),
             message: id.into(),
             sender: "user-a".into(),
+            group: false,
             text: "你好".into(),
         }
     }
+    #[test]
+    fn group_members_require_opt_in_and_cannot_send_after_revocation() {
+        let (_dir, repo, mut app) = fixture();
+        let mut guest = message(app.id, "guest");
+        guest.sender = "user-b".into();
+        guest.chat = "group-a".into();
+        guest.text = "项目是什么".into();
+        guest.group = true;
+        repo.receive(&app, &guest).unwrap();
+        assert!(repo.next().unwrap().is_none());
+        app.allow_group_members = true;
+        repo.save(&app).unwrap();
+
+        let mut private = guest.clone();
+        private.group = false;
+        repo.receive(&app, &private).unwrap();
+        assert!(repo.next().unwrap().is_none());
+
+        repo.receive(&app, &guest).unwrap();
+        let first = repo.next().unwrap().unwrap();
+        assert!(first.group_member);
+        assert_eq!(first.text, "项目是什么");
+        repo.finish(first.row, Ok("回答")).unwrap();
+        guest.message = "guest-2".into();
+        repo.receive(&app, &guest).unwrap();
+        let second = repo.next().unwrap().unwrap();
+        assert_eq!(first.session, second.session);
+        guest.sender = "user-c".into();
+        guest.message = "guest-3".into();
+        repo.receive(&app, &guest).unwrap();
+        let third = repo.next().unwrap().unwrap();
+        assert_ne!(first.session, third.session);
+
+        app.allow_group_members = false;
+        repo.save(&app).unwrap();
+        repo.finish(second.row, Ok("已撤销，不发送")).unwrap();
+        app.allow_group_members = true;
+        repo.save(&app).unwrap();
+        repo.finish(third.row, Ok("已撤销，不补发")).unwrap();
+        assert!(repo.outgoing(app.id).unwrap().is_none());
+        assert!(repo.next().unwrap().is_none());
+    }
+
     #[test]
     fn durable_dedup_and_original_conversation_delivery() {
         let (_dir, repo, app) = fixture();
@@ -638,6 +733,7 @@ mod owner_tests {
             company: "company".into(),
             chat: "owner-direct-chat".into(),
             sender: "owner".into(),
+            group: false,
             message: "1".into(),
             text: "你好".into(),
         };
@@ -733,6 +829,7 @@ mod reaction_tests {
             chat: "chat-a".into(),
             message: "original-message".into(),
             sender: "user-a".into(),
+            group: false,
             text: "执行任务".into(),
         };
         repo.receive(&app, &message).unwrap();
@@ -767,6 +864,7 @@ mod reaction_tests {
             chat: "chat-a".into(),
             message: "fail-test".into(),
             sender: "user-a".into(),
+            group: false,
             text: "hello".into(),
         };
         repo.receive(&app, &m).unwrap();

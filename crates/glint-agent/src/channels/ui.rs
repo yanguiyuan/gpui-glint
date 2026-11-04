@@ -1,7 +1,7 @@
 //! Native channel configuration and bridge into the existing partner request path.
 use super::{Application, Platform, Repository, Worker};
 use crate::*;
-use gpui_glint::components::InputField;
+use gpui_glint::components::{InputField, Switch};
 use std::collections::HashMap;
 
 pub struct State {
@@ -181,6 +181,7 @@ impl AgentWorkspace {
             let mut session = model::Session::new();
             session.id = job.session;
             session.partner_id = Some(job.app.partner);
+            session.channel_group_member = job.group_member;
             session.project = Some(job.app.project.clone());
             session.title = format!("WPS · {}", job.app.name);
             self.history.sessions.insert(0, session);
@@ -275,6 +276,7 @@ impl AgentWorkspace {
                     .map_err(|_| "项目目录不存在")?,
                 partner,
                 enabled: false,
+                allow_group_members: existing.as_ref().is_some_and(|app| app.allow_group_members),
             };
             if existing.as_ref().is_some_and(|a| a.app_id != app.app_id) {
                 return Err("已有应用的 App ID 不可修改，请新增应用".into());
@@ -328,6 +330,22 @@ impl AgentWorkspace {
             self.channels.repo.save(&app)?;
             self.channels.apps = self.channels.repo.applications()?;
             // Restart terminated workers explicitly, e.g. after connection_replaced.
+            self.channels.workers.remove(&id);
+            self.channels.repo.interrupt_sends(id)?;
+            self.channels.status.remove(&id);
+            self.channels.sync();
+            Ok::<_, String>(())
+        })();
+        self.channels.notice = result.err();
+        cx.notify();
+    }
+    fn set_channel_group_access(&mut self, id: Uuid, enabled: bool, cx: &mut Context<Self>) {
+        let result = (|| {
+            let mut app = self.channels.apps.iter().find(|app| app.id == id)
+                .cloned().ok_or("应用不存在")?;
+            app.allow_group_members = enabled;
+            self.channels.repo.save(&app)?;
+            self.channels.apps = self.channels.repo.applications()?;
             self.channels.workers.remove(&id);
             self.channels.repo.interrupt_sends(id)?;
             self.channels.status.remove(&id);
@@ -526,6 +544,13 @@ impl AgentWorkspace {
                         .child(div().flex().items_center().gap_2().text_color(rgb(p.text_muted)).child(Icon::Shield.render(14.)).child(owner.as_ref().map(|(_,sender,_)|format!("主人 · {sender}")).unwrap_or_else(||"等待主人认领".into())))
                         .child(div().text_color(rgb(p.text_muted)).child(self.channel_user_auth_label(id)))
                         .child(div().text_color(rgb(p.text_muted)).child(self.channels.repo.summary(id).unwrap_or_else(|e|e))))
+                    .child(div().flex().flex_wrap().items_center().gap_2()
+                        .child(Switch::new("允许群成员使用").checked(app.allow_group_members).theme(theme)
+                            .on_change({let host = cx.entity().downgrade(); move |enabled, _, cx| {
+                                let _ = host.update(cx, |this, cx| this.set_channel_group_access(id, enabled, cx));
+                            }}).render())
+                        .child(div().text_size(px(11.)).text_color(rgb(p.text_muted))
+                            .child("适用于本应用所在的所有同企业群聊。成员 @机器人即可提问，只使用群聊共享记忆。")))
                     .when(owner.is_none(),|d|d.child(div().px_3().py_2().rounded_lg().bg(rgb(p.panel)).text_color(rgb(p.text_muted)).text_size(px(12.)).child("首次使用：在机器人单聊中发送「我是你的主人」，完成认领。")))
             }))
     }
@@ -606,7 +631,7 @@ impl AgentWorkspace {
                     .child(Button::new("复制授权回调地址").icon(Icon::Copy).kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(|_,_,_,cx|cx.write_to_clipboard(gpui::ClipboardItem::new_string(super::auth::REDIRECT.into())))))))
                 .when_some(self.channels.selected,|d,id|d.child(div().border_t_1().border_color(rgb(p.border)).pt_4().flex().flex_col().items_start().gap_2()
                     .child(Button::new("重试失败发送").icon(Icon::Refresh).kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match this.channels.repo.retry_sends(id){Ok(())=>"已重新排队；此前送达状态不明的消息可能重复。".into(),Err(e)=>e});cx.notify();})))
-                    .child(Button::new("解除主人绑定").kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match this.channels.repo.clear_owner(id){Ok(())=>"已解除主人绑定，可在机器人单聊重新认领。".into(),Err(e)=>e});cx.notify();})))
+                    .child(Button::new("解除主人绑定").kind(ButtonKind::Plain).size(ButtonSize::Small).theme(theme).render().on_click(cx.listener(move|this,_,_,cx|{this.channels.notice=Some(match this.channels.repo.clear_owner(id).and_then(|_| this.channels.repo.applications()){Ok(apps)=>{this.channels.apps=apps;"已解除主人绑定，可在机器人单聊重新认领。".into()},Err(e)=>e});cx.notify();})))
                     .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("解除绑定前，请先停用应用。")))))
     }
     fn channel_setup_step(&self, icon: Icon, title: &str, text: &str) -> gpui::Div {
@@ -666,6 +691,7 @@ mod tests {
                 partner,
                 project: dir.path().canonicalize().unwrap(),
                 enabled: false,
+                allow_group_members: false,
             };
             host.channels.repo.save(&app).unwrap();
             host.open_channels(cx);

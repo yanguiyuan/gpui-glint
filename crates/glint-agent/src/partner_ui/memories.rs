@@ -128,6 +128,7 @@ impl AgentWorkspace {
         let mid = entry.id;
         let expanded = self.partners_ui.expanded == Some(mid);
         let pinned = entry.pinned;
+        let group_shared = entry.group_shared;
         let selector = format!("partner-memory-{mid}");
         let mut card =
             div()
@@ -176,9 +177,10 @@ impl AgentWorkspace {
                                         .text_size(px(10.))
                                         .text_color(rgb(p.text_muted))
                                         .child(format!(
-                                            "{} · {}",
+                                            "{} · {}{}",
                                             entry_scope(entry),
-                                            local_date(entry.occurred_at, "%Y-%m-%d %H:%M")
+                                            local_date(entry.occurred_at, "%Y-%m-%d %H:%M"),
+                                            if group_shared { " · 群聊可用" } else { "" }
                                         )),
                                 ),
                         )
@@ -217,6 +219,17 @@ impl AgentWorkspace {
                     .child(entry.content.clone()),
             );
             let mut actions = div().flex().flex_wrap().items_center().gap_2();
+            actions = actions.child(
+                Button::new(if group_shared { "取消群聊共享" } else { "标为群聊可用" })
+                    .kind(if group_shared { ButtonKind::Tinted } else { ButtonKind::Plain })
+                    .size(ButtonSize::Small)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.partners_ui.notice = this.partner_repo().set_group_shared(partner, mid, !group_shared).err();
+                        cx.notify();
+                    })),
+            );
             if entry.kind == "identity" {
                 let name = entry.content.clone();
                 actions = actions.child(
