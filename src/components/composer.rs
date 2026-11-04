@@ -376,6 +376,7 @@ pub enum ComposerEvent {
 /// as rows above the card with 立即 / edit / dismiss actions, and the next
 /// queued prompt is submitted automatically once the host clears `busy`.
 struct QueueEntry {
+    scope: Option<String>,
     id: u64,
     submission: ComposerSubmission,
     label: Option<SharedString>,
@@ -390,6 +391,7 @@ impl From<ComposerSubmission> for QueueEntry {
     fn from(submission: ComposerSubmission) -> Self {
         Self {
             id: 0,
+            scope: None,
             submission,
             label: None,
         }
@@ -410,6 +412,7 @@ pub struct Composer {
     queue_editor_references: Vec<super::ComposerReference>,
     queue_editor_subscription: Option<Subscription>,
     managed_queue: bool,
+    queue_scope: Option<String>,
     next_queue_id: u64,
     /// Images pasted with ⌘/Ctrl-V, submitted with the next send.
     attachments: Vec<PastedImage>,
@@ -521,6 +524,7 @@ impl Composer {
             queue_editor_references: Vec::new(),
             queue_editor_subscription: None,
             managed_queue: false,
+            queue_scope: None,
             next_queue_id: 0,
             attachments: Vec::new(),
             context_trigger: None,
@@ -1104,6 +1108,7 @@ impl Composer {
             let id = self.next_queue_id;
             self.queue.push(QueueEntry {
                 id,
+                scope: self.queue_scope.clone(),
                 submission: submission.clone(),
                 label: None,
             });
@@ -1120,18 +1125,47 @@ impl Composer {
         cx.notify();
     }
 
+    /// Group queued prompts by the host conversation and show only that group.
+    pub fn set_queue_scope(&mut self, scope: String, cx: &mut Context<Self>) {
+        if self.queue_scope.as_ref() == Some(&scope) {
+            return;
+        }
+        self.queue_scope = Some(scope);
+        self.queue_editor = None;
+        self.queue_editor_references.clear();
+        self.queue_editor_subscription = None;
+        cx.notify();
+    }
+
+    /// Dispatch the next queued prompt for a conversation that has become idle.
+    pub fn submit_scoped_queue(&mut self, scope: &str, cx: &mut Context<Self>) {
+        self.submit_next_in_scope(Some(scope), cx);
+    }
+
+    pub fn discard_scoped_queue(&mut self, scope: &str, cx: &mut Context<Self>) {
+        self.queue.retain(|entry| entry.scope.as_deref() != Some(scope));
+        if self.queue_scope.as_deref() == Some(scope) {
+            self.queue_editor = None;
+            self.queue_editor_references.clear();
+            self.queue_editor_subscription = None;
+        }
+        cx.notify();
+    }
+
     fn submit_next_queued(&mut self, cx: &mut Context<Self>) {
-        if self.queue.is_empty() {
+        let scope = self.queue_scope.clone();
+        self.submit_next_in_scope(scope.as_deref(), cx);
+    }
+
+    fn submit_next_in_scope(&mut self, scope: Option<&str>, cx: &mut Context<Self>) {
+        let Some(index) = self.queue.iter().position(|entry| entry.scope.as_deref() == scope) else {
+            return;
+        };
+        if self.queue_editor.as_ref().is_some_and(|(id, _)| *id == self.queue[index].id) {
             return;
         }
-        if self
-            .queue_editor
-            .as_ref()
-            .is_some_and(|(id, _)| *id == self.queue[0].id)
-        {
-            return;
-        }
-        let next = self.queue.remove(0);
+        let next = self.queue.remove(index);
+        cx.notify();
         if self.managed_queue {
             cx.emit(ComposerEvent::QueueSubmitted {
                 id: next.id,
@@ -1655,7 +1689,12 @@ impl Render for Composer {
             .flex()
             .flex_col()
             .gap(px(6.));
+        let mut has_queue = false;
         for (index, submission) in self.queue.iter().enumerate() {
+            if submission.scope != self.queue_scope {
+                continue;
+            }
+            has_queue = true;
             let row = div()
                 .w_full()
                 .flex()
@@ -1826,7 +1865,7 @@ impl Render for Composer {
             queue_rows = queue_rows.child(row);
         }
 
-        root.when(!self.queue.is_empty(), |root| root.child(queue_rows))
+        root.when(has_queue, |root| root.child(queue_rows))
             .child(card)
             .children(todo_panel)
     }

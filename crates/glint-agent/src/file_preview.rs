@@ -626,12 +626,11 @@ impl State {
     }
 }
 impl AgentWorkspace {
-    pub fn invalidate_preview_paths(&self, record: &tools::ToolRecord) {
-        let root = self
-            .pending
-            .as_ref()
-            .and_then(|(id, _)| self.history.sessions.iter().find(|s| s.id == *id))
-            .unwrap_or_else(|| self.history.active())
+    pub fn invalidate_preview_paths(&self, id: Uuid, record: &tools::ToolRecord) {
+        let Some(session) = self.history.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let root = session
             .project
             .clone();
         let path = match record.call.name.as_str() {
@@ -644,7 +643,7 @@ impl AgentWorkspace {
                 .map(|t| t.path),
             "code_mode" => {
                 for child in record.nested_tools.iter() {
-                    self.invalidate_preview_paths(child);
+                    self.invalidate_preview_paths(id, child);
                 }
                 return;
             }

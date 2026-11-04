@@ -2890,6 +2890,8 @@ impl CodeCard {
         }
         let source_count = cache.ranges.len();
         let count = cache.visible.len();
+        let gutter_width =
+            viewport_gutter_width(source_count) + if folding { px(16.) } else { px(0.) };
         let search_matches = self.cached_search_matches();
         if let Some(hit) = self.pending_search_reveal.take() {
             let cache = self.viewport_cache.as_mut().unwrap();
@@ -2910,16 +2912,30 @@ impl CodeCard {
             }];
             let line = EditorLine::shape(window, false, text, font_size, &runs, None);
             cache.width = cache.width.max(line.width);
-            let x = line.x_for_index(hit.start - range.start);
-            self.scroll
-                .set_offset(point(-(x - px(40.)).max(px(0.)), px(0.)));
+            let start = line.x_for_index(hit.start - range.start);
+            let end = line.x_for_index(hit.end.min(range.end) - range.start);
+            let viewport_width = self.viewport_scroll.0.borrow().base_handle.bounds().size.width
+                - gutter_width;
+            let offset = self.scroll.offset();
+            let left = -offset.x - px(8.);
+            let right = left + viewport_width;
+            let next_x = if hit.is_empty() {
+                px(0.)
+            } else if viewport_width <= px(0.) || (start >= left && end <= right) {
+                offset.x
+            } else if start < left || end - start >= viewport_width {
+                -start
+            } else {
+                (viewport_width - px(8.) - end).min(px(0.))
+            };
+            if next_x != offset.x {
+                self.scroll.set_offset(point(next_x, offset.y));
+            }
             self.viewport_scroll.scroll_to_item(
                 cache.visible.binary_search(&index).unwrap_or(0),
                 gpui::ScrollStrategy::Top,
             );
         }
-        let gutter_width =
-            viewport_gutter_width(source_count) + if folding { px(16.) } else { px(0.) };
         let list = gpui::uniform_list(
             "code-card-viewport-lines",
             count,
@@ -4151,7 +4167,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let content = format!(
-            "Rust 关键词\n{}{}关键词 RUST",
+            "let visible = Rust 关键词\n{}{}关键词 RUST",
             "plain\n".repeat(500),
             "x".repeat(300)
         );
@@ -4159,6 +4175,15 @@ mod tests {
             CodeCard::new(cx, "text", content.clone())
                 .read_only(true)
                 .viewport()
+        });
+        window.simulate_resize(gpui::size(px(640.), px(400.)));
+        editor.update(window, |editor, cx| {
+            editor.set_search_query("关键词", cx);
+            assert!(editor.reveal_search_match(0, cx));
+        });
+        window.run_until_parked();
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.scroll.offset().x, px(0.));
         });
         editor.update(window, |editor, cx| {
             editor.set_search_query("关键词", cx);

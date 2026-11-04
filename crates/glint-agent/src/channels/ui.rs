@@ -138,8 +138,7 @@ impl AgentWorkspace {
             cx.notify();
         }
         if !self.channels.apps.iter().any(|a| a.enabled)
-            || self.pending.is_some()
-            || self.preparing.is_some()
+            || self.any_run_busy()
             || self.edits_ui.undo_task.is_some()
             || !self.queued_requests.is_empty()
             || (!self.provider.enabled
@@ -194,7 +193,7 @@ impl AgentWorkspace {
             false,
             cx,
         );
-        if self.preparing.is_none() && self.pending.is_none() {
+        if !self.session_busy(job.session) {
             self.finish_channel(job.session, None, Some("无法启动伙伴请求"));
         }
     }

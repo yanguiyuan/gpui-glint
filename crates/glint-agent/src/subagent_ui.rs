@@ -1,9 +1,8 @@
 use super::*;
-use crate::subagent::{Registry, Status, Trace};
+use crate::subagent::{Status, Trace};
 
 #[derive(Default)]
 pub struct State {
-    pub live: Registry,
     pub selected: Option<(Uuid, Uuid)>,
     pub picker_open: bool,
     pub scrolls: std::cell::RefCell<std::collections::HashMap<Uuid, ScrollHandle>>,
@@ -28,12 +27,9 @@ impl AgentWorkspace {
                 }
             }
         }
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|(id, _)| *id == self.history.active)
+        if self.session_busy(self.history.active)
         {
-            if let Ok(live) = self.subagent_ui.live.lock() {
+            if let Ok(live) = self.active_run().subagents.lock() {
                 for trace in live.iter() {
                     if !traces.iter().any(|other| other.id == trace.id) {
                         traces.push(trace.clone());
@@ -79,8 +75,7 @@ impl AgentWorkspace {
             if record.call.name != "subagent" || record.result != "执行中…" {
                 return None;
             }
-            self.subagent_ui
-                .live
+            self.active_run().subagents
                 .lock()
                 .ok()?
                 .iter()
@@ -92,8 +87,9 @@ impl AgentWorkspace {
 
     /// Merge directly from the request's registry, including events not yet drained
     /// by the UI. This keeps stopped/failed turns inspectable in saved history.
-    pub fn finish_subagent_records(&mut self) {
-        let traces = if let Ok(mut traces) = self.subagent_ui.live.lock() {
+    pub fn finish_subagent_records(&mut self, id: Uuid) {
+        let run = self.run_mut(id);
+        let traces = if let Ok(mut traces) = run.subagents.lock() {
             for trace in traces.iter_mut() {
                 trace.interrupt();
             }
@@ -102,8 +98,7 @@ impl AgentWorkspace {
             Vec::new()
         };
         for trace in traces {
-            if let Some(record) = self
-                .tool_activity
+            if let Some(record) = run.tool_activity
                 .iter_mut()
                 .find(|record| record.call.id == trace.call_id)
             {
@@ -117,7 +112,7 @@ impl AgentWorkspace {
                     record.success = trace.status == Status::Completed;
                 }
             } else {
-                self.tool_activity.push(tools::ToolRecord {
+                run.tool_activity.push(tools::ToolRecord {
                     call: tools::ToolCall {
                         id: trace.call_id.clone(),
                         name: "subagent".into(),
@@ -135,15 +130,14 @@ impl AgentWorkspace {
                     change: None,
                 });
             }
-            let record = self
-                .tool_activity
+            let record = run.tool_activity
                 .iter()
                 .find(|record| record.call.id == trace.call_id)
                 .unwrap()
                 .clone();
-            if let Some(block) = self.transcript.iter_mut().find(|block| matches!(block, generation::ContentBlock::ToolResult(record) if record.call.id == trace.call_id)) {
+            if let Some(block) = run.transcript.iter_mut().find(|block| matches!(block, generation::ContentBlock::ToolResult(record) if record.call.id == trace.call_id)) {
                 *block = generation::ContentBlock::ToolResult(record);
-            } else { self.transcript.push(generation::ContentBlock::ToolResult(record)); }
+            } else { run.transcript.push(generation::ContentBlock::ToolResult(record)); }
         }
     }
 
@@ -164,7 +158,7 @@ impl AgentWorkspace {
     pub fn subagent_revision(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hash = std::hash::DefaultHasher::new();
-        if let Ok(traces) = self.subagent_ui.live.lock() {
+        if let Ok(traces) = self.active_run().subagents.lock() {
             for trace in traces.iter() {
                 trace.id.hash(&mut hash);
                 trace.status.label().hash(&mut hash);
@@ -424,13 +418,11 @@ impl AgentWorkspace {
             .flex_col()
             .items_center()
             .gap_2()
-            .when(self.approval.is_some(), |body| {
+            .when(self.active_run().approval.is_some(), |body| {
                 body.child(self.approval_panel(cx))
             })
             .when(
-                self.pending
-                    .as_ref()
-                    .is_some_and(|(session, _)| *session == self.history.active),
+                self.session_busy(self.history.active),
                 |body| {
                     body.child(
                         Button::new("停止主任务及子代理")

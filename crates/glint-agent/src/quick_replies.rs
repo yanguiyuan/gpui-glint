@@ -40,7 +40,7 @@ impl AgentWorkspace {
         self.history.quick_replies_enabled = enabled;
         if !enabled {
             self.quick_reply_jobs.clear();
-        } else if self.pending.is_none() && self.preparing.is_none() {
+        } else if !self.session_busy(self.history.active) {
             let session = self.history.active();
             let id = session.id;
             let prompt = session
@@ -186,8 +186,7 @@ impl AgentWorkspace {
     ) {
         if !self.history.quick_replies_enabled
             || self.history.active != session_id
-            || self.pending.is_some()
-            || self.preparing.is_some()
+            || self.session_busy(self.history.active)
         {
             return;
         }

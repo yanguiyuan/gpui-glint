@@ -81,11 +81,7 @@ impl AgentWorkspace {
         self.history.preferred_partner = id;
         if self.history.active().partner_id != id {
             let active = self.history.active;
-            let in_flight = self
-                .pending
-                .as_ref()
-                .or(self.preparing.as_ref())
-                .is_some_and(|(sid, _)| *sid == active)
+            let in_flight = self.session_busy(active)
                 || self.queued_requests.values().any(|(sid, _)| *sid == active);
             if self.history.active().messages.is_empty() && !in_flight {
                 self.history.active_mut().partner_id = id;

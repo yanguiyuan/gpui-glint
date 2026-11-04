@@ -19,11 +19,7 @@ impl AgentWorkspace {
             }
         }
         let active = self.history.active;
-        let running = self
-            .pending
-            .as_ref()
-            .or(self.preparing.as_ref())
-            .is_some_and(|(id, _)| *id == active);
+        let running = self.session_busy(active);
         if self.history.active().messages.is_empty() && !running {
             self.history.active_mut().project = Some(path);
         } else if self.history.active().project.as_ref() != Some(&path) {
@@ -218,7 +214,7 @@ impl AgentWorkspace {
 pub fn session_groups(
     history: &History,
     query: &str,
-    running: Option<Uuid>,
+    running: impl IntoIterator<Item = Uuid>,
 ) -> Vec<GroupListGroup> {
     session_groups_with_partners(history, query, running, &[])
 }
@@ -226,12 +222,13 @@ pub fn session_groups(
 pub fn session_groups_with_partners(
     history: &History,
     query: &str,
-    running: Option<Uuid>,
+    running: impl IntoIterator<Item = Uuid>,
     partners: &[partners::Partner],
 ) -> Vec<GroupListGroup> {
     if history.group_by_partner {
         return partner_session_groups(history, query, running, partners);
     }
+    let running: std::collections::HashSet<_> = running.into_iter().collect();
     let query = query.trim().to_lowercase();
     let mut sessions: Vec<_> = history
         .sessions
@@ -293,7 +290,7 @@ pub fn session_groups_with_partners(
             .meta(session.updated.format("%H:%M").to_string())
             .action(Icon::Trash)
             .confirm_action("删除此会话？");
-        if running == Some(session.id) {
+        if running.contains(&session.id) {
             item = item.icon(Icon::Spinner);
         }
         groups[index].items.push(item);
@@ -304,9 +301,10 @@ pub fn session_groups_with_partners(
 fn partner_session_groups(
     history: &History,
     query: &str,
-    running: Option<Uuid>,
+    running: impl IntoIterator<Item = Uuid>,
     partners: &[partners::Partner],
 ) -> Vec<GroupListGroup> {
+    let running: std::collections::HashSet<_> = running.into_iter().collect();
     let query = query.trim().to_lowercase();
     let mut groups: Vec<_> = partners
         .iter()
@@ -357,7 +355,7 @@ fn partner_session_groups(
             .meta(session.updated.format("%H:%M").to_string())
             .action(Icon::Trash)
             .confirm_action("删除此会话？");
-        if running == Some(session.id) {
+        if running.contains(&session.id) {
             item = item.icon(Icon::Spinner);
         }
         groups[index].items.push(item);

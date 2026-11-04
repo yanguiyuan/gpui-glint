@@ -113,7 +113,7 @@ impl AgentWorkspace {
             composer.set_menu_chip_visible("model", !has_partner, cx);
             composer.set_menu_chip_visible("thinking", !has_partner, cx);
             composer.set_disabled(
-                !available || self.preparing.is_some() || self.edits_ui.undo_task.is_some(),
+                !available || self.active_run().preparing.is_some() || self.edits_ui.undo_task.is_some(),
                 cx,
             );
             composer.set_context_sections(sections, cx);

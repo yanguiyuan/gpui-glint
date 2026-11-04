@@ -426,7 +426,7 @@ impl AgentWorkspace {
                     .await;
                 if weak
                     .update(cx, |this, cx| {
-                        if this.pending.is_some() || this.preparing.is_some() || this.edits_ui.undo_task.is_some() {
+                        if this.any_run_busy() || this.edits_ui.undo_task.is_some() {
                             return;
                         }
                         let due = this
@@ -464,7 +464,7 @@ impl AgentWorkspace {
                                     session.title = format!("定时任务 · {}", task.title);
                                     let id = session.id;
                                     this.history.sessions.insert(0, session);
-                                    this.running_schedule = Some(task.id);
+                                    this.run_mut(id).running_schedule = Some(task.id);
                                     this.send_to(
                                         id,
                                         ComposerSubmission::text(format!("本次是日程唤醒，模式：{}。唤醒目的：{}\n先回顾自己的常驻记忆、近期经历和未完成目标，再判断现在是否仍需推进。完成后记录结果；若有必要，可用 schedule_create 自己选择下一次唤醒的时间、目的与 wake_mode，避免无进展的重复唤醒。{}", task.wake_mode.label(),task.prompt,if task.wake_mode==schedules::WakeMode::Reflect {"本次只允许阅读、回顾和更新自身记忆，以及安排自己的后续唤醒。"}else{"沿用当前工具权限执行实际工作。"})),
@@ -481,7 +481,7 @@ impl AgentWorkspace {
                                         session.title = format!("定时任务 · {}", task.title);
                                     }
                                     this.save(cx);
-                                    if this.pending.is_none() && this.preparing.is_none() {
+                                    if !this.session_busy(id) {
                                         let error = this
                                             .provider_error
                                             .clone()
@@ -490,7 +490,7 @@ impl AgentWorkspace {
                                             .schedules
                                             .lock()
                                             .map(|mut store| store.finish(task.id, Some(error)));
-                                        this.running_schedule = None;
+                                        this.runs.remove(&id);
                                     }
                                 } else {
                                     let _ = this.schedules.lock().map(|mut store| {

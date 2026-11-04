@@ -395,18 +395,15 @@ impl AgentWorkspace {
     }
 
     fn trajectory_running(&self) -> bool {
-        self.pending
-            .as_ref()
-            .or(self.preparing.as_ref())
-            .is_some_and(|(id, _)| *id == self.history.active)
+        self.session_busy(self.history.active)
     }
 
     fn copy_trajectory(&self, cx: &mut Context<Self>) {
-        let agents = self.subagent_ui.live.lock().ok();
+        let agents = self.active_run().subagents.lock().ok();
         let entries = entries(
             self.history.active(),
-            &self.transcript,
-            &self.tool_activity,
+            &self.active_run().transcript,
+            &self.active_run().tool_activity,
             agents.as_deref().map(Vec::as_slice).unwrap_or_default(),
             self.trajectory_running(),
         );
@@ -417,15 +414,15 @@ impl AgentWorkspace {
     pub(super) fn trajectory_page(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let session = self.history.active();
-        let agents = self.subagent_ui.live.lock().ok();
+        let agents = self.active_run().subagents.lock().ok();
         let mut entries = entries(
             session,
-            &self.transcript,
-            &self.tool_activity,
+            &self.active_run().transcript,
+            &self.active_run().tool_activity,
             agents.as_deref().map(Vec::as_slice).unwrap_or_default(),
             self.trajectory_running(),
         );
-        if let Some(approval) = &self.approval {
+        if let Some(approval) = &self.active_run().approval {
             for entry in &mut entries {
                 if matches!(&entry.payload,Payload::Tool{call,..} if call.id==approval.call.id) {
                     entry.status = "待批准";

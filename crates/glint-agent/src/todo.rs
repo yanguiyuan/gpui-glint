@@ -71,14 +71,15 @@ impl crate::AgentWorkspace {
     }
 
     pub fn finish_todos(&mut self, session_id: uuid::Uuid, cx: &mut gpui::Context<Self>) {
-        if let Ok(todos) = self.todo_live.lock() {
+        let todos = self.run(session_id).todo_live.lock().ok().map(|todos| todos.clone());
+        if let Some(todos) = todos {
             if let Some(session) = self
                 .history
                 .sessions
                 .iter_mut()
                 .find(|session| session.id == session_id)
             {
-                session.todos = todos.clone();
+                session.todos = todos;
             }
         }
         self.sync_todos(cx);

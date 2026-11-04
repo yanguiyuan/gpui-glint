@@ -516,13 +516,15 @@ fn coalesce_tool_snapshots(events: Vec<tools::ToolEvent>) -> Vec<tools::ToolEven
 impl AgentWorkspace {
     pub fn watch_tools(
         &mut self,
+        id: Uuid,
         receiver: async_channel::Receiver<tools::ToolEvent>,
         cx: &mut Context<Self>,
     ) {
-        self.tool_activity.clear();
-        self.transcript.clear();
-        self.thinking_timings = Default::default();
-        self.tool_listener = Some(cx.spawn(async move |weak, cx| {
+        let run = self.run_mut(id);
+        run.tool_activity.clear();
+        run.transcript.clear();
+        run.thinking_timings = Default::default();
+        run.tool_listener = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
                 let mut batch = vec![event];
                 for _ in 0..255 {
@@ -534,6 +536,9 @@ impl AgentWorkspace {
                 for event in coalesce_tool_snapshots(batch) {
                     if weak
                         .update(cx, |this, cx| {
+                            if !this.session_busy(id) {
+                                return;
+                            }
                             // Follow on the next layout only if the reader is still
                             // at the bottom of the previous layout. Scrolling back
                             // through history detaches until they return to the end.
@@ -542,51 +547,46 @@ impl AgentWorkspace {
                                 tools::ToolEvent::ContextUsage { .. }
                                     | tools::ToolEvent::SubagentUpdated
                             ) && this.subagent_ui.selected.is_none()
-                                && this
-                                    .pending
-                                    .as_ref()
-                                    .is_some_and(|(id, _)| *id == this.history.active)
+                                && id == this.history.active
                             {
                                 scroll_follow::follow_if_at_bottom(&this.scroll);
                             }
                             match event {
                                 tools::ToolEvent::SteeringFailed(error) => {
-                                    this.provider_error = Some(format!(
-                                        "引导未生效：{error}。补充要求已保存到会话。"
-                                    ));
+                                    if this.history.active == id {
+                                        this.provider_error = Some(format!(
+                                            "引导未生效：{error}。补充要求已保存到会话。"
+                                        ));
+                                    }
                                 }
                                 tools::ToolEvent::TodoUpdated(todos) => {
-                                    if let Some((id, _)) = &this.pending {
-                                        if let Some(session) = this
-                                            .history
-                                            .sessions
-                                            .iter_mut()
-                                            .find(|session| session.id == *id)
-                                        {
-                                            session.todos = todos;
-                                        }
+                                    if let Some(session) = this
+                                        .history
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|session| session.id == id)
+                                    {
+                                        session.todos = todos;
                                     }
                                     this.sync_todos(cx);
                                     this.save(cx);
                                 }
                                 tools::ToolEvent::SubagentUpdated => {
-                                    if this
-                                        .approval
+                                    let run = this.run_mut(id);
+                                    if run.approval
                                         .as_ref()
                                         .and_then(|approval| approval.agent_id)
-                                        .is_some_and(|id| {
-                                            this.subagent_ui.live.lock().ok().is_some_and(
-                                                |traces| {
-                                                    traces.iter().any(|trace| {
-                                                        trace.id == id && !trace.status.active()
-                                                    })
-                                                },
-                                            )
+                                        .is_some_and(|agent_id| {
+                                            run.subagents.lock().ok().is_some_and(|traces| {
+                                                traces.iter().any(|trace| {
+                                                    trace.id == agent_id && !trace.status.active()
+                                                })
+                                            })
                                         })
                                     {
-                                        this.approval = None;
+                                        run.approval = None;
                                     }
-                                    if this
+                                    if id == this.history.active && this
                                         .selected_subagent()
                                         .is_some_and(|trace| trace.status.active())
                                     {
@@ -596,27 +596,25 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::BatchProgress { call_id, tools } => {
-                                    let previous = this
-                                        .tool_activity
+                                    let previous = this.run(id).tool_activity
                                         .iter()
                                         .find(|r| r.call.id == call_id)
                                         .map_or(0, |r| r.nested_tools.len());
                                     for child in tools.iter().skip(previous) {
-                                        this.invalidate_preview_paths(child);
+                                        this.invalidate_preview_paths(id, child);
                                     }
                                     if let Some(record) =
-                                        this.tool_activity.iter_mut().find(|r| r.call.id == call_id)
+                                        this.run_mut(id).tool_activity.iter_mut().find(|r| r.call.id == call_id)
                                     {
                                         record.nested_tools = tools.into();
                                     }
                                 }
                                 tools::ToolEvent::ApprovalResolved => {
-                                    if this
-                                        .approval
+                                    if this.run_mut(id).approval
                                         .as_ref()
                                         .is_some_and(|a| a.respond.is_closed())
                                     {
-                                        this.approval = None;
+                                        this.run_mut(id).approval = None;
                                     }
                                 }
                                 tools::ToolEvent::ContextUsage {
@@ -625,30 +623,29 @@ impl AgentWorkspace {
                                     used_tokens,
                                     capacity_tokens,
                                 } => {
-                                    if let Some((id, _)) = &this.pending {
-                                        if let Some(session) = this
-                                            .history
-                                            .sessions
-                                            .iter_mut()
-                                            .find(|session| session.id == *id)
-                                        {
-                                            session.context =
-                                                Some(context_usage::ContextSnapshot {
-                                                    provider_id,
-                                                    model,
-                                                    used_tokens,
-                                                    capacity_tokens,
-                                                });
-                                        }
+                                    if let Some(session) = this
+                                        .history
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|session| session.id == id)
+                                    {
+                                        session.context =
+                                            Some(context_usage::ContextSnapshot {
+                                                provider_id,
+                                                model,
+                                                used_tokens,
+                                                capacity_tokens,
+                                            });
                                     }
                                     this.sync_context_usage(cx);
                                 }
                                 tools::ToolEvent::Transcript(blocks) => {
-                                    this.thinking_timings.observe(&blocks);
-                                    this.transcript = blocks;
+                                    let run = this.run_mut(id);
+                                    run.thinking_timings.observe(&blocks);
+                                    run.transcript = blocks;
                                 }
                                 tools::ToolEvent::Started(call) => {
-                                    this.tool_activity.push(tools::ToolRecord {
+                                    this.run_mut(id).tool_activity.push(tools::ToolRecord {
                                         call,
                                         result: "执行中…".into(),
                                         success: false,
@@ -661,7 +658,7 @@ impl AgentWorkspace {
                                 }
                                 tools::ToolEvent::Output { call_id, output } => {
                                     if let Some(record) =
-                                        this.tool_activity.iter_mut().find(|record| {
+                                        this.run_mut(id).tool_activity.iter_mut().find(|record| {
                                             record.call.id == call_id && record.result == "执行中…"
                                         })
                                     {
@@ -676,7 +673,7 @@ impl AgentWorkspace {
                                     if *this.access.lock().unwrap() != tools::AccessMode::Ask {
                                         let _ = respond.send(true);
                                     } else {
-                                        this.approval = Some(Approval {
+                                        this.run_mut(id).approval = Some(Approval {
                                             call,
                                             respond,
                                             agent_id,
@@ -693,20 +690,19 @@ impl AgentWorkspace {
                                                 | "code_mode"
                                         )
                                     {
-                                        this.invalidate_preview_paths(&record);
+                                        this.invalidate_preview_paths(id, &record);
                                     }
                                     if record.call.name.starts_with("schedule_") {
                                         this.refresh_calendar(cx);
                                     }
 
-                                    if let Some(existing) = this
-                                        .tool_activity
+                                    if let Some(existing) = this.run_mut(id).tool_activity
                                         .iter_mut()
                                         .find(|item| item.call.id == record.call.id)
                                     {
                                         *existing = record;
                                     } else {
-                                        this.tool_activity.push(record);
+                                        this.run_mut(id).tool_activity.push(record);
                                     }
                                 }
                             }
@@ -1175,7 +1171,7 @@ impl AgentWorkspace {
                 blocks,
                 thinking_ms,
                 complete,
-                if complete { &[] } else { &self.tool_activity },
+                if complete { &[] } else { &self.active_run().tool_activity },
                 cx,
             ))
     }
@@ -1337,7 +1333,7 @@ impl AgentWorkspace {
                     &blocks[..split],
                     thinking_ms,
                     &summary,
-                    if complete { &[] } else { &self.tool_activity },
+                    if complete { &[] } else { &self.active_run().tool_activity },
                 )
             });
         let signature = source_signature ^ self.subagent_revision();
@@ -1365,7 +1361,7 @@ impl AgentWorkspace {
             let activity = if complete {
                 Vec::new()
             } else {
-                self.tool_activity.clone()
+                self.active_run().tool_activity.clone()
             };
             let content_key = key.to_owned();
             entry.panel.update(cx, |panel, cx| {
@@ -1430,12 +1426,12 @@ impl AgentWorkspace {
     pub fn approval_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let mut panel = div();
-        if let Some(approval) = &self.approval {
+        let session = self.history.active;
+        if let Some(approval) = &self.active_run().approval {
             let source = approval
                 .agent_id
                 .and_then(|id| {
-                    self.subagent_ui
-                        .live
+                    self.active_run().subagents
                         .lock()
                         .ok()?
                         .iter()
@@ -1449,8 +1445,8 @@ impl AgentWorkspace {
                 .child(div().id("approval-arguments").max_h(px(180.)).overflow_y_scroll().text_size(px(11.)).child(serde_json::to_string_pretty(&approval.call.arguments).unwrap_or_default()))
                 .when(approval.call.name == "run_command", |panel| panel.child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("命令在项目目录运行，批准前请检查程序和参数；命令自身可以访问项目外部。")))
                 .child(div().flex().gap_3()
-                    .child(Button::new("允许本次").theme(self.theme).render().on_click(cx.listener(|this, _, _, cx| { if let Some(approval) = this.approval.take() { let _=approval.respond.send(true); } cx.notify(); })))
-                    .child(Button::new("拒绝").kind(ButtonKind::Glass).theme(self.theme).render().on_click(cx.listener(|this, _, _, cx| { if let Some(approval) = this.approval.take() { let _=approval.respond.send(false); } cx.notify(); }))));
+                    .child(Button::new("允许本次").theme(self.theme).render().on_click(cx.listener(move |this, _, _, cx| { if let Some(approval) = this.runs.get_mut(&session).and_then(|run| run.approval.take()) { let _=approval.respond.send(true); } cx.notify(); })))
+                    .child(Button::new("拒绝").kind(ButtonKind::Glass).theme(self.theme).render().on_click(cx.listener(move |this, _, _, cx| { if let Some(approval) = this.runs.get_mut(&session).and_then(|run| run.approval.take()) { let _=approval.respond.send(false); } cx.notify(); }))));
         }
         panel
     }
@@ -1761,9 +1757,9 @@ mod tests {
                 serde_json::json!({"matches": vec!["很长的记忆结果。".repeat(30); 20]}).to_string(),
             );
             memory.success = true;
-            host.transcript = vec![generation::ContentBlock::ToolResult(memory)];
-            host.transcript.extend((0..6).map(|_| Thinking("继续查询".into())));
-            host.pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
+            host.run_mut(host.history.active).transcript = vec![generation::ContentBlock::ToolResult(memory)];
+            host.run_mut(host.history.active).transcript.extend((0..6).map(|_| Thinking("继续查询".into())));
+            host.run_mut(host.history.active).pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
             host
         });
         window.simulate_resize(size(px(1200.), px(700.)));
@@ -1802,11 +1798,11 @@ mod tests {
             record.nested_tools = vec![tools::rejected(tools::ToolCall {
                 id: "nested-command".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"df","args":["-h"]}),
             }, "输出".into())].into();
-            host.transcript = vec![generation::ContentBlock::ToolResult(record)];
+            host.run_mut(host.history.active).transcript = vec![generation::ContentBlock::ToolResult(record)];
             for _ in 0..18 {
-                host.transcript.push(Thinking("继续检查".into()));
+                host.run_mut(host.history.active).transcript.push(Thinking("继续检查".into()));
             }
-            host.pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
+            host.run_mut(host.history.active).pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
             host
         });
         window.simulate_resize(size(px(1200.), px(700.)));
@@ -1912,6 +1908,75 @@ mod tests {
         });
     }
     #[gpui::test]
+    fn background_project_streams_and_stops_independently(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let first_project = directory.path().join("first");
+        let second_project = directory.path().join("second");
+        std::fs::create_dir(&first_project).unwrap();
+        std::fs::create_dir(&second_project).unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (first_sender, first_receiver) = async_channel::unbounded();
+        let (second_sender, second_receiver) = async_channel::unbounded();
+        let (workspace, window) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            // Keep the GPUI test scheduler independent of disk writes.
+            workspace.storage_readable = false;
+            workspace
+        });
+        let (first, second) = workspace.update(window, |workspace, cx| {
+            workspace.history.active_mut().project = Some(first_project);
+            let first = workspace.history.active;
+            workspace.run_mut(first).pending = Some((
+                first,
+                cx.spawn(async move |_, _| std::future::pending::<()>().await),
+            ));
+            workspace.watch_tools(first, first_receiver, cx);
+
+            let mut session = model::Session::new();
+            session.project = Some(second_project);
+            let second = session.id;
+            workspace.history.sessions.insert(0, session);
+            workspace.switch(second, cx);
+            assert!(workspace.session_busy(first));
+            assert!(!workspace.session_busy(second));
+
+            workspace.run_mut(second).pending = Some((
+                second,
+                cx.spawn(async move |_, _| std::future::pending::<()>().await),
+            ));
+            workspace.watch_tools(second, second_receiver, cx);
+            (first, second)
+        });
+
+        first_sender.try_send(tools::ToolEvent::Transcript(vec![
+            generation::ContentBlock::Text("first".into()),
+        ])).unwrap();
+        second_sender.try_send(tools::ToolEvent::Transcript(vec![
+            generation::ContentBlock::Text("second".into()),
+        ])).unwrap();
+        window.run_until_parked();
+        workspace.update(window, |workspace, cx| {
+            assert!(matches!(
+                workspace.active_run().transcript.as_slice(),
+                [generation::ContentBlock::Text(text)] if text == "second"
+            ));
+            workspace.stop(cx);
+            assert!(!workspace.session_busy(second));
+            assert!(workspace.session_busy(first));
+            workspace.switch(first, cx);
+            assert!(matches!(
+                workspace.active_run().transcript.as_slice(),
+                [generation::ContentBlock::Text(text)] if text == "first"
+            ));
+        });
+    }
+
+    #[gpui::test]
     fn streaming_follows_the_end_detaches_on_wheel_and_resumes_when_reader_returns(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1931,11 +1996,11 @@ mod tests {
                     format!("历史记录 {index}，阅读时不应被新回复打断。\n\n").repeat(8),
                 );
             }
-            workspace.pending = Some((
+            workspace.run_mut(workspace.history.active).pending = Some((
                 workspace.history.active,
                 cx.spawn(async move |_, _| std::future::pending::<()>().await),
             ));
-            workspace.watch_tools(receiver, cx);
+            workspace.watch_tools(workspace.history.active, receiver, cx);
             workspace
         });
         window.simulate_resize(size(px(1440.), px(900.)));
@@ -2020,7 +2085,7 @@ mod tests {
         window.run_until_parked();
         let reading_offset = scroll.offset();
         workspace.update(window, |workspace, cx| {
-            let blocks = std::mem::take(&mut workspace.transcript);
+            let blocks = std::mem::take(&mut workspace.run_mut(workspace.history.active).transcript);
             workspace
                 .history
                 .active_mut()
@@ -2032,8 +2097,7 @@ mod tests {
                 .last_mut()
                 .unwrap()
                 .blocks = blocks;
-            workspace.pending = None;
-            workspace.tool_listener = None;
+            workspace.runs.remove(&workspace.history.active);
             scroll_follow::follow_if_at_bottom(&workspace.scroll);
             cx.notify();
         });

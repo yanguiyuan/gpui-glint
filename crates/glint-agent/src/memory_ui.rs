@@ -140,7 +140,7 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub fn tick_memory(&mut self, manual: bool, cx: &mut Context<Self>) {
-        if self.memory_task.is_some() || self.pending.is_some() || self.preparing.is_some() {
+        if self.memory_task.is_some() || self.any_run_busy() {
             if manual {
                 self.memory_ui.notice = Some("请等待当前对话或整理任务完成".into());
                 cx.notify();

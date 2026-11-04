@@ -88,7 +88,30 @@ use uuid::Uuid;
 
 gpui::actions!(agent_workspace, [NewSession, SearchSessions, OpenSettings]);
 
+#[derive(Default)]
+struct SessionRun {
+    steering_sender: Option<(Uuid, async_channel::Sender<provider::Steering>)>,
+    todo_live: todo::Store,
+    running_schedule: Option<Uuid>,
+    tool_listener: Option<Task<()>>,
+    tool_activity: Vec<tools::ToolRecord>,
+    transcript: Vec<generation::ContentBlock>,
+    thinking_timings: generation::ThinkingTimings,
+    approval: Option<app_tools_ui::Approval>,
+    pending: Option<(Uuid, Task<()>)>,
+    preparing: Option<(Uuid, Task<()>)>,
+    subagents: subagent::Registry,
+}
+
+impl SessionRun {
+    fn busy(&self) -> bool {
+        self.pending.is_some() || self.preparing.is_some()
+    }
+}
+
 pub struct AgentWorkspace {
+    runs: std::collections::HashMap<Uuid, SessionRun>,
+    idle_run: SessionRun,
     trajectory: trajectory::State,
     git_ui: git_ui::State,
     commands: commands::State,
@@ -104,9 +127,7 @@ pub struct AgentWorkspace {
     host_shell: Option<gpui_glint::components::ShellRenderer>,
     edits_ui: edits_ui::State,
     code_fonts: code_fonts_ui::State,
-    steering_sender: Option<(Uuid, async_channel::Sender<provider::Steering>)>,
     queued_requests: std::collections::HashMap<u64, (Uuid, provider::Config)>,
-    todo_live: todo::Store,
     group_list: Entity<GroupList>,
     calendar: Entity<Calendar>,
 
@@ -115,11 +136,6 @@ pub struct AgentWorkspace {
     schedules: std::sync::Arc<std::sync::Mutex<schedules::ScheduleStore>>,
     schedule_editor: schedule_ui::ScheduleEditor,
     scheduler_task: Option<Task<()>>,
-    running_schedule: Option<Uuid>,
-    tool_listener: Option<Task<()>>,
-    tool_activity: Vec<tools::ToolRecord>,
-    transcript: Vec<generation::ContentBlock>,
-    thinking_timings: generation::ThinkingTimings,
     subagent_ui: subagent_ui::State,
     markdown_views:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
@@ -127,7 +143,6 @@ pub struct AgentWorkspace {
     process_panels:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ProcessPanel>>,
     tool_panels: std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ToolPanel>>,
-    approval: Option<app_tools_ui::Approval>,
     access: std::sync::Arc<std::sync::Mutex<tools::AccessMode>>,
     catalog: provider_catalog::ProviderCatalog,
     history: History,
@@ -150,7 +165,6 @@ pub struct AgentWorkspace {
     show_auxiliary_sidebar: bool,
     project_picker_open: bool,
     outline: Entity<outline::ConversationOutline>,
-    pending: Option<(Uuid, Task<()>)>,
     titles: Entity<titles::TitleGenerator>,
     quick_reply_jobs: std::collections::HashMap<Uuid, Task<()>>,
     save_sender: Option<async_channel::Sender<storage::SaveRequest>>,
@@ -158,7 +172,6 @@ pub struct AgentWorkspace {
     save_delay: Option<Task<()>>,
     save_revision: u64,
     save_full_pending: bool,
-    preparing: Option<(Uuid, Task<()>)>,
     context_models: Option<Task<()>>,
     partners_ui: partner_ui::State,
     partner_worker: Option<Task<()>>,
@@ -416,8 +429,7 @@ impl AgentWorkspace {
                             }
                         };
                         let sent =
-                            this.steering_sender
-                                .as_ref()
+                            target.and_then(|id| this.run(id).steering_sender.as_ref())
                                 .is_some_and(|(session, sender)| {
                                     Some(*session) == target
                                         && sender
@@ -458,31 +470,23 @@ impl AgentWorkspace {
                     }
                     ComposerEvent::QueueSubmitted { id, submission } => {
                         if let Some((session, config)) = this.queued_requests.remove(id) {
-                            if this.history.sessions.iter().any(|item| item.id == session) {
-                                this.send_to(session, submission.clone(), config, false, cx);
-                                if this.pending.is_none() && this.preparing.is_none() {
-                                    if let Some(error) = this.provider_error.clone() {
-                                        if let Some(target) = this
-                                            .history
-                                            .sessions
-                                            .iter_mut()
-                                            .find(|item| item.id == session)
-                                        {
-                                            target.push(
-                                                Role::Notice,
-                                                format!(
-                                                    "排队任务未启动：{}\n{error}",
-                                                    submission.text
-                                                ),
-                                            );
-                                        }
-                                    }
+                            if let Err(error) =
+                                this.try_send_to(session, submission.clone(), config, false, cx)
+                            {
+                                if let Some(target) =
+                                    this.history.sessions.iter_mut().find(|item| item.id == session)
+                                {
+                                    target.push(
+                                        Role::Notice,
+                                        format!("排队任务未启动：{}\n{error}", submission.text),
+                                    );
+                                    this.save(cx);
                                 }
+                                this.composer.update(cx, |composer, cx| {
+                                    composer.submit_scoped_queue(&session.to_string(), cx);
+                                });
+                                cx.notify();
                             }
-                        }
-                        if this.pending.is_none() && this.preparing.is_none() {
-                            this.composer
-                                .update(cx, |composer, cx| composer.set_busy(false, cx));
                         }
                     }
                     ComposerEvent::StopRequested => this.stop(cx),
@@ -529,8 +533,10 @@ impl AgentWorkspace {
                         this.history.access_mode = mode;
                         *this.access.lock().unwrap() = mode;
                         if mode != tools::AccessMode::Ask {
-                            if let Some(approval) = this.approval.take() {
-                                let _ = approval.respond.send(true);
+                            for run in this.runs.values_mut() {
+                                if let Some(approval) = run.approval.take() {
+                                    let _ = approval.respond.send(true);
+                                }
                             }
                         }
                         this.save(cx);
@@ -576,23 +582,17 @@ impl AgentWorkspace {
             vault: vault.unwrap_or_else(|| {
                 cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx))
             }),
+            runs: Default::default(),
+            idle_run: Default::default(),
             scheduler_task: None,
-            running_schedule: None,
-            tool_listener: None,
             queued_requests: Default::default(),
             edits_ui: Default::default(),
             code_fonts: code_fonts_ui::State::new(&path, cx),
-            steering_sender: None,
-            todo_live: Default::default(),
-            tool_activity: vec![],
-            transcript: vec![],
-            thinking_timings: Default::default(),
             subagent_ui: Default::default(),
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_views: std::cell::RefCell::new(images::PreviewCache::default()),
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
-            approval: None,
             access,
             history,
             catalog,
@@ -615,7 +615,6 @@ impl AgentWorkspace {
             project_picker_open: false,
             git_ui: git_ui::State::new(theme, cx),
             outline,
-            pending: None,
             titles,
             quick_reply_jobs: Default::default(),
             save_sender: None,
@@ -623,7 +622,6 @@ impl AgentWorkspace {
             save_delay: None,
             save_revision: 0,
             save_full_pending: true,
-            preparing: None,
             context_models: None,
             partners_ui: partner_ui::State::new(cx),
             partner_worker: None,
@@ -691,6 +689,53 @@ impl AgentWorkspace {
         });
         self.reset_skill_context(cx);
         self.reset_project_context(cx);
+        self.sync_composer_run(cx);
+    }
+
+    fn run(&self, id: Uuid) -> &SessionRun {
+        self.runs.get(&id).unwrap_or(&self.idle_run)
+    }
+
+    fn run_mut(&mut self, id: Uuid) -> &mut SessionRun {
+        self.runs.entry(id).or_default()
+    }
+
+    fn active_run(&self) -> &SessionRun {
+        self.run(self.history.active)
+    }
+
+    fn session_busy(&self, id: Uuid) -> bool {
+        self.run(id).busy()
+    }
+
+    fn any_run_busy(&self) -> bool {
+        self.runs.values().any(SessionRun::busy)
+    }
+
+    fn sync_composer_run(&self, cx: &mut Context<Self>) {
+        let id = self.history.active;
+        let disabled = !self.active_model_enabled()
+            || self.run(id).preparing.is_some()
+            || self.edits_ui.undo_task.is_some();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_queue_scope(id.to_string(), cx);
+            composer.set_busy(self.session_busy(id), cx);
+            composer.set_disabled(disabled, cx);
+        });
+    }
+
+    fn finish_run_ui(&mut self, id: Uuid, error: Option<String>, cx: &mut Context<Self>) {
+        if let Some(schedule) = self.runs.remove(&id).and_then(|run| run.running_schedule) {
+            let _ = self.schedules.lock().map(|mut store| store.finish(schedule, error));
+        }
+        if self.history.active == id {
+            self.sync_composer_run(cx);
+        } else {
+            self.composer.update(cx, |composer, cx| {
+                composer.submit_scoped_queue(&id.to_string(), cx);
+            });
+        }
+        cx.notify();
     }
 
     fn switch(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -711,11 +756,7 @@ impl AgentWorkspace {
     /// Removes a session from the list. Deleting the active session falls
     /// back to the newest remaining one; the session awaiting a reply is kept.
     fn delete_session(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        if self
-            .pending
-            .as_ref()
-            .or(self.preparing.as_ref())
-            .is_some_and(|(pending, _)| *pending == id)
+        if self.session_busy(id)
         {
             self.provider_error = Some("会话正在等待回复，请先停止再删除。".into());
             cx.notify();
@@ -730,6 +771,10 @@ impl AgentWorkspace {
         if !self.history.remove(id) {
             return;
         }
+        self.queued_requests.retain(|_, (session, _)| *session != id);
+        self.composer.update(cx, |composer, cx| {
+            composer.discard_scoped_queue(&id.to_string(), cx);
+        });
         if self.history.active != previous_active {
             self.restore_draft(cx);
             self.page = crate::Page::Chat;
@@ -783,41 +828,39 @@ impl AgentWorkspace {
         clear_composer: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.pending.is_some() {
-            return;
+        if let Err(error) = self.try_send_to(id, submission, config, clear_composer, cx) {
+            self.provider_error = Some(error);
+            cx.notify();
+        }
+    }
+
+    fn try_send_to(
+        &mut self,
+        id: Uuid,
+        submission: ComposerSubmission,
+        config: provider::Config,
+        clear_composer: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.session_busy(id) {
+            return Err("会话正在等待回复".into());
         }
         let group_member = self.history.sessions.iter()
             .any(|session| session.id == id && session.channel_group_member);
         if group_member && !self.channels.running.is_some_and(|(_, session, _)| session == id) {
-            self.provider_error = Some("请在原 WPS 群中继续这段会话。".into());
-            cx.notify();
-            return;
+            return Err("请在原 WPS 群中继续这段会话。".into());
         }
-        let config = match self.session_model(id, config) {
-            Ok(config) => config,
-            Err(error) => {
-                self.provider_error = Some(error);
-                cx.notify();
-                return;
-            }
-        };
+        let config = self.session_model(id, config)?;
         if self.edits_ui.undo_task.is_some() {
-            self.provider_error = Some("正在撤销文件改动，请稍后发送。".into());
-            cx.notify();
-            return;
+            return Err("正在撤销文件改动，请稍后发送。".into());
         }
         let text = submission.prompt_text().trim().to_owned();
         let display = model::MessageDisplay::from_submission(&submission);
         if text.is_empty() && submission.images.is_empty() {
-            return;
+            return Err("请输入消息内容".into());
         }
         if !config.enabled {
-            self.provider_error = Some("请先在设置中连接 Provider。".into());
-            cx.notify();
-            return;
-        }
-        if self.preparing.is_some() {
-            return;
+            return Err("请先在设置中连接 Provider。".into());
         }
         if self
             .history
@@ -827,9 +870,7 @@ impl AgentWorkspace {
             .and_then(|session| session.project.as_ref())
             .is_none()
         {
-            self.provider_error = Some("请先选择项目，再开始会话".into());
-            cx.notify();
-            return;
+            return Err("请先选择项目，再开始会话".into());
         }
         let compact_plan = self
             .history
@@ -865,7 +906,7 @@ impl AgentWorkspace {
                 ));
             Ok::<_, String>((images, skills))
         });
-        self.preparing = Some((
+        self.run_mut(id).preparing = Some((
             id,
             cx.spawn(async move |weak, cx| {
                 let result = async {
@@ -885,7 +926,7 @@ impl AgentWorkspace {
                 }
                 .await;
                 let _ = weak.update(cx, |this, cx| {
-                    if let Some((_, task)) = this.preparing.take() {
+                    if let Some((_, task)) = this.run_mut(id).preparing.take() {
                         task.detach();
                     }
                     match result {
@@ -897,20 +938,14 @@ impl AgentWorkspace {
                                     if let Err(error) =
                                         compaction::apply(session, summary, previous)
                                     {
-                                        this.finish_channel(id, None, Some(&error));
-                                        this.provider_error = Some(error);
-                                        this.composer.update(cx, |composer, cx| {
-                                            composer.set_busy(false, cx);
-                                            composer.set_disabled(!this.active_model_enabled(), cx);
-                                        });
-                                        cx.notify();
+                                        this.fail_preparation(id, error, cx);
                                         return;
                                     }
                                     this.save(cx);
                                     this.sync_context_usage(cx);
                                 }
                             }
-                            this.begin_request(
+                            if let Err(error) = this.begin_request(
                                 id,
                                 text,
                                 display,
@@ -919,33 +954,31 @@ impl AgentWorkspace {
                                 config,
                                 clear_composer,
                                 cx,
-                            );
-                            if this.pending.is_none() {
-                                this.finish_channel(
-                                    id,
-                                    None,
-                                    Some("无法启动伙伴请求，请检查 Provider 配置"),
-                                );
+                            ) {
+                                this.fail_preparation(id, error, cx);
                             }
                         }
-                        Err(error) => {
-                            this.finish_channel(id, None, Some(&error));
-                            this.provider_error = Some(error);
-                            this.composer.update(cx, |composer, cx| {
-                                composer.set_disabled(!this.active_model_enabled(), cx);
-                                composer.set_busy(false, cx);
-                            });
-                            cx.notify();
-                        }
+                        Err(error) => this.fail_preparation(id, error, cx),
                     }
                 });
             }),
         ));
-        self.composer.update(cx, |composer, cx| {
-            composer.set_busy(true, cx);
-            composer.set_disabled(true, cx);
-        });
+        if self.history.active == id {
+            self.sync_composer_run(cx);
+        }
         cx.notify();
+        Ok(())
+    }
+
+    fn fail_preparation(&mut self, id: Uuid, error: String, cx: &mut Context<Self>) {
+        self.finish_channel(id, None, Some(&error));
+        if self.history.active == id {
+            self.provider_error = Some(error.clone());
+        } else if let Some(session) = self.history.sessions.iter_mut().find(|s| s.id == id) {
+            session.push(Role::Notice, format!("请求未启动：{error}"));
+            self.save(cx);
+        }
+        self.finish_run_ui(id, Some(error), cx);
     }
 
     fn begin_request(
@@ -958,14 +991,14 @@ impl AgentWorkspace {
         config: provider::Config,
         clear_composer: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
         let Some(index) = self
             .history
             .sessions
             .iter()
             .position(|session| session.id == id)
         else {
-            return;
+            return Err("会话已删除".into());
         };
         let partner_id = self.history.sessions[index].partner_id;
         let group_member = self.history.sessions[index].channel_group_member;
@@ -984,14 +1017,7 @@ impl AgentWorkspace {
         } else {
             partner_repo.context(partner_id, project)
         };
-        let partner_context = match partner_context {
-            Ok(context) => context,
-            Err(error) => {
-                self.provider_error = Some(format!("伙伴记忆读取失败：{error}"));
-                cx.notify();
-                return;
-            }
-        };
+        let partner_context = partner_context.map_err(|error| format!("伙伴记忆读取失败：{error}"))?;
         let (events, receiver) = async_channel::unbounded();
         let (steering_sender, steering_receiver) = async_channel::unbounded();
         let (recall_sender, recall_receiver) = async_channel::bounded(1);
@@ -1002,14 +1028,14 @@ impl AgentWorkspace {
             .settings()
             .map(|settings| settings.automatic_recall)
             .unwrap_or(false);
-        self.subagent_ui.live = Default::default();
-        self.todo_live = std::sync::Arc::new(std::sync::Mutex::new(
+        let todos = std::sync::Arc::new(std::sync::Mutex::new(
             self.history.sessions[index].todos.clone(),
         ));
+        let subagents = subagent::Registry::default();
         let tool_context = tools::ToolContext {
             steering: Some(steering_receiver),
-            todos: self.todo_live.clone(),
-            subagents: self.subagent_ui.live.clone(),
+            todos: todos.clone(),
+            subagents: subagents.clone(),
             delegation: Default::default(),
             registry: tool_registry::ToolRegistry::new(self.path.with_file_name("mcp.json"))
                 .with_host_tools(self.host_tools.clone()),
@@ -1074,22 +1100,16 @@ impl AgentWorkspace {
                 Some(tool_context),
             )
         })();
-        let request = match result {
-            Ok(request) => request,
-            Err(error) => {
-                self.provider_error = Some(error);
-                self.composer.update(cx, |composer, cx| {
-                    composer.set_disabled(!self.active_model_enabled(), cx);
-                    composer.set_busy(false, cx);
-                });
-                cx.notify();
-                return;
-            }
-        };
-        self.provider_error = None;
-        self.steering_sender = Some((id, steering_sender));
-        self.watch_tools(receiver, cx);
-        self.memory_ui.notice = None;
+        let request = result?;
+        if self.history.active == id {
+            self.provider_error = None;
+            self.memory_ui.notice = None;
+        }
+        let run = self.run_mut(id);
+        run.steering_sender = Some((id, steering_sender));
+        run.todo_live = todos;
+        run.subagents = subagents;
+        self.watch_tools(id, receiver, cx);
         let message_index = self.history.sessions[index].messages.len();
         self.history.sessions[index].push_message(Role::User, text.clone(), images);
         self.history.sessions[index].messages.last_mut().unwrap().display = display;
@@ -1132,20 +1152,24 @@ impl AgentWorkspace {
             let _ = weak.update(cx, |this, cx| {
                 let error = result.as_ref().err().cloned();
                 this.finish_channel(id, reply.as_deref(), error.as_deref());
+                let run = this.run_mut(id);
                 if let Ok(completion) = &result {
-                    this.thinking_timings.observe(&completion.blocks);
+                    run.thinking_timings.observe(&completion.blocks);
                 }
-                this.thinking_timings.finish();
+                run.thinking_timings.finish();
                 if let Some(error) = &error {
                     generation::close_unfinished_tools(
-                        &mut this.transcript,
-                        &mut this.tool_activity,
+                        &mut run.transcript,
+                        &mut run.tool_activity,
                         error,
                     );
                 }
-                this.finish_subagent_records();
+                this.finish_subagent_records(id);
                 this.finish_todos(id, cx);
-                let thinking_ms = this.thinking_timings.snapshot();
+                let run = this.run_mut(id);
+                let thinking_ms = run.thinking_timings.snapshot();
+                let tools = std::mem::take(&mut run.tool_activity);
+                let blocks = std::mem::take(&mut run.transcript);
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
                         Ok(completion) => {
@@ -1163,13 +1187,13 @@ impl AgentWorkspace {
                         }
                         Err(error) => {
                             session.push(Role::Notice, format!("请求失败：{error}"));
-                            session.messages.last_mut().unwrap().tools = this.tool_activity.clone();
-                            session.messages.last_mut().unwrap().blocks = this.transcript.clone();
+                            session.messages.last_mut().unwrap().tools = tools;
+                            session.messages.last_mut().unwrap().blocks = blocks;
                             session.messages.last_mut().unwrap().thinking_ms = thinking_ms;
                         }
                     }
                 }
-                if error.is_none() && this.running_schedule.is_none() {
+                if error.is_none() && this.run(id).running_schedule.is_none() {
                     this.generate_quick_replies(id, quick_reply_config, &prompt, cx);
                 }
                 if let (Some(config), Some(reply)) = (title_config, reply) {
@@ -1187,23 +1211,8 @@ impl AgentWorkspace {
                         }
                     }
                 }
-                this.pending = None;
-                this.steering_sender = None;
-                this.tool_listener = None;
-                this.approval = None;
-                this.tool_activity.clear();
-                this.transcript.clear();
-                if let Some(task) = this.running_schedule.take() {
-                    let _ = this
-                        .schedules
-                        .lock()
-                        .map(|mut store| store.finish(task, error));
-                }
+                this.finish_run_ui(id, error, cx);
                 this.refresh_calendar(cx);
-                this.composer.update(cx, |composer, cx| {
-                    composer.set_disabled(false, cx);
-                    composer.set_busy(false, cx);
-                });
                 this.save(cx);
                 if this.history.active == id && this.subagent_ui.selected.is_none() {
                     scroll_follow::follow_if_at_bottom(&this.scroll);
@@ -1211,57 +1220,52 @@ impl AgentWorkspace {
                 cx.notify();
             });
         });
-        self.pending = Some((id, task));
-        self.composer.update(cx, |composer, cx| {
-            composer.set_busy(true, cx);
-            composer.set_disabled(false, cx);
-        });
+        self.run_mut(id).pending = Some((id, task));
+        if self.history.active == id {
+            self.sync_composer_run(cx);
+        }
         cx.notify();
+        Ok(())
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some((id, _)) = self.preparing.take() {
-            self.finish_channel(id, None, Some("伙伴回复已停止"));
-            self.composer.update(cx, |composer, cx| {
-                composer.set_disabled(!self.active_model_enabled(), cx);
-                composer.set_busy(false, cx);
-            });
-            cx.notify();
+        self.stop_session(self.history.active, true, cx);
+    }
+
+    fn stop_session(&mut self, id: Uuid, dispatch_queue: bool, cx: &mut Context<Self>) {
+        if !self.session_busy(id) {
+            return;
         }
-        if let Some((id, _task)) = self.pending.take() {
-            self.finish_channel(id, None, Some("伙伴回复已停止"));
-            self.steering_sender = None;
-            self.finish_subagent_records();
+        self.finish_channel(id, None, Some("伙伴回复已停止"));
+        if self.run_mut(id).pending.take().is_some() {
+            self.finish_subagent_records(id);
             self.finish_todos(id, cx);
-            self.thinking_timings.finish();
+            self.recall_runner.update(cx, |runner, _| runner.cancel(id));
+            let run = self.run_mut(id);
+            run.thinking_timings.finish();
             generation::close_unfinished_tools(
-                &mut self.transcript,
-                &mut self.tool_activity,
+                &mut run.transcript,
+                &mut run.tool_activity,
                 "用户已停止任务",
             );
-            self.recall_runner.update(cx, |runner, _| runner.cancel(id));
-            self.tool_listener = None;
-            self.approval = None;
-            if let Some(task) = self.running_schedule.take() {
-                let _ = self
-                    .schedules
-                    .lock()
-                    .map(|mut store| store.finish(task, Some("用户已停止任务".into())));
-            }
-            self.composer.update(cx, |composer, cx| {
-                composer.set_disabled(false, cx);
-                composer.set_busy(false, cx);
-            });
+            let blocks = std::mem::take(&mut run.transcript);
+            let tools = std::mem::take(&mut run.tool_activity);
+            let thinking_ms = run.thinking_timings.snapshot();
             if let Some(session) = self.history.sessions.iter_mut().find(|s| s.id == id) {
                 session.push(Role::Notice, "已停止回复。".into());
-                session.messages.last_mut().unwrap().blocks = std::mem::take(&mut self.transcript);
-                session.messages.last_mut().unwrap().tools =
-                    std::mem::take(&mut self.tool_activity);
-                session.messages.last_mut().unwrap().thinking_ms = self.thinking_timings.snapshot();
+                let message = session.messages.last_mut().unwrap();
+                message.blocks = blocks;
+                message.tools = tools;
+                message.thinking_ms = thinking_ms;
             }
-            self.save(cx);
-            cx.notify();
         }
+        if dispatch_queue {
+            self.finish_run_ui(id, Some("用户已停止任务".into()), cx);
+        } else if let Some(schedule) = self.runs.remove(&id).and_then(|run| run.running_schedule) {
+            let _ = self.schedules.lock().map(|mut store| store.finish(schedule, Some("用户已停止任务".into())));
+        }
+        self.save(cx);
+        cx.notify();
     }
 
     fn search_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1567,10 +1571,7 @@ impl AgentWorkspace {
         let mut groups = project_ui::session_groups_with_partners(
             &self.history,
             self.search.read(cx).value(),
-            self.pending
-                .as_ref()
-                .or(self.preparing.as_ref())
-                .map(|(id, _)| *id),
+            self.runs.iter().filter_map(|(id, run)| run.busy().then_some(*id)),
             &partners,
         );
         for group in &mut groups {
@@ -1838,11 +1839,7 @@ impl AgentWorkspace {
                     cx,
                 )
             });
-            let running = self
-                .pending
-                .as_ref()
-                .or(self.preparing.as_ref())
-                .is_some_and(|(id, _)| *id == session.id);
+            let running = self.session_busy(session.id);
             let layout_context = (session.id, self.theme, session.messages.len());
             let viewport = self.scroll.bounds();
             let offset = self.scroll.offset();
@@ -2063,8 +2060,7 @@ impl AgentWorkspace {
                                         self.history.quick_replies_enabled
                                             && message.role == Role::Agent
                                             && index + 1 == session.messages.len()
-                                            && self.pending.is_none()
-                                            && self.preparing.is_none()
+                                            && !self.session_busy(self.history.active)
                                             && !message.quick_replies.is_empty(),
                                         |body| {
                                             body.child(self.quick_reply_bubbles(
@@ -2079,7 +2075,7 @@ impl AgentWorkspace {
                 }
             }
             if running {
-                if !self.transcript.is_empty() {
+                if !self.active_run().transcript.is_empty() {
                     let key = format!(
                         "{}:{}",
                         self.history.active,
@@ -2098,9 +2094,9 @@ impl AgentWorkspace {
                             .max_w(px(800.))
                             .child(self.response_view(
                                 &key,
-                                &self.transcript,
+                                &self.active_run().transcript,
                                 None,
-                                &self.thinking_timings.snapshot(),
+                                &self.active_run().thinking_timings.snapshot(),
                                 false,
                                 cx,
                             )),
@@ -2137,7 +2133,7 @@ impl AgentWorkspace {
             .flex()
             .flex_col()
             .gap_2()
-            .when(self.approval.is_some(), |panel| {
+            .when(self.active_run().approval.is_some(), |panel| {
                 panel.child(self.approval_panel(cx))
             })
             .child(

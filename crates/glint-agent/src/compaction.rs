@@ -170,7 +170,7 @@ pub fn apply(
 
 impl AgentWorkspace {
     pub fn compact_session(&mut self, cx: &mut Context<Self>) {
-        if self.pending.is_some() || self.preparing.is_some() {
+        if self.session_busy(self.history.active) {
             return;
         }
         let id = self.history.active;
@@ -189,16 +189,12 @@ impl AgentWorkspace {
         };
         let previous = plan.previous();
         self.provider_error = None;
-        self.composer.update(cx, |composer, cx| {
-            composer.set_busy(true, cx);
-            composer.set_disabled(true, cx);
-        });
-        self.preparing = Some((
+        self.run_mut(id).preparing = Some((
             id,
             cx.spawn(async move |weak, cx| {
                 let result = plan.generate(config).await;
                 let _ = weak.update(cx, |this, cx| {
-                    if let Some((_, task)) = this.preparing.take() {
+                    if let Some((_, task)) = this.run_mut(id).preparing.take() {
                         task.detach();
                     }
                     let result = result.and_then(|summary| {
@@ -215,16 +211,16 @@ impl AgentWorkspace {
                             this.save(cx);
                             this.sync_context_usage(cx);
                         }
-                        Err(error) => this.provider_error = Some(format!("会话压缩失败：{error}")),
+                        Err(error) if this.history.active == id => {
+                            this.provider_error = Some(format!("会话压缩失败：{error}"));
+                        }
+                        Err(_) => {}
                     }
-                    this.composer.update(cx, |composer, cx| {
-                        composer.set_busy(false, cx);
-                        composer.set_disabled(!this.active_model_enabled(), cx);
-                    });
-                    cx.notify();
+                    this.finish_run_ui(id, None, cx);
                 });
             }),
         ));
+        self.sync_composer_run(cx);
         cx.notify();
     }
 }

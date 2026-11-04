@@ -23,7 +23,7 @@ impl State {
 }
 impl AgentWorkspace {
     pub fn open_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let busy = self.pending.is_some() || self.preparing.is_some();
+        let busy = self.session_busy(self.history.active);
         let session = self.history.active();
         let can_compact = session
             .messages

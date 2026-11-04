@@ -78,8 +78,9 @@ impl AgentWorkspace {
             }
         }));
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
-            if this.pending.is_some() || this.preparing.is_some() {
-                this.stop(cx);
+            let sessions: Vec<_> = this.runs.keys().copied().collect();
+            for id in sessions {
+                this.stop_session(id, false, cx);
             }
             this.save_delay = None;
             let (send, receive) = tokio::sync::oneshot::channel();

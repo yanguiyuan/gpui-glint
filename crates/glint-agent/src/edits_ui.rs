@@ -65,8 +65,7 @@ impl AgentWorkspace {
         self.refresh_workspace_edits(cx);
     }
     fn undo_session_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
-        if self.pending.is_some()
-            || self.preparing.is_some()
+        if self.any_run_busy()
             || !self.queued_requests.is_empty()
             || self.edits_ui.undo_task.is_some()
         {
@@ -194,14 +193,11 @@ impl AgentWorkspace {
             .iter()
             .flat_map(|message| message.tools.iter())
             .collect();
-        let running = self
-            .pending
-            .as_ref()
-            .is_some_and(|(id, _)| *id == self.history.active);
+        let running = self.session_busy(self.history.active);
         if running {
-            records.extend(self.tool_activity.iter());
+            records.extend(self.active_run().tool_activity.iter());
         }
-        let live = self.subagent_ui.live.lock().ok();
+        let live = self.active_run().subagents.lock().ok();
         if running {
             if let Some(live) = &live {
                 for trace in live.iter() {
@@ -469,8 +465,7 @@ impl AgentWorkspace {
                 .children(self.edits_ui.conflicts.iter().cloned());
         }
         let can_undo = !workspace_mode
-            && self.pending.is_none()
-            && self.preparing.is_none()
+            && !self.any_run_busy()
             && self.edits_ui.undo_task.is_none()
             && self.queued_requests.is_empty();
         if !virtualized {
@@ -811,8 +806,7 @@ impl ConflictView {
                 if workspace.history.active().project.as_ref() != Some(&self.project) {
                     return Err("项目已切换，请回到原项目后重试".into());
                 }
-                if workspace.pending.is_some()
-                    || workspace.preparing.is_some()
+                if workspace.any_run_busy()
                     || workspace.edits_ui.undo_task.is_some()
                     || !workspace.queued_requests.is_empty()
                 {
@@ -828,7 +822,7 @@ impl ConflictView {
                     false,
                     cx,
                 );
-                if workspace.preparing.is_none() && workspace.pending.is_none() {
+                if !workspace.session_busy(workspace.history.active) {
                     return Err(workspace
                         .provider_error
                         .clone()

@@ -279,7 +279,7 @@ impl AgentWorkspace {
         let chip = model_chip(&self.catalog);
         self.composer.update(cx, |composer, cx| {
             composer.set_menu_chip(chip, cx);
-            composer.set_disabled(!self.active_model_enabled() || self.preparing.is_some(), cx);
+            composer.set_disabled(!self.active_model_enabled() || self.active_run().preparing.is_some(), cx);
         });
         self.sync_context_usage(cx);
         self.context_models = None;
@@ -331,7 +331,7 @@ impl AgentWorkspace {
 
     pub(super) fn choose_model(&mut self, value: &str, cx: &mut Context<Self>) {
         let result = (|| {
-            if self.pending.is_some() || self.preparing.is_some() {
+            if self.session_busy(self.history.active) {
                 return Err("请先停止当前回复，再切换模型".to_owned());
             }
             let (id, model) = value.split_once(':').ok_or("模型选择无效")?;
@@ -460,7 +460,7 @@ impl AgentWorkspace {
                         .map_err(|error| format!("{model}：{error}"))?;
                 }
             }
-            if (self.pending.is_some() || self.preparing.is_some())
+            if (self.session_busy(self.history.active))
                 && (activate || self.catalog.active == Some(config.id))
             {
                 return Err("请先停止当前回复，再修改正在使用的供应商".into());
