@@ -48,8 +48,7 @@ impl Workbench {
         if self.proxy_services.contains_key(&id) {
             return Ok(());
         }
-        let settings = self.profile_draft(index, cx);
-        settings.listener.validate()?;
+        let settings = self.profile_draft(index, cx)?;
         let authority = Arc::new(proxy_service::ca::Authority::generate(
             &self.proxy_ca_directory(),
         )?);
@@ -74,18 +73,20 @@ impl Workbench {
     ) {
         self.proxy_app_menu = false;
         let result = self.start_proxy_service(cx).and_then(|_| {
+            let app_data = storage::Store::default_path()?;
+            let directory = app_data
+                .parent()
+                .ok_or("无法确定应用数据目录")?
+                .join("proxy-service");
             let service = &self.proxy_services[&self.workspace.proxies[self.editing_proxy].id];
-            proxy_service::browser::launch(
-                &browser,
-                &self.proxy_directory(),
-                service.address.port(),
-            )
+            let port = service.route_browser(&directory)?;
+            proxy_service::browser::launch(&browser, &directory, port)
         });
         match result {
             Ok(()) => {
                 self.variable_error = None;
                 self.notice = format!(
-                    "已打开 {} 独立代理窗口；HTTPS 抓包需先安装代理 CA",
+                    "已打开 {} 的 Glint 代理窗口，现有代理浏览器窗口也会切换到此代理",
                     browser.name
                 );
             }
@@ -229,6 +230,7 @@ impl Workbench {
         let owner = cx.entity().downgrade();
         let mut actions = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .child(
@@ -447,9 +449,6 @@ mod tests {
                 )
                 .unwrap();
         });
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = Workbench::with_store(
                 storage::Store::open(&directory.path().join("listener.sqlite3")).unwrap(),
@@ -471,21 +470,22 @@ mod tests {
             host.page = crate::Page::Proxies;
             host
         });
-        let endpoint = host.update(window, |host, cx| {
+        let (endpoint, port) = host.update(window, |host, cx| {
             assert!(host.proxy_services.is_empty());
             host.profile_inputs[0]
                 .listener_port
-                .update(cx, |entry, cx| entry.set_value("0", cx));
+                .update(cx, |entry, cx| entry.set_value("invalid", cx));
             assert!(host.start_proxy_service(cx).unwrap_err().contains("端口"));
             host.profile_inputs[0]
                 .listener_port
-                .update(cx, |entry, cx| entry.set_value(port.to_string(), cx));
+                .update(cx, |entry, cx| entry.set_value("", cx));
             host.start_proxy_service(cx).unwrap();
             assert!(host.proxy_certificate_status.contains("SHA-256"));
             let service = &host.proxy_services[&host.workspace.proxies[0].id];
-            assert_eq!(service.address.port(), port);
+            assert_ne!(service.address.port(), 0);
+            assert_eq!(host.profile_draft(0, cx).unwrap().listener.port, 0);
             assert!(service.address.ip().is_loopback());
-            service.endpoint()
+            (service.endpoint(), service.address.port())
         });
         let result = reqwest::blocking::Client::builder()
             .no_proxy()

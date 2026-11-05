@@ -33,6 +33,7 @@ pub struct PreparedRequest {
     pub(super) url: Url,
     pub(super) headers: Vec<(HeaderName, HeaderValue)>,
     body: String,
+    binary: Option<(String, Vec<u8>)>,
     pub(super) skip_tls_verification: bool,
     pub(super) proxy: Option<ProxySettings>,
     pub preview: String,
@@ -113,6 +114,9 @@ impl PreparedRequest {
             };
             args.push(format!("--header {}", super::curl::quote(&header)?));
         }
+        if self.binary.is_some() {
+            return Err("二进制请求体暂不支持导出 cURL".into());
+        }
         if !self.body.is_empty() {
             args.push(format!("--data-raw {}", super::curl::quote(&self.body)?));
         }
@@ -120,6 +124,11 @@ impl PreparedRequest {
     }
 
     pub fn plugin_payload(&self) -> Result<serde_json::Value, String> {
+        let body = match &self.binary {
+            Some((_, bytes)) => std::str::from_utf8(bytes)
+                .map_err(|_| "前置动作的文本接口无法处理非 UTF-8 二进制请求体")?,
+            None => &self.body,
+        };
         let mut headers = serde_json::Map::new();
         for (name, value) in &self.headers {
             if headers.contains_key(name.as_str()) {
@@ -135,7 +144,7 @@ impl PreparedRequest {
             None => self.url.path().to_owned(),
         };
         Ok(
-            serde_json::json!({"method":self.method.as_str(), "scheme":self.url.scheme(), "uri":uri, "body":self.body, "headers":headers}),
+            serde_json::json!({"method":self.method.as_str(), "scheme":self.url.scheme(), "uri":uri, "body":body, "headers":headers}),
         )
     }
     /// Validate the complete patch before changing the request; scripts cannot mutate body/URL.
@@ -197,7 +206,11 @@ impl PreparedRequest {
             self.preview.push_str(&format!("\n{name}: {shown}"));
         }
         self.preview.push_str("\n\n");
-        self.preview.push_str(&self.body);
+        self.preview.push_str(
+            self.binary
+                .as_ref()
+                .map_or(self.body.as_str(), |(description, _)| description),
+        );
         Ok(())
     }
     pub fn with_proxy(mut self, proxy: &ProxySettings) -> Result<Self, String> {
@@ -231,7 +244,21 @@ impl PreparedRequest {
         }
         resolved.url = environment.resolve(&draft.url)?;
         let sends_body = matches!(draft.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
-        resolved.body = if !sends_body {
+        let binary = if sends_body && draft.body_format == BodyFormat::Binary {
+            let file = if let Some(name) = &draft.binary_file_variable {
+                environment.file(name)?
+            } else {
+                draft.binary_body.clone().ok_or("请选择二进制请求体文件")?
+            };
+            let bytes = file.decode()?;
+            Some((
+                format!("{} · {} 字节", file.description(), bytes.len()),
+                bytes,
+            ))
+        } else {
+            None
+        };
+        resolved.body = if !sends_body || binary.is_some() {
             String::new()
         } else if draft.body_format == BodyFormat::UrlEncoded {
             let mut serializer = form_urlencoded::Serializer::new(String::new());
@@ -247,7 +274,7 @@ impl PreparedRequest {
             }
             serializer.finish()
         } else {
-            environment.resolve(&draft.body)?
+            environment.resolve_body(&draft.body)?
         };
         resolved.params = draft
             .params
@@ -294,10 +321,14 @@ impl PreparedRequest {
             headers.push((name, parsed));
         }
         // Default JSON content type matches the editor, but explicit content types win.
-        if (!body.is_empty() || sends_body && draft.body_format == BodyFormat::UrlEncoded)
+        if (binary.is_some()
+            || !body.is_empty()
+            || sends_body && draft.body_format == BodyFormat::UrlEncoded)
             && !headers.iter().any(|(name, _)| name == CONTENT_TYPE)
         {
-            let content_type = if draft.body_format == BodyFormat::UrlEncoded {
+            let content_type = if binary.is_some() {
+                "application/octet-stream"
+            } else if draft.body_format == BodyFormat::UrlEncoded {
                 "application/x-www-form-urlencoded"
             } else if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
                 "application/json"
@@ -308,12 +339,17 @@ impl PreparedRequest {
             preview.push_str(&format!("\nContent-Type: {content_type}"));
         }
         preview.push_str("\n\n");
-        preview.push_str(&body);
+        preview.push_str(
+            binary
+                .as_ref()
+                .map_or(body.as_str(), |(description, _)| description),
+        );
         Ok(Self {
             method,
             url,
             headers,
             body,
+            binary,
             skip_tls_verification: draft.skip_tls_verification,
             proxy: None,
             preview,
@@ -437,7 +473,9 @@ pub async fn execute_stream(
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
-        if !request.body.is_empty() {
+        if let Some((_, bytes)) = request.binary {
+            builder = builder.body(bytes);
+        } else if !request.body.is_empty() {
             builder = builder.body(request.body);
         }
         let mut response = tokio::time::timeout_at(deadline, builder.send())
@@ -585,7 +623,7 @@ mod tests {
         thread,
     };
     fn variables(base_url: &str) -> EnvironmentValues {
-        EnvironmentValues(
+        EnvironmentValues::new(
             [
                 ("base_url".into(), base_url.into()),
                 ("workspace_id".into(), "test_workspace".into()),
@@ -856,6 +894,10 @@ mod tests {
         read_mapped_request(stream)
     }
     fn read_mapped_request(stream: &mut impl std::io::Read) -> String {
+        String::from_utf8(read_request_bytes(stream)).unwrap()
+    }
+
+    fn read_request_bytes(stream: &mut impl std::io::Read) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut chunk = [0; 2048];
         loop {
@@ -873,7 +915,7 @@ mod tests {
                     })
                     .unwrap_or(0);
                 if bytes.len() >= end + 4 + length {
-                    return String::from_utf8(bytes).unwrap();
+                    return bytes;
                 }
             }
         }
@@ -982,6 +1024,85 @@ mod tests {
                 .unwrap()
                 .contains("missing")
         );
+    }
+
+    #[test]
+    fn sends_file_variable_bytes_and_resolves_matching_metadata() {
+        let bytes = [0, 0xff, b'\r', b'\n', 0x80];
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("report.pdf");
+        std::fs::write(&file, b"previous file").unwrap();
+        let file_variable = super::super::model::FileVariable::select(file.clone()).unwrap();
+        std::fs::write(&file, bytes).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let wire = read_request_bytes(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            wire
+        });
+        let mut env = variables(&url);
+        env.1.insert("upload".into(), file_variable);
+        let saved = serde_json::to_string(&env.1).unwrap();
+        assert!(!saved.contains("base64"));
+        env.1 = serde_json::from_str(&saved).unwrap();
+        let init = Draft {
+            method: "POST".into(),
+            url: url.clone(),
+            body: r#"{"file_name":"{{upload.name}}","file_size":{{upload.size}},"checksum":"{{upload.sha256}}"}"#.into(),
+            ..Draft::default()
+        };
+        let init = PreparedRequest::new(&init, &env).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&init.body).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(metadata["file_name"], "report.pdf");
+        assert_eq!(metadata["file_size"], 5);
+        assert_eq!(metadata["checksum"], format!("{:x}", Sha256::digest(bytes)));
+
+        // Preparatory requests and upload share the snapshot even if the file changes.
+        std::fs::write(&file, b"replaced after initialization").unwrap();
+        let mut draft = Draft {
+            method: "POST".into(),
+            url,
+            body: "{{unused_raw_missing}}".into(),
+            body_format: BodyFormat::Binary,
+            binary_file_variable: Some("upload".into()),
+            ..Draft::default()
+        };
+        let draft_json = serde_json::to_string(&draft).unwrap();
+        draft = serde_json::from_str(&draft_json).unwrap();
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert!(request.preview.ends_with("5 字节"));
+        runtime().block_on(execute(request)).unwrap();
+        let wire = server.join().unwrap();
+        let end = wire.windows(4).position(|b| b == b"\r\n\r\n").unwrap();
+        let headers = String::from_utf8_lossy(&wire[..end]).to_ascii_lowercase();
+        assert!(headers.contains("content-type: application/octet-stream"));
+        assert_eq!(&wire[end + 4..], &bytes);
+
+        draft
+            .headers
+            .push(Pair::new("Content-Type", "image/png", ""));
+        let request = PreparedRequest::new(&draft, &env).unwrap();
+        assert!(request.preview.contains("Content-Type: image/png"));
+        env.1.remove("upload");
+        assert!(
+            PreparedRequest::new(&draft, &env)
+                .err()
+                .unwrap()
+                .contains("upload")
+        );
+        draft.binary_file_variable = None;
+        assert!(PreparedRequest::new(&draft, &env).is_err());
+        draft.method = "GET".into();
+        assert!(PreparedRequest::new(&draft, &env).unwrap().binary.is_none());
     }
 
     #[test]

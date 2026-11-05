@@ -36,6 +36,7 @@ pub struct Button {
     size: ButtonSize,
     pill: bool,
     disabled: bool,
+    truncate_label: bool,
 }
 
 impl Button {
@@ -53,6 +54,7 @@ impl Button {
             size: ButtonSize::Regular,
             pill: false,
             disabled: false,
+            truncate_label: false,
         }
     }
 
@@ -75,6 +77,11 @@ impl Button {
     }
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
+        self
+    }
+
+    pub fn truncate_label(mut self) -> Self {
+        self.truncate_label = true;
         self
     }
 
@@ -155,8 +162,15 @@ impl Button {
             .text_size(px(font_size))
             .font_weight(gpui::FontWeight::MEDIUM)
             .gap(px(6.))
-            .children(self.icon.map(|icon| icon.render(font_size)))
-            .child(self.label);
+            .children(self.icon.map(|icon| icon.render(font_size)));
+        button = if self.truncate_label {
+            button
+                .min_w_0()
+                .overflow_hidden()
+                .child(div().min_w_0().truncate().child(self.label))
+        } else {
+            button.child(self.label)
+        };
         if self.disabled {
             button = button.opacity(0.45);
         } else {

@@ -245,8 +245,10 @@ fn project(source: &storage::Workspace, contents: &Contents) -> storage::Workspa
         data.previews.clear();
         data.curls.clear();
         if !contents.has(Section::CollectionSettings) {
-            data.collections
-                .retain(|c| contents.has(Section::Environments) && !c.environments.is_empty());
+            data.collections.retain(|c| {
+                contents.has(Section::Environments)
+                    && (!c.environments.is_empty() || !c.file_variables.is_empty())
+            });
             for collection in &mut data.collections {
                 collection.names.clear();
                 collection.folder_order.clear();
@@ -259,6 +261,14 @@ fn project(source: &storage::Workspace, contents: &Contents) -> storage::Workspa
         }
         if !contents.has(Section::Environments) {
             collection.environments.clear();
+            collection.file_variables.clear();
+        } else {
+            // Machine-local paths must be explicitly chosen on the destination.
+            for file in collection.file_variables.values_mut() {
+                if matches!(file, super::model::FileVariable::Local { .. }) {
+                    *file = super::model::FileVariable::Unbound { needs_file: true };
+                }
+            }
         }
     }
     if !contents.has(Section::Environments) {
@@ -459,6 +469,28 @@ mod tests {
         );
         assert_eq!(loaded.requests[0].versions[0].source, VersionSource::Mcp);
     }
+    #[test]
+    fn local_file_variable_names_survive_export_without_machine_paths() {
+        use crate::model::FileVariable;
+
+        let mut data = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("private-local-file");
+        std::fs::write(&file, b"local contents").unwrap();
+        data.collections[0]
+            .file_variables
+            .insert("upload".into(), FileVariable::select(file).unwrap());
+
+        let archive = Archive::new("项目".into(), &data, Contents::all(), vec![]).unwrap();
+        let json = serde_json::to_string(&archive).unwrap();
+        assert!(!json.contains("private-local-file"));
+        let imported = Archive::decode(json.as_bytes()).unwrap();
+        assert!(matches!(
+            imported.data.collections[0].file_variables["upload"],
+            FileVariable::Unbound { .. }
+        ));
+    }
+
     #[test]
     fn every_selection_is_valid_and_omitted_data_does_not_leak() {
         let source = fixture();

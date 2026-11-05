@@ -356,6 +356,66 @@ fn websocket_and_secure_websocket_upgrade_and_relay_messages() {
 }
 
 #[test]
+fn websocket_proxy_accepts_absolute_ws_urls_and_plain_connect_tunnels() {
+    async fn headers(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < 16384);
+            bytes.push(socket.read_u8().await.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    for tunneled in [false, true] {
+        test_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                use futures_util::SinkExt;
+                let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = origin.local_addr().unwrap().port();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = origin.accept().await.unwrap();
+                    let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    let message = websocket.next().await.unwrap().unwrap();
+                    websocket.send(message).await.unwrap();
+                    let _ = websocket.close(None).await;
+                });
+                let mut config = settings();
+                config.mappings.push(super::super::environment::HostMapping {
+                    domain: "ws.test".into(),
+                    ip: "127.0.0.1".into(),
+                });
+                let captures = Arc::new(CaptureStore::default());
+                let proxy = RunningProxy::start(config, None, captures.clone()).unwrap();
+                let mut socket = tokio::net::TcpStream::connect(proxy.address).await.unwrap();
+                if tunneled {
+                    socket.write_all(format!(
+                        "CONNECT ws.test:{port} HTTP/1.1\r\nHost: ws.test:{port}\r\n\r\n"
+                    ).as_bytes()).await.unwrap();
+                    let response = headers(&mut socket).await;
+                    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                }
+                let path = if tunneled { "/socket".into() } else { format!("ws://ws.test:{port}/socket") };
+                socket.write_all(format!(
+                    "GET {path} HTTP/1.1\r\nHost: ws.test:{port}\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                ).as_bytes()).await.unwrap();
+                let response = headers(&mut socket).await;
+                assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+                let mut websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    socket, tokio_tungstenite::tungstenite::protocol::Role::Client, None,
+                ).await;
+                let sent = tokio_tungstenite::tungstenite::Message::Binary(vec![0, 255, 1].into());
+                websocket.send(sent.clone()).await.unwrap();
+                assert_eq!(websocket.next().await.unwrap().unwrap(), sent);
+                let _ = websocket.close(None).await;
+                drop(websocket);
+                server.await.unwrap();
+                assert_eq!(wait_complete(&captures).await.status, Some(101));
+            }).await.unwrap();
+        });
+    }
+}
+
+#[test]
 fn listening_address_and_port_conflicts_are_explicit() {
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut config = settings();

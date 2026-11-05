@@ -26,7 +26,9 @@ pub fn draft_schema() -> Value {
     object(
         json!({
             "method":enumeration(&["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS","WS"]),
-            "url":string(),"body":string(),"body_format":enumeration(&["raw","url_encoded"]),
+            "url":string(),"body":string(),"body_format":enumeration(&["raw","url_encoded","binary"]),
+            "binary_file_variable":{"anyOf":[string(),{"type":"null"}]},
+            "binary_body":{"anyOf":[object(json!({"name":string(),"base64":string()}), &["name","base64"]),{"type":"null"}]},
             "params":array(pair()),"headers":array(pair()),"cookies":array(pair()),"form":array(pair()),
             "oauth": {"anyOf": [object(json!({
                 "id":string(),"authorization_url":string(),"token_url":string(),"client_id":string(),

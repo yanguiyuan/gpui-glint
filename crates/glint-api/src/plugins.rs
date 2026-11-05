@@ -912,7 +912,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let mut variables = super::super::environment::EnvironmentValues(BTreeMap::from([
+        let mut variables = super::super::environment::EnvironmentValues::new(BTreeMap::from([
             ("wps_app_id".into(), "DEFAULT".into()),
             ("wps_app_key".into(), "default-key".into()),
             ("wps_app_id1".into(), "CUSTOM".into()),
@@ -963,7 +963,7 @@ mod tests {
             enabled: true,
         };
         let catalog = vec![plugin];
-        let mut variables = super::super::environment::EnvironmentValues(BTreeMap::new());
+        let mut variables = super::super::environment::EnvironmentValues::new(BTreeMap::new());
         let error = validate_variables(&[action.clone()], &catalog, &variables).unwrap_err();
         assert!(error.contains("WPS KSO-1 签名"));
         assert!(error.contains("wps_app_id") && error.contains("wps_app_key"));
@@ -1101,7 +1101,7 @@ mod tests {
             };
             let mut request = super::super::http::PreparedRequest::new(
                 &draft,
-                &super::super::environment::EnvironmentValues(BTreeMap::new()),
+                &super::super::environment::EnvironmentValues::new(BTreeMap::new()),
             )
             .unwrap();
             let original_payload = request.plugin_payload().unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
             };
             let mut request = super::super::http::PreparedRequest::new(
                 &draft,
-                &super::super::environment::EnvironmentValues(BTreeMap::new()),
+                &super::super::environment::EnvironmentValues::new(BTreeMap::new()),
             )
             .unwrap();
             let mut plugin = catalog().0.remove(0);
@@ -1223,7 +1223,7 @@ mod tests {
         };
         let mut request = super::super::http::PreparedRequest::new(
             &draft,
-            &super::super::environment::EnvironmentValues(BTreeMap::new()),
+            &super::super::environment::EnvironmentValues::new(BTreeMap::new()),
         )
         .unwrap();
         assert_eq!(
@@ -1396,7 +1396,7 @@ mod oauth_preset_tests {
             validate_variables(
                 &[binding],
                 &[plugin],
-                &super::super::environment::EnvironmentValues(BTreeMap::new())
+                &super::super::environment::EnvironmentValues::new(BTreeMap::new())
             )
             .is_err()
         );
@@ -1556,7 +1556,7 @@ mod event_decode_tests {
             action_id: "decrypt-event".into(),
             enabled: true,
         };
-        let variables = super::super::environment::EnvironmentValues(BTreeMap::new());
+        let variables = super::super::environment::EnvironmentValues::new(BTreeMap::new());
         let error = decode_event(&binding, &[plugin.clone()], &variables, "{}").unwrap_err();
         assert!(error.contains("wps_app_"));
         binding.approval.fingerprint = "changed".into();

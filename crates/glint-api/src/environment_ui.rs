@@ -21,16 +21,16 @@ impl Workbench {
         collection: Option<&str>,
     ) -> environment::EnvironmentValues {
         let mut values = self.workspace.environment_inputs[index].values();
-        if let Some(local) = collection
-            .and_then(|name| {
-                self.workspace
-                    .collections
-                    .iter()
-                    .find(|c| c.collection == name)
-            })
-            .and_then(|c| c.environments.get(self.environment_name(index)))
-        {
-            values.0.extend(local.values().0);
+        if let Some(collection) = collection.and_then(|name| {
+            self.workspace
+                .collections
+                .iter()
+                .find(|c| c.collection == name)
+        }) {
+            if let Some(local) = collection.environments.get(self.environment_name(index)) {
+                values.0.extend(local.values().0);
+            }
+            values.1 = collection.file_variables.clone();
         }
         values
     }
@@ -83,6 +83,26 @@ impl Workbench {
                                 scope.into()
                             },
                         ),
+                    );
+                }
+            }
+        }
+        if let Some(collection) = collection.and_then(|name| {
+            self.workspace
+                .collections
+                .iter()
+                .find(|c| c.collection == name)
+        }) {
+            for name in collection.file_variables.keys() {
+                for (field, description) in [
+                    ("name", "文件名"),
+                    ("size", "文件字节数"),
+                    ("sha256", "文件 SHA-256"),
+                ] {
+                    let expression = format!("{name}.{field}");
+                    entries.insert(
+                        expression.clone(),
+                        TextCompletion::new(expression, description),
                     );
                 }
             }
@@ -682,6 +702,7 @@ impl Workbench {
             table.set_theme(theme, cx);
             table.set_rows(rows, cx);
         });
+        self.sync_file_variable_table(cx);
     }
     fn variable_scope_tabs(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut tabs = div().flex().items_center().gap_2();
@@ -754,6 +775,281 @@ impl Workbench {
         self.group_edit = Some(GroupEdit::CreateEnvironment);
         self.group_error = None;
         window.focus(&self.group_name.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub(super) fn add_file_variable(&mut self, cx: &mut Context<Self>) {
+        let Some(collection) = self.editing_variable_collection.as_ref().and_then(|name| {
+            self.workspace
+                .collections
+                .iter()
+                .find(|c| &c.collection == name)
+        }) else {
+            return;
+        };
+        if self.pending_file_variable.as_ref() == Some(&collection.id) {
+            return;
+        }
+        let mut name = "upload".to_owned();
+        let mut number = 2;
+        while collection.file_variables.contains_key(&name) {
+            name = format!("upload_{number}");
+            number += 1;
+        }
+        self.pending_file_variable = Some(collection.id.clone());
+        self.file_variable_name
+            .update(cx, |input, cx| input.set_value(name, cx));
+        self.sync_file_variable_table(cx);
+        cx.notify();
+    }
+
+    fn sync_file_variable_table(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme;
+        let owner = cx.entity().downgrade();
+        let mut rows = Vec::new();
+        let collection = self.editing_variable_collection.as_ref().and_then(|name| {
+            self.workspace
+                .collections
+                .iter()
+                .find(|c| &c.collection == name)
+        });
+        if let Some(collection) = collection {
+            let workspace_id = self.workspace.storage.workspace_id.clone();
+            for (name, file) in &collection.file_variables {
+                let (label, size, hash) = match file {
+                    model::FileVariable::Local { path, size, sha256 } => (
+                        path.to_string_lossy().into_owned(),
+                        size.to_string(),
+                        sha256.clone(),
+                    ),
+                    model::FileVariable::Unbound { .. } => {
+                        ("选择本地文件".into(), "—".into(), "—".into())
+                    }
+                    model::FileVariable::Embedded(file) => {
+                        let metadata = file.metadata().ok();
+                        (
+                            format!("{} · 旧版附件", file.name),
+                            metadata.map_or("—".into(), |m| m.size.to_string()),
+                            metadata.map_or("—".into(), |m| m.sha256.clone()),
+                        )
+                    }
+                };
+                let row_name = name.clone();
+                let file = file.clone();
+                let scope = (workspace_id.clone(), collection.id.clone());
+                let file_owner = owner.clone();
+                let icon = gpui_glint::components::ComposerReference::file(&label, false).icon();
+                let value = TableCell::custom(move || {
+                    let owner = file_owner.clone();
+                    let scope = scope.clone();
+                    let name = row_name.clone();
+                    let previous = file.clone();
+                    Button::new(label.clone())
+                        .kind(ButtonKind::Tinted)
+                        .icon(icon)
+                        .size(ButtonSize::Mini)
+                        .truncate_label()
+                        .theme(theme)
+                        .render()
+                        .max_w_full()
+                        .on_click(move |_, _, cx| {
+                            let scope = scope.clone();
+                            let name = name.clone();
+                            let previous = previous.clone();
+                            let _ = owner.update(cx, |_, cx| {
+                                request_config_ui::choose_request_file(
+                                    cx,
+                                    model::FileVariable::select,
+                                    move |this, result, cx| {
+                                        this.update_collection_file(
+                                            &scope.0,
+                                            &scope.1,
+                                            &name,
+                                            Some(&previous),
+                                            result,
+                                            cx,
+                                        );
+                                    },
+                                );
+                            });
+                        })
+                });
+                let scope = (workspace_id.clone(), collection.id.clone());
+                let file = collection.file_variables[name].clone();
+                let row_name = name.clone();
+                let row_owner = owner.clone();
+                let actions = TableCell::custom(move || {
+                    let owner = row_owner.clone();
+                    let scope = scope.clone();
+                    let name = row_name.clone();
+                    let previous = file.clone();
+                    let checksum = format!("{{{{{name}.sha256}}}}");
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            IconButton::new(Icon::Copy, "复制校验值引用")
+                                .plain()
+                                .theme(theme)
+                                .render()
+                                .size(px(22.))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        checksum.clone(),
+                                    ))
+                                }),
+                        )
+                        .child(
+                            IconButton::new(Icon::Trash, "移除文件变量")
+                                .plain()
+                                .theme(theme)
+                                .render()
+                                .size(px(22.))
+                                .on_click(move |_, _, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.update_collection_file(
+                                            &scope.0,
+                                            &scope.1,
+                                            &name,
+                                            Some(&previous),
+                                            Ok(None),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                });
+                rows.push(TableRow::new(
+                    name.clone(),
+                    [
+                        TableCell::mono(name.clone()),
+                        value,
+                        TableCell::text(size),
+                        TableCell::mono(hash),
+                        actions,
+                    ],
+                ));
+            }
+            if self.pending_file_variable.as_ref() == Some(&collection.id) {
+                let name = self.file_variable_name.clone();
+                let scope = (workspace_id, collection.id.clone());
+                let pick_owner = owner.clone();
+                let value = TableCell::custom(move || {
+                    let owner = pick_owner.clone();
+                    let scope = scope.clone();
+                    Button::new("选择文件")
+                        .kind(ButtonKind::Tinted)
+                        .icon(Icon::Upload)
+                        .size(ButtonSize::Mini)
+                        .theme(theme)
+                        .render()
+                        .on_click(move |_, _, cx| {
+                            let scope = scope.clone();
+                            let _ = owner.update(cx, |this, cx| {
+                                let name =
+                                    this.file_variable_name.read(cx).value().trim().to_owned();
+                                if let Err(error) =
+                                    EnvironmentVariables::default().save(None, &name, "", false)
+                                {
+                                    this.variable_error = Some(error);
+                                    cx.notify();
+                                    return;
+                                }
+                                request_config_ui::choose_request_file(
+                                    cx,
+                                    model::FileVariable::select,
+                                    move |this, result, cx| {
+                                        this.update_collection_file(
+                                            &scope.0, &scope.1, &name, None, result, cx,
+                                        );
+                                    },
+                                );
+                            });
+                        })
+                });
+                let actions = TableCell::custom(move || {
+                    let owner = owner.clone();
+                    div().flex().justify_end().child(
+                        IconButton::new(Icon::Trash, "取消添加")
+                            .plain()
+                            .theme(theme)
+                            .render()
+                            .size(px(22.))
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.pending_file_variable = None;
+                                    this.sync_file_variable_table(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                });
+                rows.push(TableRow::new(
+                    "new-file-variable",
+                    [
+                        TableCell::custom(move || div().w_full().child(name.clone())),
+                        value,
+                        TableCell::text(""),
+                        TableCell::text(""),
+                        actions,
+                    ],
+                ));
+            }
+        }
+        self.file_variable_table.update(cx, |table, cx| {
+            table.set_theme(theme, cx);
+            table.set_rows(rows, cx);
+        });
+    }
+
+    fn update_collection_file(
+        &mut self,
+        workspace_id: &str,
+        collection_id: &str,
+        name: &str,
+        previous_file: Option<&model::FileVariable>,
+        result: Result<Option<model::FileVariable>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.storage.workspace_id != workspace_id {
+            return;
+        }
+        let Some(collection) = self
+            .workspace
+            .collections
+            .iter_mut()
+            .find(|c| c.id == collection_id)
+        else {
+            return;
+        };
+        if collection.file_variables.get(name) != previous_file {
+            self.variable_error = Some(format!("文件变量 {name} 已发生变化，请重试"));
+            cx.notify();
+            return;
+        }
+        match result {
+            Ok(Some(file)) => {
+                collection.file_variables.insert(name.into(), file);
+            }
+            Ok(None) => {
+                collection.file_variables.remove(name);
+            }
+            Err(error) => {
+                self.variable_error = Some(error);
+                cx.notify();
+                return;
+            }
+        }
+        if previous_file.is_none() {
+            self.pending_file_variable = None;
+        }
+        self.variable_error = None;
+        self.workspace.storage_dirty = true;
+        self.sync_file_variable_table(cx);
+        self.sync_reference_inputs(cx);
+        self.sync_request_preview(cx);
+        self.persist(cx);
         cx.notify();
     }
 
@@ -887,6 +1183,13 @@ impl Workbench {
                     .text_color(rgb(p.text_muted))
                     .child("点击单元格编辑 · 使用 {{变量名}} 引用 · 敏感值点击眼睛后编辑"),
             )
+            .when(self.editing_variable_collection.is_some(), |body| {
+                body.child(div().flex().flex_col().gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("集合文件变量"))
+                    .child(self.file_variable_table.clone())
+                    .child(div().text_size(px(10.)).text_color(rgb(p.text_muted))
+                        .child("点击文件路径可替换。大小和校验值为选择时的快照，发送时重新读取本地文件。")))
+            })
             .child(
                 div().flex().flex_col().gap_2()
                     .child(div().text_size(px(11.)).child("模板方法 · 点击复制引用"))

@@ -82,29 +82,33 @@ pub enum PromptEditorEvent {
 
 impl EventEmitter<PromptEditorEvent> for PromptEditor {}
 
-/// Extracts pasteable images from a clipboard item: embedded image entries
-/// first, then image files among the external paths.
+/// File paths and embedded bitmaps can represent the same clipboard image.
+/// Prefer the original files, falling back to embedded images for screenshots.
 fn clipboard_images(item: &ClipboardItem) -> Result<Vec<PastedImage>, String> {
     let mut images = Vec::new();
+    let mut paths_seen = std::collections::HashSet::new();
     for entry in item.entries() {
-        match entry {
-            ClipboardEntry::Image(image) => {
+        if let ClipboardEntry::ExternalPaths(paths) = entry {
+            for path in paths.paths() {
+                if paths_seen.insert(path)
+                    && let Some(image) = image_file(path)?
+                {
+                    images.push(image);
+                    if images.len() > 16 {
+                        return Err("一次最多粘贴 16 张图片".into());
+                    }
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(image) = entry {
                 if image.bytes.len() > 20 * 1024 * 1024 {
                     return Err("图片原始数据超过 20MB".into());
                 }
                 images.push(PastedImage::from(image));
             }
-            ClipboardEntry::ExternalPaths(paths) => {
-                for path in paths.paths() {
-                    if images.len() >= 16 {
-                        return Err("一次最多粘贴 16 张图片".into());
-                    }
-                    if let Some(image) = image_file(path)? {
-                        images.push(image);
-                    }
-                }
-            }
-            ClipboardEntry::String(_) => {}
         }
     }
     if images.len() > 16 {
@@ -1912,6 +1916,55 @@ mod tests {
         assert_eq!(images[0].format(), ImageFormat::Png);
         assert_eq!(images[0].bytes(), &[4, 5, 6]);
         assert_eq!(png, PastedImage::new(ImageFormat::Png, vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn clipboard_image_files_and_embedded_bitmap_are_alternative_representations() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.jpg");
+        std::fs::write(&first, [1, 2, 3]).unwrap();
+        std::fs::write(&second, [4, 5, 6]).unwrap();
+        let bitmap =
+            ClipboardEntry::Image(gpui::Image::from_bytes(ImageFormat::Bmp, vec![7, 8, 9]));
+        let paths = ClipboardEntry::ExternalPaths(gpui::ExternalPaths(vec![first.clone()].into()));
+        for entries in [
+            vec![bitmap.clone(), paths.clone()],
+            vec![paths.clone(), bitmap.clone()],
+        ] {
+            let item = ClipboardItem { entries };
+            assert_eq!(
+                clipboard_images(&item).unwrap(),
+                [PastedImage::new(ImageFormat::Png, vec![1, 2, 3]),]
+            );
+        }
+        let item = ClipboardItem {
+            entries: vec![
+                bitmap.clone(),
+                ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    vec![first.clone(), second, first].into(),
+                )),
+            ],
+        };
+        assert_eq!(
+            clipboard_images(&item).unwrap(),
+            [
+                PastedImage::new(ImageFormat::Png, vec![1, 2, 3]),
+                PastedImage::new(ImageFormat::Jpeg, vec![4, 5, 6]),
+            ]
+        );
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    vec![directory.path().join("notes.txt")].into(),
+                )),
+                bitmap,
+            ],
+        };
+        assert_eq!(
+            clipboard_images(&item).unwrap(),
+            [PastedImage::new(ImageFormat::Bmp, vec![7, 8, 9]),]
+        );
     }
 
     #[test]

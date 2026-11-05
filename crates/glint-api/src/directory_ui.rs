@@ -22,6 +22,9 @@ pub(super) struct DirectorySettings {
     oauth_source: Option<oauth::Config>,
     body: Entity<CodeCard>,
     body_format: BodyFormat,
+    binary_body: Option<model::BinaryBody>,
+    binary_file_variable: Option<String>,
+    binary_body_error: Option<String>,
     rows: BTreeMap<Section, Vec<PairInput>>,
     form: Vec<PairInput>,
     pair_delete: Option<(Section, bool, gpui::EntityId)>,
@@ -271,6 +274,9 @@ impl DirectorySettings {
             oauth_source: None,
             body,
             body_format: draft.body_format,
+            binary_body: draft.binary_body.clone(),
+            binary_file_variable: draft.binary_file_variable.clone(),
+            binary_body_error: None,
             rows,
             form,
             pair_delete: None,
@@ -365,6 +371,8 @@ impl DirectorySettings {
             extractors: pairs(&self.rows[&Section::Extractors]),
             body: self.body.read(cx).content().into(),
             body_format: self.body_format,
+            binary_body: self.binary_body.clone(),
+            binary_file_variable: self.binary_file_variable.clone(),
             form: pairs(&self.form),
             plugins: self
                 .actions
@@ -558,6 +566,11 @@ impl DirectorySettings {
             Section::Body => {
                 if d.body_format == BodyFormat::UrlEncoded {
                     format!("表单 · {} 个字段", d.form.len())
+                } else if d.body_format == BodyFormat::Binary {
+                    match &d.binary_file_variable {
+                        Some(name) => format!("集合文件变量 · {name}"),
+                        None => request_config_ui::binary_body_description(d.binary_body.as_ref()),
+                    }
                 } else {
                     format!("原始请求体 · {} 字节", d.body.len())
                 }
@@ -667,21 +680,14 @@ impl Render for DirectorySettings {
                             SegmentedControl::new([
                                 SegmentOption::new("原始 / JSON"),
                                 SegmentOption::new("x-www-form-urlencoded"),
+                                SegmentOption::new("二进制文件"),
                             ])
                             .id("directory-body-format")
-                            .selected(if self.body_format == BodyFormat::Raw {
-                                0
-                            } else {
-                                1
-                            })
+                            .selected(self.body_format.index())
                             .theme(self.theme)
                             .on_change(move |value, _, cx| {
                                 owner.update(cx, |this, cx| {
-                                    this.body_format = if value == 1 {
-                                        BodyFormat::UrlEncoded
-                                    } else {
-                                        BodyFormat::Raw
-                                    };
+                                    this.body_format = BodyFormat::from_index(value);
                                     cx.notify();
                                 });
                             })
@@ -689,6 +695,25 @@ impl Render for DirectorySettings {
                         )
                         .child(if self.body_format == BodyFormat::UrlEncoded {
                             self.pairs_view(section, true, cx)
+                        } else if self.body_format == BodyFormat::Binary {
+                            request_config_ui::binary_body_editor(
+                                self.binary_body.as_ref(),
+                                self.theme,
+                                |this: &mut Self, body, cx| {
+                                    this.binary_body_error = match body {
+                                        Ok(body) => {
+                                            this.binary_body = body;
+                                            this.binary_file_variable = None;
+                                            None
+                                        }
+                                        Err(error) => Some(error),
+                                    };
+                                    cx.notify();
+                                },
+                                cx,
+                            )
+                            .children(self.binary_file_variable.as_ref().map(|name| format!("已绑定集合文件变量：{name}")))
+                            .children(self.binary_body_error.clone())
                         } else {
                             div().h(px(300.)).child(self.body.clone())
                         })

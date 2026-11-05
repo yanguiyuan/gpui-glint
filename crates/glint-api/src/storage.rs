@@ -42,7 +42,7 @@ impl Workspace {
     pub(super) fn migrate_proxies(&mut self) -> bool {
         let mut migrated_proxies = false;
         for (index, variables) in self.variables.iter_mut().enumerate().skip(1) {
-            if variables.proxy != super::environment::ProxySettings::default() {
+            if !variables.proxy.is_unconfigured() {
                 let id = if let Some(profile) =
                     self.proxies.iter().find(|p| p.settings == variables.proxy)
                 {
@@ -138,7 +138,7 @@ impl Workspace {
             }
             for (name, variables) in &collection.environments {
                 if !self.environments.contains(name)
-                    || (variables.proxy != Default::default() || variables.proxy_id.is_some())
+                    || (!variables.proxy.is_unconfigured() || variables.proxy_id.is_some())
                 {
                     return Err("集合环境引用了不存在的环境或包含代理设置".into());
                 }
@@ -628,6 +628,7 @@ mod tests {
         let data = Workspace {
             collections: vec![RequestGroups {
                 id: crate::model::new_id(),
+                file_variables: Default::default(),
                 environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
@@ -696,6 +697,7 @@ mod tests {
         let mut data = Workspace {
             collections: vec![RequestGroups {
                 id: crate::model::new_id(),
+                file_variables: Default::default(),
                 environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
@@ -765,6 +767,7 @@ mod tests {
             assert_eq!(data.environments.len(), 1);
             data.collections.push(RequestGroups {
                 id: crate::model::new_id(),
+                file_variables: Default::default(),
                 environments: Default::default(),
                 defaults: Default::default(),
                 folder_order: Default::default(),
@@ -1077,6 +1080,41 @@ mod workspace_tests {
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
+    #[test]
+    fn loads_legacy_empty_proxy_defaults_without_creating_proxy_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        let mut workspace = Workspace::default();
+        let mut legacy = EnvironmentVariables::default();
+        legacy.proxy.listener.port = 8899;
+        workspace.environments.push("Dev".into());
+        workspace.variables.push(legacy.clone());
+        let mut collection = RequestGroups::create_collection("API", &[]).unwrap();
+        collection.environments.insert("Dev".into(), legacy);
+        workspace.collections.push(collection);
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspace (id, data) VALUES (1, ?1)",
+                [serde_json::to_string(&workspace).unwrap()],
+            )
+            .unwrap();
+
+        let mut loaded = store.load().unwrap();
+        assert!(!loaded.migrate_proxies());
+        assert!(loaded.proxies.is_empty());
+        assert!(loaded.variables[1].proxy_id.is_none());
+        loaded.collections[0]
+            .environments
+            .get_mut("Dev")
+            .unwrap()
+            .proxy
+            .listener
+            .allow_lan = true;
+        assert!(loaded.validate().is_err());
+    }
+
     #[test]
     fn legacy_proxy_migration_deduplicates_and_rejects_dangling_bindings() {
         let mut data = Workspace::default();

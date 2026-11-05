@@ -38,6 +38,16 @@ impl Fingerprint {
         match draft.body_format {
             BodyFormat::Raw => draft.form.clear(),
             BodyFormat::UrlEncoded => draft.body.clear(),
+            BodyFormat::Binary => {
+                draft.body.clear();
+                draft.form.clear();
+            }
+        }
+        if draft.body_format != BodyFormat::Binary {
+            draft.binary_file_variable = None;
+        }
+        if draft.body_format != BodyFormat::Binary || draft.binary_file_variable.is_some() {
+            draft.binary_body = None;
         }
         let mut value = serde_json::to_value(&draft).expect("request serializes");
         // Defaults inside repeated and optional settings also need to be

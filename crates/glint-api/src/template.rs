@@ -11,6 +11,26 @@ pub struct TemplateResolver {
     cache: RefCell<BTreeMap<String, String>>,
     now: DateTime<Utc>,
 }
+#[derive(Clone, Copy, Default)]
+struct JsonString {
+    quoted: bool,
+    escaped: bool,
+}
+
+impl JsonString {
+    fn scan(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'"' {
+                self.quoted = !self.quoted;
+            } else if byte == b'\\' && self.quoted {
+                self.escaped = true;
+            }
+        }
+    }
+}
+
 impl TemplateResolver {
     pub fn new(values: &EnvironmentValues) -> Self {
         Self {
@@ -73,13 +93,32 @@ impl TemplateResolver {
         Ok(resolver)
     }
     pub fn resolve(&self, input: &str) -> Result<String, String> {
-        self.resolve_inner(input, &mut Vec::new())
+        self.resolve_inner(input, &mut Vec::new(), None)
     }
-    fn resolve_inner(&self, input: &str, stack: &mut Vec<String>) -> Result<String, String> {
+    pub fn resolve_body(&self, input: &str) -> Result<String, String> {
+        let json = input.trim_start().starts_with(['{', '[', '"'])
+            && !input.trim_start().starts_with("{{");
+        self.resolve_inner(input, &mut Vec::new(), json.then(JsonString::default))
+    }
+
+    pub(super) fn file(&self, name: &str) -> Result<super::model::BinaryBody, String> {
+        self.values.file(name)
+    }
+
+    fn resolve_inner(
+        &self,
+        input: &str,
+        stack: &mut Vec<String>,
+        mut json: Option<JsonString>,
+    ) -> Result<String, String> {
         let mut output = String::new();
         let mut rest = input;
         while let Some(start) = rest.find("{{") {
-            output.push_str(&rest[..start]);
+            let literal = &rest[..start];
+            output.push_str(literal);
+            if let Some(json) = &mut json {
+                json.scan(literal);
+            }
             let variable = &rest[start + 2..];
             let end = variable.find("}}").ok_or("模板缺少结束符 }}")?;
             let expression = variable[..end].trim();
@@ -101,6 +140,20 @@ impl TemplateResolver {
                         .insert(expression.into(), value.clone());
                     value
                 }
+            } else if let Some((name, property @ ("name" | "size" | "sha256"))) =
+                expression.split_once('.')
+            {
+                let file = self.file(name)?;
+                match property {
+                    "name" if json.is_some_and(|state| state.quoted) => {
+                        let encoded =
+                            serde_json::to_string(&file.name).expect("file name serializes");
+                        encoded[1..encoded.len() - 1].to_owned()
+                    }
+                    "name" => file.name.clone(),
+                    "size" => file.metadata()?.size.to_string(),
+                    _ => file.metadata()?.sha256.clone(),
+                }
             } else {
                 let value = self
                     .values
@@ -110,10 +163,13 @@ impl TemplateResolver {
                 if value.is_empty() {
                     return Err(format!("请在环境变量中填写 {expression}"));
                 }
-                self.resolve_inner(value, stack)?
+                self.resolve_inner(value, stack, json)?
             };
             stack.pop();
             output.push_str(&value);
+            if let Some(json) = &mut json {
+                json.scan(&value);
+            }
             rest = &variable[end + 2..];
         }
         output.push_str(rest);
@@ -205,7 +261,7 @@ impl TemplateResolver {
                         .cookies
                         .get(name)
                         .ok_or_else(|| format!("请求 Cookie 中不存在：{name}"))?;
-                    self.resolve_inner(value, stack)
+                    self.resolve_inner(value, stack, None)
                 }
                 _ => Err(invalid()),
             },
@@ -285,11 +341,11 @@ mod tests {
     use super::super::model::Pair;
     use super::*;
     fn empty() -> EnvironmentValues {
-        EnvironmentValues(BTreeMap::new())
+        EnvironmentValues::new(BTreeMap::new())
     }
     #[test]
     fn generators_share_values_per_send_and_refresh_between_sends() {
-        let env = EnvironmentValues(BTreeMap::from([("id".into(), "{{uuid()}}".into())]));
+        let env = EnvironmentValues::new(BTreeMap::from([("id".into(), "{{uuid()}}".into())]));
         let resolver = TemplateResolver::new(&env);
         let id = resolver.resolve("{{id}}").unwrap();
         let uuid = uuid::Uuid::parse_str(&id).unwrap();
@@ -368,7 +424,7 @@ mod tests {
     }
     #[test]
     fn preview_isolates_cookie_errors_and_preserves_indirect_dependencies() {
-        let env = EnvironmentValues(BTreeMap::from([
+        let env = EnvironmentValues::new(BTreeMap::from([
             ("baseurl".into(), "https://example.test".into()),
             ("csrf".into(), "{{cookie('csrftoken')}}".into()),
             ("endpoint".into(), "{{baseurl}}/api".into()),
@@ -408,7 +464,7 @@ mod tests {
     }
     #[test]
     fn cookie_extraction_merges_headers_overrides_and_detects_cycles() {
-        let env = EnvironmentValues(BTreeMap::from([
+        let env = EnvironmentValues::new(BTreeMap::from([
             ("token".into(), "a=b".into()),
             (
                 "cookie_header".into(),

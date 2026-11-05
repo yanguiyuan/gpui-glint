@@ -184,7 +184,12 @@ impl Workbench {
                 }
             }
         });
-        let listener_port = Self::entry(&saved.listener.port.to_string(), "8899", cx);
+        let configured_port = if saved.listener.port == 0 {
+            String::new()
+        } else {
+            saved.listener.port.to_string()
+        };
+        let listener_port = Self::entry(&configured_port, "自动分配", cx);
         listener_port.update(cx, |entry, cx| entry.set_theme(theme, cx));
         let listener_subscription = cx.observe(&listener_port, |this, _, cx| {
             this.variable_error = None;
@@ -345,17 +350,23 @@ impl Workbench {
             .min(self.workspace.proxies.len().saturating_sub(1));
         self.sync_proxy_binding_options(cx);
     }
-    pub(super) fn profile_draft(&self, index: usize, cx: &App) -> environment::ProxySettings {
+    pub(super) fn profile_draft(
+        &self,
+        index: usize,
+        cx: &App,
+    ) -> Result<environment::ProxySettings, String> {
         let input = &self.profile_inputs[index];
-        environment::ProxySettings {
+        let configured_port = input.listener_port.read(cx).value().trim();
+        let port = if configured_port.is_empty() {
+            0
+        } else {
+            configured_port
+                .parse()
+                .map_err(|_| "监听端口须为 0–65535，留空或填 0 自动分配")?
+        };
+        Ok(environment::ProxySettings {
             listener: environment::ProxyListenerSettings {
-                port: input
-                    .listener_port
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .parse()
-                    .unwrap_or(0),
+                port,
                 allow_lan: input.allow_lan,
             },
             enabled: input.enabled,
@@ -370,7 +381,7 @@ impl Workbench {
                     ip: row.value.read(cx).value().trim().into(),
                 })
                 .collect(),
-        }
+        })
     }
     pub(super) fn proxy_drafts(&self, cx: &App) -> Result<Vec<environment::ProxyProfile>, String> {
         let mut names = HashSet::new();
@@ -383,8 +394,7 @@ impl Workbench {
                 if name.is_empty() || !names.insert(name.clone()) {
                     return Err("代理名称不能为空或重复".into());
                 }
-                let settings = self.profile_draft(index, cx);
-                settings.listener.validate()?;
+                let settings = self.profile_draft(index, cx)?;
                 settings.validate()?;
                 Ok(environment::ProxyProfile {
                     id: saved.id.clone(),
@@ -397,32 +407,28 @@ impl Workbench {
     pub(super) fn has_unsaved_proxies(&self, cx: &App) -> bool {
         self.workspace.proxies.iter().enumerate().any(|(i, p)| {
             self.profile_names[i].read(cx).value().trim() != p.name
-                || self.profile_draft(i, cx) != p.settings
+                || self.profile_draft(i, cx).as_ref().ok() != Some(&p.settings)
         })
     }
     fn save_proxy_profile(&mut self, cx: &mut Context<Self>) {
         let index = self.editing_proxy;
         let name = self.profile_names[index].read(cx).value().trim().to_owned();
-        let settings = self.profile_draft(index, cx);
-        let result = settings
-            .listener
-            .validate()
-            .and_then(|_| settings.validate())
-            .and_then(|_| {
-                if name.is_empty()
-                    || self
-                        .workspace
-                        .proxies
-                        .iter()
-                        .enumerate()
-                        .any(|(i, p)| i != index && p.name == name)
-                {
-                    return Err("代理名称不能为空或重复".into());
-                }
-                Ok(())
-            });
+        let result = self.profile_draft(index, cx).and_then(|settings| {
+            settings.validate()?;
+            if name.is_empty()
+                || self
+                    .workspace
+                    .proxies
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| i != index && p.name == name)
+            {
+                return Err("代理名称不能为空或重复".into());
+            }
+            Ok(settings)
+        });
         match result {
-            Ok(()) => {
+            Ok(settings) => {
                 self.workspace.proxies[index].name = name;
                 self.workspace.proxies[index].settings = settings;
                 self.sync_proxy_binding_options(cx);
@@ -550,17 +556,19 @@ impl Workbench {
         })
     }
     pub(super) fn proxy_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut list = div().flex().flex_col().gap_2().p_3().child("代理管理");
+        let mut list = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child("代理管理");
         for (index, profile) in self.workspace.proxies.iter().enumerate() {
-            let count = self
-                .workspace
-                .environment_inputs
-                .iter()
-                .filter(|v| v.proxy_id.as_ref() == Some(&profile.id))
-                .count();
             list = list.child(
-                Button::new(format!("{} · {} 个环境", profile.name, count))
+                Button::new(profile.name.clone())
                     .kind(ButtonKind::Gray)
+                    .truncate_label()
                     .theme(self.theme)
                     .render()
                     .id(("proxy-profile", index))
@@ -711,6 +719,7 @@ impl Workbench {
                                         .child(
                                             div()
                                                 .w(px(52.))
+                                                .flex_shrink_0()
                                                 .text_color(rgb(p.text_muted))
                                                 .child("名称"),
                                         )
@@ -718,19 +727,26 @@ impl Workbench {
                                             div()
                                                 .flex_1()
                                                 .max_w(px(360.))
+                                                .min_w_0()
                                                 .child(self.profile_names[index].clone()),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .pl(px(64.))
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
                                         .text_size(px(11.))
                                         .text_color(rgb(p.text_muted))
                                         .child(if bound.is_empty() {
                                             "尚未绑定环境".into()
                                         } else {
-                                            format!("已绑定 · {}", bound.join("、"))
-                                        }),
+                                            format!("绑定环境（{}）", bound.len())
+                                        })
+                                        .children(bound.into_iter().map(|name| {
+                                            div().min_w_0().max_w_full().truncate().child(name)
+                                        })),
                                 ),
                         )
                         .child(self.proxy_profile_settings(cx))
@@ -1309,7 +1325,7 @@ mod tests {
         let bounds = window.debug_bounds("proxy-hosts-import").unwrap();
         window.simulate_click(bounds.center(), gpui::Modifiers::default());
         let draft = host.update(window, |host, cx| {
-            let draft = host.profile_draft(0, cx);
+            let draft = host.profile_draft(0, cx).unwrap();
             assert_eq!(draft.mappings.len(), 4);
             assert_eq!(draft.mappings[0].domain, "api.test");
             assert_eq!(draft.mappings[0].ip, "10.0.0.3");
@@ -1341,7 +1357,7 @@ mod tests {
         window.simulate_click(bounds.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
             assert!(host.variable_error.as_ref().unwrap().contains("第 2 行"));
-            assert_eq!(host.profile_draft(0, cx), draft);
+            assert_eq!(host.profile_draft(0, cx).unwrap(), draft);
             host.save_proxy_profile(cx);
             assert!(host.variable_error.is_none());
             assert_eq!(

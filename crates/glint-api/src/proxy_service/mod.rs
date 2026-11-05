@@ -1,4 +1,5 @@
 pub mod browser;
+mod browser_relay;
 pub mod ca;
 
 use super::environment::ProxySettings;
@@ -24,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
     sync::{Semaphore, watch},
 };
 
@@ -315,6 +316,10 @@ impl RunningProxy {
             task,
         })
     }
+    pub(super) fn route_browser(&self, directory: &std::path::Path) -> Result<u16, String> {
+        browser_relay::route(directory, self.address.port(), self.cancel.subscribe())
+    }
+
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.address.port())
     }
@@ -395,6 +400,17 @@ async fn dispatch(
         }
         return Ok(connect(request, service, peer));
     }
+    let has_token = |name, token: &str| {
+        request
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|value| value.trim().eq_ignore_ascii_case(token))
+    };
+    let upgrade = has_token(hyper::header::UPGRADE, "websocket")
+        && has_token(hyper::header::CONNECTION, "upgrade");
     let url = if let Some(base) = &target {
         if request.uri().scheme().is_some() || !request.uri().path().starts_with('/') {
             return Ok(failure(StatusCode::BAD_REQUEST, "HTTPS 隧道内需要相对路径"));
@@ -406,12 +422,18 @@ async fn dispatch(
         url
     } else {
         match reqwest::Url::parse(&request.uri().to_string()) {
-            Ok(url)
-                if url.scheme() == "http"
+            Ok(mut url)
+                if (url.scheme() == "http" || upgrade && matches!(url.scheme(), "ws" | "wss"))
                     && url.host_str().is_some()
                     && url.username().is_empty()
                     && url.password().is_none() =>
             {
+                let scheme = match url.scheme() {
+                    "ws" => "http",
+                    "wss" => "https",
+                    _ => "http",
+                };
+                let _ = url.set_scheme(scheme);
                 url
             }
             _ => {
@@ -441,10 +463,6 @@ async fn dispatch(
         started,
         finished: false,
     };
-    let upgrade = request
-        .headers()
-        .get("upgrade")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let incoming_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
     let method = request.method().clone();
     let head = method == hyper::Method::HEAD;
@@ -576,13 +594,6 @@ fn connect(mut request: Request<Incoming>, service: Service, peer: SocketAddr) -
     if is_self(&target, service.address) {
         return failure(StatusCode::LOOP_DETECTED, "不能连接当前代理自身");
     }
-    let Some(ca) = &service.ca else {
-        return failure(StatusCode::BAD_GATEWAY, "请先生成或导入 HTTPS 抓包 CA 证书");
-    };
-    let tls = match ca.tls_for(target.host_str().unwrap()) {
-        Ok(config) => tokio_rustls::TlsAcceptor::from(config),
-        Err(error) => return failure(StatusCode::BAD_GATEWAY, error),
-    };
     let Ok(permit) = service.limits.clone().try_acquire_owned() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "连接数已达到上限");
     };
@@ -592,12 +603,33 @@ fn connect(mut request: Request<Incoming>, service: Service, peer: SocketAddr) -
         let _permit = permit;
         let operation = async {
             let incoming = incoming.await.map_err(|e| e.to_string())?;
-            let socket =
-                tokio::time::timeout(Duration::from_secs(15), tls.accept(TokioIo::new(incoming)))
+            let mut socket = BufReader::new(TokioIo::new(incoming));
+            let first = tokio::time::timeout(Duration::from_secs(15), socket.fill_buf())
+                .await
+                .map_err(|_| "等待 CONNECT 隧道请求超时".to_owned())?
+                .map_err(|e| e.to_string())?
+                .first()
+                .copied()
+                .ok_or("CONNECT 隧道已关闭")?;
+            if first == 0x16 {
+                let ca = service
+                    .ca
+                    .as_ref()
+                    .ok_or("请先生成或导入 HTTPS 抓包 CA 证书")?;
+                let tls = tokio_rustls::TlsAcceptor::from(ca.tls_for(target.host_str().unwrap())?);
+                let socket = tokio::time::timeout(Duration::from_secs(15), tls.accept(socket))
                     .await
                     .map_err(|_| "TLS 握手超时".to_owned())?
                     .map_err(|e| e.to_string())?;
-            serve(socket, service.clone(), peer, Some(target.clone())).await;
+                serve(socket, service.clone(), peer, Some(target.clone())).await;
+            } else {
+                // Browsers also use CONNECT for unencrypted ws:// handshakes.
+                let mut target = target.clone();
+                let port = target.port_or_known_default();
+                target.set_scheme("http").map_err(|_| "CONNECT 地址无效")?;
+                target.set_port(port).map_err(|_| "CONNECT 端口无效")?;
+                serve(socket, service.clone(), peer, Some(target)).await;
+            }
             Ok::<_, String>(())
         };
         let result =

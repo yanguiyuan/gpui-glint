@@ -191,6 +191,13 @@ impl RequestPreview {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
+        } else if snapshot.draft.body_format == BodyFormat::Binary {
+            match &snapshot.draft.binary_file_variable {
+                Some(name) => format!("集合文件变量 · {name}"),
+                None => {
+                    request_config_ui::binary_body_description(snapshot.draft.binary_body.as_ref())
+                }
+            }
         } else {
             snapshot.draft.body.clone()
         };

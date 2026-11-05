@@ -333,7 +333,9 @@ impl AgentWorkspace {
             cx.subscribe(&titles, |this, _, event: &titles::GeneratedTitle, cx| {
                 if let Some(session) =
                     this.history.sessions.iter_mut().find(|session| {
-                        session.id == event.session && session.title == event.previous
+                        session.id == event.session
+                            && session.title == event.previous
+                            && session.title != event.title
                     })
                 {
                     session.title = event.title.clone();
@@ -881,6 +883,7 @@ impl AgentWorkspace {
             .and_then(|s| compaction::plan(s, config.protocol));
         let compact_config = config.clone();
         self.quick_reply_jobs.remove(&id);
+        self.titles.update(cx, |titles, _| titles.cancel(id));
         let raw_images = submission.images;
         let project = self
             .history
@@ -1051,11 +1054,8 @@ impl AgentWorkspace {
             session_id: Some(id),
             changes: Default::default(),
         };
-        // Generate titles after the first reply for API providers. Subscription
-        // conversations keep their existing title without an extra request.
+        let title_config = (config.kind == provider::Kind::Compatible).then(|| config.clone());
         let first_turn = self.history.sessions[index].messages.is_empty();
-        let title_config =
-            (first_turn && config.kind == provider::Kind::Compatible).then(|| config.clone());
         let prompt = text.clone();
         let quick_reply_config = config.clone();
         let request_provider_id = config.id;
@@ -1206,7 +1206,7 @@ impl AgentWorkspace {
                         {
                             let previous = session.title.clone();
                             this.titles.update(cx, |titles, cx| {
-                                titles.generate(id, previous, config, prompt, reply, cx)
+                                titles.generate(id, previous, first_turn, config, prompt, reply, cx)
                             });
                         }
                     }

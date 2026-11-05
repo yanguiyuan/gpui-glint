@@ -2,9 +2,13 @@
 
 将 Glint API 和 Glint Agent 集成到一个原生窗口，用统一侧边图标栏切换功能。
 
+在仓库根目录运行：
+
 ```sh
-cargo run -p glint-workbench
+make dev
 ```
+
+Windows 会先加载 Visual Studio x64 C++ 工具链，再运行 `cargo run -p glint-workbench`。
 
 默认启用 API 的原生 HTML 预览；不需要时可用 `--no-default-features` 构建。
 

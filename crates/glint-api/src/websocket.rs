@@ -220,7 +220,7 @@ mod tests {
                 url,
                 ..Draft::default()
             },
-            &EnvironmentValues(Default::default()),
+            &EnvironmentValues::new(Default::default()),
         )
         .unwrap()
     }
@@ -274,7 +274,7 @@ mod tests {
                 ..Draft::default()
             };
             let session = start(
-                PreparedRequest::new(&draft, &EnvironmentValues(Default::default())).unwrap(),
+                PreparedRequest::new(&draft, &EnvironmentValues::new(Default::default())).unwrap(),
             )
             .unwrap();
             assert!(matches!(next(&session).await, Event::Connected));

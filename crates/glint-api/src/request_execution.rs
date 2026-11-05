@@ -86,6 +86,7 @@ impl Workbench {
                 requests,
                 collection,
                 local,
+                files: variables.clone(),
                 global: self.workspace.environment_inputs[environment_index].clone(),
                 proxy: proxy.clone(),
                 catalog: self.plugin_catalog.clone(),
@@ -216,10 +217,12 @@ impl Workbench {
                                     this.sync_reference_inputs(cx);
                                     this.push_trace(format!("前置刷新完成 · {name}"), cx);
                                 }
-                                let variables = this.environment_values(
+                                let mut variables = this.environment_values(
                                     environment_index,
                                     Some(&this.workspace.requests[this.active].collection),
                                 );
+                                // Keep file bytes and metadata consistent with the prerequisite requests.
+                                variables.share_files_from(&plugin_variables);
                                 let prepared = PreparedRequest::new(&draft, &variables)
                                     .and_then(|r| this.oauth_attach(r, &draft, cx))
                                     .and_then(|r| r.with_proxy(&proxy))?;

@@ -1436,7 +1436,7 @@ mod enable_tests {
                 plugins::validate_variables(
                     &actions,
                     &host.plugin_catalog,
-                    &environment::EnvironmentValues(Default::default())
+                    &environment::EnvironmentValues::new(Default::default())
                 )
                 .is_ok()
             );
@@ -1445,7 +1445,7 @@ mod enable_tests {
                     url: "https://example.test".into(),
                     ..Default::default()
                 },
-                &environment::EnvironmentValues(Default::default()),
+                &environment::EnvironmentValues::new(Default::default()),
             )
             .unwrap();
             assert!(
@@ -1453,7 +1453,7 @@ mod enable_tests {
                     prepared,
                     &actions,
                     &host.plugin_catalog,
-                    &environment::EnvironmentValues(Default::default())
+                    &environment::EnvironmentValues::new(Default::default())
                 )
                 .is_ok()
             );

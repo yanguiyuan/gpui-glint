@@ -278,6 +278,8 @@ impl Workbench {
             url: self.endpoint.read(cx).value().text.to_string(),
             body: self.body.read(cx).content().into(),
             body_format: self.body_format,
+            binary_body: self.binary_body.clone(),
+            binary_file_variable: self.binary_file_variable.clone(),
             form: pairs(&self.form),
             params: pairs(&self.params),
             headers: pairs(&self.headers),
@@ -357,6 +359,8 @@ impl Workbench {
         self.headers = draft.headers.iter().map(|p| self.pair(p, cx)).collect();
         self.cookies = draft.cookies.iter().map(|p| self.pair(p, cx)).collect();
         self.body_format = draft.body_format;
+        self.binary_body = draft.binary_body.clone();
+        self.binary_file_variable = draft.binary_file_variable.clone();
         self.form = draft.form.iter().map(|pair| self.pair(pair, cx)).collect();
         self.trigger_rows = draft
             .triggers

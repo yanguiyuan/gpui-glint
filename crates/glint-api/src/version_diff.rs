@@ -169,6 +169,8 @@ impl VersionDiff {
             "body_format",
             "body",
             "form",
+            "binary_body",
+            "binary_file_variable",
             "plugins",
             "extractors",
             "event_decoder",
@@ -185,8 +187,19 @@ impl VersionDiff {
         self.cards = keys
             .into_iter()
             .map(|key| {
-                let before = field_text(old.get(&key));
-                let after = field_text(new.get(&key));
+                let describe = |value: Option<&serde_json::Value>| {
+                    if key == "binary_body"
+                        && let Some(file) = value
+                        && let (Some(name), Some(base64)) =
+                            (file["name"].as_str(), file["base64"].as_str())
+                    {
+                        use sha2::{Digest, Sha256};
+                        return format!("{name:?}\nBase64 SHA-256 {:x}", Sha256::digest(base64));
+                    }
+                    field_text(value)
+                };
+                let before = describe(old.get(&key));
+                let after = describe(new.get(&key));
                 let changed = before != after;
                 let language = if matches!(key.as_str(), "body" | "url" | "token") {
                     "text"
@@ -231,6 +244,8 @@ fn field_label(key: &str) -> String {
         "body" => "请求体",
         "body_format" => "请求体格式",
         "form" => "表单参数",
+        "binary_body" => "二进制文件",
+        "binary_file_variable" => "绑定的集合文件变量",
         "plugins" => "前置动作",
         "extractors" => "后置提取",
         "triggers" => "规则触发器",

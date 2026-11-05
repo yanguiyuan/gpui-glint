@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn oauth_templates_resolve_runtime_configuration_and_exchange_without_changing_draft() {
         let (url, worker) = server(vec![(200, reply("access", "refresh"))]);
-        let values = super::super::environment::EnvironmentValues(
+        let values = super::super::environment::EnvironmentValues::new(
             [
                 ("host".into(), "https://auth.example.test".into()),
                 ("app_id".into(), "app&one".into()),
@@ -766,7 +766,7 @@ mod tests {
         assert!(
             config
                 .resolve(&super::super::template::TemplateResolver::new(
-                    &super::super::environment::EnvironmentValues(Default::default())
+                    &super::super::environment::EnvironmentValues::new(Default::default())
                 ))
                 .is_err()
         );

@@ -1,6 +1,6 @@
 //! Conditional request dependencies, evaluated before resolving the main request.
 use super::{
-    environment::{EnvironmentVariables, ProxySettings},
+    environment::{EnvironmentValues, EnvironmentVariables, ProxySettings},
     http,
     model::{Draft, Request, TriggerAction, TriggerCondition},
     plugins, post_actions,
@@ -27,6 +27,7 @@ pub struct TriggerContext {
     pub collection: String,
     pub global: EnvironmentVariables,
     pub local: EnvironmentVariables,
+    pub files: EnvironmentValues,
     pub proxy: ProxySettings,
     pub catalog: Vec<gpui_glint::plugins::Plugin>,
     pub completed: Vec<(String, EnvironmentVariables, Vec<String>)>,
@@ -82,6 +83,7 @@ impl TriggerContext {
                     stack.pop();
                     let mut values = self.global.values();
                     values.0.extend(self.local.values().0);
+                    values.share_files_from(&self.files);
                     let request = http::PreparedRequest::new(&target.draft, &values)?
                         .with_proxy(&self.proxy)?;
                     plugins::validate_variables(&target.draft.plugins, &self.catalog, &values)?;
@@ -171,6 +173,7 @@ mod tests {
             collection: "API".into(),
             global: Default::default(),
             local: Default::default(),
+            files: EnvironmentValues::new(Default::default()),
             proxy: Default::default(),
             catalog: vec![],
             completed: vec![],

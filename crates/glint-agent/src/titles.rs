@@ -28,20 +28,26 @@ impl TitleGenerator {
         &mut self,
         session: Uuid,
         previous: String,
+        first_turn: bool,
         config: provider::Config,
         prompt: String,
         reply: String,
         cx: &mut Context<Self>,
     ) {
+        let current_title = (!first_turn).then(|| truncate_chars(&previous, 48));
         self.start(session, previous, async move {
             let key = config.key().ok()?;
             let messages = vec![
-                serde_json::json!({"role":"system","content":"你是会话标题生成器。根据这段对话给出不超过 12 个字、概括任务意图的标题。只回复标题本身：不要引号、句号或任何解释。"}),
-                serde_json::json!({"role":"user","content":format!("用户：{}\n\n助手：{}", truncate_chars(&prompt, 400), truncate_chars(&reply, 400))}),
+                serde_json::json!({"role":"system","content":"你是会话标题生成器。根据最新一轮对话，给出不超过 12 个字、概括当前任务意图的标题。若有已有标题且本轮只是追问、确认、补充或延续同一任务，只回复 KEEP_TITLE；若本轮发起新的任务，生成新标题。只回复标题或 KEEP_TITLE，不加引号、句号或解释。"}),
+                serde_json::json!({"role":"user","content":serde_json::json!({
+                    "已有标题": current_title,
+                    "用户": truncate_chars(&prompt, 400),
+                    "助手": truncate_chars(&reply, 400),
+                }).to_string()}),
             ];
             let request = provider::Request::start(config, key, messages, provider::Thinking::Default).ok()?;
             let completion = request.response().await.ok()?;
-            session_title(&completion.text)
+            session_title(&completion.text).filter(|title| !title.eq_ignore_ascii_case("KEEP_TITLE"))
         }, cx);
     }
 
@@ -124,5 +130,16 @@ mod tests {
         cx.run_until_parked();
         assert!(send.send("late".into()).is_err());
         assert_eq!(results.borrow().len(), 1);
+
+        generator.update(cx, |generator, cx| {
+            generator.start(
+                session,
+                "自动标题".into(),
+                async { Some("新任务".into()) },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(results.borrow().last(), Some(&(session, "新任务".into())));
     }
 }

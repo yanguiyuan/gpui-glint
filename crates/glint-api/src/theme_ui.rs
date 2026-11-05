@@ -48,6 +48,7 @@ impl Workbench {
             &self.version_tag_input,
             &self.workspace_name_input,
             &self.workspace_transfer_name,
+            &self.file_variable_name,
         ] {
             entry.update(cx, |e, cx| e.set_theme(theme, cx));
         }

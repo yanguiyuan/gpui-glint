@@ -2,6 +2,92 @@
 
 use super::*;
 
+pub(super) fn binary_body_description(body: Option<&model::BinaryBody>) -> String {
+    body.map_or_else(|| "未选择文件".into(), model::BinaryBody::description)
+}
+
+pub(super) fn choose_binary_file<T: 'static>(
+    cx: &mut Context<T>,
+    set_body: impl FnOnce(&mut T, Result<Option<model::BinaryBody>, String>, &mut Context<T>) + 'static,
+) {
+    choose_request_file(cx, |path| model::BinaryBody::read(&path), set_body);
+}
+
+pub(super) fn choose_request_file<T: 'static, F: Send + 'static>(
+    cx: &mut Context<T>,
+    read: impl FnOnce(std::path::PathBuf) -> Result<F, String> + Send + 'static,
+    set_file: impl FnOnce(&mut T, Result<Option<F>, String>, &mut Context<T>) + 'static,
+) {
+    let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("选择二进制请求体文件".into()),
+    });
+    cx.spawn(async move |this, cx| {
+        let result = async {
+            let paths = picker
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
+                return Ok(None);
+            };
+            cx.background_executor()
+                .spawn(async move { read(path) })
+                .await
+                .map(Some)
+        }
+        .await;
+        let _ = this.update(cx, |this, cx| match result {
+            Ok(Some(file)) => set_file(this, Ok(Some(file)), cx),
+            Ok(None) => {}
+            Err(error) => set_file(this, Err(error), cx),
+        });
+    })
+    .detach();
+}
+
+pub(super) fn binary_body_editor<T: 'static>(
+    body: Option<&model::BinaryBody>,
+    theme: ThemePreset,
+    set_body: impl Fn(&mut T, Result<Option<model::BinaryBody>, String>, &mut Context<T>)
+    + Clone
+    + 'static,
+    cx: &mut Context<T>,
+) -> gpui::Div {
+    let choose = set_body.clone();
+    div().flex().flex_col().gap_2().child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("选择文件")
+                    .theme(theme)
+                    .render()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        choose_binary_file(cx, choose.clone());
+                    })),
+            )
+            .when(body.is_some(), |row| {
+                row.child(
+                    Button::new("移除")
+                        .kind(ButtonKind::Plain)
+                        .theme(theme)
+                        .render()
+                        .on_click(cx.listener(move |this, _, _, cx| set_body(this, Ok(None), cx))),
+                )
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(binary_body_description(body)),
+            ),
+    )
+}
+
 impl Workbench {
     pub(super) fn request_setting_row(
         &self,
@@ -75,17 +161,14 @@ impl Workbench {
             SegmentedControl::new([
                 SegmentOption::new("JSON / 原始"),
                 SegmentOption::new("x-www-form-urlencoded"),
+                SegmentOption::new("二进制文件"),
             ])
             .id("request-body-format")
-            .selected(usize::from(self.body_format == BodyFormat::UrlEncoded))
+            .selected(self.body_format.index())
             .theme(self.theme)
             .on_change(move |index, _, cx| {
                 let _ = owner.update(cx, |this, cx| {
-                    this.body_format = if index == 1 {
-                        BodyFormat::UrlEncoded
-                    } else {
-                        BodyFormat::Raw
-                    };
+                    this.body_format = BodyFormat::from_index(index);
                     cx.notify();
                 });
             })
@@ -123,6 +206,88 @@ impl Workbench {
         if self.body_format == BodyFormat::UrlEncoded {
             content.child(self.form_table.clone()).child(div().text_size(px(10.)).text_color(rgb(self.theme.palette().text_muted))
                 .child("仅发送已启用字段，支持同名字段和模板变量；无需手动编码。自动使用 application/x-www-form-urlencoded，显式 Content-Type 优先。"))
+        } else if self.body_format == BodyFormat::Binary {
+            let request = &self.workspace.requests[self.active];
+            let request_id = request.id.clone();
+            let mut files = div().flex().flex_wrap().gap_2();
+            if let Some(collection) = self
+                .workspace
+                .collections
+                .iter()
+                .find(|c| c.collection == request.collection)
+            {
+                for name in collection.file_variables.keys() {
+                    let selected = self.binary_file_variable.as_ref() == Some(name);
+                    let name = name.clone();
+                    files = files.child(
+                        Button::new(name.clone())
+                            .kind(if selected {
+                                ButtonKind::Primary
+                            } else {
+                                ButtonKind::Gray
+                            })
+                            .size(ButtonSize::Mini)
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.binary_file_variable = Some(name.clone());
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            let mut body = content
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .child("集合文件变量 · 在集合变量页添加文件"),
+                )
+                .child(files);
+            if let Some(name) = &self.binary_file_variable {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(format!("已绑定：{name}"))
+                        .child(
+                            Button::new("解除绑定")
+                                .kind(ButtonKind::Plain)
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.binary_file_variable = None;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            body.child(binary_body_editor(
+                self.binary_body.as_ref(),
+                self.theme,
+                move |this: &mut Self, body, cx| {
+                    if this.workspace.requests[this.active].id == request_id {
+                        match body {
+                            Ok(body) => {
+                                if body.is_some() {
+                                    this.binary_file_variable = None;
+                                }
+                                this.notice = binary_body_description(body.as_ref()).into();
+                                this.binary_body = body;
+                            }
+                            Err(error) => this.notice = error.into(),
+                        }
+                        cx.notify();
+                    }
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(self.theme.palette().text_muted))
+                    .child("直接发送文件字节，最大 16 MiB。默认使用 application/octet-stream。"),
+            )
         } else {
             content.child(
                 div()

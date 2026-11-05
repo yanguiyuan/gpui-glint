@@ -13,28 +13,12 @@ pub struct ProxySettings {
     pub url: String,
     pub skip_tls_verification: bool,
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyListenerSettings {
+    // Zero lets the OS choose and reserve a free port at bind time.
     pub port: u16,
     pub allow_lan: bool,
-}
-impl Default for ProxyListenerSettings {
-    fn default() -> Self {
-        Self {
-            port: 8899,
-            allow_lan: false,
-        }
-    }
-}
-impl ProxyListenerSettings {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.port == 0 {
-            Err("代理监听端口须为 1–65535".into())
-        } else {
-            Ok(())
-        }
-    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProxyProfile {
@@ -119,6 +103,17 @@ impl HostMapping {
     }
 }
 impl ProxySettings {
+    pub(super) fn is_unconfigured(&self) -> bool {
+        // Older workspaces serialized 8899 even for empty environment proxies.
+        matches!(self.listener.port, 0 | 8899)
+            && !self.listener.allow_lan
+            && !self.enabled
+            && !self.built_in
+            && self.mappings.is_empty()
+            && self.url.is_empty()
+            && !self.skip_tls_verification
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -319,7 +314,7 @@ impl EnvironmentVariables {
         Some(self.variables.remove(index))
     }
     pub fn values(&self) -> EnvironmentValues {
-        EnvironmentValues(
+        EnvironmentValues::new(
             self.variables
                 .iter()
                 .map(|variable| (variable.name.clone(), variable.value.clone()))
@@ -328,8 +323,37 @@ impl EnvironmentVariables {
     }
 }
 #[derive(Clone)]
-pub struct EnvironmentValues(pub BTreeMap<String, String>);
+pub struct EnvironmentValues(
+    pub BTreeMap<String, String>,
+    pub BTreeMap<String, super::model::FileVariable>,
+    FileSnapshots,
+);
+
+type FileSnapshots =
+    std::sync::Arc<std::sync::Mutex<BTreeMap<String, Result<super::model::BinaryBody, String>>>>;
 impl EnvironmentValues {
+    pub fn new(values: BTreeMap<String, String>) -> Self {
+        Self(values, BTreeMap::new(), Default::default())
+    }
+
+    pub(super) fn file(&self, name: &str) -> Result<super::model::BinaryBody, String> {
+        let file = self
+            .1
+            .get(name)
+            .ok_or_else(|| format!("未定义集合文件变量：{name}"))?;
+        self.2
+            .lock()
+            .map_err(|_| "无法读取文件变量")?
+            .entry(name.into())
+            .or_insert_with(|| file.snapshot())
+            .clone()
+    }
+
+    pub(super) fn share_files_from(&mut self, source: &Self) {
+        self.1 = source.1.clone();
+        self.2 = source.2.clone();
+    }
+
     #[cfg(test)]
     pub fn resolve(&self, input: &str) -> Result<String, String> {
         super::template::TemplateResolver::new(self).resolve(input)

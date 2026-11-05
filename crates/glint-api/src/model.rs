@@ -86,7 +86,150 @@ pub enum BodyFormat {
     #[default]
     Raw,
     UrlEncoded,
+    Binary,
 }
+impl BodyFormat {
+    pub(super) fn index(self) -> usize {
+        match self {
+            Self::Raw => 0,
+            Self::UrlEncoded => 1,
+            Self::Binary => 2,
+        }
+    }
+
+    pub(super) fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::UrlEncoded,
+            2 => Self::Binary,
+            _ => Self::Raw,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinaryBody {
+    pub name: String,
+    base64: std::sync::Arc<str>,
+    #[serde(skip)]
+    metadata: std::sync::Arc<std::sync::OnceLock<Result<FileMetadata, String>>>,
+}
+
+#[derive(Debug)]
+pub(super) struct FileMetadata {
+    pub size: usize,
+    pub sha256: String,
+}
+
+impl PartialEq for BinaryBody {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.base64 == other.base64
+    }
+}
+
+impl BinaryBody {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    fn read_bytes(path: &std::path::Path) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+
+        let file = std::fs::File::open(path).map_err(|e| format!("无法打开文件：{e}"))?;
+        let mut bytes = Vec::new();
+        file.take((Self::MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("无法读取文件：{e}"))?;
+        if bytes.len() > Self::MAX_BYTES {
+            return Err("二进制文件大小不能超过 16 MiB".into());
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn read(path: &std::path::Path) -> Result<Self, String> {
+        use base64::Engine as _;
+
+        let bytes = Self::read_bytes(path)?;
+        Ok(Self {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            base64: base64::engine::general_purpose::STANDARD
+                .encode(&bytes)
+                .into(),
+            metadata: std::sync::Arc::new(std::sync::OnceLock::from(Ok(Self::metadata_for(
+                &bytes,
+            )))),
+        })
+    }
+
+    pub(super) fn decode(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+
+        if self.base64.len() > Self::MAX_BYTES.div_ceil(3) * 4 {
+            return Err("二进制文件大小不能超过 16 MiB".into());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(self.base64.as_bytes())
+            .map_err(|_| "二进制文件内容不是有效的 Base64")?;
+        if bytes.len() > Self::MAX_BYTES {
+            return Err("二进制文件大小不能超过 16 MiB".into());
+        }
+        Ok(bytes)
+    }
+
+    fn metadata_for(bytes: &[u8]) -> FileMetadata {
+        use sha2::{Digest, Sha256};
+        FileMetadata {
+            size: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    pub(super) fn metadata(&self) -> Result<&FileMetadata, String> {
+        self.metadata
+            .get_or_init(|| self.decode().map(|bytes| Self::metadata_for(&bytes)))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(super) fn description(&self) -> String {
+        format!("二进制文件 · {:?}", self.name)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FileVariable {
+    Local {
+        path: std::path::PathBuf,
+        size: usize,
+        sha256: String,
+    },
+    Embedded(BinaryBody),
+    Unbound {
+        needs_file: bool,
+    },
+}
+
+impl FileVariable {
+    pub(super) fn select(path: std::path::PathBuf) -> Result<Self, String> {
+        let metadata = BinaryBody::metadata_for(&BinaryBody::read_bytes(&path)?);
+        Ok(Self::Local {
+            path,
+            size: metadata.size,
+            sha256: metadata.sha256,
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> Result<BinaryBody, String> {
+        match self {
+            Self::Local { path, .. } if path.is_absolute() => BinaryBody::read(path),
+            Self::Local { .. } => Err("文件变量需要本地绝对路径，请重新选择文件".into()),
+            Self::Embedded(file) => Ok(file.clone()),
+            Self::Unbound { .. } => Err("请在集合文件变量表中重新选择文件".into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Draft {
     #[serde(default)]
@@ -108,6 +251,10 @@ pub struct Draft {
     pub body_format: BodyFormat,
     #[serde(default)]
     pub form: Vec<Pair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_body: Option<BinaryBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_file_variable: Option<String>,
     pub params: Vec<Pair>,
     pub headers: Vec<Pair>,
     pub cookies: Vec<Pair>,
@@ -247,6 +394,8 @@ impl DefaultSection {
             Self::Body => {
                 to.body = from.body.clone();
                 to.body_format = from.body_format;
+                to.binary_body = from.binary_body.clone();
+                to.binary_file_variable = from.binary_file_variable.clone();
                 to.form = from.form.clone();
             }
             Self::Plugins => {
@@ -278,6 +427,8 @@ pub struct RequestGroups {
     pub environments: std::collections::BTreeMap<String, super::environment::EnvironmentVariables>,
     #[serde(default)]
     pub defaults: std::collections::BTreeMap<String, DirectoryDefaults>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub file_variables: std::collections::BTreeMap<String, FileVariable>,
     #[serde(default)]
     pub folder_order: std::collections::BTreeMap<String, u64>,
     pub collection: String,
@@ -298,6 +449,7 @@ impl RequestGroups {
         }
         Self {
             id: new_id(),
+            file_variables: Default::default(),
             environments: Default::default(),
             collection: "Test API".into(),
             folder_order: Default::default(),
@@ -318,6 +470,7 @@ impl RequestGroups {
         }
         Ok(Self {
             id: new_id(),
+            file_variables: Default::default(),
             environments: Default::default(),
             collection: name.into(),
             folder_order: Default::default(),
@@ -819,6 +972,8 @@ impl Default for Draft {
             body: String::new(),
             body_format: BodyFormat::Raw,
             form: vec![],
+            binary_body: None,
+            binary_file_variable: None,
             params: vec![],
             headers: vec![],
             cookies: vec![],

@@ -121,6 +121,9 @@ pub struct Workbench {
     pub(super) revealed_variables: HashSet<(usize, u64)>,
     pub(super) variable_delete: Option<(usize, u64)>,
     pub(super) variable_search: Entity<TextEntry>,
+    pub(super) file_variable_name: Entity<TextEntry>,
+    pub(super) pending_file_variable: Option<String>,
+    pub(super) file_variable_table: Entity<DataTable>,
     pub(super) variable_error: Option<String>,
     pub(super) variable_rows: Vec<Vec<VariableInput>>,
     pub(super) proxy_inputs: Vec<ProxyBindingInput>,
@@ -171,6 +174,8 @@ pub struct Workbench {
     pub(super) cookies_table: Entity<DataTable>,
     pub(super) body: Entity<CodeCard>,
     pub(super) body_format: BodyFormat,
+    pub(super) binary_body: Option<model::BinaryBody>,
+    pub(super) binary_file_variable: Option<String>,
     pub(super) form: Vec<PairInput>,
     pub(super) form_table: Entity<DataTable>,
     pub(super) response: Entity<CodeCard>,
@@ -390,6 +395,7 @@ impl Workbench {
                 .viewport()
         });
         let commands = cx.new(|cx| CommandPalette::new(Self::command_items(&requests), cx));
+        let file_variable_name = Self::entry("", "文件变量名（默认 upload）", cx);
         let variable_search = Self::entry("", "搜索变量名称…", cx);
         let response_search = Self::entry("", "搜索响应体…", cx);
         let mut subscriptions = vec![];
@@ -620,6 +626,31 @@ impl Workbench {
                 }
             },
         ));
+        let file_variable_table = cx.new(|cx| {
+            DataTable::new(
+                cx,
+                [
+                    TableColumn::new("变量名称", 135.).flexible(),
+                    TableColumn::new("文件路径", 240.).flexible(),
+                    TableColumn::new("字节数", 90.),
+                    TableColumn::new("SHA-256", 200.).flexible(),
+                    TableColumn::new("", 68.),
+                ],
+                [],
+            )
+            .document()
+            .compact()
+            .empty_row("暂无文件变量。")
+            .add_row("添加一行")
+        });
+        subscriptions.push(cx.subscribe(
+            &file_variable_table,
+            |this: &mut Self, _, event: &TableEvent, cx| {
+                if let TableEvent::AddRow = event {
+                    this.add_file_variable(cx);
+                }
+            },
+        ));
         let tabs = if requests.is_empty() { vec![] } else { vec![0] };
         let traces = data.traces;
         let current_versions = requests
@@ -823,6 +854,9 @@ impl Workbench {
             revealed_variables: HashSet::new(),
             variable_delete: None,
             variable_search,
+            file_variable_name,
+            pending_file_variable: None,
+            file_variable_table,
             variable_error: None,
             variable_rows: vec![vec![]; environment_count],
             proxy_inputs: vec![],
@@ -872,6 +906,8 @@ impl Workbench {
             cookies_table,
             body,
             body_format: BodyFormat::Raw,
+            binary_body: None,
+            binary_file_variable: None,
             form: vec![],
             form_table,
             response,

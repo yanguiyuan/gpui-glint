@@ -136,11 +136,16 @@ pub fn discover() -> Vec<Browser> {
     browsers
 }
 
+fn profile_directory(directory: &Path, browser: &Browser) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    directory
+        .join("browser-profiles")
+        .join(format!("{:x}", Sha256::digest(browser.name.as_bytes())))
+}
+
 pub fn launch(browser: &Browser, directory: &Path, port: u16) -> Result<(), String> {
-    // A unique profile is essential: an already running browser otherwise silently ignores proxy flags.
-    let profile = directory
-        .join("browser-sessions")
-        .join(uuid::Uuid::new_v4().to_string());
+    let profile = profile_directory(directory, browser);
     std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
     let mut command = prepare(browser, &profile, port)?;
     command
@@ -164,6 +169,7 @@ fn prepare(browser: &Browser, profile: &Path, port: u16) -> Result<Command, Stri
                     "--disable-quic",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--new-window",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                     "about:blank",
                 ]);
@@ -172,10 +178,9 @@ fn prepare(browser: &Browser, profile: &Path, port: u16) -> Result<Command, Stri
             std::fs::write(profile.join("user.js"), firefox_preferences(port))
                 .map_err(|e| e.to_string())?;
             command
-                .arg("-no-remote")
                 .arg("-profile")
-                .arg(&profile)
-                .arg("about:blank");
+                .arg(profile)
+                .args(["-new-window", "about:blank"]);
         }
     }
     Ok(command)
@@ -219,6 +224,21 @@ mod tests {
         assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
         assert!(!args.iter().any(|arg| arg.contains("ignore-certificate")));
     }
+    #[test]
+    fn profile_is_shared_across_proxy_launches_and_separate_by_browser() {
+        let root = std::path::Path::new("app-data");
+        let chrome = super::Browser {
+            name: "Chrome".into(),
+            path: "chrome.exe".into(),
+            kind: super::BrowserKind::Chromium,
+        };
+        let mut edge = chrome.clone();
+        edge.name = "Edge".into();
+        let profile = super::profile_directory(root, &chrome);
+        assert_eq!(profile, super::profile_directory(root, &chrome));
+        assert_ne!(profile, super::profile_directory(root, &edge));
+    }
+
     #[test]
     fn firefox_routes_http_https_and_localhost_and_trusts_os_roots() {
         let config = super::firefox_preferences(8899);
