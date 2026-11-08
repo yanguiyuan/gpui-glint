@@ -2189,6 +2189,51 @@ mod tests {
     }
 
     #[gpui::test]
+    fn expanded_history_process_culls_rows_after_scroll_and_session_switch(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (workspace, window) = cx.add_window_view(|_, cx| {
+            let mut workspace = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            workspace.history.active_mut().push(Role::Agent, "done".into());
+            workspace.history.active_mut().messages[0].blocks = (0..300).map(|i| {
+                let record = tools::rejected(tools::ToolCall { id: format!("row-{i}"), name: "read_file".into(), arguments: serde_json::json!({"path":format!("file-{i}.rs")}) }, "example output".into());
+                generation::ContentBlock::ToolResult(record)
+            }).collect();
+            workspace
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let original = workspace.read_with(window, |workspace, _| workspace.history.active);
+        let key = format!("{original}:0");
+        workspace.update(window, |workspace, cx| {
+            workspace.process_panels.borrow()[&key].panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
+            workspace.scroll.scroll_to_top_of_item(0);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("history-row-0").is_some());
+        assert!(window.debug_bounds("history-spacer-299").is_some());
+        let height = workspace.read_with(window, |w, _| w.scroll.max_offset().y);
+        workspace.update(window, |w, cx| { w.scroll.scroll_to_bottom(); cx.notify(); });
+        window.run_until_parked();
+        assert!(window.debug_bounds("history-spacer-0").is_some());
+        assert!(window.debug_bounds("history-row-299").is_some());
+        workspace.read_with(window, |w, _| assert_eq!(w.scroll.max_offset().y, height));
+        workspace.update(window, |w, cx| {
+            w.history.new_session_for(None);
+            w.switch(w.history.active, cx);
+        });
+        window.run_until_parked();
+        workspace.update(window, |w, cx| w.switch(original, cx));
+        window.run_until_parked();
+        assert!(window.debug_bounds("history-row-0").is_some());
+        assert!(window.debug_bounds("history-spacer-299").is_some());
+        window.simulate_resize(size(px(1000.), px(700.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("history-row-0").is_some());
+    }
+
+    #[gpui::test]
     fn measured_history_reappears_after_jump_resize_and_session_switch(
         cx: &mut gpui::TestAppContext,
     ) {

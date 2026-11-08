@@ -1,8 +1,8 @@
 //! Cull rows inside a long message against the conversation's existing viewport.
 //! Kept entities retain expansion/selection state; spacers retain exact geometry.
 use gpui::{
-    AnyView, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Pixels, Render, ScrollHandle, Styled,
-    Window, div, px,
+    AnyView, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
+    ScrollHandle, Styled, Window, div, px,
 };
 
 const OVERSCAN: f32 = 400.;
@@ -59,10 +59,20 @@ impl Render for HistoryRows {
             mounted.push(visible);
             if visible {
                 self.mounted += 1;
-                body = body.child(div().w_full().min_w_0().flex_shrink_0().child(row.clone()));
+                body = body.child(
+                    div()
+                        .id(("history-row", index))
+                        .debug_selector(move || format!("history-row-{index}").into())
+                        .w_full()
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .child(row.clone()),
+                );
             } else {
                 body = body.child(
                     div()
+                        .id(("history-row", index))
+                        .debug_selector(move || format!("history-spacer-{index}").into())
                         .w_full()
                         .h(self.measured[index].size.height)
                         .flex_shrink_0(),
