@@ -140,6 +140,9 @@ pub struct AgentWorkspace {
     markdown_views:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
     image_views: std::cell::RefCell<images::PreviewCache>,
+    /// Full-window view of a message image opened from its thumbnail.
+    image_preview: Option<ImageLightbox>,
+    image_preview_focus: gpui::FocusHandle,
     process_panels:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ProcessPanel>>,
     tool_panels: std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ToolPanel>>,
@@ -185,12 +188,50 @@ pub struct AgentWorkspace {
     memory_last_probe: Option<std::time::Instant>,
 }
 
+/// Decoded message image plus the focus to return to when the viewer closes.
+#[derive(Clone)]
+struct ImageLightbox {
+    source: std::sync::Arc<Image>,
+    origin: Option<gpui::FocusHandle>,
+}
+
 /// Measured rows keep their exact height while distant history is unmounted.
 #[derive(Default)]
 struct MessageLayout {
     context: Option<(Uuid, ThemePreset, usize)>,
     width: gpui::Pixels,
     measure_passes: u8,
+    /// Conversation that should open at its newest message and keep following
+    /// until the reader scrolls it away.
+    pin: Option<PinnedEnd>,
+}
+
+/// Landing on the newest message only works once the rows measured, so the pin
+/// records the geometry it scrolled to: a changed extent means the layout
+/// reflowed and should be followed, while an unchanged extent with the offset
+/// somewhere else means the reader scrolled away.
+#[derive(Clone, Copy)]
+struct PinnedEnd {
+    session: Uuid,
+    /// Offset this view asked for; the scroll container applies it a frame
+    /// later, so it cannot be read back in the same pass.
+    target: gpui::Pixels,
+    /// Extent the target was computed from.
+    extent: gpui::Pixels,
+    /// Passes still allowed for the engine to land on the target before an
+    /// offset elsewhere is treated as the reader's own scroll.
+    settle: u8,
+}
+
+impl PinnedEnd {
+    fn new(session: Uuid) -> Self {
+        Self {
+            session,
+            target: px(0.),
+            extent: px(0.),
+            settle: 0,
+        }
+    }
 }
 
 impl AgentWorkspace {
@@ -327,6 +368,7 @@ impl AgentWorkspace {
         let subscriptions = vec![
             recall_subscription,
             cx.subscribe(&outline, |this, _, event: &outline::Jump, cx| {
+                this.message_layout.pin = None;
                 this.scroll.scroll_to_top_of_item(event.0);
                 cx.notify();
             }),
@@ -562,6 +604,8 @@ impl AgentWorkspace {
             cx.observe(&search, |_, _, cx| cx.notify()),
             cx.observe(&provider_settings.search, |_, _, cx| cx.notify()),
         ];
+        // The session restored on launch opens at its newest message too.
+        let opened_session = history.active;
         let mut workspace = Self {
             trajectory: Default::default(),
             commands: commands::State::new(cx),
@@ -593,6 +637,8 @@ impl AgentWorkspace {
             subagent_ui: Default::default(),
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_views: std::cell::RefCell::new(images::PreviewCache::default()),
+            image_preview: None,
+            image_preview_focus: cx.focus_handle(),
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             access,
@@ -611,7 +657,10 @@ impl AgentWorkspace {
             search,
             _subscriptions: subscriptions,
             scroll: ScrollHandle::new(),
-            message_layout: MessageLayout::default(),
+            message_layout: MessageLayout {
+                pin: Some(PinnedEnd::new(opened_session)),
+                ..Default::default()
+            },
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
@@ -750,9 +799,17 @@ impl AgentWorkspace {
         self.project_picker_open = false;
         images::release_previews(self.image_views.borrow_mut().clear(), cx);
         self.restore_draft(cx);
-        self.scroll = ScrollHandle::new();
+        self.open_conversation_at_latest();
         self.save(cx);
         cx.notify();
+    }
+
+    /// A conversation opened from the list starts at its newest message instead
+    /// of the oldest task row. The extent is unknown until the transcript
+    /// lays out, so the pin is resolved during prepaint.
+    fn open_conversation_at_latest(&mut self) {
+        self.scroll = ScrollHandle::new();
+        self.message_layout.pin = Some(PinnedEnd::new(self.history.active));
     }
 
     /// Removes a session from the list. Deleting the active session falls
@@ -780,7 +837,7 @@ impl AgentWorkspace {
         if self.history.active != previous_active {
             self.restore_draft(cx);
             self.page = crate::Page::Chat;
-            self.scroll = ScrollHandle::new();
+            self.open_conversation_at_latest();
         }
         self.save(cx);
         cx.notify();
@@ -806,7 +863,7 @@ impl AgentWorkspace {
         self.history
             .new_session_for(self.history.active().project.clone());
         self.restore_draft(cx);
-        self.scroll = ScrollHandle::new();
+        self.open_conversation_at_latest();
         self.save(cx);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
@@ -1735,6 +1792,89 @@ impl AgentWorkspace {
         Some(decoded)
     }
 
+    fn open_image_preview(
+        &mut self,
+        source: std::sync::Arc<Image>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_preview = Some(ImageLightbox {
+            source,
+            origin: window.focused(cx),
+        });
+        window.focus(&self.image_preview_focus, cx);
+        cx.notify();
+    }
+
+    fn close_image_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = self.image_preview.take() else {
+            return;
+        };
+        if let Some(origin) = preview.origin {
+            window.focus(&origin, cx);
+        }
+        cx.notify();
+    }
+
+    /// Full-window view of a clicked message image; the scrim closes it on click or Escape.
+    fn image_lightbox(
+        &self,
+        preview: ImageLightbox,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Leave a margin so the photo never touches the window edge.
+        let maximum_width = (f32::from(viewport.width) - 96.).max(120.);
+        let maximum_height = (f32::from(viewport.height) - 96.).max(90.);
+        gpui::deferred(
+            div()
+                .id("agent-image-lightbox")
+                .debug_selector(|| "agent-image-lightbox".into())
+                .absolute()
+                .inset_0()
+                .size_full()
+                .bg(gpui::rgba(0x0c121cd8))
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .track_focus(&self.image_preview_focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key != "escape" {
+                        return;
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.close_image_preview(window, cx);
+                }))
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_image_preview(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "agent-image-viewer".into())
+                        .rounded(px(6.))
+                        .shadow_lg()
+                        // Intrinsic size, capped to the window: small images stay
+                        // sharp instead of stretching, screenshots shrink to fit.
+                        .child(
+                            img(preview.source)
+                                .max_w(px(maximum_width))
+                                .max_h(px(maximum_height))
+                                .object_fit(ObjectFit::Contain)
+                                .rounded(px(6.)),
+                        ),
+                ),
+        )
+        .with_priority(120)
+        .into_any_element()
+    }
+
     fn welcome(&self) -> gpui::Div {
         let p = self.theme.palette();
         div()
@@ -1858,7 +1998,41 @@ impl AgentWorkspace {
                             layout.width = width;
                             layout.measure_passes = 2;
                         }
-                        if layout.measure_passes > 0 || this.scroll.offset() != offset {
+                        // A conversation opened from the list must land on its
+                        // newest message. The handle only knows its extent once
+                        // the rows measured, so the pin waits for the settled
+                        // layout and retries until it reports the end.
+                        let mut pinned = false;
+                        if let Some(pin) = &mut layout.pin {
+                            let extent = this.scroll.max_offset().y;
+                            let offset = this.scroll.offset().y;
+                            if pin.session != layout_context.0
+                                || layout.measure_passes > 0
+                                || this.scroll.bounds().size.height <= px(0.)
+                            {
+                                // Another page is on screen, or the rows are still
+                                // settling; the next pass decides.
+                            } else if extent != pin.extent {
+                                // The transcript reflowed (window or new rows): keep
+                                // the newest message in view.
+                                this.scroll.scroll_to_bottom();
+                                pin.extent = extent;
+                                pin.target = -extent;
+                                pin.settle = 2;
+                                pinned = true;
+                            } else if offset != pin.target {
+                                if pin.settle > 0 {
+                                    // The scroll container has not applied the target
+                                    // we asked for yet.
+                                    pin.settle -= 1;
+                                } else {
+                                    // Same extent, different offset: the reader
+                                    // scrolled the transcript themselves.
+                                    layout.pin = None;
+                                }
+                            }
+                        }
+                        if layout.measure_passes > 0 || pinned || this.scroll.offset() != offset {
                             layout.measure_passes = layout.measure_passes.saturating_sub(1);
                             let id = cx.entity_id();
                             cx.defer(move |cx| cx.notify(id));
@@ -1881,6 +2055,9 @@ impl AgentWorkspace {
                 .pb(px(if session.todos.is_empty() { 96. } else { 300. }))
                 .gap_6()
                 .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                    // Reader intent wins over the pending jump to the newest
+                    // message of a freshly opened conversation.
+                    this.message_layout.pin = None;
                     // Keep the outline's active tick tracking the scroll position.
                     this.outline.update(cx, |outline, cx| {
                         outline.set_top(this.scroll.top_item(), cx)
@@ -2029,13 +2206,38 @@ impl AgentWorkspace {
                                                         self.history.active
                                                     );
                                                     self.user_image(key, image, cx).map(|source| {
-                                                        img(source)
+                                                        let full = source.clone();
+                                                        let selector = format!(
+                                                            "message-image:{index}:{image_index}"
+                                                        );
+                                                        div()
+                                                            .id(("message-image", index * 16 + image_index))
+                                                            .debug_selector(move || selector.clone())
                                                             .w(px(160.))
                                                             .h(px(120.))
-                                                            .object_fit(ObjectFit::Cover)
+                                                            .flex_shrink_0()
+                                                            .overflow_hidden()
                                                             .rounded(px(8.))
                                                             .border_1()
                                                             .border_color(rgb(p.border))
+                                                            .cursor_pointer()
+                                                            .hover(|style| {
+                                                                style.border_color(rgb(p.accent))
+                                                            })
+                                                            .child(
+                                                                img(source)
+                                                                    .size_full()
+                                                                    .object_fit(ObjectFit::Cover),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _, window, cx| {
+                                                                    this.open_image_preview(
+                                                                        full.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
                                                     })
                                                 },
                                             ),
@@ -2282,6 +2484,11 @@ impl Render for AgentWorkspace {
             .commands
             .palette
             .update(cx, |palette, cx| palette.overlay(cx));
+        let viewport = window.viewport_size();
+        let image_lightbox = self
+            .image_preview
+            .clone()
+            .map(|preview| self.image_lightbox(preview, viewport, cx));
         let maximum = (f32::from(window.viewport_size().width)
             - if self.show_sessions { 706. } else { 446. })
         .clamp(240., 1000.);
@@ -2444,6 +2651,7 @@ impl Render for AgentWorkspace {
                 root.child(self.ssh_project_dialog(cx))
             })
             .children(command_overlay)
+            .children(image_lightbox)
             .child(self.git_ui.toasts.clone())
     }
 }

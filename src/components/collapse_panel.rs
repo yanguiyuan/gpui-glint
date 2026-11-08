@@ -192,8 +192,10 @@ impl Render for CollapsePanel {
         let trigger =
             div()
                 .id("glass-collapse-panel-trigger")
+                .debug_selector(|| "glass-collapse-panel-trigger".into())
                 .w_full()
                 .h(px(30.))
+                .flex_shrink_0()
                 .px(px(10.))
                 .flex()
                 .items_center()
@@ -221,8 +223,10 @@ impl Render for CollapsePanel {
 
         let mut root = div()
             .id("glass-collapse-panel")
+            .debug_selector(|| "glass-collapse-panel".into())
             .w_full()
             .min_w_0()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .child(trigger);
@@ -235,6 +239,7 @@ impl Render for CollapsePanel {
                     .ml(px(15.))
                     .pl(px(18.))
                     .py(px(2.))
+                    .flex_shrink_0()
                     .border_l_1()
                     .border_color(rgb(p.border))
                     .child(content(window, cx)),
@@ -282,5 +287,36 @@ mod tests {
             assert!(!panel.streaming_summary);
             assert!(panel.is_expanded());
         });
+    }
+
+    #[gpui::test]
+    fn short_parent_never_compresses_an_expanded_panel(cx: &mut TestAppContext) {
+        struct Viewport(Entity<CollapsePanel>);
+        impl Render for Viewport {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(240.))
+                    .h(px(80.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(self.0.clone())
+            }
+        }
+        let (_view, window) = cx.add_window_view(|_, cx| {
+            Viewport(cx.new(|_| {
+                CollapsePanel::new("思考")
+                    .expanded(true)
+                    .content(|_, _| div().h(px(200.)).into_any_element())
+            }))
+        });
+        window.run_until_parked();
+        let panel = window
+            .debug_bounds("glass-collapse-panel")
+            .expect("panel bounds");
+        assert!(
+            panel.size.height >= px(230.),
+            "expanded panel was compressed to {panel:?}"
+        );
     }
 }
