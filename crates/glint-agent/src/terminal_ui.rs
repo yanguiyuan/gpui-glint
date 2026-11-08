@@ -220,6 +220,12 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
     }
     #[cfg(not(windows))]
     {
+        // A Finder-launched instance starts with launchd's PATH, which hides
+        // toolchains installed by rustup, Homebrew or mise.
+        options.env.insert(
+            "PATH".into(),
+            crate::user_path::env_value().to_string_lossy().into_owned(),
+        );
         Ok((options, "Shell".into()))
     }
 }

@@ -20,6 +20,18 @@ use tokio::{
 const WINDOW: usize = 32 * 1024;
 const LOG_LIMIT: u64 = 32 * 1024 * 1024;
 
+/// Spawn failures are reported before the process exists, so the message can
+/// explain PATH instead of only echoing the OS error.
+fn spawn_error(program: &str, error: &std::io::Error) -> String {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return format!("无法启动命令：{error}");
+    }
+    let searched = crate::user_path::effective().len();
+    format!(
+        "无法启动命令：{error}。在 {searched} 个 PATH 目录中找不到 `{program}`；可改用绝对路径，或确认该工具已安装（Finder 启动的应用不继承终端 PATH，Glint 已尝试登录 shell 与常见安装目录）"
+    )
+}
+
 fn environment_error(stderr: &str) -> bool {
     let text = stderr.to_ascii_lowercase();
     ["shim: could not create process", "untrusted mount point", "the path cannot be traversed"]
@@ -401,13 +413,16 @@ async fn worker(
         }
         command.env("NO_COLOR", "1").env("TERM", "dumb");
         if !remote {
+            // A Finder-launched application only has launchd's minimal PATH, but
+            // children (cargo -> rustc, build scripts, hooks) need the toolchains
+            // the user's shell configuration adds.
+            let mut directories = Vec::new();
             if let Some(rg) = crate::executable::bundled_rg() {
-                let paths = std::iter::once(rg.parent().unwrap().to_owned()).chain(
-                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-                ).collect::<Vec<_>>();
-                if let Ok(path) = std::env::join_paths(paths) {
-                    command.env("PATH", path);
-                }
+                directories.push(rg.parent().unwrap().to_owned());
+            }
+            directories.extend(crate::user_path::effective().iter().cloned());
+            if let Ok(path) = std::env::join_paths(directories) {
+                command.env("PATH", path);
             }
         }
         spawn_attempted = true;
@@ -418,7 +433,7 @@ async fn worker(
                 // resolution finds a different executable; never replay an exit.
                 let retry = crate::executable::resolve(&program, &cwd);
                 if retry == target || *cancel.borrow() {
-                    return Err(format!("无法启动命令：{first}"));
+                    return Err(spawn_error(&program, &first));
                 }
                 let mut fallback = crate::child_process::async_command(&retry);
                 fallback.args(&args).current_dir(&cwd)

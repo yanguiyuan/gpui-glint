@@ -19,8 +19,31 @@ pub fn resolve(program: &str, cwd: &Path) -> PathBuf {
     #[cfg(not(windows))]
     {
         let _ = cwd;
-        program.into()
+        let path = Path::new(program);
+        if path.components().count() > 1 {
+            return path.to_owned();
+        }
+        resolve_in(crate::user_path::effective(), program).unwrap_or_else(|| path.to_owned())
     }
+}
+
+/// First match wins, as with execvp.
+#[cfg(not(windows))]
+fn resolve_in(directories: &[PathBuf], program: &str) -> Option<PathBuf> {
+    directories
+        .iter()
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// PATH lookup only accepts regular files with an execute bit, matching what
+/// the kernel would accept after execvp.
+#[cfg(not(windows))]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -30,7 +53,7 @@ fn find(program: &str, cwd: &Path) -> Option<PathBuf> {
         vec![cwd.to_owned()]
     } else {
         // Do not implicitly search the untrusted project directory before PATH.
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect()
+        crate::user_path::effective().to_vec()
     };
     for directory in directories {
         let candidate = directory.join(program);
@@ -184,6 +207,35 @@ pub fn bundled_rg() -> Option<PathBuf> {
 #[cfg(not(all(windows, target_arch = "x86_64")))]
 pub fn bundled_rg() -> Option<PathBuf> {
     None
+}
+
+#[cfg(all(test, not(windows)))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_in_skips_missing_and_non_executable_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let plain = temp.path().join("plain");
+        let found = temp.path().join("probe");
+        std::fs::create_dir_all(&missing).unwrap();
+        std::fs::write(&plain, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&found, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let directories = vec![temp.path().join("none"), missing, plain, temp.path().to_owned()];
+        assert_eq!(resolve_in(&directories, "probe"), Some(found));
+        assert_eq!(resolve_in(&directories, "absent"), None);
+    }
+
+    #[test]
+    fn resolve_keeps_explicit_paths_unchanged() {
+        assert_eq!(
+            resolve("/usr/bin/env", Path::new(".")),
+            PathBuf::from("/usr/bin/env")
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -153,6 +153,37 @@ impl Session {
         }
     }
 
+    pub fn can_retry_message(&self, index: usize) -> bool {
+        self.messages
+            .get(index)
+            .is_some_and(|message| message.role == Role::User)
+            && self.messages[index + 1..]
+                .iter()
+                .take_while(|message| message.role != Role::User)
+                .any(|message| {
+                    message.role == Role::Notice && message.text.starts_with("请求失败：")
+                })
+    }
+
+    pub fn retry_prefix(&self, index: usize) -> Result<Self, String> {
+        if !self.can_retry_message(index) {
+            return Err("这条消息已无法重试".into());
+        }
+        let mut prefix = self.clone();
+        prefix.messages.truncate(index);
+        // Summaries after this point contain discarded messages and must not be sent.
+        if prefix
+            .compaction
+            .as_ref()
+            .is_some_and(|summary| summary.through > index)
+        {
+            prefix.compaction = None;
+        }
+        prefix.context = None;
+        prefix.todos.clear();
+        Ok(prefix)
+    }
+
     pub fn push(&mut self, role: Role, text: String) {
         self.push_message(role, text, vec![]);
     }

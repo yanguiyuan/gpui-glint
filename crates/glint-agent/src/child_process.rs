@@ -9,15 +9,25 @@ fn hide_console(_command: &mut Command) {
     }
 }
 
+/// Children inherit the effective PATH so that tools installed for the user's
+/// shell (cargo, npx, mise shims) are found even when the application was
+/// launched from Finder or a desktop session. Setting it here also makes the
+/// name lookup itself use that PATH.
+fn apply_path(command: &mut Command) {
+    command.env("PATH", crate::user_path::env_value());
+}
+
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     hide_console(&mut command);
+    apply_path(&mut command);
     command
 }
 
 pub fn async_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
     hide_console(command.as_std_mut());
+    apply_path(command.as_std_mut());
     command
 }
 
