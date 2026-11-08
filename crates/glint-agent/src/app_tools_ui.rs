@@ -989,6 +989,7 @@ impl AgentWorkspace {
                         }
                         div()
                             .id("tool-output")
+                            .debug_selector(|| "tool-output".into())
                             .w_full()
                             .min_w_0()
                             .flex_shrink_0()
@@ -1852,7 +1853,205 @@ mod tests {
         let live = window.debug_bounds("live-response").unwrap();
         let waiting = window.debug_bounds("waiting-for-model").unwrap();
         assert!(waiting.top() >= live.bottom(), "{waiting:?} overlaps {live:?}");
-        assert!(waiting.top() > before.top(), "waiting row did not move after expansion");
+        // A conversation resting at its newest message follows the growth by
+        // scrolling, so the waiting row may stay put instead of moving down;
+        // an overlap would pull it up over the response above.
+        assert!(
+            waiting.top() >= before.top(),
+            "expanding must never pull the waiting row up: {before:?} -> {waiting:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn expanded_skill_read_keeps_waiting_below_the_live_response(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            host.history
+                .active_mut()
+                .push(Role::User, "用 ego-browser 查页面".into());
+            let guide = "1: ---\n2: name: ego-browser\n3: description: browse pages\n".repeat(160);
+            let mut skill = tools::rejected(
+                tools::ToolCall {
+                    id: "skill-overlap".into(),
+                    name: "skill_read".into(),
+                    arguments: serde_json::json!({"name": "ego-browser"}),
+                },
+                serde_json::json!({"name": "ego-browser", "content": guide}).to_string(),
+            );
+            skill.success = true;
+            let mut command = tools::rejected(
+                tools::ToolCall {
+                    id: "skill-overlap-command".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"program": "ego-browser", "args": ["skill"]}),
+                },
+                "usage guide output".into(),
+            );
+            command.success = true;
+            host.run_mut(host.history.active).transcript =
+                vec![generation::ContentBlock::ToolResult(skill)];
+            host.run_mut(host.history.active)
+                .transcript
+                .push(generation::ContentBlock::Thinking("继续读取".into()));
+            host.run_mut(host.history.active)
+                .transcript
+                .push(generation::ContentBlock::ToolResult(command));
+            host.run_mut(host.history.active).pending = Some((
+                host.history.active,
+                cx.spawn(async move |_, _| std::future::pending::<()>().await),
+            ));
+            host
+        });
+        window.simulate_resize(size(px(1200.), px(700.)));
+        window.run_until_parked();
+        let panel = host.read_with(window, |host, _| {
+            host.tool_panels
+                .borrow()
+                .iter()
+                .find(|(key, _)| key.ends_with(":tool:skill-overlap"))
+                .expect("skill panel")
+                .1
+                .panel
+                .clone()
+        });
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        window.run_until_parked();
+        if host.read_with(window, |host, _| host.scroll.offset().y) != px(0.) {
+            host.update(window, |host, cx| {
+                host.scroll.scroll_to_bottom();
+                cx.notify();
+            });
+            window.run_until_parked();
+        }
+        let live = window.debug_bounds("live-response").unwrap();
+        let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        let output = window.debug_bounds("tool-output").unwrap();
+        assert!(
+            output.size.height <= px(320.),
+            "expanded tool output must clamp to its scroll viewport: {output:?}"
+        );
+        assert!(
+            output.bottom() <= live.bottom() + px(1.),
+            "expanded tool output escapes the live response: {output:?}, {live:?}"
+        );
+        assert!(
+            waiting.top() >= live.bottom(),
+            "waiting label overlaps the expanded skill card: {waiting:?}, {live:?}"
+        );
+        // A running command row that settles while the skill panel stays expanded
+        // must still push the waiting row down instead of drawing underneath it.
+        host.update(window, |host, cx| {
+            let run = host.run_mut(host.history.active);
+            if let Some(generation::ContentBlock::ToolResult(r)) = run
+                .transcript
+                .iter_mut()
+                .find(|block| matches!(block, generation::ContentBlock::ToolResult(r) if r.call.id == "skill-overlap-command"))
+            {
+                r.result = "exit: 0".into();
+                r.success = true;
+                r.elapsed_ms = 600;
+            }
+            cx.notify();
+        });
+        window.run_until_parked();
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        let live = window.debug_bounds("live-response").unwrap();
+        let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        assert!(
+            waiting.top() >= live.bottom(),
+            "waiting label overlaps the settled command row: {waiting:?}, {live:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_message_image_opens_the_viewer_and_escape_closes_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use base64::Engine as _;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        // 300x200: the 160x120 thumbnail crops it, the viewer must not.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(300, 200, image::Rgba([40, 90, 160, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data: std::sync::Arc<str> =
+            base64::engine::general_purpose::STANDARD.encode(&png).into();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            host.history
+                .active_mut()
+                .push_message(Role::User, "看看这张图".into(), vec![crate::model::MessageImage {
+                    media_type: "image/png".into(),
+                    data,
+                    file: None,
+                }]);
+            host
+        });
+        window.simulate_resize(size(px(1000.), px(760.)));
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("agent-image-lightbox").is_none(),
+            "the viewer must stay closed until the image is clicked"
+        );
+        let thumbnail = window
+            .debug_bounds("message-image:0:0")
+            .expect("message image thumbnail");
+        window.simulate_click(thumbnail.center(), Default::default());
+        window.run_until_parked();
+        let viewer = window
+            .debug_bounds("agent-image-lightbox")
+            .expect("image viewer after click");
+        assert!(
+            viewer.size.width >= px(990.) && viewer.size.height >= px(750.),
+            "the viewer must cover the window: {viewer:?}"
+        );
+        assert!(host.read_with(window, |host, _| host.image_preview.is_some()));
+        // The source is 300x200; the viewer must show it whole (the 160x120
+        // thumbnail crops it), hence both sides grow and the 3:2 ratio holds.
+        let shown = window
+            .debug_bounds("agent-image-viewer")
+            .expect("viewer image bounds");
+        assert!(
+            shown.size.width > px(280.) && shown.size.height > px(180.),
+            "the viewer must enlarge the image: {shown:?}"
+        );
+        let ratio = f32::from(shown.size.width) / f32::from(shown.size.height);
+        assert!(
+            (ratio - 1.5).abs() < 0.05,
+            "the viewer must preserve the aspect ratio: {shown:?}"
+        );
+        window.simulate_keystrokes("escape");
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("agent-image-lightbox").is_none(),
+            "Escape must close the viewer"
+        );
+        assert!(host.read_with(window, |host, _| host.image_preview.is_none()));
+        // Reopening and clicking the scrim also dismisses it.
+        window.simulate_click(thumbnail.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("agent-image-lightbox").is_some());
+        window.simulate_click(point(px(8.), px(8.)), Default::default());
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("agent-image-lightbox").is_none(),
+            "clicking the scrim must close the viewer"
+        );
     }
 
     #[gpui::test]
@@ -2293,6 +2492,123 @@ mod tests {
         workspace.read_with(window, |this, _| {
             assert!(this.scroll.max_offset().y > px(400.))
         });
+    }
+
+    #[gpui::test]
+    fn switching_to_a_conversation_opens_it_at_the_latest_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (workspace, window) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            // Keep the GPUI test scheduler independent of disk writes.
+            workspace.storage_readable = false;
+            for index in 0..30 {
+                workspace.history.active_mut().push(
+                    Role::User,
+                    format!("History {index} with variable wrapping and paragraphs.\n\n").repeat(6),
+                );
+            }
+            workspace
+        });
+        let view = workspace.clone();
+        let assert_at_latest = move |window: &mut gpui::VisualTestContext| {
+            view.read_with(window, |this, _| {
+                assert!(
+                    this.scroll.max_offset().y > px(400.),
+                    "the conversation needs more history than the viewport"
+                );
+                assert!(
+                    this.scroll.max_offset().y + this.scroll.offset().y <= px(2.),
+                    "a conversation must open at its newest message, not its first task row"
+                );
+            });
+        };
+
+        // The session restored on launch opens at its newest message.
+        window.simulate_resize(size(px(1000.), px(700.)));
+        window.run_until_parked();
+        assert_at_latest(window);
+        assert!(
+            window.debug_bounds("message-spacer-0").is_some(),
+            "the oldest rows should stay virtualized above the newest message"
+        );
+
+        let second = workspace.update(window, |this, _| {
+            let mut session = model::Session::new();
+            for index in 0..30 {
+                session.push(
+                    Role::User,
+                    format!("Second {index} with variable wrapping and paragraphs.\n\n").repeat(6),
+                );
+            }
+            let second = session.id;
+            this.history.sessions.insert(0, session);
+            second
+        });
+        let first = workspace.read_with(window, |this, _| this.history.active);
+        workspace.update(window, |this, cx| this.switch(second, cx));
+        window.run_until_parked();
+        assert_at_latest(window);
+
+        // Scrolling away keeps the reader's position instead of pulling them
+        // back to the end.
+        let viewport = workspace.read_with(window, |this, _| this.scroll.bounds());
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(600.))),
+            ..Default::default()
+        });
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert!(this.message_layout.pin.is_none(), "scrolling cancels the pin");
+            assert!(
+                this.scroll.max_offset().y + this.scroll.offset().y > px(2.),
+                "the reader must keep the position they scrolled to"
+            );
+        });
+
+        // Reading the top of a session and then switching away must not leak
+        // that position into the next conversation.
+        workspace.update(window, |this, cx| {
+            this.scroll.scroll_to_top_of_item(0);
+            cx.notify();
+        });
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert!(
+                this.scroll.max_offset().y + this.scroll.offset().y > px(400.),
+                "the reader is at the top of the conversation"
+            );
+        });
+        workspace.update(window, |this, cx| this.switch(first, cx));
+        window.run_until_parked();
+        assert_at_latest(window);
+
+        // A new, still empty session has nothing to scroll and must not drag
+        // the conversation that is opened next.
+        workspace.update(window, |this, cx| {
+            this.history.new_session_for(None);
+            let id = this.history.active;
+            this.switch(id, cx);
+        });
+        window.run_until_parked();
+        workspace.read_with(window, |this, _| {
+            assert_eq!(
+                this.scroll.max_offset().y,
+                px(0.),
+                "an empty session has nothing to scroll"
+            );
+        });
+        workspace.update(window, |this, cx| this.switch(second, cx));
+        window.run_until_parked();
+        assert_at_latest(window);
     }
 
     #[test]

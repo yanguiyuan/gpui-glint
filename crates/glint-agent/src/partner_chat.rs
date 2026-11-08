@@ -98,7 +98,7 @@ impl AgentWorkspace {
                 target.draft_images = images;
                 target.draft_references = references;
                 self.restore_draft(cx);
-                self.scroll = ScrollHandle::new();
+                self.open_conversation_at_latest();
             }
         } else {
             self.sync_skill_context(cx);
@@ -134,7 +134,7 @@ impl AgentWorkspace {
                 .new_session_for(self.history.active().project.clone());
             self.restore_draft(cx);
             self.page = crate::Page::Chat;
-            self.scroll = ScrollHandle::new();
+            self.open_conversation_at_latest();
             self.save(cx);
             cx.notify();
         } else if index == 1 {
