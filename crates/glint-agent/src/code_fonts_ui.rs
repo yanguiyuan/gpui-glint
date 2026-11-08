@@ -91,7 +91,7 @@ impl State {
         let notice = result.as_ref().err().cloned();
         Self {
             library: result.unwrap_or_default(),
-            input: cx.new(|cx| TextEntry::new(cx, "本地字体文件路径（TTF / OTF / WOFF2）", "")),
+            input: cx.new(|cx| TextEntry::new(cx, "/path/to/font.ttf", "")),
             task: None,
             notice,
             readable,
@@ -218,24 +218,14 @@ impl AgentWorkspace {
     pub(super) fn code_font_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let busy = self.code_fonts.task.is_some() || !self.code_fonts.readable;
+        let current_family = gpui_glint::code_font::family();
         self.code_fonts
             .input
             .update(cx, |input, cx| input.set_theme(self.theme, cx));
-        let mut panel = div().w_full().mt_5().p_5().rounded(px(12.)).border_1().border_color(rgb(p.border)).flex().flex_col().gap_3()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child("代码字体"))
-            .child(div().text_size(px(12.)).text_color(rgb(p.text_muted)).child("用于 Diff、CodeCard、文件预览和代码片段。导入后复制到软件管理目录，历史字体可随时选择。"))
-            .child(self.code_fonts.input.clone())
-            .child(div().flex().gap_2()
-                .child(Button::new("选择本地字体…").kind(ButtonKind::Glass).theme(self.theme).when(busy, |b| b.disabled()).render()
-                    .debug_selector(|| "pick-code-font".into()).on_click(cx.listener(|this, _, _, cx| this.pick_code_font(cx))))
-                .child(Button::new("导入并使用").theme(self.theme).when(busy, |b| b.disabled()).render()
-                    .debug_selector(|| "import-code-font".into()).on_click(cx.listener(|this, _, _, cx| {
-                        let path = this.code_fonts.input.read(cx).value().trim().trim_matches('"').to_owned();
-                        if path.is_empty() { this.code_fonts.notice = Some("请输入或选择字体文件".into()); cx.notify(); return; }
-                        this.change_code_font(Some(PathBuf::from(path)), None, cx);
-                    }))));
+
+        let mut fonts = div().flex().flex_col().gap_2();
         for (id, family, label) in
-            std::iter::once((None, "Menlo".to_owned(), "默认代码字体".to_owned())).chain(
+            std::iter::once((None, "Menlo".to_owned(), "系统默认".to_owned())).chain(
                 self.code_fonts.library.fonts.iter().map(|entry| {
                     (
                         Some(entry.id.clone()),
@@ -247,13 +237,8 @@ impl AgentWorkspace {
         {
             let selected = self.code_fonts.library.selected == id;
             let selector = format!("code-font:{}", id.as_deref().unwrap_or("default"));
-            panel = panel.child(
-                Button::new(format!("{}  ·  {}", family, label))
-                    .icon(if selected {
-                        Icon::CheckCircle
-                    } else {
-                        Icon::HalfCircle
-                    })
+            fonts = fonts.child(
+                Button::new("")
                     .kind(if selected {
                         ButtonKind::Tinted
                     } else {
@@ -264,32 +249,274 @@ impl AgentWorkspace {
                     .render()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
+                    .w_full()
+                    .h_auto()
+                    .py_3()
+                    .justify_start()
+                    .border_color(rgb(if selected { p.accent } else { p.border }))
+                    .child(
+                        if selected {
+                            Icon::CheckCircle
+                        } else {
+                            Icon::HalfCircle
+                        }
+                        .render(16.),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(family),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(p.text_muted))
+                                    .truncate()
+                                    .child(label),
+                            ),
+                    )
+                    .when(selected, |row| {
+                        row.child(div().text_size(px(11.)).child("使用中"))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.change_code_font(None, id.clone(), cx)
+                        if !busy && !selected {
+                            this.change_code_font(None, id.clone(), cx)
+                        }
                     })),
             );
         }
-        if let Some(notice) = &self.code_fonts.notice {
-            panel = panel.child(div().text_size(px(12.)).child(notice.clone()));
-        }
-        panel
+
+        let preview = div()
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .overflow_hidden()
             .child(
                 div()
-                    .mt_2()
-                    .p_3()
-                    .rounded(px(8.))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child(Icon::Code.render(13.))
+                    .child(div().flex_1().child("字体预览"))
+                    .child(
+                        div()
+                            .max_w(px(180.))
+                            .truncate()
+                            .child(current_family.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .p_4()
                     .bg(rgb(p.surface_subtle))
-                    .font_family(gpui_glint::code_font::family())
-                    .child("fn main() { println!(\"Hello, Glint! 0123456789\"); }"),
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .font_family(current_family)
+                    .text_size(px(13.))
+                    .line_height(px(22.))
+                    .children(
+                        [
+                            ("1", "fn main() {"),
+                            ("2", "    println!(\"Hello, Glint!\");"),
+                            ("3", "}"),
+                        ]
+                        .into_iter()
+                        .map(|(number, code)| {
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_shrink_0()
+                                        .text_color(rgb(p.text_muted))
+                                        .child(number),
+                                )
+                                .child(div().min_w_0().child(code))
+                        }),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .pt_3()
+                            .border_t_1()
+                            .border_color(rgb(p.border))
+                            .text_size(px(12.))
+                            .text_color(rgb(p.text_muted))
+                            .child("0O  1lI  {} []  => !=  0123456789"),
+                    ),
+            );
+
+        let mut panel = div()
+            .w_full()
+            .min_w_0()
+            .mt_5()
+            .p_5()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(200.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("代码字体"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("用于 Diff、代码卡片、文件预览和代码片段。"),
+                            ),
+                    )
+                    .child(
+                        Button::new(if self.code_fonts.task.is_some() {
+                            "正在处理…"
+                        } else {
+                            "选择并导入…"
+                        })
+                        .icon(Icon::Plus)
+                        .theme(self.theme)
+                        .when(busy, |b| b.disabled())
+                        .render()
+                        .debug_selector(|| "pick-code-font".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !busy {
+                                this.pick_code_font(cx);
+                            }
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(format!(
+                                        "可用字体 · {}",
+                                        self.code_fonts.library.fonts.len() + 1
+                                    )),
+                            )
+                            .child(fonts),
+                    )
+                    .child(div().flex_1().min_w(px(280.)).child(preview)),
+            )
+            .child(
+                div()
+                    .pt_4()
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child("也可以粘贴文件路径 · 支持 TTF、OTF、WOFF2"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(32.))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(7.))
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .bg(rgb(p.surface))
+                                    .child(self.code_fonts.input.clone()),
+                            )
+                            .child(
+                                Button::new("导入并使用")
+                                    .kind(ButtonKind::Glass)
+                                    .theme(self.theme)
+                                    .when(busy, |b| b.disabled())
+                                    .render()
+                                    .debug_selector(|| "import-code-font".into())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if busy {
+                                            return;
+                                        }
+                                        let path = this
+                                            .code_fonts
+                                            .input
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .trim_matches('"')
+                                            .to_owned();
+                                        if path.is_empty() {
+                                            this.code_fonts.notice = Some(
+                                                "请粘贴字体文件路径，或点击“选择并导入”".into(),
+                                            );
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.change_code_font(Some(PathBuf::from(path)), None, cx);
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child(format!(
-                        "字体目录：{}",
-                        gpui_glint::paths::display_path(code_fonts::directory(&self.path))
-                    )),
-            )
+                    .child("导入的字体会保存在本机，可随时切换。"),
+            );
+        if let Some(notice) = &self.code_fonts.notice {
+            panel = panel.child(div().text_size(px(12.)).child(notice.clone()));
+        }
+        panel
     }
 }
