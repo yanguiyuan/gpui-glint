@@ -42,6 +42,8 @@ pub enum ToolEvent {
     TodoUpdated(Vec<crate::todo::Item>),
     SubagentUpdated,
     ApprovalResolved,
+    Question(crate::ask_question::Request),
+    QuestionResolved(Uuid),
     ContextUsage {
         provider_id: Uuid,
         model: String,
@@ -217,6 +219,12 @@ pub fn definitions(anthropic: bool) -> Value {
             "Execute a JavaScript async function body to orchestrate tools in one model round trip. Use await tools.<tool_name>(args); results are JSON-parsed when possible, otherwise strings. Supports conditions, loops and Promise.all; at most 4 trusted read-only calls run concurrently, mutations and approvals are ordered barriers. Always await every call. Only return the filtered data needed by the model; intermediate results remain in the durable nested trace, not model context. First tool failure, rejection, timeout or cancellation stops remaining work; completed effects are retained and file edits remain undoable. No automatic retry or transaction rollback; after partial failure inspect calls/changes and retry only remaining work, never replay the whole script blindly. No Node/process/require/fetch, imports, timers or direct filesystem access; use tools. No nested code_mode or subagent. At most 64 calls, 64KiB code/result, 4MiB RPC result; default wall time 120s, 1..600 configurable. run_command retains its own approval and process permissions; a running command is not completed. Example: const f=await tools.read_file({path:'src/main.rs'}); return {lines:f.total_lines};",
             json!({"code":string(),"timeout_seconds":{"type":"integer","minimum":1,"maximum":600}}),
             &["code"],
+        ),
+        definition(
+            "ask_question",
+            "Ask the user a concise question when missing information or a decision is needed to continue. Waits for their answer. Optionally provide up to 6 suggested answers; the user can always type a custom answer or skip. Do not use for routine progress updates. Ask one question per call, directly rather than inside code_mode.",
+            json!({"question":string(),"options":{"type":"array","items":string(),"maxItems":6}}),
+            &["question"],
         ),
         definition(
             "run_command",
@@ -686,6 +694,9 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             .registry
             .call_host(&call.id, &call.name, &call.arguments)
             .await;
+    }
+    if call.name == "ask_question" {
+        return crate::ask_question::execute(&call.arguments, &context.events).await;
     }
     if call.name == "todo_read" {
         let todos = context.todos.lock().map_err(|_| "无法读取任务清单")?;

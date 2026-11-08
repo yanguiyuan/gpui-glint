@@ -123,7 +123,7 @@ async fn protocol(
         .unwrap()
         .iter()
         .filter_map(|tool| tool["name"].as_str())
-        .filter(|name| !matches!(*name, "code_mode" | "subagent"))
+        .filter(|name| !matches!(*name, "code_mode" | "subagent" | "ask_question"))
         .map(str::to_owned)
         .collect();
     let deadline =
@@ -456,7 +456,7 @@ receive()
     }
     #[tokio::test]
     async fn timeout_kills_worker_and_unknown_or_recursive_tools_are_not_executed() {
-        for name in ["code_mode", "subagent", "unknown"] {
+        for name in ["code_mode", "subagent", "ask_question", "unknown"] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
             let context = crate::edits::tests::context(&root);

@@ -418,6 +418,7 @@ impl AgentWorkspace {
             .flex_col()
             .items_center()
             .gap_2()
+            .child(self.question_panel(cx))
             .when(self.active_run().approval.is_some(), |body| {
                 body.child(self.approval_panel(cx))
             })

@@ -1,5 +1,7 @@
+mod ask_question;
 pub mod host_tools;
 mod hosting;
+mod history_rows;
 pub use hosting::{Page, WpsCredentialSource};
 
 mod app_icon;
@@ -98,6 +100,7 @@ struct SessionRun {
     transcript: Vec<generation::ContentBlock>,
     thinking_timings: generation::ThinkingTimings,
     approval: Option<app_tools_ui::Approval>,
+    questions: Vec<app_tools_ui::Question>,
     pending: Option<(Uuid, Task<()>)>,
     preparing: Option<(Uuid, Task<()>)>,
     subagents: subagent::Registry,
@@ -2133,6 +2136,7 @@ impl AgentWorkspace {
             .flex()
             .flex_col()
             .gap_2()
+            .child(self.question_panel(cx))
             .when(self.active_run().approval.is_some(), |panel| {
                 panel.child(self.approval_panel(cx))
             })

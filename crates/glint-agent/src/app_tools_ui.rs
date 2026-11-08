@@ -31,6 +31,11 @@ pub struct ProcessPanel {
     panel: Entity<gpui_glint::components::CollapsePanel>,
 }
 
+pub struct Question {
+    pub request: crate::ask_question::Request,
+    pub input: Entity<TextEntry>,
+}
+
 pub struct Approval {
     pub agent_id: Option<Uuid>,
     pub call: tools::ToolCall,
@@ -608,6 +613,16 @@ impl AgentWorkspace {
                                     {
                                         record.nested_tools = tools.into();
                                     }
+                                }
+                                tools::ToolEvent::Question(request) => {
+                                    if !request.respond.is_closed() {
+                                        let theme = this.theme;
+                                        let input = cx.new(|cx| TextEntry::new(cx, "输入回答…", "").theme(theme));
+                                        this.run_mut(id).questions.push(Question { request, input });
+                                    }
+                                }
+                                tools::ToolEvent::QuestionResolved(question_id) => {
+                                    this.run_mut(id).questions.retain(|q| q.request.id != question_id);
                                 }
                                 tools::ToolEvent::ApprovalResolved => {
                                     if this.run_mut(id).approval
@@ -1354,7 +1369,7 @@ impl AgentWorkspace {
             // Build child entities once on expansion, then reuse them while the
             // source is unchanged. Scrolling must not hash every tool result or
             // repeat Markdown/cache lookups; collapsed history stays lazy.
-            let rows = std::cell::RefCell::new(None::<Vec<gpui::AnyView>>);
+            let rows = std::cell::RefCell::new(None::<Entity<crate::history_rows::HistoryRows>>);
             let weak = cx.entity().downgrade();
             let process = blocks[..split].to_vec();
             let thinking_ms = thinking_ms.clone();
@@ -1372,9 +1387,10 @@ impl AgentWorkspace {
                 }
                 panel.set_content(
                     move |_, cx| {
+                        let scroll = weak.update(cx, |this, _| this.scroll.clone()).unwrap_or_default();
                         let mut rows = rows.borrow_mut();
                         let rows = rows.get_or_insert_with(|| {
-                            weak.update(cx, |this, cx| {
+                            let children = weak.update(cx, |this, cx| {
                                 this.transcript_rows(
                                     &content_key,
                                     &process,
@@ -1383,17 +1399,11 @@ impl AgentWorkspace {
                                     &activity,
                                     cx,
                                 )
-                            })
-                            .unwrap_or_default()
+                            }).unwrap_or_default();
+                            cx.new(|_| crate::history_rows::HistoryRows::new(children, scroll.clone()))
                         });
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .children(rows.iter().cloned())
-                            .into_any_element()
+                        rows.update(cx, |rows, _| rows.set_scroll(scroll));
+                        div().w_full().min_w_0().child(rows.clone()).into_any_element()
                     },
                     cx,
                 );
@@ -1421,6 +1431,47 @@ impl AgentWorkspace {
             }
         }
         body
+    }
+
+    fn answer_question(&mut self, session: Uuid, id: Uuid, answer: Option<String>, cx: &mut Context<Self>) {
+        let questions = &mut self.run_mut(session).questions;
+        if let Some(index) = questions.iter().position(|q| q.request.id == id) {
+            let question = questions.remove(index);
+            let _ = question.request.respond.send(answer);
+        }
+        cx.notify();
+    }
+
+    pub fn question_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let session = self.history.active;
+        let mut panel = div().flex().flex_col().gap_2();
+        for question in self.active_run().questions.iter().filter(|q| !q.request.respond.is_closed()) {
+            let id = question.request.id;
+            let input = question.input.clone();
+            let source = question.request.agent_id.and_then(|id| {
+                self.active_run().subagents.lock().ok()?.iter().find(|trace| trace.id == id).map(|trace| format!("子 Agent「{}」提问", trace.title))
+            }).unwrap_or_else(|| "Agent 提问".into());
+            let mut choices = div().flex().flex_wrap().gap_2();
+            for option in &question.request.options {
+                let answer = option.clone();
+                choices = choices.child(Button::new(option.clone()).theme(self.theme).render()
+                    .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, Some(answer.clone()), cx))));
+            }
+            panel = panel.child(div().id(SharedString::from(format!("agent-question-{id}"))).p_3().rounded_lg().bg(rgb(self.theme.palette().surface_subtle))
+                .flex().flex_col().gap_2()
+                .child(div().text_size(px(11.)).child(source))
+                .child(question.request.question.clone())
+                .child(choices)
+                .child(input.clone())
+                .child(div().flex().gap_2()
+                    .child(Button::new("提交回答").theme(self.theme).render().on_click(cx.listener(move |this, _, _, cx| {
+                        let answer = input.read(cx).value().trim().to_owned();
+                        if !answer.is_empty() { this.answer_question(session, id, Some(answer), cx); }
+                    })))
+                    .child(Button::new("跳过").kind(ButtonKind::Glass).theme(self.theme).render()
+                        .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, None, cx))))));
+        }
+        panel
     }
 
     pub fn approval_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -1598,6 +1649,34 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn question_answers_are_scoped_and_preserve_other_pending_questions(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        let (respond, mut response) = tokio::sync::oneshot::channel();
+        let (other, mut other_response) = tokio::sync::oneshot::channel();
+        host.update(cx, |host, cx| {
+            let session = host.history.active;
+            let id = Uuid::new_v4();
+            for (question_id, sender) in [(id, respond), (Uuid::new_v4(), other)] {
+                let input = cx.new(|cx| TextEntry::new(cx, "回答", ""));
+                host.run_mut(session).questions.push(Question {
+                    request: crate::ask_question::Request { id: question_id, agent_id: None, question: "问题".into(), options: vec![], respond: sender }, input,
+                });
+            }
+            host.answer_question(Uuid::new_v4(), id, Some("错误会话".into()), cx);
+            assert!(response.try_recv().is_err());
+            host.answer_question(session, id, Some("用户回答".into()), cx);
+            assert_eq!(response.try_recv().unwrap(), Some("用户回答".into()));
+            assert_eq!(host.run(session).questions.len(), 1);
+            assert!(other_response.try_recv().is_err());
+            let remaining = host.run(session).questions[0].request.id;
+            host.answer_question(session, remaining, None, cx);
+            assert_eq!(other_response.try_recv().unwrap(), None);
+        });
+    }
 
     #[gpui::test]
     fn running_command_stop_button_does_not_toggle_tool_details(cx: &mut gpui::TestAppContext) {

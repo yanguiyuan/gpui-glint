@@ -20,6 +20,7 @@ pub type Registry = Arc<Mutex<Vec<Trace>>>;
 pub enum Status {
     Running,
     WaitingApproval,
+    WaitingInput,
     Completed,
     Failed,
     Cancelled,
@@ -27,12 +28,13 @@ pub enum Status {
 
 impl Status {
     pub fn active(self) -> bool {
-        matches!(self, Self::Running | Self::WaitingApproval)
+        matches!(self, Self::Running | Self::WaitingApproval | Self::WaitingInput)
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "运行中",
             Self::WaitingApproval => "待批准",
+            Self::WaitingInput => "待回答",
             Self::Completed => "已完成",
             Self::Failed => "失败",
             Self::Cancelled => "已取消",
@@ -152,6 +154,8 @@ impl Recording {
                 }
                 if !self.trace.blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult(tool) if tool.call.id == record.call.id)) { self.trace.blocks.push(ContentBlock::ToolResult(record.clone())); }
             }
+            ToolEvent::Question(_) => self.trace.status = Status::WaitingInput,
+            ToolEvent::QuestionResolved(_) => self.trace.status = Status::Running,
             ToolEvent::Approval { .. } => self.trace.status = Status::WaitingApproval,
             ToolEvent::ApprovalResolved => self.trace.status = Status::Running,
             _ => {}
@@ -325,7 +329,10 @@ impl Runner {
             self.thinking,
             Some(child),
         )?;
-        let response = tokio::time::timeout(Duration::from_secs(120), request.response());
+        let response = request.response();
+        let timeout = tokio::time::sleep(Duration::from_secs(120));
+        tokio::pin!(timeout);
+        let mut waiting_since = None;
         tokio::pin!(response);
         let mut events_open = true;
         loop {
@@ -337,12 +344,28 @@ impl Runner {
                         continue;
                     };
                     recording.observe(&event);
-                    if let ToolEvent::Approval { call, respond, .. } = event {
-                        context.events.send(ToolEvent::Approval { call, respond, agent_id: Some(recording.trace.id) }).await.map_err(|_| "界面已关闭")?;
+                    match event {
+                        ToolEvent::Approval { call, respond, .. } => {
+                            context.events.send(ToolEvent::Approval { call, respond, agent_id: Some(recording.trace.id) }).await.map_err(|_| "界面已关闭")?;
+                        }
+                        ToolEvent::Question(mut question) => {
+                            waiting_since = Some(tokio::time::Instant::now());
+                            question.agent_id = Some(recording.trace.id);
+                            context.events.send(ToolEvent::Question(question)).await.map_err(|_| "界面已关闭")?;
+                        }
+                        ToolEvent::QuestionResolved(id) => {
+                            if let Some(since) = waiting_since.take() {
+                                let deadline = timeout.deadline() + since.elapsed();
+                                timeout.as_mut().reset(deadline);
+                            }
+                            let _ = context.events.send(ToolEvent::QuestionResolved(id)).await;
+                        }
+                        _ => {}
                     }
                 }
+                _ = &mut timeout, if waiting_since.is_none() => return Err("子代理执行超时，已取消".into()),
                 result = &mut response => {
-                    let completion = result.map_err(|_| "子代理执行超时，已取消")??;
+                    let completion = result?;
                     if completion.text.trim().is_empty() {
                         return Err("子代理未返回文本结果".into());
                     }
@@ -493,6 +516,7 @@ mod tests {
                                 json!({"path":"denied.txt","content":"must not write"}),
                             ),
                             ("nested", "subagent", json!({"task":"must not run"})),
+                            ("ask", "ask_question", json!({"question":"Which approach?","options":["A","B"]})),
                         ],
                         _ => vec![],
                     };
@@ -538,15 +562,17 @@ mod tests {
                         !matches!(&event, ToolEvent::TodoUpdated(_)),
                         "child checklist must not update the parent panel"
                     );
-                    if let ToolEvent::Approval {
-                        call,
-                        respond,
-                        agent_id,
-                    } = event
-                    {
-                        assert_eq!(call.name, "write_file");
-                        assert!(agent_id.is_some());
-                        respond.send(false).unwrap();
+                    match event {
+                        ToolEvent::Approval { call, respond, agent_id } => {
+                            assert_eq!(call.name, "write_file");
+                            assert!(agent_id.is_some());
+                            respond.send(false).unwrap();
+                        }
+                        ToolEvent::Question(question) => {
+                            assert!(question.agent_id.is_some());
+                            question.respond.send(Some("B-user-answer".into())).unwrap();
+                        }
+                        _ => {}
                     }
                 }
             };
@@ -557,7 +583,8 @@ mod tests {
             let trace_id = trace.id;
             assert_eq!(trace.status, Status::Completed);
             assert_eq!(trace.task, "Inspect the project");
-            assert_eq!(trace.tools.len(), 3);
+            assert_eq!(trace.tools.len(), 4);
+            assert!(trace.tools.iter().any(|t| t.call.name == "ask_question" && t.success && t.result.contains("B-user-answer")));
             assert_eq!(trace.todos[0].content, "child-plan-sentinel");
             assert_eq!(
                 parent_todos.lock().unwrap()[0].content,
@@ -580,7 +607,7 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.id, trace_id);
             assert_eq!(saved.status, Status::Completed);
-            assert_eq!(saved.tools.len(), 3);
+            assert_eq!(saved.tools.len(), 4);
             assert_eq!(saved.todos[0].content, "child-plan-sentinel");
             assert!(!directory.path().join("denied.txt").exists());
             let requests = server.join().unwrap();
@@ -591,6 +618,7 @@ mod tests {
                 assert!(!request.to_string().contains("parent-plan-sentinel"));
                 assert!(request.to_string().contains("project-instructions"));
             }
+            assert!(requests[2].to_string().contains("B-user-answer"));
             assert!(requests[2].to_string().contains("用户拒绝"));
             assert!(requests[2].to_string().contains("不允许继续派生"));
             assert!(requests[3].to_string().contains("child-result"));
