@@ -1,3 +1,4 @@
+mod source_syntax;
 use super::rich_text::{Format, RichText};
 use super::text_completion::{CompletionKey, CompletionState, TextCompletion, completion_menu};
 use super::text_reference::{TextReference, TextReferenceResolver, reference_colors, references};
@@ -1665,7 +1666,7 @@ impl TokenKind {
     }
 }
 
-/// A small lexer for Rust/Go/JSON/HTML fences; other languages remain plain.
+/// Lightweight source lexers for supported fence languages; others remain plain.
 /// Ranges are byte offsets, so Unicode and original whitespace are preserved.
 /// Syntax-colored ranges for one source snippet, as plain colors. Shared with
 /// `DiffCard` so both cards highlight identically.
@@ -1681,18 +1682,35 @@ pub(crate) fn highlight_runs(
 }
 
 fn tokens(source: &str, language: &str) -> Vec<(Range<usize>, TokenKind)> {
+    if ["md", "markdown"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::markdown(source);
+    }
+    if language.eq_ignore_ascii_case("toml") { return source_syntax::toml(source); }
+    if ["yaml", "yml"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::yaml(source);
+    }
     if ["html", "htm", "xml", "svg"]
         .iter()
         .any(|name| language.eq_ignore_ascii_case(name))
     {
         return markup_tokens(source);
     }
-    if ["css", "javascript", "js"]
-        .iter()
-        .any(|name| language.eq_ignore_ascii_case(name))
-    {
-        return web_tokens(source, language.eq_ignore_ascii_case("css"));
+    if ["make", "makefile", "mk", "gnumake"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::makefile(source);
     }
+    if ["dockerfile", "docker", "containerfile"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::dockerfile(source);
+    }
+    if ["python", "python3", "py"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::python(source);
+    }
+    if ["javascript", "js", "mjs", "cjs"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::script(source, false);
+    }
+    if ["typescript", "ts", "mts", "cts"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+        return source_syntax::script(source, true);
+    }
+    if language.eq_ignore_ascii_case("css") { return web_tokens(source, true); }
     if language.eq_ignore_ascii_case("rust") || language.eq_ignore_ascii_case("rs") {
         return rust_tokens(source);
     }
@@ -1981,6 +1999,7 @@ fn markup_tokens(source: &str) -> Vec<(Range<usize>, TokenKind)> {
     result
 }
 fn web_tokens(source: &str, css: bool) -> Vec<(Range<usize>, TokenKind)> {
+    if !css { return source_syntax::script(source, false); }
     let mut result = Vec::new();
     let mut i = 0;
     while i < source.len() {

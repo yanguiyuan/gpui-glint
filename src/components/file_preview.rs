@@ -20,6 +20,10 @@ pub struct FilePreviewEntry {
 #[derive(Clone, Debug)]
 pub enum FilePreviewEvent {
     OpenRequested(String),
+    DirectoryRequested {
+        path: String,
+        request: u64,
+    },
     CloseRequested,
     ExpandedChanged(bool),
     QuoteRequested {
@@ -34,12 +38,24 @@ enum Page {
     File(Entity<CodeCard>),
     Image(std::sync::Arc<gpui::Image>),
 }
+#[derive(Default)]
+struct FolderNode {
+    expanded: bool,
+    entries: Option<Vec<FilePreviewEntry>>,
+    loading: Option<u64>,
+    error: Option<String>,
+}
+
 pub struct FilePreview {
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     html: Option<String>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     browser: Option<Result<Entity<super::WebView>, String>>,
     expanded: bool,
+    navigation: Option<(String, Vec<FilePreviewEntry>)>,
+    navigation_scroll: gpui::ScrollHandle,
+    folders: std::collections::HashMap<String, FolderNode>,
+    next_request: u64,
     path: String,
     parent: Option<String>,
     page: Page,
@@ -77,6 +93,10 @@ impl FilePreview {
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             browser: None,
             expanded: false,
+            navigation: None,
+            navigation_scroll: Default::default(),
+            folders: Default::default(),
+            next_request: 0,
             path: String::new(),
             parent: None,
             page: Page::Loading,
@@ -136,6 +156,14 @@ impl FilePreview {
         }
     }
     pub fn set_loading(&mut self, path: String, cx: &mut Context<Self>) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|(root, _)| !std::path::Path::new(&path).starts_with(root))
+        {
+            self.navigation = None;
+            self.folders.clear();
+        }
         self.path = path;
         self.clear_html();
         self.page = Page::Loading;
@@ -160,6 +188,9 @@ impl FilePreview {
         image: std::sync::Arc<gpui::Image>,
         cx: &mut Context<Self>,
     ) {
+        if parent.is_none() {
+            self.navigation = None;
+        }
         self.path = path;
         self.parent = parent;
         self.markdown = None;
@@ -177,6 +208,14 @@ impl FilePreview {
         text: String,
         cx: &mut Context<Self>,
     ) {
+        let language = match Icon::for_file_name(&path) {
+            Icon::Docker => "dockerfile".to_owned(),
+            Icon::Makefile => "makefile".to_owned(),
+            _ => language,
+        };
+        if parent.is_none() {
+            self.navigation = None;
+        }
         self.clear_html();
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
         if matches!(Icon::for_language(&language), Icon::Html)
@@ -306,6 +345,292 @@ impl FilePreview {
             cx.notify();
         }
     }
+    fn directory_list(
+        &self,
+        entries: &[FilePreviewEntry],
+        scroll: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.theme.palette();
+        let mut list = div()
+            .id("file-preview-directory")
+            .h_full()
+            .overflow_y_scroll()
+            .track_scroll(scroll);
+        if entries.is_empty() {
+            list = list.child(div().p_4().text_color(rgb(p.text_muted)).child("空目录"));
+        }
+        for entry in entries {
+            let path = entry.path.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("preview-entry:{path}")))
+                    .debug_selector(move || format!("preview-entry:{path}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(entry.path == self.path, |row| row.bg(rgb(p.accent_tint)))
+                    .px_4()
+                    .py_2()
+                    .text_color(rgb(if entry.previewable || entry.directory {
+                        p.text
+                    } else {
+                        p.text_muted
+                    }))
+                    .child(
+                        if entry.directory {
+                            Icon::Folder
+                        } else {
+                            Icon::for_file_name(&entry.name)
+                        }
+                        .render(15.),
+                    )
+                    .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
+                    .when(entry.directory || entry.previewable, |row| {
+                        let path = entry.path.clone();
+                        row.cursor_pointer()
+                            .hover(|s| s.bg(rgb(p.surface_subtle)))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(FilePreviewEvent::OpenRequested(path.clone()))
+                            }))
+                    }),
+            );
+        }
+        list
+    }
+
+    pub fn navigation_path(&self) -> Option<&str> {
+        let parent = std::path::Path::new(&self.path).parent()?.to_str()?;
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|(root, _)| root == parent)
+            || self
+                .folders
+                .get(parent)
+                .is_some_and(|node| node.entries.is_some())
+        {
+            Some(parent)
+        } else {
+            None
+        }
+    }
+
+    fn toggle_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        let node = self.folders.entry(path.clone()).or_default();
+        node.expanded = !node.expanded;
+        if node.expanded && node.entries.is_none() && node.loading.is_none() {
+            self.next_request += 1;
+            node.loading = Some(self.next_request);
+            node.error = None;
+            cx.emit(FilePreviewEvent::DirectoryRequested {
+                path,
+                request: self.next_request,
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_directory_requests(&mut self, cx: &mut Context<Self>) {
+        for node in self.folders.values_mut() {
+            if node.loading.take().is_some() {
+                node.expanded = false;
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_directory_children(
+        &mut self,
+        path: String,
+        request: u64,
+        result: Result<(Vec<FilePreviewEntry>, bool), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self
+            .folders
+            .get_mut(&path)
+            .filter(|node| node.loading == Some(request))
+        else {
+            return;
+        };
+        node.loading = None;
+        match result {
+            Ok((mut entries, truncated)) => {
+                Self::append_truncation(&mut entries, truncated);
+                node.entries = Some(entries);
+                node.error = None;
+            }
+            Err(error) => node.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn append_truncation(entries: &mut Vec<FilePreviewEntry>, truncated: bool) {
+        if truncated {
+            entries.push(FilePreviewEntry {
+                name: "仅显示前 1000 项".into(),
+                path: String::new(),
+                directory: false,
+                previewable: false,
+            });
+        }
+    }
+
+    fn tree_rows(
+        &self,
+        entries: &[FilePreviewEntry],
+        depth: usize,
+        rows: &mut Vec<(FilePreviewEntry, usize)>,
+    ) {
+        if depth >= 64 {
+            return;
+        }
+        for entry in entries {
+            rows.push((entry.clone(), depth));
+            if let Some(node) = self
+                .folders
+                .get(&entry.path)
+                .filter(|node| entry.directory && node.expanded)
+            {
+                if let Some(entries) = &node.entries {
+                    if entries.is_empty() {
+                        rows.push((
+                            FilePreviewEntry {
+                                name: "空目录".into(),
+                                path: String::new(),
+                                directory: false,
+                                previewable: false,
+                            },
+                            depth + 1,
+                        ));
+                    } else {
+                        self.tree_rows(entries, depth + 1, rows);
+                    }
+                } else {
+                    rows.push((
+                        FilePreviewEntry {
+                            name: node
+                                .error
+                                .as_ref()
+                                .map(|error| format!("读取失败：{error}（收起后展开重试）"))
+                                .unwrap_or_else(|| "正在读取…".into()),
+                            path: String::new(),
+                            directory: false,
+                            previewable: false,
+                        },
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn navigation_tree(
+        &self,
+        entries: &[FilePreviewEntry],
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.theme.palette();
+        let mut rows = Vec::new();
+        self.tree_rows(entries, 0, &mut rows);
+        let mut list = div()
+            .id("file-preview-tree")
+            .h_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.navigation_scroll);
+        if rows.is_empty() {
+            list = list.child(div().p_4().child("空目录"));
+        }
+        for (index, (entry, depth)) in rows.into_iter().enumerate() {
+            let path = entry.path.clone();
+            let expanded = self.folders.get(&path).is_some_and(|node| node.expanded);
+            list = list.child(
+                div()
+                    .id(("tree-entry", index))
+                    .debug_selector(move || format!("preview-entry:{path}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(8. + depth as f32 * 16.))
+                    .pr_2()
+                    .py_1()
+                    .when(entry.path == self.path, |row| row.bg(rgb(p.accent_tint)))
+                    .text_color(rgb(if entry.directory || entry.previewable {
+                        p.text
+                    } else {
+                        p.text_muted
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_shrink_0()
+                            .when(entry.directory, |row| {
+                                row.child(
+                                    if expanded {
+                                        Icon::ChevronDown
+                                    } else {
+                                        Icon::ChevronRight
+                                    }
+                                    .render(12.),
+                                )
+                            }),
+                    )
+                    .child(
+                        if entry.directory {
+                            Icon::Folder
+                        } else {
+                            Icon::for_file_name(&entry.name)
+                        }
+                        .render(15.),
+                    )
+                    .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
+                    .when(entry.directory || entry.previewable, |row| {
+                        let path = entry.path.clone();
+                        row.cursor_pointer()
+                            .hover(|style| style.bg(rgb(p.surface_subtle)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if entry.directory {
+                                    this.toggle_folder(path.clone(), cx);
+                                } else {
+                                    cx.emit(FilePreviewEvent::OpenRequested(path.clone()));
+                                }
+                            }))
+                    }),
+            );
+        }
+        list
+    }
+
+    /// Retain the folder independently of the currently previewed file.
+    pub fn set_navigation(
+        &mut self,
+        path: String,
+        mut entries: Vec<FilePreviewEntry>,
+        truncated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        Self::append_truncation(&mut entries, truncated);
+        if let Some((root, _)) = &self.navigation {
+            if root != &path && std::path::Path::new(&path).starts_with(root) {
+                let node = self.folders.entry(path).or_default();
+                node.entries = Some(entries);
+                node.expanded = true;
+                cx.notify();
+                return;
+            }
+            if root != &path {
+                self.folders.clear();
+                self.navigation_scroll = Default::default();
+            }
+        } else {
+            self.folders.clear();
+            self.navigation_scroll = Default::default();
+        }
+        self.navigation = Some((path, entries));
+        cx.notify();
+    }
+
     pub fn set_directory(
         &mut self,
         path: String,
@@ -313,6 +638,7 @@ impl FilePreview {
         entries: Vec<FilePreviewEntry>,
         cx: &mut Context<Self>,
     ) {
+        self.set_navigation(path.clone(), entries.clone(), false, cx);
         self.path = path;
         self.parent = parent;
         self.clear_html();
@@ -357,49 +683,11 @@ impl Render for FilePreview {
             }
             Page::File(editor) => body.flex().child(editor.clone()),
             Page::Directory(entries) => {
-                let mut list = div()
-                    .id("file-preview-directory")
-                    .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll);
-                if entries.is_empty() {
-                    list = list.child(div().p_4().text_color(rgb(p.text_muted)).child("空目录"));
-                }
-                for entry in entries {
-                    let path = entry.path.clone();
-                    list = list.child(
-                        div()
-                            .id(SharedString::from(format!("preview-entry:{path}")))
-                            .debug_selector(move || format!("preview-entry:{path}"))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_4()
-                            .py_2()
-                            .text_color(rgb(if entry.previewable || entry.directory {
-                                p.text
-                            } else {
-                                p.text_muted
-                            }))
-                            .child(
-                                if entry.directory {
-                                    Icon::Folder
-                                } else {
-                                    Icon::for_file_name(&entry.name)
-                                }
-                                .render(15.),
-                            )
-                            .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
-                            .when(entry.directory || entry.previewable, |row| {
-                                let path = entry.path.clone();
-                                row.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(p.surface_subtle)))
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.emit(FilePreviewEvent::OpenRequested(path.clone()))
-                                    }))
-                            }),
-                    );
-                }
+                let list = if self.expanded {
+                    self.navigation_tree(entries, cx)
+                } else {
+                    self.directory_list(entries, &self.scroll, cx)
+                };
                 body.child(list)
             }
         };
@@ -508,7 +796,50 @@ impl Render for FilePreview {
                             ),
                     ),
             )
-            .child(body)
+            .child({
+                let mut content = div().flex_1().min_h_0().min_w_0().flex();
+                if self.expanded && !matches!(self.page, Page::Directory(_)) {
+                    if let Some((path, entries)) = &self.navigation {
+                        content = content.child(
+                            div()
+                                .id("file-preview-navigation")
+                                .debug_selector(|| "file-preview-navigation".into())
+                                .w(px(260.))
+                                .max_w(gpui::relative(0.4))
+                                .h_full()
+                                .flex_shrink_0()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .border_r_1()
+                                .border_color(rgb(p.border))
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .text_size(px(12.))
+                                        .truncate()
+                                        .child(display_path(path)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(self.navigation_tree(entries, cx)),
+                                ),
+                        );
+                    }
+                }
+                content.child(
+                    div()
+                        .flex_1()
+                        .w(px(0.))
+                        .min_w_0()
+                        .min_h_0()
+                        .flex()
+                        .child(body),
+                )
+            })
     }
 }
 
@@ -548,6 +879,61 @@ mod tests {
             });
         });
     }
+    #[gpui::test]
+    fn tree_reuses_children_retries_errors_and_ignores_cancelled_requests(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let view = cx.new(FilePreview::new);
+            view.update(cx, |view, cx| {
+                view.set_directory(
+                    "/project".into(),
+                    None,
+                    vec![FilePreviewEntry {
+                        name: "src".into(),
+                        path: "/project/src".into(),
+                        directory: true,
+                        previewable: true,
+                    }],
+                    cx,
+                );
+                view.toggle_folder("/project/src".into(), cx);
+                let first = view.next_request;
+                view.set_directory_children(
+                    "/project/src".into(),
+                    first + 1,
+                    Ok((vec![], false)),
+                    cx,
+                );
+                assert!(view.folders["/project/src"].entries.is_none());
+                view.set_directory_children(
+                    "/project/src".into(),
+                    first,
+                    Err("读取失败".into()),
+                    cx,
+                );
+                assert!(view.folders["/project/src"].error.is_some());
+                view.toggle_folder("/project/src".into(), cx);
+                view.toggle_folder("/project/src".into(), cx);
+                let second = view.next_request;
+                assert!(second > first);
+                view.cancel_directory_requests(cx);
+                view.set_directory_children("/project/src".into(), second, Ok((vec![], false)), cx);
+                assert!(view.folders["/project/src"].entries.is_none());
+                view.toggle_folder("/project/src".into(), cx);
+                let third = view.next_request;
+                view.set_directory_children("/project/src".into(), third, Ok((vec![], false)), cx);
+                assert!(view.folders["/project/src"].entries.is_some());
+                view.toggle_folder("/project/src".into(), cx);
+                view.toggle_folder("/project/src".into(), cx);
+                assert_eq!(
+                    view.next_request, third,
+                    "cached children must not request another read"
+                );
+            });
+        });
+    }
+
     #[gpui::test]
     fn expand_button_requests_host_layout_changes(cx: &mut gpui::TestAppContext) {
         let (view, window) = cx.add_window_view(|_, cx| FilePreview::new(cx));

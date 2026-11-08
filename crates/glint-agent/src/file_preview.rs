@@ -396,6 +396,23 @@ enum Loaded {
     Image(Vec<u8>),
     Directory(Vec<FilePreviewEntry>, bool),
 }
+type PreviewData = (String, Option<String>, Loaded);
+type NavigationData = (String, Vec<FilePreviewEntry>, bool);
+
+async fn load_with_navigation(target: Target, known_directory: Option<String>) -> Result<(PreviewData, Option<NavigationData>), String> {
+    let root = target.root.clone();
+    let result = load(target).await?;
+    let navigation = if !matches!(result.2, Loaded::Directory(..)) {
+        if let Some(parent) = result.1.clone().filter(|parent| Some(parent) != known_directory.as_ref()) {
+            match load(Target { root, path: parent, line: None }).await {
+                Ok((path, _, Loaded::Directory(entries, truncated))) => Some((path, entries, truncated)),
+                _ => None,
+            }
+        } else { None }
+    } else { None };
+    Ok((result, navigation))
+}
+
 async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String> {
     if let Some(root) = target.root.as_deref().filter(|p| ssh_project::is_remote(p)) {
         let remote = ssh_project::Remote::from_path(root)?;
@@ -560,6 +577,7 @@ pub struct State {
     target: Option<Target>,
     task: Option<Task<()>>,
     revision: u64,
+    directory_tasks: HashMap<u64, Task<()>>,
     pub(super) hover_task: Option<Task<()>>,
 }
 impl State {
@@ -575,6 +593,8 @@ impl State {
                 this.file_preview.expanded = false;
                 this.file_preview.open = false;
                 this.file_preview.task = None;
+                this.file_preview.directory_tasks.clear();
+                this.file_preview.view.update(cx, |view, cx| view.cancel_directory_requests(cx));
                 cx.notify();
             }
             FilePreviewEvent::QuoteRequested { path, selection } => {
@@ -604,6 +624,30 @@ impl State {
                 };
                 this.quote_file_excerpt(&path, selection, cx);
             }
+            FilePreviewEvent::DirectoryRequested { path, request } => {
+                let Some(mut target) = this.file_preview.target.clone() else { return; };
+                target.path = path.clone();
+                target.line = None;
+                let request = *request;
+                let path = path.clone();
+                let work = cx.background_executor().spawn(async move {
+                    let result = if target.root.as_deref().is_some_and(ssh_project::is_remote) {
+                        provider::Job::start(load(target))?.result().await
+                    } else { load(target).await };
+                    match result? {
+                        (_, _, Loaded::Directory(entries, truncated)) => Ok((entries, truncated)),
+                        _ => Err("路径不是目录".into()),
+                    }
+                });
+                let task = cx.spawn(async move |weak, cx| {
+                    let result = work.await;
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(task) = this.file_preview.directory_tasks.remove(&request) { task.detach(); }
+                        this.file_preview.view.update(cx, |view, cx| view.set_directory_children(path, request, result, cx));
+                    });
+                });
+                this.file_preview.directory_tasks.insert(request, task);
+            }
             FilePreviewEvent::OpenRequested(path) => {
                 if let Some(mut target) = this.file_preview.target.clone() {
                     target.path = path.clone();
@@ -621,6 +665,7 @@ impl State {
             target: None,
             task: None,
             revision: 0,
+            directory_tasks: Default::default(),
             hover_task: None,
         }
     }
@@ -868,13 +913,14 @@ impl AgentWorkspace {
             view.set_theme(self.theme, cx);
             view.set_loading(target.path.clone(), cx);
         });
+        let known_directory = self.file_preview.view.read(cx).navigation_path().map(str::to_owned);
         self.file_preview.task = Some(cx.spawn(async move |weak, cx| {
             let line = target.line;
             let work = cx.background_executor().spawn(async move {
                 if target.root.as_deref().is_some_and(ssh_project::is_remote) {
-                    provider::Job::start(load(target))?.result().await
+                    provider::Job::start(load_with_navigation(target, known_directory))?.result().await
                 } else {
-                    load(target).await
+                    load_with_navigation(target, known_directory).await
                 }
             });
             let result = work.await;
@@ -885,6 +931,12 @@ impl AgentWorkspace {
                 if let Some(task) = this.file_preview.task.take() {
                     task.detach();
                 }
+                let result = result.map(|(result, navigation)| {
+                    if let Some((path, entries, truncated)) = navigation {
+                        this.file_preview.view.update(cx, |view, cx| view.set_navigation(path, entries, truncated, cx));
+                    }
+                    result
+                });
                 this.file_preview.view.update(cx, |view, cx| match result {
                     Ok((path, parent, Loaded::Image(bytes))) => {
                         view.set_image(
@@ -1301,6 +1353,92 @@ mod tests {
                 .debug_bounds("glass-document-scroll-preview")
                 .is_some()
         );
+    }
+
+    #[gpui::test]
+    fn preview_tree_expands_nested_folders_and_keeps_the_selected_file_when_collapsed(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/nested/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# Project").unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
+        window.simulate_resize(size(px(1440.), px(900.)));
+        host.update(window, |host, cx| {
+            host.storage_readable = false;
+            host.file_preview.expanded = true;
+            host.open_file_preview(Target { root: Some(root.clone()), path: root.to_string_lossy().into_owned(), line: None }, cx);
+        });
+        window.run_until_parked();
+        let folder = Box::leak(format!("preview-entry:{}", root.join("src").display()).into_boxed_str());
+        let nested = Box::leak(format!("preview-entry:{}", root.join("src/nested").display()).into_boxed_str());
+        let file = Box::leak(format!("preview-entry:{}", root.join("src/nested/main.rs").display()).into_boxed_str());
+        assert!(window.debug_bounds(nested).is_none());
+        let row = window.debug_bounds(folder).unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.to_string_lossy()));
+        let child = window.debug_bounds(nested).expect("expanded child folder");
+        assert!(child.left() >= row.left());
+        window.simulate_click(child.center(), Default::default());
+        window.run_until_parked();
+        let file_row = window.debug_bounds(file).expect("grandchild file");
+        window.simulate_click(file_row.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.expanded);
+            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("src/nested/main.rs").to_string_lossy());
+        });
+        assert!(window.debug_bounds("file-preview-navigation").is_some());
+        let row = window.debug_bounds(folder).unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds(file).is_none());
+        host.read_with(window, |host, _| assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("src/nested/main.rs").to_string_lossy()));
+        let row = window.debug_bounds(folder).unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds(file).is_some(), "nested expansion state must survive collapsing an ancestor");
+        host.read_with(window, |host, _| assert!(host.file_preview.directory_tasks.is_empty()));
+    }
+
+    #[gpui::test]
+    fn expanded_preview_keeps_directory_and_switches_files_without_collapsing(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}
+").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() {}
+").unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
+        window.simulate_resize(size(px(1440.), px(900.)));
+        host.update(window, |host, cx| {
+            host.storage_readable = false;
+            host.file_preview.expanded = true;
+            host.open_file_preview(Target { root: Some(root.clone()), path: root.join("a.rs").to_string_lossy().into_owned(), line: None }, cx);
+        });
+        window.run_until_parked();
+        let navigation = window.debug_bounds("file-preview-navigation").expect("expanded preview keeps its folder");
+        assert!(navigation.size.width > px(100.));
+        let selector = Box::leak(format!("preview-entry:{}", root.join("b.rs").display()).into_boxed_str());
+        let next = window.debug_bounds(selector).expect("sibling file in navigation");
+        assert!(next.right() <= navigation.right());
+        window.simulate_click(next.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.expanded);
+            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("b.rs").to_string_lossy());
+        });
+        assert!(window.debug_bounds("file-preview-navigation").is_some());
+        let collapse = window.debug_bounds("file-preview-expand").unwrap();
+        window.simulate_click(collapse.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("file-preview-navigation").is_none());
+        assert!(window.debug_bounds("agent-right-sidebar-resize").is_some());
+        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "fn b() {}
+");
     }
 
     #[gpui::test]

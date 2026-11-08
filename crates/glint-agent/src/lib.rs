@@ -60,6 +60,7 @@ mod skills_ui;
 mod ssh_project;
 mod ssh_ui;
 mod storage;
+mod steering_ui;
 mod subagent;
 mod subagent_ui;
 mod titles;
@@ -98,6 +99,11 @@ struct SessionRun {
     tool_listener: Option<Task<()>>,
     tool_activity: Vec<tools::ToolRecord>,
     transcript: Vec<generation::ContentBlock>,
+    segment_start: usize,
+    segment_tool_start: usize,
+    steering_waiting: bool,
+    steering_message: Option<usize>,
+    steering_anchor: Option<usize>,
     thinking_timings: generation::ThinkingTimings,
     approval: Option<app_tools_ui::Approval>,
     questions: Vec<app_tools_ui::Question>,
@@ -167,6 +173,7 @@ pub struct AgentWorkspace {
     _subscriptions: Vec<Subscription>,
     scroll: ScrollHandle,
     message_layout: MessageLayout,
+    conversation_layouts: Vec<(Uuid, ScrollHandle, MessageLayout)>,
     show_sessions: bool,
     show_auxiliary_sidebar: bool,
     project_picker_open: bool,
@@ -178,6 +185,7 @@ pub struct AgentWorkspace {
     save_delay: Option<Task<()>>,
     save_revision: u64,
     save_full_pending: bool,
+    save_drafts_pending: std::collections::HashMap<Uuid, String>,
     context_models: Option<Task<()>>,
     partners_ui: partner_ui::State,
     partner_worker: Option<Task<()>>,
@@ -488,6 +496,7 @@ impl AgentWorkspace {
                                 });
                         if sent {
                             if let Some((session, _)) = this.queued_requests.remove(id) {
+                                this.begin_steering_turn(session);
                                 if let Some(session) = this
                                     .history
                                     .sessions
@@ -496,9 +505,10 @@ impl AgentWorkspace {
                                 {
                                     session.push_message(
                                         Role::User,
-                                        format!("执行中补充：{text}"),
+                                        text.clone(),
                                         images,
                                     );
+                                    session.messages.last_mut().unwrap().display = model::MessageDisplay::from_submission(submission);
                                 }
                             }
                             this.composer
@@ -664,6 +674,7 @@ impl AgentWorkspace {
                 pin: Some(PinnedEnd::new(opened_session)),
                 ..Default::default()
             },
+            conversation_layouts: Vec::new(),
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
@@ -676,6 +687,7 @@ impl AgentWorkspace {
             save_delay: None,
             save_revision: 0,
             save_full_pending: true,
+            save_drafts_pending: Default::default(),
             context_models: None,
             partners_ui: partner_ui::State::new(cx),
             partner_worker: None,
@@ -796,23 +808,46 @@ impl AgentWorkspace {
         self.page = crate::Page::Chat;
         self.provider_error = None;
         self.capture_draft(cx);
+        self.save_drafts_pending
+            .insert(self.history.active, self.history.active().draft.clone());
         self.history.active = id;
         self.trajectory.close_detail();
         self.history.preferred_partner = self.history.active().partner_id;
         self.project_picker_open = false;
-        images::release_previews(self.image_views.borrow_mut().clear(), cx);
+        // PreviewCache is already bounded (64 images / 64 MiB); keep it warm across chats.
         self.restore_draft(cx);
         self.open_conversation_at_latest();
-        self.save(cx);
+        self.save_draft(cx);
         cx.notify();
     }
 
     /// A conversation opened from the list starts at its newest message instead
-    /// of the oldest task row. The extent is unknown until the transcript
-    /// lays out, so the pin is resolved during prepaint.
+    /// of the oldest task row. Recent conversations reuse their measured geometry;
+    /// cold or invalidated layouts resolve the final extent during prepaint.
     fn open_conversation_at_latest(&mut self) {
-        self.scroll = ScrollHandle::new();
-        self.message_layout.pin = Some(PinnedEnd::new(self.history.active));
+        let active = self.history.active;
+        let previous = std::mem::take(&mut self.message_layout);
+        if let Some((id, _, _)) = previous.context {
+            self.conversation_layouts.retain(|entry| {
+                entry.0 != id && self.history.sessions.iter().any(|s| s.id == entry.0)
+            });
+            self.conversation_layouts.push((id, self.scroll.clone(), previous));
+        }
+        if let Some(index) = self.conversation_layouts.iter().position(|entry| entry.0 == active) {
+            let (_, scroll, layout) = self.conversation_layouts.remove(index);
+            self.scroll = scroll;
+            self.message_layout = layout;
+            // Reuse measured geometry immediately, without showing the old reading position.
+            self.scroll.set_offset(gpui::point(px(0.), -self.scroll.max_offset().y));
+        } else {
+            self.scroll = ScrollHandle::new();
+        }
+        // Bound retained geometry independently of the message/editor caches.
+        if self.conversation_layouts.len() > 8 {
+            self.conversation_layouts.remove(0);
+        }
+        self.scroll.scroll_to_bottom();
+        self.message_layout.pin = Some(PinnedEnd::new(active));
     }
 
     /// Removes a session from the list. Deleting the active session falls
@@ -1226,13 +1261,29 @@ impl AgentWorkspace {
                 }
                 this.finish_subagent_records(id);
                 this.finish_todos(id, cx);
+                if let Ok(completion) = &result {
+                    if let Some(boundary) = completion.steering_boundary.filter(|_| this.run(id).steering_waiting) {
+                        let prefix = completion.blocks[..boundary.min(completion.blocks.len())].to_vec();
+                        let ids: std::collections::HashSet<_> = prefix.iter().filter_map(|block| if let generation::ContentBlock::ToolResult(record) = block { Some(record.call.id.as_str()) } else { None }).collect();
+                        this.run_mut(id).tool_activity = completion.tool_records.iter().filter(|record| ids.contains(record.call.id.as_str())).cloned().collect();
+                        this.steering_applied(id, prefix);
+                    }
+                }
+                this.finish_pending_steering(id);
                 let run = this.run_mut(id);
-                let thinking_ms = run.thinking_timings.snapshot();
-                let tools = std::mem::take(&mut run.tool_activity);
-                let blocks = std::mem::take(&mut run.transcript);
+                let segment_start = run.segment_start;
+                let tool_start = run.segment_tool_start;
+                let thinking_ms = run.segment_timings();
+                let tools = std::mem::take(&mut run.tool_activity).into_iter().skip(tool_start).collect();
+                let blocks = std::mem::take(&mut run.transcript).into_iter().skip(segment_start).collect();
                 if let Some(session) = this.history.sessions.iter_mut().find(|s| s.id == id) {
                     match result {
-                        Ok(completion) => {
+                        Ok(mut completion) => {
+                            completion.blocks = completion.blocks.into_iter().skip(segment_start).collect();
+                            completion.tool_records = completion.tool_records.into_iter().skip(tool_start).collect();
+                            if segment_start > 0 {
+                                completion.text = completion.blocks.iter().filter_map(|block| if let generation::ContentBlock::Text(text) = block { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n\n");
+                            }
                             session.context = Some(context_usage::ContextSnapshot {
                                 provider_id: request_provider_id,
                                 model: request_model,
@@ -1308,9 +1359,11 @@ impl AgentWorkspace {
                 &mut run.tool_activity,
                 "用户已停止任务",
             );
-            let blocks = std::mem::take(&mut run.transcript);
-            let tools = std::mem::take(&mut run.tool_activity);
-            let thinking_ms = run.thinking_timings.snapshot();
+            self.finish_pending_steering(id);
+            let run = self.run_mut(id);
+            let thinking_ms = run.segment_timings();
+            let blocks = std::mem::take(&mut run.transcript).into_iter().skip(run.segment_start).collect();
+            let tools = std::mem::take(&mut run.tool_activity).into_iter().skip(run.segment_tool_start).collect();
             if let Some(session) = self.history.sessions.iter_mut().find(|s| s.id == id) {
                 session.push(Role::Notice, "已停止回复。".into());
                 let message = session.messages.last_mut().unwrap();
@@ -2280,7 +2333,7 @@ impl AgentWorkspace {
                 }
             }
             if running {
-                if !self.active_run().transcript.is_empty() {
+                if !self.active_run().visible_transcript().is_empty() {
                     let key = format!(
                         "{}:{}",
                         self.history.active,
@@ -2299,9 +2352,9 @@ impl AgentWorkspace {
                             .max_w(px(800.))
                             .child(self.response_view(
                                 &key,
-                                &self.active_run().transcript,
+                                self.active_run().visible_transcript(),
                                 None,
-                                &self.active_run().thinking_timings.snapshot(),
+                                &self.active_run().segment_timings(),
                                 false,
                                 cx,
                             )),

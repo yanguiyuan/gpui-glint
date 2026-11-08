@@ -557,6 +557,9 @@ impl AgentWorkspace {
                                 scroll_follow::follow_if_at_bottom(&this.scroll);
                             }
                             match event {
+                                tools::ToolEvent::SteeringApplied(blocks) => {
+                                    this.steering_applied(id, blocks);
+                                }
                                 tools::ToolEvent::SteeringFailed(error) => {
                                     if this.history.active == id {
                                         this.provider_error = Some(format!(
@@ -658,6 +661,7 @@ impl AgentWorkspace {
                                     let run = this.run_mut(id);
                                     run.thinking_timings.observe(&blocks);
                                     run.transcript = blocks;
+                                    this.refresh_steering_turn(id);
                                 }
                                 tools::ToolEvent::Started(call) => {
                                     this.run_mut(id).tool_activity.push(tools::ToolRecord {
@@ -1187,7 +1191,7 @@ impl AgentWorkspace {
                 blocks,
                 thinking_ms,
                 complete,
-                if complete { &[] } else { &self.active_run().tool_activity },
+                if complete { &[] } else { self.active_run().visible_tools() },
                 cx,
             ))
     }
@@ -1349,7 +1353,7 @@ impl AgentWorkspace {
                     &blocks[..split],
                     thinking_ms,
                     &summary,
-                    if complete { &[] } else { &self.active_run().tool_activity },
+                    if complete { &[] } else { self.active_run().visible_tools() },
                 )
             });
         let signature = source_signature ^ self.subagent_revision();
@@ -1377,7 +1381,7 @@ impl AgentWorkspace {
             let activity = if complete {
                 Vec::new()
             } else {
-                self.active_run().tool_activity.clone()
+                self.active_run().visible_tools().to_vec()
             };
             let content_key = key.to_owned();
             entry.panel.update(cx, |panel, cx| {
@@ -2406,6 +2410,8 @@ mod tests {
         let key = format!("{original}:0");
         workspace.update(window, |workspace, cx| {
             workspace.process_panels.borrow()[&key].panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
+            // Explicitly read the top; opening a process otherwise follows the end.
+            workspace.message_layout.pin = None;
             workspace.scroll.scroll_to_top_of_item(0);
             cx.notify();
         });
@@ -2425,11 +2431,11 @@ mod tests {
         window.run_until_parked();
         workspace.update(window, |w, cx| w.switch(original, cx));
         window.run_until_parked();
-        assert!(window.debug_bounds("history-row-0").is_some());
-        assert!(window.debug_bounds("history-spacer-299").is_some());
+        assert!(window.debug_bounds("history-spacer-0").is_some());
+        assert!(window.debug_bounds("history-row-299").is_some());
         window.simulate_resize(size(px(1000.), px(700.)));
         window.run_until_parked();
-        assert!(window.debug_bounds("history-row-0").is_some());
+        assert!(window.debug_bounds("history-row-299").is_some());
     }
 
     #[gpui::test]
@@ -2487,7 +2493,13 @@ mod tests {
         workspace.read_with(window, |this, _| {
             assert_eq!(this.scroll.max_offset().y, px(0.))
         });
-        workspace.update(window, |this, cx| this.switch(original, cx));
+        workspace.update(window, |this, cx| {
+            this.switch(original, cx);
+            assert_eq!(this.message_layout.context.unwrap().0, original, "warm switch must reuse measured geometry before its first frame");
+            assert_eq!(this.message_layout.measure_passes, 0);
+            assert!(this.scroll.bounds_for_item(0).is_some());
+            assert!(this.scroll.max_offset().y > px(400.));
+        });
         window.run_until_parked();
         workspace.read_with(window, |this, _| {
             assert!(this.scroll.max_offset().y > px(400.))

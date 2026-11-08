@@ -72,6 +72,9 @@ pub enum Icon {
     Shell,
     Sql,
     Yaml,
+    Toml,
+    Docker,
+    Makefile,
     Tag,
     Star,
     Sparkles,
@@ -153,6 +156,9 @@ impl Icon {
             Self::Shell => "shell",
             Self::Sql => "sql",
             Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Docker => "docker",
+            Self::Makefile => "makefile",
             Self::Tag => "tag",
             Self::Star => "star",
             Self::Sparkles => "sparkles",
@@ -189,12 +195,22 @@ impl Icon {
             "sh" | "shell" | "bash" | "zsh" | "fish" => Self::Shell,
             "sql" | "mysql" | "postgresql" | "sqlite" => Self::Sql,
             "yaml" | "yml" => Self::Yaml,
+            "toml" => Self::Toml,
+            "dockerfile" | "docker" | "containerfile" => Self::Docker,
+            "make" | "makefile" | "mk" | "gnumake" => Self::Makefile,
             _ => Self::Code,
         }
     }
 
     /// Resolve a file name to its language icon, retaining a text icon for unknown types.
     pub fn for_file_name(name: &str) -> Self {
+        let file = std::path::Path::new(name).file_name().and_then(|name| name.to_str()).unwrap_or(name).to_ascii_lowercase();
+        if file == "dockerfile" || file == "containerfile" || file.starts_with("dockerfile.") || file.ends_with(".dockerfile") {
+            return Self::Docker;
+        }
+        if file == "makefile" || file == "gnumakefile" || file.starts_with("makefile.") {
+            return Self::Makefile;
+        }
         let extension = std::path::Path::new(name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -660,6 +676,18 @@ fn icon_svg(name: &str) -> Option<String> {
             "<ellipse cx='12' cy='5' rx='8' ry='3'/><path d='M4 5v14c0 4 16 4 16 0V5M4 11c0 4 16 4 16 0M4 17c0 4 16 4 16 0'/>",
             "none",
         ),
+        "makefile" => (
+            "<path d='M5 3h10l5 5v13H5zm10 0v5h5M8 18v-7l4 4 4-4v7'/>",
+            "none",
+        ),
+        "docker" => (
+            "<path d='M3 12h15c2 0 3-1 3-3l-3 1M3 12c0 6 4 9 9 8 4-1 6-4 6-8M5 8h4v4H5zm4 0h4v4H9zm4 0h4v4h-4zM9 4h4v4H9z'/>",
+            "none",
+        ),
+        "toml" => (
+            "<path d='M5 3h10l5 5v13H5zm10 0v5h5M8 11h8m-4 0v7M8 15H7v4h2m7-4h1v4h-2'/>",
+            "none",
+        ),
         "yaml" => (
             "<path d='M5 3h10l5 5v13H5zm10 0v5h5M8 12l3 3 3-3m-3 3v4m5-7h1m-1 5h1'/>",
             "none",
@@ -808,6 +836,16 @@ mod tests {
             ("app.tsx", Icon::TypeScript),
             ("package.json", Icon::Json),
             ("config.yml", Icon::Yaml),
+            ("Cargo.toml", Icon::Toml),
+            ("Dockerfile", Icon::Docker),
+            ("Makefile", Icon::Makefile),
+            ("GNUmakefile", Icon::Makefile),
+            ("Makefile.am", Icon::Makefile),
+            ("rules.mk", Icon::Makefile),
+            ("Dockerfile.dev", Icon::Docker),
+            ("build.Dockerfile", Icon::Docker),
+            ("/project/Containerfile", Icon::Docker),
+            ("config.TOML", Icon::Toml),
             ("script.sh", Icon::Shell),
             ("notes.txt", Icon::Text),
             ("LICENSE", Icon::Text),
@@ -837,6 +875,9 @@ mod tests {
             ("bash", "shell"),
             ("postgresql", "sql"),
             ("yml", "yaml"),
+            ("TOML", "toml"),
+            ("dockerfile", "docker"),
+            ("make", "makefile"),
             ("", "code"),
             ("unknown-language", "code"),
         ] {

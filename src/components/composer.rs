@@ -421,6 +421,9 @@ pub struct Composer {
     context_sections: Vec<ComposerContextSection>,
     context_hints: Vec<(SharedString, SharedString)>,
     context_open: bool,
+    context_from_at: bool,
+    context_selected: usize,
+    context_scroll: gpui::ScrollHandle,
     todos: Vec<super::TodoListItem>,
     todos_expanded: bool,
     observed_context_query: SharedString,
@@ -459,9 +462,13 @@ impl Composer {
                     && this.context_query(cx).is_some()
                 {
                     this.open_context_panel(cx);
+                    this.context_from_at = true;
                 }
                 this.observed_text = text.clone();
                 cx.emit(ComposerEvent::Changed(text));
+            }
+            if this.context_from_at && this.context_query(cx).is_none() {
+                this.close_context_panel(cx);
             }
             if this.context_open {
                 this.emit_context_query(false, cx);
@@ -532,6 +539,9 @@ impl Composer {
             context_sections: Vec::new(),
             context_hints: Vec::new(),
             context_open: false,
+            context_from_at: false,
+            context_selected: 0,
+            context_scroll: Default::default(),
             todos: Vec::new(),
             todos_expanded: true,
             observed_context_query: "".into(),
@@ -605,8 +615,9 @@ impl Composer {
         // Refreshing another toolbar menu must not dismiss the active menu.
         // Keep this menu open too while its options are still available.
         if self.open_chip.as_ref().is_some_and(|id| {
-            self.menu_chips
+            self.chips
                 .iter()
+                .chain(self.menu_chips.iter())
                 .find(|chip| &chip.id == id)
                 .is_none_or(|chip| chip.options.is_empty())
         }) {
@@ -823,6 +834,8 @@ impl Composer {
     fn emit_context_query(&mut self, force: bool, cx: &mut Context<Self>) {
         let query: SharedString = self.context_filter(cx).into();
         if force || query != self.observed_context_query {
+            self.context_selected = 0;
+            self.context_scroll.scroll_to_top_of_item(0);
             self.observed_context_query = query.clone();
             cx.emit(ComposerEvent::ContextQueryChanged(query));
         }
@@ -921,6 +934,8 @@ impl Composer {
             self.context_open = true;
             self.open_chip = None;
             if opening {
+                self.context_from_at = false;
+                self.context_selected = 0;
                 cx.emit(ComposerEvent::ContextOpened);
                 self.emit_context_query(true, cx);
             }
@@ -929,6 +944,7 @@ impl Composer {
     }
 
     pub fn close_context_panel(&mut self, cx: &mut Context<Self>) {
+        self.context_from_at = false;
         if self.context_open {
             self.context_open = false;
             cx.notify();
@@ -1649,6 +1665,11 @@ impl Render for Composer {
             .flex_col()
             .gap(px(6.))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                if this.context_open {
+                    if !this.editor.read(cx).is_composing() { this.accept_context_selection(window, cx); }
+                    cx.stop_propagation();
+                    return;
+                }
                 if this
                     .queue_editor
                     .as_ref()
@@ -1658,6 +1679,14 @@ impl Render for Composer {
                 } else {
                     this.submit(cx);
                 }
+            }))
+            .capture_action(cx.listener(|this, _: &super::prompt_editor::Up, _, cx| {
+                if this.context_open && !this.editor.read(cx).is_composing() { this.move_context_selection(true, cx); }
+                else { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &super::prompt_editor::Down, _, cx| {
+                if this.context_open && !this.editor.read(cx).is_composing() { this.move_context_selection(false, cx); }
+                else { cx.propagate(); }
             }))
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
@@ -2092,6 +2121,49 @@ impl Composer {
             .into_any_element()
     }
 
+    fn matching_context_entries(&self, cx: &App) -> Vec<(ComposerContextEntry, usize)> {
+        let query = self.context_filter(cx).replace('\\', "/");
+        let mut rows = Vec::new();
+        let mut child = 1; // Panel title.
+        for section in &self.context_sections {
+            let entries: Vec<_> = section.entries.iter().filter(|entry| Self::context_entry_matches(entry, &query)).collect();
+            if entries.is_empty() { continue; }
+            child += usize::from(section.title.is_some());
+            for entry in entries { rows.push((entry.clone(), child)); child += 1; }
+        }
+        rows
+    }
+
+    fn context_entry_matches(entry: &ComposerContextEntry, query: &str) -> bool {
+        query.is_empty() || entry.label.to_lowercase().replace('\\', "/").contains(query)
+            || entry.description.as_ref().is_some_and(|text| text.to_lowercase().replace('\\', "/").contains(query))
+    }
+
+    fn move_context_selection(&mut self, up: bool, cx: &mut Context<Self>) {
+        let entries = self.matching_context_entries(cx);
+        if entries.is_empty() { return; }
+        let current = self.context_selected.min(entries.len() - 1);
+        self.context_selected = if up { (current + entries.len() - 1) % entries.len() } else { (current + 1) % entries.len() };
+        self.context_scroll.scroll_to_item(entries[self.context_selected].1);
+        cx.notify();
+    }
+
+    fn select_context_entry(&mut self, entry: ComposerContextEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_panel(cx);
+        window.focus(&self.editor.focus_handle(cx), cx);
+        if entry.insert_mention { self.add_mention(entry.label.clone(), entry.color.unwrap_or(self.theme.palette().accent), cx); }
+        cx.emit(ComposerEvent::ContextSelected { id: entry.id, label: entry.label });
+        cx.notify();
+    }
+
+    fn accept_context_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.matching_context_entries(cx);
+        if !entries.is_empty() {
+            let entry = entries[self.context_selected.min(entries.len() - 1)].0.clone();
+            self.select_context_entry(entry, window, cx);
+        }
+    }
+
     /// Builds the context panel (添加 / at-mention panel) anchored above the card.
     fn context_panel_element(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
@@ -2115,6 +2187,7 @@ impl Composer {
 
         let mut panel = div()
             .id("glass-composer-context-panel-scroll")
+            .track_scroll(&self.context_scroll)
             .absolute()
             .left_0()
             .right_0()
@@ -2151,27 +2224,17 @@ impl Composer {
             .unwrap_or_default();
         let match_query = query.replace('\\', "/");
         let mut matches = 0;
+        let selected_index = self.context_selected.min(self.matching_context_entries(cx).len().saturating_sub(1));
         for section in &self.context_sections {
             let entries: Vec<_> = section
                 .entries
                 .iter()
-                .filter(|entry| {
-                    query.is_empty()
-                        || entry
-                            .label
-                            .to_lowercase()
-                            .replace('\\', "/")
-                            .contains(&match_query)
-                        || entry.description.as_ref().is_some_and(|text| {
-                            text.to_lowercase()
-                                .replace('\\', "/")
-                                .contains(&match_query)
-                        })
-                })
+                .filter(|entry| Self::context_entry_matches(entry, &match_query))
                 .collect();
             if entries.is_empty() {
                 continue;
             }
+            let start_index = matches;
             matches += entries.len();
             if let Some(title) = &section.title {
                 panel = panel.child(
@@ -2184,7 +2247,8 @@ impl Composer {
                         .child(title.clone()),
                 );
             }
-            for entry in entries {
+            for (index, entry) in entries.into_iter().enumerate() {
+                let selected = start_index + index == selected_index;
                 let entry_color = theme.color(entry.color.unwrap_or(p.accent));
                 panel = panel.child(
                     div()
@@ -2203,23 +2267,13 @@ impl Composer {
                         .gap(px(10.))
                         .rounded(px(8.))
                         .cursor_pointer()
+                        .when(selected, |row| row.bg(hover_bg))
                         .hover(move |style| style.bg(hover_bg))
                         .on_click({
-                            let id = entry.id.clone();
-                            let label = entry.label.clone();
-                            let color = entry.color.unwrap_or(p.accent);
-                            let insert_mention = entry.insert_mention;
+                            let entry = entry.clone();
                             cx.listener(move |this, _, window, cx| {
-                                this.close_context_panel(cx);
-                                window.focus(&this.editor.focus_handle(cx), cx);
-                                if insert_mention {
-                                    this.add_mention(label.clone(), color, cx);
-                                }
-                                cx.emit(ComposerEvent::ContextSelected {
-                                    id: id.clone(),
-                                    label: label.clone(),
-                                });
-                                cx.notify();
+                                cx.stop_propagation();
+                                this.select_context_entry(entry.clone(), window, cx);
                             })
                         })
                         .when_some(entry.icon, |row, icon| {
@@ -3069,6 +3123,77 @@ mod tests {
             composer.set_menu_chip(ComposerChip::new("model"), cx);
             assert!(composer.open_chip.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn at_panel_closes_with_trigger_and_supports_keyboard_selection_without_submitting(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_composer_keys);
+        cx.update(super::super::bind_prompt_editor_keys);
+        struct Preview(Entity<Composer>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().size_full().flex().flex_col().justify_end().child(self.0.clone()) }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| Preview(cx.new(|cx| {
+            Composer::new("Message", cx).context_on_at(true).context_panel("attach", "Context", [ComposerContextSection::untitled([
+                ComposerContextEntry::new("first", "First"), ComposerContextEntry::new("second", "Second")
+            ])])
+        })));
+        let composer = preview.read_with(window, |p, _| p.0.clone());
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = submitted.clone();
+        let _subscription = window.update(|_, cx| cx.subscribe(&composer, move |_, event, _| {
+            if matches!(event, ComposerEvent::Submitted(_)) { count.set(count.get() + 1); }
+        }));
+        composer.update(window, |c, cx| c.set_value("@", cx));
+        window.run_until_parked();
+        window.update(|window, cx| window.focus(&composer.read(cx).editor.focus_handle(cx), cx));
+        window.simulate_keystrokes("down enter");
+        window.run_until_parked();
+        composer.read_with(window, |c, cx| {
+            assert!(!c.context_open);
+            assert!(c.value(cx).contains("@Second"), "{}", c.value(cx));
+        });
+        assert_eq!(submitted.get(), 0);
+        composer.update(window, |c, cx| c.set_value("@", cx));
+        window.run_until_parked();
+        window.simulate_keystrokes("backspace");
+        window.run_until_parked();
+        composer.read_with(window, |c, _| assert!(!c.context_open));
+        composer.update(window, |c, cx| c.set_value("@no-match", cx));
+        window.run_until_parked();
+        window.simulate_keystrokes("enter");
+        assert_eq!(submitted.get(), 0, "empty suggestions must not send a message");
+    }
+
+    #[gpui::test]
+    fn access_menu_survives_toolbar_refresh_while_hovering_between_options(cx: &mut gpui::TestAppContext) {
+        struct Preview(Entity<Composer>);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().flex_col().justify_end().child(self.0.clone())
+            }
+        }
+        let (preview, window) = cx.add_window_view(|_, cx| Preview(cx.new(|cx| {
+            Composer::new("Message", cx)
+                .chip(ComposerChip::new("access").option("ask", "请求批准").option("auto", "自动批准").option("full", "完全访问权限"))
+                .menu_chip(ComposerChip::new("model").option("a", "A"))
+        })));
+        let composer = preview.read_with(window, |preview, _| preview.0.clone());
+        composer.update(window, |composer, cx| { composer.open_chip = Some("access".into()); cx.notify(); });
+        window.run_until_parked();
+        for value in ["ask", "auto", "full", "auto", "ask"] {
+            let selector = Box::leak(format!("composer-option:access:{value}").into_boxed_str());
+            let row = window.debug_bounds(selector).unwrap();
+            window.simulate_mouse_move(row.center(), None, Default::default());
+            composer.update(window, |composer, cx| {
+                composer.set_menu_chip(ComposerChip::new("model").option("a", "A"), cx);
+                composer.set_menu_chip(ComposerChip::new("partner").option("none", "None"), cx);
+                assert_eq!(composer.open_chip.as_deref(), Some("access"));
+            });
+            window.run_until_parked();
+            assert!(window.debug_bounds("composer-chip-menu").is_some());
+        }
+
     }
 
     #[gpui::test]

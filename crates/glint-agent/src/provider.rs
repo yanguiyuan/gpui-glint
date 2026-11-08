@@ -539,16 +539,17 @@ async fn complete(
     let mut blocks = Vec::new();
     let mut total: Option<crate::generation::GenerationStats> = None;
     let mut argument_repairs = 0;
+    let mut steering_boundary = None;
     loop {
         // Never wait for recall. Consume it once at the next request boundary,
         // after all preceding tool calls have their matching results.
         if let Some(context) = &context {
-            messages.extend(
-                context
-                    .take_steering()
-                    .into_iter()
-                    .map(|steering| steering.turn(config.protocol)),
-            );
+            let steering = context.take_steering();
+            if !steering.is_empty() {
+                steering_boundary = Some(blocks.len());
+                let _ = context.events.send(crate::tools::ToolEvent::SteeringApplied(blocks.clone())).await;
+                messages.extend(steering.into_iter().map(|steering| steering.turn(config.protocol)));
+            }
         }
         if let Some(recalled) = context
             .as_ref()
@@ -605,6 +606,10 @@ async fn complete(
                 .map(|context| context.take_steering())
                 .unwrap_or_default();
             if !steering.is_empty() {
+                steering_boundary = Some(blocks.len());
+                if let Some(context) = &context {
+                    let _ = context.events.send(crate::tools::ToolEvent::SteeringApplied(blocks.clone())).await;
+                }
                 if config.kind == Kind::ChatGpt {
                     messages.push(json!({"responses_output":reply.raw_content}));
                 } else if config.protocol == Protocol::Anthropic {
@@ -622,6 +627,7 @@ async fn complete(
             reply.stats = total.unwrap();
             reply.stats.elapsed_ms = started.elapsed().as_millis() as u64;
             reply.tool_records = records;
+            reply.steering_boundary = steering_boundary;
             reply.text = blocks
                 .iter()
                 .filter_map(|block| match block {
@@ -1574,6 +1580,7 @@ mod tests {
                 .unwrap();
                 let reply = runtime().unwrap().block_on(request.response()).unwrap();
                 assert_eq!(reply.text, "before\n\ndone");
+                assert_eq!(reply.steering_boundary, deliver_recall.then_some(4));
                 use crate::generation::ContentBlock;
                 assert!(
                     matches!(&reply.blocks[..], [ContentBlock::Thinking(plan), ContentBlock::Text(before), ContentBlock::ToolCall(call), ContentBlock::ToolResult(result), ContentBlock::Text(after)] if plan == "plan" && before == "before" && call.id == "call-1" && result.success && after == "done")

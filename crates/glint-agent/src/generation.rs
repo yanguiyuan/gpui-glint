@@ -193,6 +193,8 @@ pub fn anthropic_blocks(content: &Value) -> Vec<ContentBlock> {
 
 #[derive(Debug, Default)]
 pub struct Completion {
+    /// Last applied steering boundary, even if UI events have not been drained yet.
+    pub steering_boundary: Option<usize>,
     pub blocks: Vec<ContentBlock>,
     pub text: String,
     pub stats: GenerationStats,
@@ -556,6 +558,7 @@ impl StreamCompletion {
             raw_content,
             reasoning: self.reasoning,
             tool_records: vec![],
+            steering_boundary: None,
         })
     }
 }

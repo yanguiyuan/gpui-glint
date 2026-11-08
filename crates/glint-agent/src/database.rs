@@ -217,10 +217,24 @@ pub fn load_history(anchor: &Path) -> Result<Option<Value>, String> {
     history["sessions"] = json!(sessions);
     Ok(Some(history))
 }
-/// Draft typing must not serialize or copy historical messages.
-pub fn save_drafts(anchor: &Path, drafts: &[(uuid::Uuid, String)]) -> Result<(), String> {
+/// Update navigation and drafts without touching historical message payloads.
+pub fn save_ui_state(
+    anchor: &Path,
+    drafts: &[(uuid::Uuid, String)],
+    navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+) -> Result<(), String> {
     let mut connection = open(anchor)?;
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    if let Some((active, partner)) = navigation {
+        let mut state = meta(&transaction, "history")?.ok_or("会话尚未保存，需要重试完整保存")?;
+        state["active"] = json!(active);
+        let partner = match partner {
+            Some(id) if transaction.query_row("SELECT EXISTS(SELECT 1 FROM partners WHERE id=?1)", [id.to_string()], |row| row.get::<_, bool>(0)).map_err(|e| e.to_string())? => Some(id),
+            _ => None,
+        };
+        state["preferred_partner"] = json!(partner);
+        set_meta(&transaction, "history", &state)?;
+    }
     for (id, draft) in drafts {
         let updated = transaction
             .execute(

@@ -39,6 +39,7 @@ pub enum ToolEvent {
         tools: Vec<ToolRecord>,
     },
     SteeringFailed(String),
+    SteeringApplied(Vec<crate::generation::ContentBlock>),
     TodoUpdated(Vec<crate::todo::Item>),
     SubagentUpdated,
     ApprovalResolved,

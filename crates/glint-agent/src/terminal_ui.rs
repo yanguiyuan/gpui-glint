@@ -27,6 +27,40 @@ use std::{
 
 const CELL_W: f32 = 8.;
 const CELL_H: f32 = 19.;
+const FONT_SIZE: f32 = 13.;
+
+fn fixed_pitch(widths: &[f32]) -> bool {
+    widths.first().is_some_and(|width| width.is_finite() && *width > 0.
+        && widths.iter().all(|other| other.is_finite() && (*other - *width).abs() < 0.02))
+}
+
+fn terminal_font(text: &gpui::TextSystem, configured: &str) -> (gpui::Font, f32) {
+    // Generic CSS family names can resolve to a proportional UI fallback in
+    // native font backends. Pick an installed, verified fixed-pitch family.
+    let fallback: &[&str] = if cfg!(target_os = "macos") {
+        &["Menlo", "SF Mono", "Monaco", "Courier New"]
+    } else if cfg!(windows) {
+        &["Consolas", "Cascadia Mono", "Lucida Console", "Courier New"]
+    } else {
+        &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Monospace"]
+    };
+    let installed = text.all_font_names();
+    for family in std::iter::once(configured).chain(fallback.iter().copied()) {
+        if !installed.iter().any(|name| name.eq_ignore_ascii_case(family)) { continue; }
+        let font = gpui::font(family.to_owned());
+        let id = text.resolve_font(&font);
+        let widths: Option<Vec<f32>> = ['0', 'i', 'W', 'm', '.', ' '].into_iter()
+            .map(|ch| text.advance(id, px(FONT_SIZE), ch).ok().map(|advance| f32::from(advance.width)))
+            .collect();
+        if let Some(widths) = widths.filter(|widths| fixed_pitch(widths)) {
+            return (font, widths[0]);
+        }
+    }
+    let font = gpui::font(fallback[0]);
+    let width = text.advance(text.resolve_font(&font), px(FONT_SIZE), '0')
+        .map(|advance| f32::from(advance.width)).unwrap_or(CELL_W).max(1.);
+    (font, width)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalColors {
@@ -307,11 +341,13 @@ impl Session {
         drop(term);
         let _ = self.sender.send(Msg::Input(Cow::Owned(bytes)));
     }
-    fn resize(&self, columns: usize, rows: usize) {
+    fn resize(&self, columns: usize, rows: usize, cell_width: f32) {
         let mut size = self.listener.size.lock().unwrap();
-        if usize::from(size.num_cols) == columns && usize::from(size.num_lines) == rows {
+        let width = cell_width.round().max(1.) as u16;
+        if usize::from(size.num_cols) == columns && usize::from(size.num_lines) == rows && size.cell_width == width {
             return;
         }
+        size.cell_width = width;
         size.num_cols = columns as u16;
         size.num_lines = rows as u16;
         let resized = *size;
@@ -351,6 +387,9 @@ fn color(value: Color, colors: TerminalColors) -> u32 {
 }
 
 struct TerminalView {
+    font: gpui::Font,
+    configured_font: SharedString,
+    cell_width: f32,
     theme: ThemePreset,
     session: Option<Session>,
     focus: FocusHandle,
@@ -363,6 +402,8 @@ struct TerminalView {
 }
 impl TerminalView {
     fn new(root: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
+        let configured_font = gpui_glint::code_font::family();
+        let (font, cell_width) = terminal_font(cx.text_system(), &configured_font);
         let start = cx
             .background_executor()
             .spawn(async move { Session::start(&root, theme) });
@@ -413,6 +454,9 @@ impl TerminalView {
             }
         });
         Self {
+            font,
+            configured_font,
+            cell_width,
             theme,
             session: None,
             focus: cx.focus_handle(),
@@ -524,9 +568,9 @@ impl TerminalView {
             .session
             .as_ref()
             .map_or(0, |s| s.term.lock().grid().display_offset());
-        let columns = (f32::from(self.bounds.size.width) / CELL_W).max(2.) as usize;
+        let columns = (f32::from(self.bounds.size.width) / self.cell_width).max(2.) as usize;
         let rows = (f32::from(self.bounds.size.height) / CELL_H).max(1.) as usize;
-        let col = ((f32::from(position.x - self.bounds.left()) / CELL_W).max(0.) as usize)
+        let col = ((f32::from(position.x - self.bounds.left()) / self.cell_width).max(0.) as usize)
             .min(columns - 1);
         let row =
             ((f32::from(position.y - self.bounds.top()) / CELL_H).max(0.) as usize).min(rows - 1);
@@ -538,14 +582,21 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let configured = gpui_glint::code_font::family();
+        if configured != self.configured_font {
+            let (font, cell_width) = terminal_font(window.text_system(), &configured);
+            self.font = font;
+            self.cell_width = cell_width;
+            self.configured_font = configured;
+        }
         self.bounds = bounds;
         let colors = TerminalColors::for_theme(self.theme);
         let Some(session) = &self.session else {
             return;
         };
-        let cols = ((f32::from(bounds.size.width) / CELL_W) as usize).clamp(2, 500);
+        let cols = ((f32::from(bounds.size.width) / self.cell_width) as usize).clamp(2, 500);
         let rows = ((f32::from(bounds.size.height) / CELL_H) as usize).clamp(1, 300);
-        session.resize(cols, rows);
+        session.resize(cols, rows, self.cell_width);
         let term = session.term.lock();
         let content = term.renderable_content();
         for cell in content.display_iter {
@@ -554,7 +605,7 @@ impl TerminalView {
                 continue;
             }
             let origin = point(
-                bounds.left() + px(cell.point.column.0 as f32 * CELL_W),
+                bounds.left() + px(cell.point.column.0 as f32 * self.cell_width),
                 bounds.top() + px(row as f32 * CELL_H),
             );
             let selected = content
@@ -570,7 +621,7 @@ impl TerminalView {
             }
             if bg != colors.background {
                 window.paint_quad(gpui::fill(
-                    gpui::Bounds::new(origin, size(px(CELL_W), px(CELL_H))),
+                    gpui::Bounds::new(origin, size(px(self.cell_width), px(CELL_H))),
                     rgb(bg),
                 ));
             }
@@ -584,11 +635,7 @@ impl TerminalView {
             if let Some(chars) = cell.zerowidth() {
                 text.extend(chars);
             }
-            let mut font = gpui::font(if cfg!(windows) {
-                "Consolas"
-            } else {
-                "monospace"
-            });
+            let mut font = self.font.clone();
             if cell.flags.contains(Flags::BOLD) {
                 font.weight = FontWeight::BOLD;
             }
@@ -603,14 +650,14 @@ impl TerminalView {
             };
             let line = window
                 .text_system()
-                .shape_line(text.into(), px(13.), &[run], None);
+                .shape_line(text.into(), px(FONT_SIZE), &[run], None);
             let _ = line.paint(origin, px(CELL_H), gpui::TextAlign::Left, None, window, cx);
         }
         let cursor = content.cursor.point;
         let row = cursor.line.0 + content.display_offset as i32;
         if row >= 0 && row < rows as i32 && content.mode.contains(TermMode::SHOW_CURSOR) {
             let origin = point(
-                bounds.left() + px(cursor.column.0 as f32 * CELL_W),
+                bounds.left() + px(cursor.column.0 as f32 * self.cell_width),
                 bounds.top() + px(row as f32 * CELL_H),
             );
             if self.focus.is_focused(window) {
@@ -622,7 +669,7 @@ impl TerminalView {
             if !self.preedit.is_empty() {
                 let run = TextRun {
                     len: self.preedit.len(),
-                    font: gpui::font("monospace"),
+                    font: self.font.clone(),
                     color: gpui::rgb_to_hsla(rgb(colors.cursor)),
                     background_color: None,
                     underline: None,
@@ -631,7 +678,7 @@ impl TerminalView {
                 };
                 let line = window.text_system().shape_line(
                     self.preedit.clone().into(),
-                    px(13.),
+                    px(FONT_SIZE),
                     &[run],
                     None,
                 );
@@ -812,6 +859,15 @@ impl Render for TerminalView {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn terminal_font_requires_a_finite_fixed_pitch() {
+        assert!(fixed_pitch(&[7.826, 7.826, 7.826, 7.826, 7.826, 7.826]));
+        assert!(!fixed_pitch(&[8., 3., 12., 10., 4., 4.]));
+        assert!(!fixed_pitch(&[0.; 6]));
+        assert!(!fixed_pitch(&[8., f32::NAN]));
+        assert!(!fixed_pitch(&[]));
+    }
 
     #[test]
     fn terminal_palettes_follow_every_app_theme_and_keep_text_readable() {
@@ -1002,6 +1058,16 @@ func main() {
             std::thread::sleep(Duration::from_millis(20));
             window.run_until_parked();
         }
+        view.read_with(window, |view, _| {
+            assert!(view.cell_width.is_finite() && view.cell_width > 0.);
+            assert_ne!(view.font.family.as_ref(), "monospace");
+            let session = view.session.as_ref().unwrap();
+            let expected = ((f32::from(view.bounds.size.width) / view.cell_width) as usize).clamp(2, 500);
+            assert_eq!(session.term.lock().columns(), expected);
+            assert_eq!(session.listener.size.lock().unwrap().cell_width, view.cell_width.round() as u16);
+            let position = point(view.bounds.left() + px(view.cell_width * 4.5), view.bounds.top() + px(CELL_H * 2.5));
+            assert_eq!(view.grid_point(position).column.0, 4, "selection must follow the measured glyph width");
+        });
         window.update(|window, cx| {
             host.update(cx, |host, cx| {
                 host.terminal_ui.open = false;
@@ -1202,7 +1268,7 @@ func main() {
             Some("1")
         );
         let (session, _) = Session::start(&root, ThemePreset::Moonstone).unwrap();
-        session.resize(160, 45);
+        session.resize(160, 45, CELL_W);
         session.input(
             b"printf '\\nROOT_CHECK='; pwd -W\rcd child\rprintf '\\nSTATE_CHECK='; pwd -W\r"
                 .to_vec(),
@@ -1311,10 +1377,10 @@ impl EntityInputHandler for TerminalView {
             .unwrap_or_default();
         Some(gpui::Bounds::new(
             point(
-                bounds.left() + px(caret.column.0 as f32 * CELL_W),
+                bounds.left() + px(caret.column.0 as f32 * self.cell_width),
                 bounds.top() + px(caret.line.0.max(0) as f32 * CELL_H),
             ),
-            size(px(CELL_W), px(CELL_H)),
+            size(px(self.cell_width), px(CELL_H)),
         ))
     }
     fn character_index_for_point(
