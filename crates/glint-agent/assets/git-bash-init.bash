@@ -14,7 +14,12 @@ unset glint_profile
 if [ -n "${GLINT_NATIVE_GIT_BIN:-}" ]; then
     glint_git_bin=$(/usr/bin/cygpath -u -- "$GLINT_NATIVE_GIT_BIN")
     if [ -n "$glint_git_bin" ]; then
-        export PATH="$glint_git_bin:$PATH"
+        # Native make searches PATH again for sh.exe. Repair shell lookup too,
+        # rather than only git.exe, after profiles prepend package-manager shims.
+        export PATH="$glint_git_bin:/usr/bin:/bin:$PATH"
+        # Windows make needs a native path; /bin/bash from MSYS is not a native
+        # Windows path and may cause make to fall back to the broken sh shim.
+        export SHELL="$(/usr/bin/cygpath -am -- /bin/bash.exe)"
         hash -r
     fi
     unset glint_git_bin GLINT_NATIVE_GIT_BIN

@@ -62,6 +62,7 @@ mod steering_ui;
 mod storage;
 mod subagent;
 mod subagent_ui;
+mod project_actions;
 mod terminal_ui;
 mod titles;
 mod todo;
@@ -130,6 +131,7 @@ pub struct AgentWorkspace {
     right_sidebar_resize: Option<(gpui::Pixels, f32)>,
     file_preview: file_preview::State,
     terminal_ui: terminal_ui::State,
+    project_actions: project_actions::State,
     ssh_ui: ssh_ui::State,
     channels: channels::ui::State,
     page: crate::Page,
@@ -627,6 +629,7 @@ impl AgentWorkspace {
             right_sidebar_resize: None,
             file_preview: file_preview::State::new(cx),
             terminal_ui: Default::default(),
+            project_actions: project_actions::State::new(&path, cx),
             ssh_ui: ssh_ui::State::new(cx),
             channels: channels::ui::State::new(&path, cx),
             host_tools: None,
@@ -1692,23 +1695,7 @@ impl AgentWorkspace {
                     && self.page != crate::Page::Vault
                     && self.page != crate::Page::Partners
                     && self.page != crate::Page::Channels,
-                |bar| {
-                    bar.child(
-                        div()
-                            .debug_selector(|| "agent-topbar-provider".into())
-                            .px_2()
-                            .py_1()
-                            .rounded(px(5.))
-                            .bg(rgb(p.accent_tint))
-                            .text_size(px(10.))
-                            .text_color(rgb(p.accent))
-                            .child(if self.provider.enabled {
-                                self.provider.name.clone()
-                            } else {
-                                "未连接 Provider".into()
-                            }),
-                    )
-                },
+                |bar| bar.child(self.project_action_trigger(cx)),
             )
     }
 
@@ -2664,6 +2651,7 @@ impl AgentWorkspace {
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_terminal_theme(cx);
+        self.sync_project_actions(cx);
         self.file_preview.view.update(cx, |view, cx| {
             view.set_active(
                 self.file_preview.open
@@ -2770,12 +2758,26 @@ impl Render for AgentWorkspace {
                             .size_full()
                             .min_w_0()
                             .flex()
-                            .child(div().flex_1().min_w_0().h_full().child(self.content(cx)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().flex_1().min_h_0().w_full().child(self.content(cx)))
+                                    .when(self.project_actions.panel, |body| {
+                                        body.child(self.project_action_panel(cx))
+                                    })
+                                    .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| {
+                                        body.child(self.project_terminal_sidebar(cx))
+                                    }),
+                            )
                             .when(
                                 self.file_preview.open
                                     || self.edits_ui.open
                                     || self.git_ui.open
-                                    || self.terminal_ui.open,
+                                    || (self.terminal_ui.open && !self.terminal_ui.bottom),
                                 |body| {
                                     body.child(
                                         div()
@@ -2808,7 +2810,7 @@ impl Render for AgentWorkspace {
                             .when(self.edits_ui.open, |body| {
                                 body.child(self.edits_sidebar(cx))
                             })
-                            .when(self.terminal_ui.open, |body| {
+                            .when(self.terminal_ui.open && !self.terminal_ui.bottom, |body| {
                                 body.child(self.project_terminal_sidebar(cx))
                             })
                             .when(self.git_ui.open, |body| {
@@ -2856,6 +2858,9 @@ impl Render for AgentWorkspace {
             })
             .when(self.ssh_ui.open, |root| {
                 root.child(self.ssh_project_dialog(cx))
+            })
+            .when(self.project_actions.editor.is_some(), |root| {
+                root.child(self.project_action_editor(cx))
             })
             .children(command_overlay)
             .children(image_lightbox)

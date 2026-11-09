@@ -97,7 +97,7 @@ impl TerminalColors {
 }
 
 gpui::actions!(project_terminal, [Paste, Copy, CopyOrInterrupt]);
-struct StatusChanged;
+pub(super) struct StatusChanged;
 impl gpui::EventEmitter<StatusChanged> for TerminalView {}
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -113,6 +113,7 @@ pub fn bind_keys(cx: &mut App) {
 #[derive(Default)]
 pub struct State {
     pub open: bool,
+    pub bottom: bool,
     terminals: HashMap<PathBuf, Entity<TerminalView>>,
 }
 
@@ -157,7 +158,12 @@ fn git_bash_startup(bash: &Path) -> Result<(Vec<String>, PathBuf), String> {
     ))
 }
 
+#[cfg(test)]
 fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
+    shell_options_with_command(root, None)
+}
+
+fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Result<(tty::Options, String), String> {
     let mut options = tty::Options::default();
     options.drain_on_exit = true;
     options.env.insert("TERM".into(), "xterm-256color".into());
@@ -171,13 +177,13 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
         if let Some(port) = remote.port {
             args.extend(["-p".into(), port.to_string()]);
         }
-        args.extend([
-            remote.target,
-            format!(
-                "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l",
-                ssh_project::quote(&remote.directory)
-            ),
-        ]);
+        let launch = if let Some((command, token)) = command {
+            let command = task_script(command, token, false);
+            format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -lic {}", ssh_project::quote(&remote.directory), ssh_project::quote(&command))
+        } else {
+            format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l", ssh_project::quote(&remote.directory))
+        };
+        args.extend([remote.target, launch]);
         options.shell = Some(tty::Shell::new("ssh".into(), args));
         return Ok((options, "SSH".into()));
     }
@@ -202,7 +208,8 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
         }
         if let Some(bash) = candidates.into_iter().find(|path| path.is_file()) {
             let bash = crate::executable::resolve(&bash.to_string_lossy(), root);
-            let (args, git_bin) = git_bash_startup(&bash)?;
+            let (mut args, git_bin) = git_bash_startup(&bash)?;
+            if let Some((command, token)) = command { args.extend(["-c".into(), task_script(command, token, false)]); }
             options.shell = Some(tty::Shell::new(bash.to_string_lossy().into_owned(), args));
             options.env.insert(
                 "GLINT_NATIVE_GIT_BIN".into(),
@@ -212,10 +219,9 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
             options.env.insert("MSYSTEM".into(), "MINGW64".into());
             return Ok((options, "Git Bash".into()));
         }
-        options.shell = Some(tty::Shell::new(
-            "powershell.exe".into(),
-            vec!["-NoLogo".into()],
-        ));
+        let mut args = vec!["-NoLogo".into()];
+        if let Some((command, token)) = command { args.extend(["-Command".into(), task_script(command, token, true)]); }
+        options.shell = Some(tty::Shell::new("powershell.exe".into(), args));
         return Ok((options, "PowerShell".into()));
     }
     #[cfg(not(windows))]
@@ -226,7 +232,21 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
             "PATH".into(),
             crate::user_path::env_value().to_string_lossy().into_owned(),
         );
+        if let Some((command, token)) = command {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            options.shell = Some(tty::Shell::new(shell, vec!["-lic".into(), task_script(command, token, false)]));
+        }
         Ok((options, "Shell".into()))
+    }
+}
+
+// Wait for the terminal parser to acknowledge the completion marker before
+// exiting. ConPTY can otherwise close before the final output reaches the view.
+fn task_script(command: &str, token: &str, powershell: bool) -> String {
+    if powershell {
+        format!("& {{ {command} }}; $glintExit = if ($?) {{ if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }} }} else {{ if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }} }}; [Console]::Write([char]27 + ']2;{token}:' + $glintExit + [char]7); $null = [Console]::ReadLine(); exit $glintExit")
+    } else {
+        format!("(\n{command}\n); glint_exit=$?; printf '\\033]2;{token}:%s\\007' \"$glint_exit\"; IFS= read -r glint_ack; exit \"$glint_exit\"")
     }
 }
 
@@ -235,6 +255,8 @@ struct Listener {
     wake: async_channel::Sender<()>,
     sender: Arc<OnceLock<EventLoopSender>>,
     exited: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    completion: Option<String>,
     size: Arc<Mutex<WindowSize>>,
     colors: Arc<Mutex<TerminalColors>>,
 }
@@ -242,6 +264,10 @@ impl EventListener for Listener {
     fn send_event(&self, event: Event) {
         let reply = match event {
             Event::PtyWrite(text) => Some(text),
+            Event::Title(title) if self.completion.as_ref().is_some_and(|token| title.starts_with(&format!("{token}:"))) => {
+                let code = title.rsplit_once(':').and_then(|(_, code)| code.parse::<i32>().ok());
+                if code.is_some() { *self.exit_code.lock().unwrap() = code; Some("\r".into()) } else { None }
+            }
             Event::ColorRequest(index, format) => {
                 let color = ansi_color(index, *self.colors.lock().unwrap());
                 Some(format(Rgb {
@@ -251,7 +277,12 @@ impl EventListener for Listener {
                 }))
             }
             Event::TextAreaSizeRequest(format) => Some(format(*self.size.lock().unwrap())),
-            Event::Exit | Event::ChildExit(_) => {
+            Event::ChildExit(status) => {
+                *self.exit_code.lock().unwrap() = status.code();
+                self.exited.store(true, Ordering::Release);
+                None
+            }
+            Event::Exit => {
                 self.exited.store(true, Ordering::Release);
                 None
             }
@@ -292,10 +323,14 @@ impl Drop for Session {
     }
 }
 impl Session {
+    #[cfg(test)]
     fn start(
         root: &Path,
         theme: ThemePreset,
     ) -> Result<(Self, async_channel::Receiver<()>), String> {
+        Self::start_command(root, theme, None)
+    }
+    fn start_command(root: &Path, theme: ThemePreset, command: Option<&str>) -> Result<(Self, async_channel::Receiver<()>), String> {
         let (wake, receiver) = async_channel::bounded(1);
         let size = WindowSize {
             num_lines: 28,
@@ -303,14 +338,17 @@ impl Session {
             cell_width: CELL_W as u16,
             cell_height: CELL_H as u16,
         };
+        let completion = command.map(|_| format!("glint-action-{}", uuid::Uuid::new_v4()));
         let listener = Listener {
             wake,
             sender: Arc::new(OnceLock::new()),
             exited: Arc::new(AtomicBool::new(false)),
+            exit_code: Arc::new(Mutex::new(None)),
+            completion: completion.clone(),
             size: Arc::new(Mutex::new(size)),
             colors: Arc::new(Mutex::new(TerminalColors::for_theme(theme))),
         };
-        let (options, label) = shell_options(root)?;
+        let (options, label) = shell_options_with_command(root, command.zip(completion.as_deref()))?;
         let pty =
             tty::new(&options, size, 0).map_err(|error| format!("无法启动项目终端：{error}"))?;
         let term = Arc::new(FairMutex::new(Term::new(
@@ -327,8 +365,12 @@ impl Session {
         let _ = listener.sender.set(sender.clone());
         let worker = event_loop.spawn();
         // Reap the loop and release its PTY even after the child exits naturally.
+        let completed = listener.clone();
         std::thread::spawn(move || {
+            // Dropping the returned loop releases the PTY and its child tree.
             let _ = worker.join();
+            completed.exited.store(true, Ordering::Release);
+            let _ = completed.wake.try_send(());
         });
         Ok((
             Self {
@@ -392,7 +434,7 @@ fn color(value: Color, colors: TerminalColors) -> u32 {
     }
 }
 
-struct TerminalView {
+pub(super) struct TerminalView {
     font: gpui::Font,
     configured_font: SharedString,
     cell_width: f32,
@@ -405,14 +447,21 @@ struct TerminalView {
     bounds: gpui::Bounds<gpui::Pixels>,
     dragging: bool,
     exit_notified: bool,
+    stop_requested: bool,
 }
 impl TerminalView {
     fn new(root: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
+        Self::new_with_command(root, theme, None, cx)
+    }
+    pub(super) fn new_action(root: PathBuf, command: String, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
+        Self::new_with_command(root, theme, Some(command), cx)
+    }
+    fn new_with_command(root: PathBuf, theme: ThemePreset, command: Option<String>, cx: &mut Context<Self>) -> Self {
         let configured_font = gpui_glint::code_font::family();
         let (font, cell_width) = terminal_font(cx.text_system(), &configured_font);
         let start = cx
             .background_executor()
-            .spawn(async move { Session::start(&root, theme) });
+            .spawn(async move { Session::start_command(&root, theme, command.as_deref()) });
         let task = cx.spawn(async move |weak, cx| {
             let receiver = match start.await {
                 Ok((session, receiver)) => {
@@ -420,6 +469,7 @@ impl TerminalView {
                         .update(cx, |this, cx| {
                             *session.listener.colors.lock().unwrap() =
                                 TerminalColors::for_theme(this.theme);
+                            if this.stop_requested { let _ = session.sender.send(Msg::Shutdown); }
                             this.session = Some(session);
                             cx.emit(StatusChanged);
                             cx.notify();
@@ -472,9 +522,37 @@ impl TerminalView {
             bounds: Default::default(),
             dragging: false,
             exit_notified: false,
+            stop_requested: false,
         }
     }
-    fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+    pub(super) fn busy(&self) -> bool {
+        self.error.is_none() && !self.session.as_ref().is_some_and(|s| s.listener.exited.load(Ordering::Acquire))
+    }
+    pub(super) fn status(&self) -> String {
+        if self.error.is_some() { return "启动失败".into(); }
+        if let Some(session) = &self.session {
+            if session.listener.exited.load(Ordering::Acquire) {
+                if self.stop_requested { return "已停止".into(); }
+                return session.listener.exit_code.lock().unwrap().map(|code|
+                    format!("{} · 退出码 {code}", if code == 0 { "已完成" } else { "运行失败" }))
+                    .unwrap_or_else(|| "已退出".into());
+            }
+        }
+        if self.stop_requested { "正在停止…".into() } else { "运行中…".into() }
+    }
+    pub(super) fn stop(&mut self, cx: &mut Context<Self>) {
+        self.stop_requested = true;
+        if let Some(session) = &self.session { let _ = session.sender.send(Msg::Shutdown); }
+        cx.notify();
+    }
+    pub(super) fn copy_output(&self, cx: &mut App) {
+        if let Some(session) = &self.session {
+            let term = session.term.lock();
+            let text = term.bounds_to_string(TermPoint::new(term.topmost_line(), Column(0)), TermPoint::new(term.bottommost_line(), Column(term.columns()-1)));
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+    pub(super) fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
             if let Some(session) = &self.session {
@@ -867,6 +945,78 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[cfg(windows)]
+    fn action_terminal_uses_same_git_bash_initialization_and_preserves_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project spaces");
+        std::fs::create_dir_all(&root).unwrap();
+        if shell_options(&root).unwrap().1 != "Git Bash" { return; }
+        std::fs::write(root.join("Makefile"), include_str!("../../../Makefile")).unwrap();
+        let (session, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("make -- help")).unwrap();
+        session.resize(180, 45, CELL_W);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let text: String = session.term.lock().grid().display_iter().map(|cell| cell.c).collect();
+            if session.listener.exited.load(Ordering::Acquire) && text.contains("Windows overrides: VERSION=") {
+                assert_eq!(*session.listener.exit_code.lock().unwrap(), Some(0), "{text}");
+                assert!(!text.contains("Shim:"), "{text}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "action did not complete (exited={}, code={:?}): {text}", session.listener.exited.load(Ordering::Acquire), session.listener.exit_code.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let (failed, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("exit 7")).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !failed.listener.exited.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "failed action did not exit");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(*failed.listener.exit_code.lock().unwrap(), Some(7));
+        let (stopped, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("sleep 30")).unwrap();
+        stopped.sender.send(Msg::Shutdown).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !stopped.listener.exited.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "stopped action did not release PTY");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+
+    }
+
+    #[gpui::test]
+    fn docking_terminal_keeps_the_same_session_and_only_renders_one_position(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.update(|window, cx| host.update(cx, |host, cx| {
+            host.history.active_mut().project = Some(dir.path().into());
+            host.open_project_terminal(window, cx);
+        }));
+        window.run_until_parked();
+        let original = host.read_with(window, |host, _| host.terminal_ui.terminals[dir.path()].entity_id());
+        let side = window.debug_bounds("project-terminal-sidebar").unwrap();
+        let button = window.debug_bounds("project-terminal-dock").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        let bottom = window.debug_bounds("project-terminal-sidebar").unwrap();
+        assert!(bottom.size.width > side.size.width);
+        assert!(bottom.size.height < side.size.height);
+        host.read_with(window, |host, _| {
+            assert!(host.terminal_ui.bottom);
+            assert_eq!(host.terminal_ui.terminals[dir.path()].entity_id(), original);
+        });
+        let button = window.debug_bounds("project-terminal-dock").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(!host.terminal_ui.bottom);
+            assert_eq!(host.terminal_ui.terminals[dir.path()].entity_id(), original);
+        });
+    }
+
+    #[test]
     fn terminal_font_requires_a_finite_fixed_pitch() {
         assert!(fixed_pitch(&[7.826, 7.826, 7.826, 7.826, 7.826, 7.826]));
         assert!(!fixed_pitch(&[8., 3., 12., 10., 4., 4.]));
@@ -931,6 +1081,42 @@ mod tests {
         for index in 16..=255 {
             assert_eq!(ansi_color(index, light), ansi_color(index, dark));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_profiles_cannot_redirect_make_shell_through_scoop_shims() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = crate::executable::resolve("git", dir.path());
+        let Some(base) = git.parent().and_then(Path::parent) else { return; };
+        let bash = base.join("bin/bash.exe");
+        let make = crate::executable::resolve("make", dir.path());
+        if !bash.is_file() || !make.is_file() { return; }
+        let home = dir.path().join("home");
+        let shims = home.join("scoop/shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::write(shims.join("sh.exe"), "broken shim must never execute").unwrap();
+        std::fs::write(home.join(".bash_profile"), format!(
+            "export PATH=\"$(/usr/bin/cygpath -u -- {}):$PATH\"\nexport SHELL=sh\n",
+            ssh_project::quote(&shims.to_string_lossy().replace('\\', "/"))
+        )).unwrap();
+        std::fs::write(dir.path().join("Makefile"), format!(
+            "{}\nprint-shell:\n\t@echo $(SHELL)\n", include_str!("../../../Makefile")
+        )).unwrap();
+        let (args, git_bin) = git_bash_startup(&bash).unwrap();
+        let output = crate::child_process::command(&bash)
+            .current_dir(dir.path()).args(args)
+            .args(["-c", &format!("{} -- help print-shell", ssh_project::quote(&make.to_string_lossy().replace('\\', "/")))])
+            .env("HOME", home.to_string_lossy().replace('\\', "/"))
+            .env("CHERE_INVOKING", "1").env("MSYSTEM", "MINGW64")
+            .env("GLINT_NATIVE_GIT_BIN", &git_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Windows overrides: VERSION="), "{stdout}");
+        assert!(stdout.lines().any(|line| line.ends_with("/usr/bin/bash.exe") || line.ends_with("/usr/bin/sh.exe")), "{stdout}");
+        assert!(!stdout.contains("scoop/shims"), "{stdout}");
+        assert!(!stderr.contains("Shim:"), "{stderr}");
     }
 
     #[cfg(windows)]
@@ -1432,118 +1618,62 @@ impl AgentWorkspace {
         self.edits_ui.open = false;
         self.git_ui.open = false;
         self.terminal_ui.open = true;
+        if self.terminal_ui.bottom { self.project_actions.panel = false; }
         self.right_sidebar_width = self.right_sidebar_width.max(500.);
         let terminal = &self.terminal_ui.terminals[&root];
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
     pub(super) fn project_terminal_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = self.theme.palette();
-        let terminal = self
-            .history
-            .active()
-            .project
-            .as_ref()
-            .and_then(|root| self.terminal_ui.terminals.get(root))
-            .cloned();
-        let label = terminal
-            .as_ref()
-            .and_then(|view| {
-                view.read(cx).session.as_ref().map(|s| {
-                    format!(
-                        "{}{}",
-                        s.label,
-                        if s.listener.exited.load(Ordering::Acquire) {
-                            " · 已退出"
-                        } else {
-                            ""
-                        }
-                    )
-                })
-            })
-            .unwrap_or_else(|| "项目终端".into());
-        div()
+        let root = self.history.active().project.clone();
+        let terminal = root.as_ref().and_then(|r| self.terminal_ui.terminals.get(r)).cloned();
+        let label = terminal.as_ref().and_then(|view| view.read(cx).session.as_ref().map(|s| {
+            format!("{}{}", s.label, if s.listener.exited.load(Ordering::Acquire) { " · 已退出" } else { "" })
+        })).unwrap_or_else(|| "项目终端".into());
+        let title = format!("{label} · {}", root.as_ref().map(|p| ssh_project::label(p)).unwrap_or_default());
+        let controls = div().flex().items_center().gap_2()
+            .child(IconButton::new(if self.terminal_ui.bottom { Icon::Sidebar } else { Icon::ChevronDown },
+                if self.terminal_ui.bottom { "移到右侧" } else { "移到底部" }).theme(self.theme).render()
+                .debug_selector(|| "project-terminal-dock".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.terminal_ui.bottom = !this.terminal_ui.bottom;
+                    if this.terminal_ui.bottom { this.project_actions.panel = false; }
+                    else { this.file_preview.open = false; this.edits_ui.open = false; this.git_ui.open = false; }
+                    cx.notify();
+                })))
+            .child(IconButton::new(Icon::Refresh, "重启项目终端").theme(self.theme).render()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(root) = this.history.active().project.clone() {
+                        this.terminal_ui.terminals.remove(&root);
+                        this.open_project_terminal(window, cx);
+                    }
+                })))
+            .child(IconButton::new(Icon::Trash, "结束项目终端").theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(root) = this.history.active().project.clone() { this.terminal_ui.terminals.remove(&root); }
+                    this.terminal_ui.open = false;
+                    cx.notify();
+                })))
+            .child(IconButton::new(Icon::Close, "隐藏终端（继续运行）").theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| { this.terminal_ui.open = false; cx.notify(); })));
+        terminal_panel(terminal, title, controls, self.theme, self.terminal_ui.bottom, self.right_sidebar_width)
             .debug_selector(|| "project-terminal-sidebar".into())
-            .w(px(self.right_sidebar_width))
-            .h_full()
-            .min_h_0()
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .bg(rgb(p.panel))
-            .border_l_1()
-            .border_color(rgb(p.border))
-            .child(
-                div()
-                    .debug_selector(|| "project-terminal-header".into())
-                    .h(px(46.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::Shell.render(16.).flex_shrink_0())
-                            .child(div().min_w_0().max_w(px(132.)).truncate().child(label))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(
-                                        self.history
-                                            .active()
-                                            .project
-                                            .as_ref()
-                                            .map(|path| ssh_project::label(path))
-                                            .unwrap_or_default(),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        IconButton::new(Icon::Refresh, "重启项目终端")
-                            .theme(self.theme)
-                            .render()
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(root) = this.history.active().project.clone() {
-                                    this.terminal_ui.terminals.remove(&root);
-                                    this.open_project_terminal(window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        IconButton::new(Icon::Trash, "结束项目终端")
-                            .theme(self.theme)
-                            .render()
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(root) = this.history.active().project.clone() {
-                                    this.terminal_ui.terminals.remove(&root);
-                                }
-                                this.terminal_ui.open = false;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        IconButton::new(Icon::Close, "隐藏终端侧栏")
-                            .theme(self.theme)
-                            .render()
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.terminal_ui.open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().children(terminal))
     }
+}
+
+/// Both dock positions and project actions use this same PTY view and frame.
+pub(super) fn terminal_panel(
+    terminal: Option<Entity<TerminalView>>, title: String, controls: gpui::Div,
+    theme: ThemePreset, bottom: bool, width: f32,
+) -> gpui::Div {
+    let p = theme.palette();
+    div().min_h_0().flex_shrink_0().flex().flex_col().bg(rgb(p.panel)).border_color(rgb(p.border))
+        .when(bottom, |view| view.w_full().h(px(280.)).border_t_1())
+        .when(!bottom, |view| view.w(px(width)).h_full().border_l_1())
+        .child(div().debug_selector(|| "project-terminal-header".into()).h(px(46.)).flex_shrink_0()
+            .px_3().flex().items_center().gap_2()
+            .child(Icon::Shell.render(16.).flex_shrink_0())
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(controls))
+        .child(div().flex_1().min_h_0().children(terminal))
 }
