@@ -1,6 +1,6 @@
 //! User-triggered, project-scoped commands. Discovery never evaluates Makefiles.
 use super::*;
-use gpui_glint::components::{Dialog, InputField};
+use gpui_glint::components::{Dialog, InputField, MenuItem, Tooltip};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -365,13 +365,43 @@ impl AgentWorkspace {
             .child(if busy { Icon::Pulse } else { Icon::Play }.render(15.))
             .child(if busy { "运行中" } else { "项目操作" })
             .child(Icon::ChevronDown.render(12.));
-        let mut content = div().flex().flex_col().gap_1();
+        let mut content = div().flex().flex_col().min_w_0();
         if let Some(root) = root {
             content = content.child(
-                div()
-                    .p_2()
-                    .text_color(rgb(p.text_muted))
-                    .child(ssh_project::label(&root)),
+                Tooltip::new(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .pt_1()
+                        .pb_2()
+                        .text_color(rgb(p.text_muted))
+                        .child(Icon::Folder.render(14.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(ssh_project::label(&root)),
+                        )
+                        .when(busy, |header| {
+                            header.child(
+                                div()
+                                    .px_1()
+                                    .rounded(px(4.))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(p.accent))
+                                    .bg(rgb(p.accent_tint))
+                                    .child("运行中"),
+                            )
+                        }),
+                    root.to_string_lossy().into_owned(),
+                )
+                .theme(self.theme)
+                .render(cx),
             );
             let mut actions = self
                 .project_actions
@@ -391,11 +421,43 @@ impl AgentWorkspace {
                 .flex()
                 .flex_col();
             for (index, action) in actions.into_iter().enumerate() {
+                if index == 0 && custom_count > 0 {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("自定义 · {custom_count}")),
+                    );
+                }
+                if index == custom_count {
+                    list = list.child(
+                        Tooltip::new(
+                            div()
+                                .px_2()
+                                .pt_2()
+                                .pb_1()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(format!(
+                                    "Makefile · {}",
+                                    self.project_actions.discovered.len()
+                                )),
+                            "识别根目录 Makefile 中的静态目标；不展开 include、变量和模式规则",
+                        )
+                        .theme(self.theme)
+                        .render(cx),
+                    );
+                }
                 let project = root.clone();
                 let edit_root = root.clone();
                 let delete_root = root.clone();
                 let row = div()
                     .flex()
+                    .flex_shrink_0()
+                    .min_w_0()
                     .items_center()
                     .gap_1()
                     .child(
@@ -404,17 +466,44 @@ impl AgentWorkspace {
                             .debug_selector(move || format!("project-action-{index}"))
                             .flex_1()
                             .min_w_0()
-                            .p_2()
-                            .rounded(px(5.))
+                            .px_2()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .rounded(px(6.))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(p.surface_subtle)))
-                            .child(div().truncate().child(action.name.clone()))
+                            .child(Icon::Play.render(13.).text_color(rgb(p.text_muted)))
                             .child(
                                 div()
-                                    .truncate()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(action.command.clone()),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(action.name.clone()),
+                                    )
+                                    .child(
+                                        Tooltip::new(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(action.command.clone()),
+                                            action.command.clone(),
+                                        )
+                                        .theme(self.theme)
+                                        .render(cx)
+                                        .min_w_0()
+                                        .w_full(),
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.run_project_action(project.clone(), action.clone(), window, cx)
@@ -423,8 +512,10 @@ impl AgentWorkspace {
                     .when(index < custom_count, |row| {
                         row.child(
                             IconButton::new(Icon::Pencil, "编辑操作")
+                                .plain()
                                 .theme(self.theme)
                                 .render()
+                                .size(px(24.))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.edit_project_action(
                                         edit_root.clone(),
@@ -436,8 +527,10 @@ impl AgentWorkspace {
                         )
                         .child(
                             IconButton::new(Icon::Trash, "删除操作")
+                                .plain()
                                 .theme(self.theme)
                                 .render()
+                                .size(px(24.))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let mut config = this.project_actions.config.clone();
                                     if let Some(actions) = config.projects.get_mut(&delete_root) {
@@ -456,38 +549,60 @@ impl AgentWorkspace {
             }
             content = content.child(list);
             if self.project_actions.discovery.is_some() {
-                content = content.child(div().p_2().child("正在识别 Makefile…"));
+                content = content.child(
+                    div()
+                        .px_2()
+                        .py_3()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("正在识别 Makefile…"),
+                );
             } else if custom_count == 0 && self.project_actions.discovered.is_empty() {
                 content = content.child(
                     div()
-                        .p_2()
+                        .px_2()
+                        .py_4()
+                        .text_size(px(12.))
+                        .text_color(rgb(p.text_muted))
                         .child("暂无操作，添加命令或在项目根目录创建 Makefile"),
                 );
             }
             content = content.child(
                 div()
-                    .px_2()
-                    .text_size(px(10.))
-                    .text_color(rgb(p.text_muted))
-                    .child("识别根文件中的静态目标；不展开 include、变量和模式规则"),
-            );
-            content = content.child(
-                Button::new("添加操作…")
-                    .icon(Icon::Plus)
-                    .kind(ButtonKind::Plain)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_project_action(root.clone(), None, window, cx)
-                    })),
-            );
-            content = content.child(
-                Button::new("刷新 Makefile")
-                    .icon(Icon::Refresh)
-                    .kind(ButtonKind::Plain)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_project_actions(cx))),
+                    .mt_2()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            MenuItem::new("add-project-action", "添加操作…")
+                                .icon(Icon::Plus)
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "add-project-action".into())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_project_action(root.clone(), None, window, cx)
+                                })),
+                        ),
+                    )
+                    .child(
+                        Tooltip::new(
+                            IconButton::new(Icon::Refresh, "刷新 Makefile")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "refresh-project-actions".into())
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.refresh_project_actions(cx)),
+                                ),
+                            "刷新 Makefile 操作",
+                        )
+                        .theme(self.theme)
+                        .render(cx),
+                    ),
             );
             if self
                 .history
@@ -497,9 +612,8 @@ impl AgentWorkspace {
                 .is_some_and(|r| self.project_actions.runs.contains_key(r))
             {
                 content = content.child(
-                    Button::new("显示运行输出")
+                    MenuItem::new("show-project-action-output", "显示运行输出")
                         .icon(Icon::Shell)
-                        .kind(ButtonKind::Plain)
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -746,11 +860,8 @@ mod tests {
         window.simulate_click(trigger.center(), Default::default());
         window.run_until_parked();
         host.read_with(window, |host, _| assert!(host.project_actions.open));
-        window.update(|window, cx| {
-            host.update(cx, |host, cx| {
-                host.edit_project_action(dir.path().into(), None, window, cx)
-            })
-        });
+        let add = window.debug_bounds("add-project-action").unwrap();
+        window.simulate_click(add.center(), Default::default());
         window.run_until_parked();
         host.update(window, |host, cx| {
             host.project_actions

@@ -1,6 +1,9 @@
 use super::*;
 use gpui::AnimationExt as _;
-use gpui_glint::components::{DiffCard, GitGraph, GitGraphEvent, Toast, ToastHost, ToastKind};
+use gpui_glint::components::{
+    Dialog, DiffCard, GitGraph, GitGraphEvent, InputField, MenuItem, Toast, ToastHost, ToastKind,
+    Tooltip,
+};
 use std::time::{Duration, Instant};
 
 pub struct State {
@@ -8,6 +11,11 @@ pub struct State {
     pub toasts: Entity<ToastHost>,
     pub open: bool,
     pub picker_open: bool,
+    worktree_actions: Option<PathBuf>,
+    pub dialog: Option<WorktreeDialog>,
+    branch_name: Entity<TextEntry>,
+    dialog_focus: [gpui::FocusHandle; 2],
+    _branch_observer: Subscription,
     project: Option<PathBuf>,
     repository: Option<git_project::Repository>,
     refreshed: Option<Instant>,
@@ -20,6 +28,16 @@ pub struct State {
     diff_revision: u64,
     _subscription: Subscription,
 }
+pub enum WorktreeDialog {
+    Create {
+        root: PathBuf,
+        repo: git_project::Repository,
+    },
+    Remove {
+        root: PathBuf,
+        tree: git_project::Worktree,
+    },
+}
 struct CommitDiff {
     commit: String,
     path: String,
@@ -31,6 +49,8 @@ impl State {
         let graph = cx.new(GitGraph::new);
         graph.update(cx, |g, cx| g.set_theme(theme, cx));
         let toasts = cx.new(|_| ToastHost::new().theme(theme));
+        let branch_name = cx.new(|cx| TextEntry::new(cx, "例如 feat/abc-ef", "").theme(theme));
+        let branch_observer = cx.observe(&branch_name, |_, _, cx| cx.notify());
         let subscription = cx.subscribe(&graph, |this, _, event: &GitGraphEvent, cx| {
             match event {
                 GitGraphEvent::CompareBranch(branch) => {
@@ -54,6 +74,11 @@ impl State {
             toasts,
             open: false,
             picker_open: false,
+            worktree_actions: None,
+            dialog: None,
+            branch_name,
+            dialog_focus: [cx.focus_handle(), cx.focus_handle()],
+            _branch_observer: branch_observer,
             project: None,
             repository: None,
             refreshed: None,
@@ -68,6 +93,18 @@ impl State {
         }
     }
 }
+fn compact_worktree_path(path: &str) -> String {
+    let chars: Vec<_> = path.chars().collect();
+    if chars.len() <= 46 {
+        return path.to_owned();
+    }
+    format!(
+        "{}…{}",
+        chars[..14].iter().collect::<String>(),
+        chars[chars.len() - 31..].iter().collect::<String>()
+    )
+}
+
 impl AgentWorkspace {
     fn git_error(&mut self, title: &str, error: String, cx: &mut Context<Self>) {
         self.git_ui.toasts.update(cx, |toasts, cx| {
@@ -85,6 +122,8 @@ impl AgentWorkspace {
         let project = self.history.active().project.clone();
         let changed = project != self.git_ui.project;
         if changed {
+            self.git_ui.worktree_actions = None;
+            self.git_ui.dialog = None;
             self.git_ui.diff = None;
             self.git_ui.diff_revision += 1;
             self.git_ui.project = project.clone();
@@ -173,124 +212,318 @@ impl AgentWorkspace {
             })
             .child(div().max_w(px(200.)).truncate().child(repo.current.clone()))
             .child(Icon::ChevronDown.render(12.));
-        let mut content = div()
+        let project_name = repo
+            .worktrees
+            .first()
+            .map(|tree| ssh_project::label(&tree.path))
+            .unwrap_or_else(|| ssh_project::label(&repo.worktree));
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .pt_1()
+            .pb_2()
+            .text_color(rgb(p.text_muted))
+            .child(Icon::Folder.render(14.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(project_name),
+            );
+        let create = MenuItem::new("create-worktree-branch", "创建 worktree 分支")
+            .icon(Icon::Plus)
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "create-worktree-branch".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.git_ui.switching {
+                    return;
+                }
+                if let (Some(root), Some(repo)) =
+                    (this.git_ui.project.clone(), this.git_ui.repository.clone())
+                {
+                    this.git_ui
+                        .branch_name
+                        .update(cx, |input, cx| input.set_value("", cx));
+                    this.git_ui.dialog = Some(WorktreeDialog::Create { root, repo });
+                    this.git_ui.picker_open = false;
+                    this.git_ui.worktree_actions = None;
+                    window.focus(&this.git_ui.branch_name.focus_handle(cx), cx);
+                    cx.notify();
+                }
+            }));
+        let mut list = div()
             .id("git-branch-options")
-            .max_h(px(300.))
+            .max_h(px(320.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_1();
-        for branch in &repo.branches {
-            let branch = branch.clone();
-            let reference = format!("refs/heads/{branch}");
-            let worktree = repo.worktrees.iter().find(|tree| {
-                tree.branch.as_deref() == Some(reference.as_str()) && tree.path != repo.worktree
-            });
-            content = content.child(
+        let trees: Vec<_> = repo.worktrees.iter().filter(|tree| !tree.bare).collect();
+        list = list.child(
+            div()
+                .px_2()
+                .pt_3()
+                .pb_1()
+                .text_size(px(10.))
+                .text_color(rgb(p.text_muted))
+                .child(format!("工作目录 · {}", trees.len())),
+        );
+        for tree in trees {
+            let path = tree.path.clone();
+            let current = path == repo.worktree;
+            let main = repo.worktrees.first() == Some(tree);
+            let removable = !current && !main && tree.locked.is_none();
+            let actions_open = self.git_ui.worktree_actions.as_ref() == Some(&path);
+            let label = tree
+                .branch
+                .as_deref()
+                .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                .unwrap_or("分离 HEAD")
+                .to_owned();
+            let full_path = path.to_string_lossy().into_owned();
+            let mut title = div().flex().items_center().gap_2().min_w_0().child(
                 div()
-                    .id(SharedString::from(format!("switch-branch:{branch}")))
-                    .p_2()
-                    .rounded(px(6.))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(p.surface_subtle)))
-                    .when(branch == repo.current, |d| d.text_color(rgb(p.accent)))
-                    .child(branch.clone())
-                    .when_some(worktree, |row, tree| {
-                        let state = if tree.prunable.is_some() {
-                            "worktree 目录可能不可用"
-                        } else if tree.locked.is_some() {
-                            "打开 worktree（已锁定）"
-                        } else {
-                            "打开 worktree"
-                        };
-                        row.child(
-                            div()
-                                .max_w(px(250.))
-                                .truncate()
-                                .text_size(px(10.))
-                                .text_color(rgb(p.text_muted))
-                                .child(format!("{state} · {}", ssh_project::label(&tree.path))),
-                        )
-                        .child(
-                            div()
-                                .max_w(px(250.))
-                                .text_size(px(10.))
-                                .text_color(rgb(p.text_muted))
-                                .child(tree.path.to_string_lossy().into_owned()),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.switch_git_branch(branch.clone(), cx)
-                    })),
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label),
             );
-        }
-        if repo.branches.is_empty() {
-            content = content.child(div().p_2().child("尚无本地分支提交"));
-        }
-        if repo.worktrees.len() > 1 {
-            content = content.child(
-                div()
-                    .p_2()
-                    .text_size(px(10.))
-                    .text_color(rgb(p.text_muted))
-                    .child("工作目录"),
-            );
-            for tree in repo.worktrees.iter().filter(|tree| !tree.bare) {
-                let path = tree.path.clone();
-                let current = path == repo.worktree;
-                let label = tree
-                    .branch
-                    .as_deref()
-                    .and_then(|branch| branch.strip_prefix("refs/heads/"))
-                    .unwrap_or("分离 HEAD");
-                content = content.child(
+            let badge = if current {
+                Some("当前")
+            } else if tree.locked.is_some() {
+                Some("已锁定")
+            } else if tree.prunable.is_some() {
+                Some("目录不可用")
+            } else if main {
+                Some("主目录")
+            } else {
+                None
+            };
+            if let Some(badge) = badge {
+                title = title.child(
                     div()
-                        .id(SharedString::from(format!(
-                            "open-worktree:{}",
-                            path.display()
-                        )))
-                        .p_2()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(p.surface_subtle)))
-                        .when(current, |row| row.text_color(rgb(p.accent)))
-                        .child(format!(
-                            "{} · {label}{}",
-                            ssh_project::label(&path),
-                            if current { "（当前）" } else { "" }
-                        ))
-                        .child(
-                            div()
-                                .max_w(px(250.))
-                                .text_size(px(10.))
-                                .text_color(rgb(p.text_muted))
-                                .child(path.to_string_lossy().into_owned()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !current {
-                                this.open_git_worktree(path.clone(), cx);
-                            }
-                        })),
+                        .flex_shrink_0()
+                        .px_1()
+                        .rounded(px(4.))
+                        .text_size(px(10.))
+                        .text_color(rgb(if current { p.accent } else { p.text_muted }))
+                        .child(badge),
                 );
             }
+            let details = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(title)
+                .child(
+                    Tooltip::new(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(compact_worktree_path(&full_path)),
+                        full_path,
+                    )
+                    .theme(self.theme)
+                    .render(cx)
+                    .min_w_0()
+                    .w_full(),
+                );
+            let mut line = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .w(px(16.))
+                        .flex_shrink_0()
+                        .text_color(rgb(if current { p.accent } else { p.text_muted }))
+                        .child(
+                            if current {
+                                Icon::CheckCircle
+                            } else {
+                                Icon::GitBranch
+                            }
+                            .render(14.),
+                        ),
+                )
+                .child(details);
+            if removable {
+                let action_path = path.clone();
+                let delete_tree = tree.clone();
+                let trigger = IconButton::new(Icon::More, "工作目录操作")
+                    .plain()
+                    .theme(self.theme)
+                    .render()
+                    .size(px(24.))
+                    .debug_selector(|| "worktree-more".into())
+                    .when(actions_open, |button| button.bg(rgb(p.border)));
+                let menu = MenuItem::new("delete-worktree", "删除 worktree…")
+                    .icon(Icon::Trash)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "delete-worktree".into())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if this.git_ui.switching {
+                            return;
+                        }
+                        if let Some(root) = this.history.active().project.clone() {
+                            this.git_ui.dialog = Some(WorktreeDialog::Remove {
+                                root,
+                                tree: delete_tree.clone(),
+                            });
+                            this.git_ui.picker_open = false;
+                            this.git_ui.worktree_actions = None;
+                            window.focus(&this.git_ui.dialog_focus[0], cx);
+                            cx.notify();
+                        }
+                    }));
+                let weak = cx.entity().downgrade();
+                line = line.child(
+                    Popover::new(
+                        SharedString::from(format!("worktree-actions:{}", path.display())),
+                        trigger,
+                        menu,
+                    )
+                    .open(actions_open)
+                    .width(172.)
+                    .trigger_height(24.)
+                    .gap(4.)
+                    .padding(4.)
+                    .theme(self.theme)
+                    .on_open_change(move |open, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if this.git_ui.switching {
+                                return;
+                            }
+                            if open {
+                                this.git_ui.worktree_actions = Some(action_path.clone());
+                            } else if this.git_ui.worktree_actions.as_ref() == Some(&action_path) {
+                                this.git_ui.worktree_actions = None;
+                            }
+                            cx.notify();
+                        });
+                    }),
+                );
+            } else {
+                line = line.child(div().w(px(24.)).flex_shrink_0());
+            }
+            let row = div()
+                .id(SharedString::from(format!(
+                    "open-worktree:{}",
+                    path.display()
+                )))
+                .debug_selector(move || {
+                    if current {
+                        "current-worktree-row".into()
+                    } else {
+                        "worktree-row".into()
+                    }
+                })
+                .px_2()
+                .py_2()
+                .rounded(px(6.))
+                .min_w_0()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .when(current, |row| row.bg(rgb(p.accent_tint)))
+                .when(!current, |row| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(rgb(p.surface_subtle)))
+                })
+                .child(line)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !current {
+                        this.open_git_worktree(path.clone(), cx);
+                    }
+                }));
+            list = list.child(row);
         }
-        content = content.child(
-            Button::new("查看 GitGraph")
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .render()
-                .on_click(cx.listener(|this, _, _, cx| this.open_git_graph(cx))),
-        );
+        // Occupied branches already appear as worktree rows; avoid duplicate targets.
+        let branches: Vec<_> = repo
+            .branches
+            .iter()
+            .filter(|branch| {
+                let reference = format!("refs/heads/{branch}");
+                !repo
+                    .worktrees
+                    .iter()
+                    .any(|tree| !tree.bare && tree.branch.as_deref() == Some(&reference))
+            })
+            .collect();
+        if !branches.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child("其他本地分支"),
+            );
+            for branch in branches {
+                let branch = branch.clone();
+                list =
+                    list.child(
+                        MenuItem::new(
+                            SharedString::from(format!("switch-branch:{branch}")),
+                            branch.clone(),
+                        )
+                        .icon(Icon::GitBranch)
+                        .theme(self.theme)
+                        .render()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.switch_git_branch(branch.clone(), cx)
+                        })),
+                    );
+            }
+        }
+        let content = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .child(header)
+            .child(create)
+            .child(list)
+            .child(
+                div()
+                    .mt_2()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .child(
+                        MenuItem::new("open-git-graph", "查看 GitGraph")
+                            .icon(Icon::Workflow)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "open-git-graph".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.open_git_graph(cx))),
+                    ),
+            );
         let weak = cx.entity().downgrade();
         Some(
             Popover::new("composer-git-branch", trigger, content)
                 .open(self.git_ui.picker_open)
                 .above_trigger()
                 .trigger_height(28.)
-                .width(280.)
+                .width(340.)
                 .padding(6.)
                 .theme(self.theme)
                 .on_open_change(move |open, _, cx| {
@@ -299,6 +532,7 @@ impl AgentWorkspace {
                             return;
                         }
                         this.git_ui.picker_open = open;
+                        this.git_ui.worktree_actions = None;
                         if open {
                             this.project_picker_open = false;
                             this.refresh_git_repository(true, cx);
@@ -345,7 +579,7 @@ impl AgentWorkspace {
                 return;
             }
         };
-        self.await_git_selection(job, origin_root, cx);
+        self.await_git_selection(job, origin_root, "切换分支失败", cx);
     }
 
     fn open_git_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -358,15 +592,206 @@ impl AgentWorkspace {
         let origin_root = root.clone();
         match provider::Job::start(async move { git_project::select_worktree(&root, &path).await })
         {
-            Ok(job) => self.await_git_selection(job, origin_root, cx),
+            Ok(job) => self.await_git_selection(job, origin_root, "打开 worktree 失败", cx),
             Err(error) => self.git_error("打开 worktree 失败", error, cx),
         }
+    }
+
+    pub(crate) fn worktree_dialog(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(dialog) = &self.git_ui.dialog else {
+            return div().into_any_element();
+        };
+        let mut body = div().flex().flex_col().gap_3();
+        let removing = matches!(dialog, WorktreeDialog::Remove { .. });
+        match dialog {
+            WorktreeDialog::Create { repo, .. } => {
+                let branch = self.git_ui.branch_name.read(cx).value();
+                let preview = git_project::worktree_path(
+                    repo,
+                    if branch.is_empty() {
+                        "<分支名>"
+                    } else {
+                        branch
+                    },
+                )
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|error| error);
+                body = body
+                    .child(div().text_size(px(18.)).child("创建 worktree 分支"))
+                    .child(
+                        InputField::new("分支名")
+                            .label("分支名")
+                            .control(self.git_ui.branch_name.clone())
+                            .theme(self.theme)
+                            .render(),
+                    )
+                    .child(format!(
+                        "基于当前 HEAD 创建，完成后打开新工作目录。\n{preview}"
+                    ));
+            }
+            WorktreeDialog::Remove { tree, .. } => {
+                body = body.child(div().text_size(px(18.)).child("确认删除 worktree？"))
+                    .child(tree.path.to_string_lossy().into_owned())
+                    .child("将删除此工作目录并移除 worktree 登记，保留分支和历史会话。有未提交改动、未跟踪文件或已锁定时无法删除。");
+            }
+        }
+        body = body.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("取消")
+                        .kind(ButtonKind::Plain)
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "cancel-worktree-dialog".into())
+                        .track_focus(&self.git_ui.dialog_focus[0])
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "enter" {
+                                this.git_ui.dialog = None;
+                                window.focus(&this.composer.focus_handle(cx), cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.git_ui.dialog = None;
+                            window.focus(&this.composer.focus_handle(cx), cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new(if removing {
+                        "确认删除"
+                    } else {
+                        "创建并打开"
+                    })
+                    .kind(if removing {
+                        ButtonKind::Danger
+                    } else {
+                        ButtonKind::Primary
+                    })
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "confirm-worktree-dialog".into())
+                    .track_focus(&self.git_ui.dialog_focus[1])
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "enter" {
+                            window.focus(&this.composer.focus_handle(cx), cx);
+                            this.confirm_worktree_dialog(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.composer.focus_handle(cx), cx);
+                        this.confirm_worktree_dialog(cx);
+                    })),
+                ),
+        );
+        let weak = cx.entity().downgrade();
+        Dialog::new("git-worktree-dialog", body)
+            .width(560.)
+            .theme(self.theme)
+            .focus_handles(if removing {
+                self.git_ui.dialog_focus.to_vec()
+            } else {
+                vec![
+                    self.git_ui.branch_name.focus_handle(cx),
+                    self.git_ui.dialog_focus[0].clone(),
+                    self.git_ui.dialog_focus[1].clone(),
+                ]
+            })
+            .on_close(move |_, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.git_ui.dialog = None;
+                    window.focus(&this.composer.focus_handle(cx), cx);
+                    cx.notify();
+                });
+            })
+            .render()
+    }
+
+    fn confirm_worktree_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.git_ui.switching {
+            return;
+        }
+        let Some(dialog) = self.git_ui.dialog.take() else {
+            return;
+        };
+        let root = match &dialog {
+            WorktreeDialog::Create { root, .. } | WorktreeDialog::Remove { root, .. } => {
+                root.clone()
+            }
+        };
+        if self.history.active().project.as_ref() != Some(&root) {
+            cx.notify();
+            return;
+        }
+        match dialog {
+            WorktreeDialog::Create { .. } => {
+                let branch = self.git_ui.branch_name.read(cx).value().to_owned();
+                let origin = root.clone();
+                match provider::Job::start(async move {
+                    git_project::create_worktree(&root, &branch).await
+                }) {
+                    Ok(job) => self.await_git_selection(job, origin, "创建 worktree 失败", cx),
+                    Err(error) => self.git_error("创建 worktree 失败", error, cx),
+                }
+            }
+            WorktreeDialog::Remove { tree, .. } => {
+                if self.runs.iter().any(|(id, run)| {
+                    run.busy()
+                        && self.history.sessions.iter().any(|session| {
+                            session.id == *id && session.project.as_ref() == Some(&tree.path)
+                        })
+                }) {
+                    self.git_error(
+                        "删除 worktree 失败",
+                        "该工作目录有任务正在运行，请先停止任务".into(),
+                        cx,
+                    );
+                    return;
+                }
+                let path = tree.path.clone();
+                let job = match provider::Job::start(async move {
+                    git_project::remove_worktree(&root, &tree).await
+                }) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        self.git_error("删除 worktree 失败", error, cx);
+                        return;
+                    }
+                };
+                self.git_ui.switching = true;
+                self.git_ui.revision += 1;
+                self.git_ui.loading = false;
+                cx.spawn(async move |weak, cx| {
+                    let result = job.result().await;
+                    let _ = weak.update(cx, |this, cx| {
+                        this.git_ui.switching = false;
+                        match result {
+                            Ok(()) => {
+                                this.history.projects.retain(|project| project != &path);
+                                this.save(cx);
+                            }
+                            Err(error) => this.git_error("删除 worktree 失败", error, cx),
+                        }
+                        this.refresh_git_repository(true, cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+        cx.notify();
     }
 
     fn await_git_selection(
         &mut self,
         job: provider::Job<git_project::BranchSelection>,
         origin_root: PathBuf,
+        error_title: &'static str,
         cx: &mut Context<Self>,
     ) {
         let origin = self.history.active().id;
@@ -394,7 +819,7 @@ impl AgentWorkspace {
                         return;
                     }
                     Ok(git_project::BranchSelection::Switched) => {}
-                    Err(error) => this.git_error("切换分支失败", error, cx),
+                    Err(error) => this.git_error(error_title, error, cx),
                 }
                 this.refresh_git_repository(true, cx);
                 if this.git_ui.open {
@@ -510,6 +935,9 @@ impl AgentWorkspace {
         .detach();
     }
     pub(crate) fn set_git_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        self.git_ui
+            .branch_name
+            .update(cx, |input, cx| input.set_theme(theme, cx));
         self.git_ui.graph.update(cx, |g, cx| g.set_theme(theme, cx));
         self.git_ui
             .toasts
@@ -672,6 +1100,104 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn deleting_worktree_requires_confirmation_and_cancel_preserves_directory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let main = dir.path().join("main");
+        let linked = dir
+            .path()
+            .join("worktrees/admin/a-long-worktree-directory/feat/界面优化/admin");
+        std::fs::create_dir(&main).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        let tree = git_project::Worktree {
+            path: linked.clone(),
+            branch: Some("refs/heads/feature".into()),
+            ..Default::default()
+        };
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        host.update(window, |host, cx| {
+            host.history.active_mut().project = Some(main.clone());
+            host.git_ui.project = Some(main.clone());
+            host.git_ui.repository = Some(git_project::Repository {
+                current: "main".into(),
+                branches: vec!["main".into()],
+                worktree: main.clone(),
+                common_dir: main.join(".git"),
+                worktrees: vec![
+                    git_project::Worktree {
+                        path: main.clone(),
+                        ..Default::default()
+                    },
+                    tree,
+                ],
+            });
+            host.git_ui.refreshed = Some(Instant::now());
+            host.git_ui.picker_open = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("delete-worktree").is_none());
+        let row = window.debug_bounds("worktree-row").unwrap();
+        let footer = window.debug_bounds("open-git-graph").unwrap();
+        assert!(
+            row.size.height <= px(64.),
+            "long paths must stay on one line"
+        );
+        let current = window.debug_bounds("current-worktree-row").unwrap();
+        window.simulate_click(current.center(), Default::default());
+        window.run_until_parked();
+        let more = window.debug_bounds("worktree-more").unwrap();
+        window.simulate_click(more.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(window.debug_bounds("worktree-row").unwrap(), row);
+        assert_eq!(window.debug_bounds("open-git-graph").unwrap(), footer);
+        assert!(window.debug_bounds("delete-worktree").is_some());
+        // Clicking elsewhere in the parent closes only the child popup.
+        window.simulate_click(current.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("delete-worktree").is_none());
+        host.read_with(window, |host, _| assert!(host.git_ui.picker_open));
+        window.simulate_click(more.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert_eq!(host.git_ui.worktree_actions.as_ref(), Some(&linked));
+            assert!(host.git_ui.picker_open);
+            assert!(!host.git_ui.switching);
+        });
+        let delete = window.debug_bounds("delete-worktree").unwrap();
+        window.simulate_click(delete.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(matches!(
+                host.git_ui.dialog,
+                Some(WorktreeDialog::Remove { .. })
+            ));
+            assert!(!host.git_ui.switching);
+            assert_eq!(host.history.active().project.as_ref(), Some(&main));
+        });
+        assert!(linked.exists());
+        assert!(window.debug_bounds("confirm-worktree-dialog").is_some());
+        // Enter initially activates Cancel; the destructive action needs explicit selection.
+        window.simulate_keystrokes("enter");
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.git_ui.dialog.is_none());
+            assert!(!host.git_ui.switching);
+        });
+        assert!(linked.exists());
+        assert!(window.debug_bounds("confirm-worktree-dialog").is_none());
+    }
 
     #[gpui::test]
     fn worktree_navigation_keeps_source_drafts_and_reuses_target_sessions(

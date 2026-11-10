@@ -2862,6 +2862,9 @@ impl Render for AgentWorkspace {
             .when(self.project_actions.editor.is_some(), |root| {
                 root.child(self.project_action_editor(cx))
             })
+            .when(self.git_ui.dialog.is_some(), |root| {
+                root.child(self.worktree_dialog(cx))
+            })
             .children(command_overlay)
             .children(image_lightbox)
             .child(self.git_ui.toasts.clone())

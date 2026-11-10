@@ -195,6 +195,94 @@ pub async fn select_worktree(root: &Path, path: &Path) -> Result<BranchSelection
     Ok(BranchSelection::Worktree(tree.path.clone()))
 }
 
+/// Anchor linked checkouts to the main project, even from another worktree.
+pub fn worktree_path(repo: &Repository, branch: &str) -> Result<PathBuf, String> {
+    if branch.is_empty()
+        || branch.contains(['\\', ':', '\0'])
+        || branch
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("请输入有效的分支名，例如 feat/abc-ef".into());
+    }
+    let main = &repo.worktrees.first().ok_or("找不到主工作目录")?.path;
+    if crate::ssh_project::is_remote(main) {
+        let mut remote = crate::ssh_project::Remote::from_path(main)?;
+        let (parent, name) = remote
+            .directory
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .ok_or("项目没有父目录")?;
+        remote.directory = format!("{parent}/worktree/{name}/{branch}");
+        Ok(remote.uri())
+    } else {
+        let parent = main.parent().ok_or("项目没有父目录")?;
+        let name = main.file_name().ok_or("项目名称无效")?;
+        // Join branch segments separately so local paths use native separators,
+        // while the Git ref keeps its original forward slashes.
+        Ok(branch
+            .split('/')
+            .fold(parent.join("worktree").join(name), |path, segment| {
+                path.join(segment)
+            }))
+    }
+}
+
+pub async fn create_worktree(root: &Path, branch: &str) -> Result<BranchSelection, String> {
+    let repo = repository(root).await?.ok_or("当前项目不是 Git 工作区")?;
+    let path = worktree_path(&repo, branch)?;
+    text(run(root, &["check-ref-format", &format!("refs/heads/{branch}")]).await?)?;
+    text(run(root, &["check-ref-format", "--branch", branch]).await?)?;
+    if repo.branches.iter().any(|name| name == branch) {
+        return Err("分支已存在，请使用新的分支名".into());
+    }
+    let destination = if crate::ssh_project::is_remote(&path) {
+        crate::ssh_project::Remote::from_path(&path)?.directory
+    } else {
+        path.to_str()
+            .ok_or("worktree 路径不是有效 UTF-8")?
+            .to_owned()
+    };
+    // Git creates parent directories; never reuse/reset a branch or overwrite files.
+    text(
+        run(
+            root,
+            &["worktree", "add", "-b", branch, "--", &destination, "HEAD"],
+        )
+        .await?,
+    )?;
+    Ok(BranchSelection::Worktree(git_path(root, &destination)?))
+}
+
+pub async fn remove_worktree(root: &Path, expected: &Worktree) -> Result<(), String> {
+    let repo = repository(root).await?.ok_or("当前项目不是 Git 工作区")?;
+    let tree = repo
+        .worktrees
+        .iter()
+        .find(|tree| tree.path == expected.path)
+        .ok_or("该 worktree 已不存在，请刷新后重试")?;
+    if tree != expected {
+        return Err("worktree 状态已变化，请重新确认删除".into());
+    }
+    if tree.path == repo.worktree || repo.worktrees.first() == Some(tree) || tree.bare {
+        return Err("不能删除当前工作目录或主工作目录".into());
+    }
+    if tree.locked.is_some() {
+        return Err("worktree 已锁定，请先解除锁定".into());
+    }
+    let destination = if crate::ssh_project::is_remote(&tree.path) {
+        crate::ssh_project::Remote::from_path(&tree.path)?.directory
+    } else {
+        tree.path
+            .to_str()
+            .ok_or("worktree 路径不是有效 UTF-8")?
+            .to_owned()
+    };
+    // No --force: Git protects dirty/untracked files and submodules. Keep the branch.
+    text(run(root, &["worktree", "remove", "--", &destination]).await?)?;
+    Ok(())
+}
+
 pub async fn select_branch(
     root: &Path,
     branch: &str,
@@ -465,6 +553,113 @@ pub async fn file_diff(root: &Path, id: &str, path: &str) -> Result<Vec<DiffLine
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worktree_creation_and_removal_preserve_branches_and_local_changes() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = parent.path().join("gpui-glint");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-b", "master"]);
+        commit(&main, "initial");
+        let repo = repository(&main).await.unwrap().unwrap();
+        let path = worktree_path(&repo, "feat/abc-ef").unwrap();
+        #[cfg(windows)]
+        assert!(
+            !path.to_string_lossy().contains('/'),
+            "Windows preview and Git destination must use native separators"
+        );
+        assert_eq!(
+            path,
+            repo.worktree
+                .parent()
+                .unwrap()
+                .join("worktree/gpui-glint/feat/abc-ef")
+        );
+        assert_eq!(
+            create_worktree(&main, "feat/abc-ef").await.unwrap(),
+            BranchSelection::Worktree(path.clone())
+        );
+        assert_eq!(git(&main, &["branch", "--show-current"]), "master");
+        let linked = repository(&path).await.unwrap().unwrap();
+        assert_eq!(linked.current, "feat/abc-ef");
+        assert_eq!(
+            worktree_path(&linked, "feat/next").unwrap(),
+            repo.worktree
+                .parent()
+                .unwrap()
+                .join("worktree/gpui-glint/feat/next")
+        );
+        let tree = linked
+            .worktrees
+            .iter()
+            .find(|tree| tree.path == path)
+            .unwrap()
+            .clone();
+        assert!(remove_worktree(&path, &tree).await.is_err());
+        assert!(remove_worktree(&path, &linked.worktrees[0]).await.is_err());
+        std::fs::write(path.join("draft.txt"), "keep untracked").unwrap();
+        assert!(remove_worktree(&main, &tree).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("draft.txt")).unwrap(),
+            "keep untracked"
+        );
+        std::fs::remove_file(path.join("draft.txt")).unwrap();
+        std::fs::write(path.join("file.txt"), "keep tracked").unwrap();
+        assert!(remove_worktree(&main, &tree).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "keep tracked"
+        );
+        std::fs::write(path.join("file.txt"), "initial").unwrap();
+        git(&main, &["worktree", "lock", path.to_str().unwrap()]);
+        assert!(remove_worktree(&main, &tree).await.is_err());
+        git(&main, &["worktree", "unlock", path.to_str().unwrap()]);
+        assert!(create_worktree(&main, "feat/abc-ef").await.is_err());
+        for invalid in [
+            "../escape",
+            "/absolute",
+            "feat/../../escape",
+            "feat\\escape",
+            "C:/escape",
+            "-option",
+            "bad name",
+            "@{-1}",
+        ] {
+            assert!(create_worktree(&main, invalid).await.is_err(), "{invalid}");
+        }
+        let mut stale = tree.clone();
+        stale.head = "stale".into();
+        assert!(remove_worktree(&main, &stale).await.is_err());
+        remove_worktree(&main, &tree).await.unwrap();
+        assert!(!path.exists());
+        assert!(
+            repository(&main)
+                .await
+                .unwrap()
+                .unwrap()
+                .branches
+                .contains(&"feat/abc-ef".into())
+        );
+        assert!(remove_worktree(&main, &tree).await.is_err());
+    }
+
+    #[test]
+    fn remote_worktree_path_uses_remote_parent_and_main_project() {
+        let repo = Repository {
+            current: "main".into(),
+            branches: vec![],
+            worktree: PathBuf::from("ssh://user@host/work/worktree/demo/feat/old"),
+            common_dir: PathBuf::from("ssh://user@host/work/demo/.git"),
+            worktrees: vec![Worktree {
+                path: PathBuf::from("ssh://user@host/work/demo"),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            worktree_path(&repo, "feat/abc-ef").unwrap(),
+            PathBuf::from("ssh://user@host/work/worktree/demo/feat/abc-ef")
+        );
+    }
 
     #[test]
     fn worktree_porcelain_preserves_paths_and_state_flags() {
