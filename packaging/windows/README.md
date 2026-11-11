@@ -13,7 +13,7 @@ make win-installer PRODUCT=workbench
 ./packaging/windows/test-webview2.ps1
 ```
 
-`PRODUCT` defaults to `workbench`.
+`PRODUCT` defaults to `workbench`. The Windows Make targets launch PowerShell with `-ExecutionPolicy Bypass` for that child process so local unsigned build scripts can run; user and machine execution policies are unchanged.
 
 The build script finds the installed Visual Studio C++ toolchain and initializes the x64 MSVC and Windows SDK environment before launching Cargo. Run the same Make target from Git Bash, PowerShell, or an IDE terminal.
 

@@ -705,68 +705,69 @@ impl Workbench {
         self.sync_file_variable_table(cx);
     }
     fn variable_scope_tabs(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut tabs = div().flex().items_center().gap_2();
-        let collection = self.editing_variable_collection.clone().or_else(|| {
-            self.workspace
-                .collections
-                .get(self.current_collection)
-                .map(|c| c.collection.clone())
-        });
-        for (local, scope, title) in [
-            (false, None, "全局变量".to_owned()),
-            (
-                true,
-                collection.clone(),
-                format!(
-                    "集合变量 · {}",
-                    collection.as_deref().unwrap_or("未选择集合")
-                ),
-            ),
-        ] {
-            if local && scope.is_none() || !local && self.workspace.environment_names.len() <= 1 {
-                continue;
-            }
-            let active = self.editing_variable_collection == scope;
-            tabs = tabs.child(
-                Button::new(title)
-                    .kind(if active {
-                        ButtonKind::Primary
-                    } else {
-                        ButtonKind::Gray
-                    })
-                    .size(ButtonSize::Mini)
-                    .theme(self.theme)
-                    .render()
-                    .debug_selector({
-                        let local = scope.is_some();
-                        move || {
-                            if local {
-                                "variable-scope-collection".into()
-                            } else {
-                                "variable-scope-global".into()
-                            }
-                        }
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Err(error) = this.set_variable_scope(scope.clone(), cx) {
-                            this.variable_error = Some(error);
-                        }
-                        cx.notify();
-                    })),
-            );
+        let mut scopes = Vec::new();
+        if self.workspace.environment_names.len() > 1 {
+            scopes.push((None, SegmentOption::new("全局变量")));
         }
-        tabs.when(
-            self.workspace.environment_names.len() > 1 && collection.is_some(),
-            |tabs| {
-                tabs.child(
-                    div()
-                        .debug_selector(|| "variable-scope-hint".into())
-                        .text_size(px(10.))
-                        .text_color(rgb(self.theme.palette().text_muted))
-                        .child("集合优先于全局，仅在所属集合生效"),
-                )
-            },
-        )
+        scopes.extend(self.workspace.collections.iter().map(|collection| {
+            (
+                Some(collection.collection.clone()),
+                SegmentOption::new(format!("集合变量 · {}", collection.collection)),
+            )
+        }));
+        let selected = scopes
+            .iter()
+            .position(|(scope, _)| *scope == self.editing_variable_collection)
+            .unwrap_or(usize::MAX);
+        let options = scopes
+            .iter()
+            .map(|(_, option)| option.clone())
+            .collect::<Vec<_>>();
+        let owner = cx.entity().downgrade();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id("variable-scope-scroll")
+                    .w_full()
+                    .flex()
+                    .overflow_x_scroll()
+                    .child(
+                        SegmentedControl::new(options)
+                            .id("variable-scope-segments")
+                            .selected(selected)
+                            .theme(self.theme)
+                            .on_change(move |index, _, cx| {
+                                let Some((scope, _)) = scopes.get(index) else {
+                                    return;
+                                };
+                                let _ = owner.update(cx, |this, cx| {
+                                    if let Err(error) = this.set_variable_scope(scope.clone(), cx) {
+                                        this.variable_error = Some(error);
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .render()
+                            .whitespace_nowrap()
+                            .flex_shrink_0(),
+                    ),
+            )
+            .when(
+                self.workspace.environment_names.len() > 1
+                    && !self.workspace.collections.is_empty(),
+                |tabs| {
+                    tabs.child(
+                        div()
+                            .debug_selector(|| "variable-scope-hint".into())
+                            .text_size(px(10.))
+                            .text_color(rgb(self.theme.palette().text_muted))
+                            .child("集合优先于全局，仅在所属集合生效"),
+                    )
+                },
+            )
     }
 
     pub(super) fn begin_create_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1091,7 +1092,7 @@ impl Workbench {
                         .justify_center()
                         .text_color(rgb(p.text_muted))
                         .child(if self.workspace.environment_names.len() <= 1 {
-                            "选择集合变量来管理当前集合的变量，或创建请求环境。"
+                            "选择任意集合来管理其变量，或创建请求环境。"
                         } else {
                             "请选择环境来管理全局变量；集合变量可单独设置。"
                         }),
@@ -1618,9 +1619,11 @@ mod scope_tests {
             host.editing_environment = 1;
             host
         });
-        let local = window.debug_bounds("variable-scope-collection").unwrap();
-        window.simulate_click(local.center(), gpui::Modifiers::default());
         host.update(window, |host, cx| {
+            host.set_variable_scope(Some("B".into()), cx).unwrap();
+            assert_eq!(host.current_collection, 0);
+            assert_eq!(host.editing_variable_collection.as_deref(), Some("B"));
+            host.set_variable_scope(Some("A".into()), cx).unwrap();
             assert_eq!(host.editing_variable_collection.as_deref(), Some("A"));
             assert_eq!(host.editor_environment(1).variables.len(), 2);
             host.variable_rows[1][0]

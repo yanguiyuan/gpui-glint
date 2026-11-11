@@ -20,13 +20,13 @@ help:
 
 dev:
 ifeq ($(OS),Windows_NT)
-	"$(POWERSHELL)" -NoProfile -File packaging/windows/run-dev.ps1
+	"$(POWERSHELL)" -NoProfile -ExecutionPolicy Bypass -File packaging/windows/run-dev.ps1
 else
 	cargo run -p glint-workbench
 endif
 
 win-installer:
-	"$(POWERSHELL)" -NoProfile -File packaging/windows/build-windows.ps1 -Product "$(PRODUCT)" $(if $(VERSION),-Version "$(VERSION)") $(if $(ISCC),-IsccPath "$(ISCC)")
+	"$(POWERSHELL)" -NoProfile -ExecutionPolicy Bypass -File packaging/windows/build-windows.ps1 -Product "$(PRODUCT)" $(if $(VERSION),-Version "$(VERSION)") $(if $(ISCC),-IsccPath "$(ISCC)")
 
 # Native architecture; defaults to local ad-hoc signing.
 macos-installer:
