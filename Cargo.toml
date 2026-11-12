@@ -43,6 +43,7 @@ plugin-registry = ["dep:glint-plugin-registry"]
 wry = { version = "0.55", optional = true }
 
 [dependencies]
+irosashi = { version = "=0.3.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 glint-plugin = { path = "crates/glint-plugin", version = "0.1.0", optional = true }
 glint-plugin-registry = { path = "crates/glint-plugin-registry", version = "0.1.0", optional = true }

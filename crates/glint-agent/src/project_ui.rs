@@ -2,8 +2,65 @@ use super::*;
 use gpui_glint::components::{GroupListGroup, GroupListHeader, GroupListItem};
 
 impl AgentWorkspace {
+    pub(super) fn remove_project_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = self.project_grouping.removing.as_ref().unwrap();
+        let p = self.theme.palette();
+        let body = div().flex().flex_col().gap_4()
+            .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("移除项目？"))
+            .child(div().p_3().rounded(px(8.)).bg(rgb(p.surface_subtle)).flex().flex_col().gap_1()
+                .child(project_grouping::project_label(&self.history, path))
+                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).truncate()
+                    .child(gpui_glint::paths::display_path(path))))
+            .child("仅从项目列表移除，磁盘文件和历史会话会保留。再次打开此项目即可恢复。")
+            .child(div().flex().justify_end().gap_2()
+                .child(Button::new("取消").kind(ButtonKind::Plain).theme(self.theme).render()
+                    .debug_selector(|| "cancel-remove-project".into())
+                    .on_click(cx.listener(|this, _, _, cx| { this.project_grouping.removing = None; cx.notify(); })))
+                .child(Button::new("移除项目").kind(ButtonKind::Danger).theme(self.theme).render()
+                    .debug_selector(|| "confirm-remove-project".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(path) = this.project_grouping.removing.take() { this.remove_project(path, cx); }
+                        cx.notify();
+                    }))));
+        let weak = cx.entity().downgrade();
+        gpui_glint::components::Dialog::new("remove-project-dialog", body).width(480.).theme(self.theme)
+            .on_close(move |_, _, cx| { let _ = weak.update(cx, |this, cx| {
+                this.project_grouping.removing = None;
+                cx.notify();
+            }); }).render()
+    }
+
+    pub(super) fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.history.projects.contains(&path) { return; }
+        self.capture_draft(cx);
+        self.history.projects.retain(|project| project != &path);
+        self.history.removed_projects.insert(path.clone());
+        if self.history.active().project.as_ref() == Some(&path) {
+            let next = self.history.sessions.iter().find(|session| session.project.as_ref().is_some_and(|project| self.history.projects.contains(project))).map(|session| session.id);
+            if let Some(next) = next { self.switch(next, cx); }
+            else {
+                self.history.new_session_for(self.history.projects.first().cloned());
+                self.restore_draft(cx);
+                self.open_conversation_at_latest();
+            }
+            self.edits_ui.open = false;
+            self.file_preview.open = false;
+            self.git_ui.open = false;
+            self.terminal_ui.open = false;
+            self.project_actions.panel = false;
+        }
+        self.project_picker_open = false;
+        self.project_grouping.editing = None;
+        self.git_ui.toasts.update(cx, |toasts, cx| toasts.push(
+            gpui_glint::components::Toast::new("已从列表移除项目")
+                .description("文件与历史会话已保留，再次打开项目即可恢复。"), cx));
+        self.save(cx);
+        cx.notify();
+    }
+
     pub fn choose_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.capture_draft(cx);
+        self.history.removed_projects.remove(&path);
         if !self.history.projects.contains(&path) {
             self.history.projects.push(path.clone());
         }
@@ -270,19 +327,20 @@ pub fn session_groups_with_partners(
             groups.push(GroupListGroup::new(
                 GroupListHeader::new(id, project_grouping::project_label(history, path))
                     .icon(Icon::Folder)
-                    .actions([Icon::Plus, Icon::Settings]),
+                    .actions([Icon::Plus, Icon::More])
+                    .menu([("设置分组".into(), Icon::Folders), ("移除项目".into(), Icon::Trash)]),
             ));
         }
     }
     for session in sessions {
         let (id, label, icon) = if history.group_by_project {
             match &session.project {
-                Some(path) => (
+                Some(path) if !history.removed_projects.contains(path) => (
                     format!("project:{}", path.display()),
                     project_grouping::project_label(history, path),
                     Icon::Folder,
                 ),
-                None => continue,
+                _ => continue,
             }
         } else {
             let day = session.updated.format("%Y-%m-%d").to_string();
@@ -407,6 +465,61 @@ fn partner_session_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn project_more_menu_removes_persistently_and_reopening_restores_history(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("keep.txt"), "keep").unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
+        window.simulate_resize(size(px(1200.), px(900.)));
+        let old_session = host.update(window, |host, cx| {
+            host.history.projects.push(project.clone());
+            host.history.active_mut().project = Some(project.clone());
+            host.history.active_mut().push(Role::User, "保留这条历史".into());
+            cx.notify();
+            host.history.active
+        });
+        let group = SharedString::from(format!("project:{}", project.display()));
+        let list = host.read_with(window, |host, _| host.group_list.clone());
+        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group: group.clone(), index: 0 }));
+        host.read_with(window, |host, _| assert_eq!(host.project_grouping.editing.as_ref(), Some(&project)));
+        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group: group.clone(), index: 1 }));
+        host.read_with(window, |host, _| {
+            assert!(host.history.projects.contains(&project));
+            assert_eq!(host.project_grouping.removing.as_ref(), Some(&project));
+        });
+        let cancel = window.debug_bounds("cancel-remove-project").unwrap();
+        window.simulate_click(cancel.center(), Default::default());
+        host.read_with(window, |host, _| {
+            assert!(host.project_grouping.removing.is_none());
+            assert!(host.history.projects.contains(&project));
+        });
+        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group, index: 1 }));
+        let confirm = window.debug_bounds("confirm-remove-project").unwrap();
+        window.simulate_click(confirm.center(), Default::default());
+        host.update(window, |host, _| {
+            assert!(!host.history.projects.contains(&project));
+            assert_ne!(host.history.active, old_session);
+            assert!(host.history.sessions.iter().any(|session| session.id == old_session && session.messages[0].text == "保留这条历史"));
+            assert!(session_groups(&host.history, "", None).is_empty());
+            host.history.save(&path).unwrap();
+            let restored = History::load(&path).unwrap();
+            assert!(!restored.projects.contains(&project));
+            assert!(session_groups(&restored, "", None).is_empty());
+        });
+        assert_eq!(std::fs::read_to_string(project.join("keep.txt")).unwrap(), "keep");
+        host.update(window, |host, cx| {
+            host.choose_project(project.clone(), cx);
+            assert!(!host.history.removed_projects.contains(&project));
+            assert_eq!(session_groups(&host.history, "", None).len(), 1);
+            assert!(host.history.sessions.iter().any(|session| session.id == old_session));
+        });
+    }
 
     #[test]
     fn worktree_groups_keep_repository_and_session_identity_across_repositories() {

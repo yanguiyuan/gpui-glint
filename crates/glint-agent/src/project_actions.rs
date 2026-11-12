@@ -760,7 +760,7 @@ impl AgentWorkspace {
                         .text_color(rgb(self.theme.color(0x16833a))),
                 )
             })
-            .child(div().min_w_0().truncate().child(title));
+            .child(div().flex_1().min_w_0().truncate().child(title));
         let controls = div()
             .flex()
             .items_center()

@@ -1448,32 +1448,54 @@ impl AgentWorkspace {
     }
 
     pub fn question_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        const MAX_WIDTH: f32 = 800.;
+        // Bound text during intrinsic measurement as well as final layout.
+        // The card's padding and border leave 26 px less for wrapped content.
+        const CONTENT_WIDTH: f32 = MAX_WIDTH - 26.;
+        let p = self.theme.palette();
         let session = self.history.active;
-        let mut panel = div().flex().flex_col().gap_2();
+        let mut panel = div().debug_selector(|| "agent-question-panel".into()).w_full().max_w(px(MAX_WIDTH)).min_w_0().flex_shrink_0().flex().flex_col().gap_3();
         for question in self.active_run().questions.iter().filter(|q| !q.request.respond.is_closed()) {
             let id = question.request.id;
             let input = question.input.clone();
             let source = question.request.agent_id.and_then(|id| {
                 self.active_run().subagents.lock().ok()?.iter().find(|trace| trace.id == id).map(|trace| format!("子 Agent「{}」提问", trace.title))
             }).unwrap_or_else(|| "Agent 提问".into());
-            let mut choices = div().flex().flex_wrap().gap_2();
-            for option in &question.request.options {
+            let mut choices = div().max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().flex().flex_col().gap_2();
+            for (index, option) in question.request.options.iter().enumerate() {
                 let answer = option.clone();
-                choices = choices.child(Button::new(option.clone()).theme(self.theme).render()
+                choices = choices.child(div()
+                    .id(("question-option", index))
+                    .debug_selector(move || format!("question-option-{id}-{index}"))
+                    .max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().whitespace_normal()
+                    .px_3().py_2().rounded(px(7.)).border_1().border_color(rgb(p.border))
+                    .bg(rgb(p.surface)).text_size(px(12.)).cursor_pointer()
+                    .hover(|style| style.bg(rgb(p.accent_tint)).border_color(rgb(p.accent)))
+                    .child(format!("{}. {option}", index + 1))
                     .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, Some(answer.clone()), cx))));
             }
-            panel = panel.child(div().id(SharedString::from(format!("agent-question-{id}"))).p_3().rounded_lg().bg(rgb(self.theme.palette().surface_subtle))
-                .flex().flex_col().gap_2()
-                .child(div().text_size(px(11.)).child(source))
-                .child(question.request.question.clone())
-                .child(choices)
-                .child(input.clone())
-                .child(div().flex().gap_2()
-                    .child(Button::new("提交回答").theme(self.theme).render().on_click(cx.listener(move |this, _, _, cx| {
+            panel = panel.child(div().id(SharedString::from(format!("agent-question-{id}")))
+                .debug_selector(move || format!("agent-question-{id}"))
+                .max_w(px(MAX_WIDTH)).min_w_0().flex_shrink_0().p_3().rounded_lg()
+                .border_1().border_color(rgb(p.border)).bg(rgb(p.panel))
+                .flex().flex_col().gap_3()
+                .child(div().flex_shrink_0().flex().items_center().gap_2().text_size(px(11.)).text_color(rgb(p.text_muted))
+                    .child(Icon::Text.render(14.).text_color(rgb(p.accent)))
+                    .child(source).child("· 等待你的回答"))
+                .child(div().max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().whitespace_normal().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(question.request.question.clone()))
+                .when(!question.request.options.is_empty(), |card| card
+                    .child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(p.text_muted)).child("点击一项直接回答，也可以在下方自行填写"))
+                    .child(choices))
+                .child(div().flex_shrink_0().h(px(38.)).px_3().rounded(px(7.))
+                    .border_1().border_color(rgb(p.border)).bg(rgb(p.surface)).child(input.clone()))
+                .child(div().flex_shrink_0().flex().items_center().gap_2()
+                    .child(Button::new("提交回答").theme(self.theme).render()
+                        .debug_selector(move || format!("question-submit-{id}"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
                         let answer = input.read(cx).value().trim().to_owned();
                         if !answer.is_empty() { this.answer_question(session, id, Some(answer), cx); }
                     })))
-                    .child(Button::new("跳过").kind(ButtonKind::Glass).theme(self.theme).render()
+                    .child(Button::new("跳过").kind(ButtonKind::Plain).theme(self.theme).render()
                         .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, None, cx))))));
         }
         panel
@@ -1654,6 +1676,60 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn long_questions_scroll_without_displacing_the_composer(cx: &mut gpui::TestAppContext) {
+        struct Preview { host: Entity<AgentWorkspace>, _subscription: Subscription }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.host.update(cx, |host, cx| host.content(cx))
+            }
+        }
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (respond, mut response) = tokio::sync::oneshot::channel();
+        let id = Uuid::new_v4();
+        let submit_selector: &'static str = Box::leak(format!("question-submit-{id}").into_boxed_str());
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+            host.update(cx, |host, cx| {
+                host.history.active_mut().push(Role::User, "请选择目标文件".into());
+                let session = host.history.active;
+                let input = cx.new(|cx| TextEntry::new(cx, "输入回答…", "自定义目标"));
+                host.run_mut(session).questions.push(Question {
+                    request: crate::ask_question::Request {
+                        id, agent_id: None, question: "具体要覆盖哪个文件？".repeat(20),
+                        options: (0..6).map(|index| format!("{index}：覆盖 xidl/apis/spec/open/im/api_chat_control.xidl {}", "请确认目标文件及写入范围。".repeat(12))).collect(),
+                        respond,
+                    }, input,
+                });
+            });
+            let subscription = cx.observe(&host, |_, _, cx| cx.notify());
+            Preview { host, _subscription: subscription }
+        });
+        let host = preview.read_with(window, |preview, _| preview.host.clone());
+        for (width, height) in [(520., 420.), (1440., 900.), (900., 480.)] {
+            window.simulate_resize(size(px(width), px(height)));
+            preview.update(window, |_, cx| cx.notify());
+            window.run_until_parked();
+            host.update(window, |host, cx| { host.scroll.scroll_to_bottom(); cx.notify(); });
+            preview.update(window, |_, cx| cx.notify());
+            window.run_until_parked();
+            let composer = window.debug_bounds("agent-composer-panel").unwrap();
+            let conversation = window.debug_bounds("agent-chat-conversation").unwrap();
+            let submit = window.debug_bounds(submit_selector).unwrap();
+            assert!(composer.top() >= px(0.) && composer.bottom() <= px(height));
+            assert!(composer.size.height > px(60.));
+            assert!(conversation.size.height > px(0.) && conversation.bottom() <= composer.top());
+            assert!(submit.top() >= conversation.top() && submit.bottom() <= conversation.bottom(),
+                "{width}x{height}: submit={submit:?}, conversation={conversation:?}, composer={composer:?}");
+        }
+        let submit = window.debug_bounds(submit_selector).unwrap();
+        window.simulate_click(submit.center(), Default::default());
+        assert_eq!(response.try_recv().unwrap(), Some("自定义目标".into()));
+    }
 
     #[gpui::test]
     fn question_answers_are_scoped_and_preserve_other_pending_questions(cx: &mut gpui::TestAppContext) {

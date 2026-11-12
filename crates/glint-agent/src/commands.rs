@@ -68,6 +68,7 @@ impl AgentWorkspace {
                 .disabled(session.project.is_none()),
             CommandItem::new("project-terminal", "打开项目终端")
                 .icon(Icon::Shell)
+                .shortcut(crate::shortcuts::terminal_shortcut_label(&self.history.terminal_shortcut))
                 .group("项目")
                 .keywords("终端 terminal shell bash gitbash powershell 命令行")
                 .disabled(session.project.is_none()),

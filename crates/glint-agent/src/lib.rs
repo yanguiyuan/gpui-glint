@@ -1,4 +1,5 @@
 mod ask_question;
+mod shortcuts;
 mod history_rows;
 pub mod host_tools;
 mod hosting;
@@ -74,6 +75,7 @@ mod trajectory;
 mod undo;
 mod user_path;
 mod workspace_diff;
+mod workspace_tree;
 
 use gpui::{
     App, AppContext, Bounds, Context, Entity, Focusable, FontWeight, Image, ImageFormat,
@@ -418,6 +420,19 @@ impl AgentWorkspace {
                         this.partner_group_action(key, *index, cx);
                     }
                 }
+                if let GroupListEvent::HeaderMenuAction { group, index } = event {
+                    if let Some(path) = this.history.projects.iter().find(|path| format!("project:{}", path.display()) == group.as_ref()).cloned() {
+                        match index {
+                            0 => this.edit_project_group(path, cx),
+                            1 => {
+                                this.project_grouping.editing = None;
+                                this.project_grouping.removing = Some(path);
+                                cx.notify();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let GroupListEvent::HeaderAction { group, index: 0 } = event {
                     if let Some(path) = this
                         .history
@@ -718,6 +733,14 @@ impl AgentWorkspace {
             memory_task: None,
             memory_last_probe: None,
         };
+        let weak = cx.entity().downgrade();
+        workspace._subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if this.focus.contains_focused(window, cx) {
+                    this.project_terminal_shortcut(event, window, cx);
+                }
+            });
+        }));
         workspace._subscriptions.push(cx.observe_self(|this, cx| {
             if !this.host_owns_vault {
                 this.vault.update(cx, |vault, cx| {
@@ -2253,7 +2276,13 @@ impl AgentWorkspace {
                 .pt_6()
                 // The todo panel floats above the composer. Keep enough scrollable
                 // space for its expanded height so the final message stays visible.
-                .pb(px(if session.todos.is_empty() { 96. } else { 300. }))
+                .pb(px(if !session.todos.is_empty() {
+                    300.
+                } else if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+                    16.
+                } else {
+                    96.
+                }))
                 .gap_6()
                 .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                     // Reader intent wins over the pending jump to the newest
@@ -2524,6 +2553,11 @@ impl AgentWorkspace {
                         ),
                 );
             }
+            // Questions belong to the scrollable conversation so their intrinsic
+            // height cannot push the fixed composer outside the viewport.
+            if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+                messages = messages.child(self.question_panel(cx));
+            }
             div()
                 .flex_1()
                 .min_h_0()
@@ -2539,7 +2573,6 @@ impl AgentWorkspace {
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.question_panel(cx))
             .when(self.active_run().approval.is_some(), |panel| {
                 panel.child(self.approval_panel(cx))
             })
@@ -2753,9 +2786,9 @@ impl Render for AgentWorkspace {
                         self.sidebar(cx)
                     })
                     .into_any_element(),
-                    content: (if self.file_preview.open && self.file_preview.expanded {
+                    content: (if self.page == crate::Page::Chat && self.file_preview.open && self.file_preview.expanded {
                         self.file_preview_sidebar(cx)
-                    } else if self.edits_ui.open && self.edits_ui.expanded {
+                    } else if self.page == crate::Page::Chat && self.edits_ui.open && self.edits_ui.expanded {
                         self.edits_sidebar(cx)
                     } else if self.page == crate::Page::Channels {
                         div().size_full().child(self.channels_page(cx))
@@ -2881,6 +2914,9 @@ impl Render for AgentWorkspace {
             })
             .when(self.project_grouping.editing.is_some(), |root| {
                 root.child(self.project_group_dialog(cx))
+            })
+            .when(self.project_grouping.removing.is_some(), |root| {
+                root.child(self.remove_project_dialog(cx))
             })
             .children(command_overlay)
             .children(image_lightbox)
@@ -3108,6 +3144,7 @@ mod tests {
 
 /// Registers Agent editor shortcuts in the hosting application.
 pub fn initialize(cx: &mut App) {
+    let _ = gpui_glint::syntax::global();
     // Resolve the login shell PATH off the UI thread so the first command can
     // use toolchains a Finder-launched application cannot see.
     user_path::warm_up();

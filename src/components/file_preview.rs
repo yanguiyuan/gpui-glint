@@ -208,11 +208,13 @@ impl FilePreview {
         text: String,
         cx: &mut Context<Self>,
     ) {
-        let language = match Icon::for_file_name(&path) {
-            Icon::Docker => "dockerfile".to_owned(),
-            Icon::Makefile => "makefile".to_owned(),
-            _ => language,
-        };
+        let language = crate::syntax::global()
+            .language_for_path(&path)
+            .unwrap_or_else(|| match Icon::for_file_name(&path) {
+                Icon::Docker => "dockerfile".to_owned(),
+                Icon::Makefile => "makefile".to_owned(),
+                _ => language,
+            });
         if parent.is_none() {
             self.navigation = None;
         }

@@ -15,6 +15,7 @@
 pub mod components;
 pub mod code_font;
 pub mod paths;
+pub mod syntax;
 pub mod theme;
 
 /// Application-independent plugin contracts and optional JavaScript runtime.

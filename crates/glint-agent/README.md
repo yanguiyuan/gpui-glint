@@ -15,6 +15,7 @@ cargo run -p glint-agent
 - 真实 token 用量、首 token 延迟和输出速度；缺少服务端用量时不按字符估算。
 - 独立日程页面使用共享 `Calendar` 组件，可添加、编辑、删除单次、每天和每周任务。
 - `Enter` / `Cmd/Ctrl+Enter` 发送，`Shift+Enter` 换行，`Cmd/Ctrl+N` 新建会话，`Cmd/Ctrl+K` 搜索，`Cmd/Ctrl+,` 设置。
+- 支持安装外部 TextMate JSON 语言包，为文件预览、代码块和 Diff 扩展 DSL 高亮；安装方式与 JSON 示例见[语言包文档](../../docs/language-packs.md)。
 
 ## 供应商
 

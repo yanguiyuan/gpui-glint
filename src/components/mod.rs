@@ -3,6 +3,7 @@ mod button;
 mod calendar;
 mod closable_tabs;
 mod code_card;
+pub(crate) use code_card::TokenKind;
 mod composer_reference;
 mod reference_preview;
 pub use composer_reference::ComposerReference;

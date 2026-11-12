@@ -13,9 +13,11 @@ use std::{
 type ListLink = Rc<RefCell<Option<(gpui::ListState, usize)>>>;
 struct VirtualFiles {
     files: Rc<Vec<Change>>,
+    rows: Option<Rc<Vec<crate::workspace_tree::Row>>>,
     scope: String,
     state: gpui::ListState,
     expanded: bool,
+    measured_width: gpui::Pixels,
 }
 fn watch_row<V: 'static>(view: &Entity<V>, link: ListLink, cx: &mut Context<AgentWorkspace>) {
     cx.observe(view, move |_, _, cx| {
@@ -41,6 +43,8 @@ pub struct State {
     workspace_files: Rc<Vec<Change>>,
     workspace_sources: Rc<HashMap<PathBuf, crate::workspace_diff::Source>>,
     virtual_files: RefCell<Option<VirtualFiles>>,
+    tree_cache: RefCell<Option<(String, Rc<Vec<Change>>, Rc<Vec<crate::workspace_tree::Row>>)>>,
+    collapsed_directories: HashMap<String, std::collections::HashSet<String>>,
     workspace_notes: Vec<String>,
     workspace_error: Option<String>,
     workspace_task: Option<Task<()>>,
@@ -307,7 +311,7 @@ impl AgentWorkspace {
         )
     }
 
-    fn file_row(&self, file: &Change, scope: &str, link: Option<(gpui::ListState, usize)>, can_undo: bool, reveal: bool, cx: &mut Context<Self>) -> Entity<FileDiff> {
+    fn file_row(&self, file: &Change, scope: &str, link: Option<(gpui::ListState, usize)>, tree_depth: Option<usize>, can_undo: bool, reveal: bool, cx: &mut Context<Self>) -> Entity<FileDiff> {
         let key = format!("{scope}:{}", file.path.display());
         let mut views = self.edits_ui.file_views.borrow_mut();
         let view = views.entry(key).or_insert_with(|| {
@@ -320,6 +324,7 @@ impl AgentWorkspace {
         view.update(cx, |view, cx| {
             *view.list_link.borrow_mut() = link;
             view.set_file(file, self.theme, cx);
+            if view.tree_depth != tree_depth { view.tree_depth = tree_depth; cx.notify(); }
             view.source = if self.edits_ui.workspace_mode { self.edits_ui.workspace_sources.get(&file.path).cloned() } else { None };
             if view.side_by_side != self.edits_ui.expanded {
                 view.side_by_side = self.edits_ui.expanded;
@@ -337,23 +342,47 @@ impl AgentWorkspace {
         view
     }
 
-    fn virtual_workspace_files(&self, files: Rc<Vec<Change>>, scope: String, cx: &mut Context<Self>) -> gpui::List {
+    fn virtual_workspace_files(&self, files: Rc<Vec<Change>>, scope: String, cx: &mut Context<Self>) -> gpui::Div {
+        let rows = if self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree {
+            let mut cache = self.edits_ui.tree_cache.borrow_mut();
+            if cache.as_ref().is_none_or(|(cached_scope, cached_files, _)| cached_scope != &scope || !Rc::ptr_eq(cached_files, &files)) {
+                let empty = Default::default();
+                let collapsed = self.edits_ui.collapsed_directories.get(&scope).unwrap_or(&empty);
+                *cache = Some((scope.clone(), files.clone(), Rc::new(crate::workspace_tree::rows(&files, collapsed))));
+            }
+            Some(cache.as_ref().unwrap().2.clone())
+        } else { None };
+        let row_count = rows.as_ref().map_or(files.len(), |rows| rows.len());
         let conflicts = self.edits_ui.conflicts.clone();
         let notes = self.edits_ui.workspace_notes.clone();
         let prefix = if conflicts.is_empty() { 0 } else { conflicts.len() + 1 };
-        let count = prefix + files.len() + notes.len();
+        let count = prefix + row_count + notes.len();
         let mut cached = self.edits_ui.virtual_files.borrow_mut();
+        let same_rows = cached.as_ref().is_some_and(|cache| cache.rows == rows);
         if let Some(cache) = cached.as_mut() {
-            if cache.scope == scope && !Rc::ptr_eq(&cache.files, &files) && cache.state.item_count() == count
+            if cache.scope == scope && !same_rows && cache.files.len() == files.len()
+                && cache.files.iter().zip(files.iter()).all(|(a,b)| a.id == b.id) {
+                if let (Some(old), Some(new)) = (&cache.rows, &rows) {
+                    if cache.state.item_count() == prefix + old.len() + notes.len() {
+                        let common = old.iter().zip(new.iter()).take_while(|(a,b)| a == b).count();
+                        let suffix = old[common..].iter().rev().zip(new[common..].iter().rev()).take_while(|(a,b)| a == b).count();
+                        cache.state.splice(prefix + common..prefix + old.len() - suffix, new.len() - common - suffix);
+                        cache.state.clone().with_uniform_item_height(px(49.));
+                        cache.rows = rows.clone();
+                        cache.files = files.clone();
+                    }
+                }
+            }
+            if cache.scope == scope && same_rows && !Rc::ptr_eq(&cache.files, &files) && cache.state.item_count() == count
                 && cache.files.len() == files.len() && cache.files.iter().zip(files.iter()).all(|(a,b)| a.id == b.id) {
                 // Background statistics must not reset scroll position or disclosures.
                 cache.files = files.clone();
             }
         }
-        if cached.as_ref().is_none_or(|cache| cache.scope != scope || !Rc::ptr_eq(&cache.files, &files)) {
+        if cached.as_ref().is_none_or(|cache| cache.rows != rows || cache.scope != scope || !Rc::ptr_eq(&cache.files, &files)) {
             let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
             state.reset_with_uniform_height(count, px(49.));
-            *cached = Some(VirtualFiles { files: files.clone(), scope: scope.clone(), state, expanded: self.edits_ui.expanded });
+            *cached = Some(VirtualFiles { files: files.clone(), rows: rows.clone(), scope: scope.clone(), state, expanded: self.edits_ui.expanded, measured_width: px(0.) });
         }
         let cached = cached.as_mut().unwrap();
         if cached.expanded != self.edits_ui.expanded {
@@ -363,7 +392,8 @@ impl AgentWorkspace {
         let state = cached.state.clone();
         let link_state = state.clone();
         let weak = cx.entity().downgrade();
-        gpui::list(state, move |index, _, cx| {
+        let layout_weak = weak.clone();
+        let list = gpui::list(state, move |index, _, cx| {
             weak.update(cx, |this, cx| {
                 if prefix > 0 && index == 0 {
                     return div().px_3().py_2().flex().items_center().gap_1()
@@ -384,13 +414,57 @@ impl AgentWorkspace {
                     });
                     return view.clone().into_any_element();
                 }
-                if let Some(file) = files.get(index - prefix) {
-                    return this.file_row(file, &scope, Some((link_state.clone(), index)), false, false, cx).into_any_element();
+                let row_index = index - prefix;
+                let (file_index, depth) = match rows.as_ref().and_then(|rows| rows.get(row_index)) {
+                    Some(crate::workspace_tree::Row::Directory { path, label, depth, count, collapsed }) => {
+                        let path = path.clone();
+                        let directory_scope = scope.clone();
+                        let selector = format!("workspace-directory:{path}");
+                        let p = this.theme.palette();
+                        return div().id(SharedString::from(format!("workspace-directory:{scope}:{path}")))
+                            .debug_selector(move || selector.clone()).h(px(34.)).pr_3().pl(px(12. + *depth as f32 * 16.))
+                            .flex().items_center().gap_2().cursor_pointer().hover(|style| style.bg(rgb(p.surface_subtle)))
+                            .child(if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown }.render(13.).flex_shrink_0().text_color(rgb(p.text_muted)))
+                            .child(Icon::Folder.render(15.).flex_shrink_0().text_color(rgb(p.text_muted)))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label.clone()))
+                            .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child(count.to_string()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let collapsed = this.edits_ui.collapsed_directories.entry(directory_scope.clone()).or_default();
+                                if !collapsed.remove(&path) { collapsed.insert(path.clone()); }
+                                this.edits_ui.tree_cache.borrow_mut().take();
+                                cx.notify();
+                            })).into_any_element();
+                    }
+                    Some(crate::workspace_tree::Row::File { index, depth }) => (*index, Some(*depth)),
+                    None => (row_index, None),
+                };
+                if row_index < row_count {
+                    if let Some(file) = files.get(file_index) {
+                        return this.file_row(file, &scope, Some((link_state.clone(), index)), depth, false, false, cx).into_any_element();
+                    }
                 }
                 div().px_3().text_size(px(11.)).text_color(rgb(this.theme.palette().text_muted))
-                    .child(notes.get(index - prefix - files.len()).cloned().unwrap_or_default()).into_any_element()
+                    .child(notes.get(row_index.saturating_sub(row_count)).cloned().unwrap_or_default()).into_any_element()
             }).unwrap_or_else(|_| div().into_any_element())
-        }).flex_1().min_h_0().w_full()
+        }).flex_1().min_h_0().w_full();
+        div().flex_1().min_h_0().w_full().flex().flex_col()
+            .on_children_prepainted(move |_, _, cx| {
+                let _ = layout_weak.update(cx, |this, cx| {
+                    let mut cache = this.edits_ui.virtual_files.borrow_mut();
+                    let Some(cache) = cache.as_mut() else { return; };
+                    let width = cache.state.viewport_bounds().size.width;
+                    if width > px(0.) && cache.measured_width != width {
+                        cache.measured_width = width;
+                        // GPUI clears all off-screen height hints on the first paint
+                        // and on width changes. Restore estimates after that pass,
+                        // retaining actual heights for measured/open Diff rows.
+                        cache.state.clone().with_uniform_item_height(px(49.));
+                        let id = cx.entity_id();
+                        cx.defer(move |cx| cx.notify(id));
+                    }
+                });
+            })
+            .child(list)
     }
 
     pub fn edits_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -442,7 +516,7 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
-        let virtualized = workspace_mode && files.len() > 128;
+        let virtualized = workspace_mode && (files.len() > 128 || (!files.is_empty() && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
         if virtualized {
             list = div().id("edited-files-scroll").flex_1().min_h_0().flex().flex_col()
                 .child(self.virtual_workspace_files(files.clone(), scope.clone(), cx));
@@ -470,7 +544,7 @@ impl AgentWorkspace {
             && self.queued_requests.is_empty();
         if !virtualized {
             for (index, file) in files.iter().enumerate() {
-                let view = self.file_row(file, &scope, None, can_undo, reveal_index == Some(index), cx);
+                let view = self.file_row(file, &scope, None, None, can_undo, reveal_index == Some(index), cx);
                 list = list.child(view);
             }
         }
@@ -1313,6 +1387,7 @@ impl Render for ConflictView {
 /// Each file owns its disclosure state. Closed files never construct a diff;
 /// opening another file leaves all existing disclosures and scroll positions intact.
 struct FileDiff {
+    tree_depth: Option<usize>,
     list_link: ListLink,
     source: Option<crate::workspace_diff::Source>,
     loaded: Option<Change>,
@@ -1332,6 +1407,7 @@ struct FileDiff {
 impl FileDiff {
     fn new(file: Change, theme: ThemePreset) -> Self {
         Self {
+            tree_depth: None,
             list_link: Default::default(),
             source: None,
             loaded: None,
@@ -1452,6 +1528,7 @@ impl Render for FileDiff {
                     .debug_selector(move || selector.clone())
                     .h(px(48.))
                     .px_3()
+                    .pl(px(12. + self.tree_depth.unwrap_or(0) as f32 * 16.))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1477,7 +1554,9 @@ impl Render for FileDiff {
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.))
-                            .child(self.file.label.clone()),
+                            .child(if self.tree_depth.is_some() {
+                                self.file.label.rsplit('/').next().unwrap_or(&self.file.label).to_owned()
+                            } else { self.file.label.clone() }),
                     )
                     .child(if let Some(loaded) = &self.loaded {
                         counts(loaded.added, loaded.removed)
@@ -1687,6 +1766,102 @@ impl Render for Summary {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn workspace_tree_folders_keep_diff_state_and_settings_switch_back_to_list(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("sessions.json");
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(path.clone(), cx);
+            host.edits_ui.open = true;
+            host.edits_ui.expanded = true;
+            host.edits_ui.workspace_mode = true;
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.workspace_files = Rc::new(vec![change("root.rs", "new\n"), change("src/a.rs", "new\n"), change("src/nested/b.rs", "new\n"), change("tests/a.rs", "new\n")]);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        window.run_until_parked();
+        let file = window.debug_bounds("edit-file:src/a.rs").unwrap();
+        window.simulate_click(file.center(), Default::default());
+        window.run_until_parked();
+        let view = host.read_with(window, |host, cx| {
+            let views = host.edits_ui.file_views.borrow();
+            let view = views.values().find(|view| view.read(cx).file.label == "src/a.rs").unwrap().clone();
+            assert!(view.read(cx).expanded && view.read(cx).card.is_some());
+            assert_eq!(view.read(cx).tree_depth, Some(1));
+            view
+        });
+        let directory = window.debug_bounds("workspace-directory:src").unwrap();
+        window.simulate_click(directory.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert_eq!(host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.item_count(), 4);
+            assert!(view.read(cx).expanded);
+        });
+        let directory = window.debug_bounds("workspace-directory:src").unwrap();
+        window.simulate_click(directory.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert_eq!(host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.item_count(), 7);
+            assert!(view.read(cx).expanded && view.read(cx).card.is_some());
+        });
+        host.update(window, |host, cx| {
+            host.page = crate::Page::Settings;
+            host.provider_settings.section = provider_ui::Section::Appearance;
+            cx.notify();
+        });
+        window.run_until_parked();
+        let list = window.debug_bounds("workspace-display-list").unwrap();
+        window.simulate_click(list.center(), Default::default());
+        host.update(window, |host, cx| {
+            assert!(host.history.workspace_display == crate::workspace_tree::DisplayMode::List);
+            host.history.save(&path).unwrap();
+            assert!(model::History::load(&path).unwrap().workspace_display == crate::workspace_tree::DisplayMode::List);
+            host.page = crate::Page::Chat;
+            cx.notify();
+        });
+        window.run_until_parked();
+        host.read_with(window, |_, cx| {
+            assert_eq!(view.read(cx).tree_depth, None);
+            assert!(view.read(cx).expanded && view.read(cx).card.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_tree_virtualizes_thousands_of_nested_files(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.edits_ui.open = true;
+            host.edits_ui.expanded = true;
+            host.edits_ui.workspace_mode = true;
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.workspace_files = Rc::new((0..5000).map(|index| change(&format!("vendor/{index:04}.rs"), "new\n")).collect());
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let list = host.read_with(window, |host, _| {
+            assert!(host.edits_ui.file_views.borrow().len() < 64);
+            let cache = host.edits_ui.virtual_files.borrow();
+            assert_eq!(cache.as_ref().unwrap().state.item_count(), 5001);
+            cache.as_ref().unwrap().state.clone()
+        });
+        host.update(window, |_, cx| { list.scroll_to_reveal_item(4001); cx.notify(); });
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:vendor/4000.rs").is_some());
+        host.read_with(window, |host, cx| {
+            let views = host.edits_ui.file_views.borrow();
+            assert!(views.len() < 128, "{} views", views.len());
+            assert!(views.values().all(|view| view.read(cx).card.is_none()));
+        });
+    }
+
     #[test]
     fn conflict_requests_attach_the_snapshot_as_a_highlighted_diff_reference() {
         let repo = crate::merge_conflicts::tests::conflicted();
@@ -1740,7 +1915,9 @@ mod tests {
             assert!(views.values().all(|view| view.read(cx).loaded.is_none() && view.read(cx).load_task.is_none()));
             host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.clone()
         });
-        host.update(window, |_, cx| { list.scroll_to_reveal_item(2500); cx.notify(); });
+        // Leave room below the target so the following row remains visible
+        // after opening the Diff; off-screen rows are intentionally not rendered.
+        host.update(window, |_, cx| { list.scroll_to(gpui::ListOffset { item_ix: 2499, offset_in_item: px(0.) }); cx.notify(); });
         window.run_until_parked();
         let row = window.debug_bounds("edit-file:vendor/2500.rs").unwrap();
         window.simulate_click(row.center(), Default::default());

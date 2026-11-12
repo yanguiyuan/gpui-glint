@@ -1644,7 +1644,7 @@ impl CodeColors {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenKind {
+pub(crate) enum TokenKind {
     Plain,
     Key,
     String,
@@ -1682,6 +1682,9 @@ pub(crate) fn highlight_runs(
 }
 
 fn tokens(source: &str, language: &str) -> Vec<(Range<usize>, TokenKind)> {
+    if let Some(tokens) = crate::syntax::global().tokens(source, language) {
+        return tokens;
+    }
     if ["md", "markdown"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
         return source_syntax::markdown(source);
     }

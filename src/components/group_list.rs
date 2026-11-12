@@ -18,6 +18,8 @@ pub struct GroupListHeader {
     pub avatar: Option<Avatar>,
     pub label: SharedString,
     pub actions: Vec<Icon>,
+    /// Menu entries attached to the last trailing action.
+    pub menu: Vec<(SharedString, Icon)>,
 }
 
 impl GroupListHeader {
@@ -28,6 +30,7 @@ impl GroupListHeader {
             avatar: None,
             label: label.into(),
             actions: Vec::new(),
+            menu: Vec::new(),
         }
     }
 
@@ -45,6 +48,10 @@ impl GroupListHeader {
     /// Trailing action icons revealed while the header is hovered.
     pub fn actions(mut self, actions: impl IntoIterator<Item = Icon>) -> Self {
         self.actions = actions.into_iter().collect();
+        self
+    }
+    pub fn menu(mut self, items: impl IntoIterator<Item = (SharedString, Icon)>) -> Self {
+        self.menu = items.into_iter().collect();
         self
     }
 }
@@ -170,6 +177,7 @@ pub enum GroupListEvent {
     /// One of a header's hover actions was clicked, by its position in
     /// [`GroupListHeader::actions`].
     HeaderAction { group: SharedString, index: usize },
+    HeaderMenuAction { group: SharedString, index: usize },
     /// An item was clicked; the list updates its own selection first.
     ItemSelected {
         group: SharedString,
@@ -190,6 +198,7 @@ pub struct GroupList {
     selected: Option<SharedString>,
     hovered: Option<SharedString>,
     confirming: Option<SharedString>,
+    header_menu: Option<SharedString>,
     collapsed: HashSet<SharedString>,
     theme: ThemePreset,
     width: Option<f32>,
@@ -204,6 +213,7 @@ impl GroupList {
             selected: None,
             hovered: None,
             confirming: None,
+            header_menu: None,
             collapsed: HashSet::new(),
             theme: ThemePreset::default(),
             width: None,
@@ -329,7 +339,7 @@ impl Render for GroupList {
         for (group, depth) in visible {
             let group_id = group.header.id.clone();
             let header_key = SharedString::from(format!("h:{}", group_id));
-            let header_hovered = self.hovered.as_ref() == Some(&header_key);
+            let header_hovered = self.hovered.as_ref() == Some(&header_key) || self.header_menu.as_ref() == Some(&group_id);
             let mut header = div()
                 .id(header_key.clone())
                 .debug_selector({
@@ -388,12 +398,12 @@ impl Render for GroupList {
             );
             if header_hovered {
                 for (index, icon) in group.header.actions.iter().enumerate() {
-                    header = header.child(
-                        div()
+                    let action = div()
                             .id(SharedString::from(format!(
                                 "glass-group-list-header-action-{}-{index}",
                                 group_id
                             )))
+                            .debug_selector({ let group = group_id.clone(); move || format!("group-list-header-action:{group}:{index}") })
                             .size(px(22.))
                             .flex_shrink_0()
                             .flex()
@@ -411,7 +421,32 @@ impl Render for GroupList {
                                     })
                                     .text_color(rgb(p.text))
                             })
-                            .on_click(cx.listener({
+                            .child(icon.render(14.));
+                    if index + 1 == group.header.actions.len() && !group.header.menu.is_empty() {
+                        let mut menu = div().flex().flex_col().gap_1();
+                        for (menu_index, (label, menu_icon)) in group.header.menu.iter().enumerate() {
+                            menu = menu.child(div().id(("header-menu-entry", menu_index))
+                                .debug_selector({ let group = group_id.clone(); move || format!("group-list-menu:{group}:{menu_index}") })
+                                .px_2().py_2().rounded(px(5.)).flex().items_center().gap_2().cursor_pointer()
+                                .text_color(rgb(if *menu_icon == Icon::Trash { self.theme.color(0xd9342b) } else { p.text }))
+                                .hover(|style| style.bg(rgb(p.surface_subtle)))
+                                .child(menu_icon.render(14.)).child(label.clone())
+                                .on_click(cx.listener({ let group = group_id.clone(); move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.header_menu = None;
+                                    cx.emit(GroupListEvent::HeaderMenuAction { group: group.clone(), index: menu_index });
+                                    cx.notify();
+                                }})));
+                        }
+                        let weak = cx.entity().downgrade();
+                        let menu_group = group_id.clone();
+                        header = header.child(Popover::new(SharedString::from(format!("header-menu:{group_id}")), action, menu)
+                            .open(self.header_menu.as_ref() == Some(&group_id)).trigger_height(22.).width(190.).padding(4.).theme(self.theme)
+                            .on_open_change(move |open, _, cx| { let _ = weak.update(cx, |this, cx| {
+                                this.header_menu = open.then(|| menu_group.clone()); cx.notify();
+                            }); }));
+                    } else {
+                        header = header.child(action.on_click(cx.listener({
                                 let group_id = group_id.clone();
                                 move |_, _, _, cx| {
                                     cx.stop_propagation();
@@ -421,9 +456,8 @@ impl Render for GroupList {
                                     });
                                     cx.notify();
                                 }
-                            }))
-                            .child(icon.render(14.)),
-                    );
+                            })));
+                    }
                 }
             }
             let mut section = div().ml(px(depth as f32 * 14.)).flex().flex_col().gap(px(2.)).child(header);
@@ -656,6 +690,29 @@ impl Render for GroupList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn project_more_menu_keeps_header_open_and_emits_selected_entry(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (list, window) = cx.add_window_view(|_, _| GroupList::new([
+            GroupListGroup::new(GroupListHeader::new("project", "Project").actions([Icon::Plus, Icon::More])
+                .menu([("设置分组".into(), Icon::Folders), ("移除项目".into(), Icon::Trash)])),
+        ]).width(260.));
+        let received = Rc::new(Cell::new(None));
+        let captured = received.clone();
+        let _subscription = window.update(|_, cx| cx.subscribe(&list, move |_, event, _| {
+            if let GroupListEvent::HeaderMenuAction { index, .. } = event { captured.set(Some(*index)); }
+        }));
+        list.update(window, |list, cx| { list.hovered = Some("h:project".into()); cx.notify(); });
+        let more = window.debug_bounds("group-list-header-action:project:1").unwrap();
+        window.simulate_click(more.center(), Default::default());
+        list.update(window, |list, cx| { list.hovered = None; cx.notify(); });
+        assert!(window.debug_bounds("group-list-menu:project:1").is_some());
+        let remove = window.debug_bounds("group-list-menu:project:1").unwrap();
+        window.simulate_click(remove.center(), Default::default());
+        assert_eq!(received.get(), Some(1));
+        list.read_with(window, |list, _| { assert!(list.header_menu.is_none()); assert!(!list.collapsed.contains("project")); });
+    }
 
     #[gpui::test]
     fn nested_groups_collapse_independently_and_preserve_confirmation(cx: &mut gpui::TestAppContext) {

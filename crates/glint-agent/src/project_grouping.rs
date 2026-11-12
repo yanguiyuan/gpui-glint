@@ -12,6 +12,35 @@ pub struct Metadata {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn project_group_editor_modes_only_persist_on_save(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let project = PathBuf::from("/repo/feature");
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        window.simulate_resize(size(px(1200.), px(900.)));
+        host.update(window, |host, cx| {
+            host.history.project_group_overrides.insert(project.clone(), "custom".into());
+            host.edit_project_group(project.clone(), cx);
+        });
+        let auto = window.debug_bounds("project-group-auto").unwrap();
+        window.simulate_click(auto.center(), Default::default());
+        host.read_with(window, |host, _| {
+            assert!(host.project_grouping.automatic);
+            assert_eq!(host.history.project_group_overrides[&project], "custom");
+        });
+        let save = window.debug_bounds("save-project-group").unwrap();
+        window.simulate_click(save.center(), Default::default());
+        host.read_with(window, |host, _| assert!(!host.history.project_group_overrides.contains_key(&project)));
+        host.update(window, |host, cx| host.edit_project_group(project.clone(), cx));
+        let manual = window.debug_bounds("project-group-manual").unwrap();
+        window.simulate_click(manual.center(), Default::default());
+        host.update(window, |host, cx| { host.project_grouping.name.update(cx, |input, cx| input.set_value("", cx)); });
+        let save = window.debug_bounds("save-project-group").unwrap();
+        window.simulate_click(save.center(), Default::default());
+        host.read_with(window, |host, _| assert_eq!(host.history.project_group_overrides[&project], ""));
+    }
+
     fn git(root: &std::path::Path, args: &[&str]) {
         let output = crate::child_process::command("git")
             .current_dir(root)
@@ -205,6 +234,8 @@ pub fn project_label(history: &History, path: &std::path::Path) -> String {
 
 pub struct State {
     pub editing: Option<PathBuf>,
+    pub removing: Option<PathBuf>,
+    automatic: bool,
     name: Entity<TextEntry>,
     _observer: Subscription,
 }
@@ -215,6 +246,8 @@ impl State {
         let observer = cx.observe(&name, |_, _, cx| cx.notify());
         Self {
             editing: None,
+            removing: None,
+            automatic: true,
             name,
             _observer: observer,
         }
@@ -279,6 +312,7 @@ impl AgentWorkspace {
     }
 
     pub(crate) fn edit_project_group(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.project_grouping.automatic = !self.history.project_group_overrides.contains_key(&path);
         let name = group_name(&self.history, &path).unwrap_or("").to_owned();
         self.project_grouping.name.update(cx, |field, cx| {
             field.set_theme(self.theme, cx);
@@ -318,52 +352,64 @@ impl AgentWorkspace {
             .collect();
         names.sort();
         names.dedup();
+        let has_names = !names.is_empty();
         let mut choices = div().flex().flex_wrap().gap_2();
         for name in names {
             choices = choices.child(
                 Button::new(name.clone())
-                    .kind(ButtonKind::Gray)
+                    .kind(if self.project_grouping.name.read(cx).value() == name { ButtonKind::Tinted } else { ButtonKind::Plain })
                     .size(ButtonSize::Small)
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.project_grouping.automatic = false;
                         this.project_grouping
                             .name
                             .update(cx, |field, cx| field.set_value(name.clone(), cx));
                     })),
             );
         }
+        let automatic = self.project_grouping.automatic;
         let body =
             div()
                 .flex()
                 .flex_col()
                 .gap_4()
-                .child(div().text_size(px(18.)).child("项目分组"))
-                .child(project_label(&self.history, path))
-                .child(
+                .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("设置项目分组"))
+                .child(div().p_3().rounded(px(8.)).bg(rgb(self.theme.palette().surface_subtle)).flex().flex_col().gap_1()
+                    .child(div().flex().items_center().gap_2().child(Icon::Folder.render(16.)).child(project_label(&self.history, path)))
+                    .child(div().text_size(px(11.)).text_color(rgb(self.theme.palette().text_muted)).truncate()
+                        .child(gpui_glint::paths::display_path(path))))
+                .child(div().flex().gap_2().children([
+                    ("自动跟随分支", true), ("手动设置", false),
+                ].into_iter().map(|(label, mode)| Button::new(label)
+                    .kind(if automatic == mode { ButtonKind::Tinted } else { ButtonKind::Plain }).theme(self.theme).render()
+                    .debug_selector(move || if mode { "project-group-auto".into() } else { "project-group-manual".into() })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.project_grouping.automatic = mode;
+                        window.focus(&if mode { this.focus.clone() } else { this.project_grouping.name.focus_handle(cx) }, cx);
+                        cx.notify();
+                    })))))
+                .when(automatic, |body| body.child(div().text_size(px(12.)).text_color(rgb(self.theme.palette().text_muted))
+                    .child("根据 worktree 分支自动分组；普通项目保持不分组。分支变化后会自动更新。")))
+                .when(!automatic, |body| body.child(
                     InputField::new("组名")
                         .label("组名（留空不分组）")
                         .control(self.project_grouping.name.clone())
                         .theme(self.theme)
-                        .render(),
-                )
-                .child(choices)
+                        .render().w_full(),
+                ).when(has_names, |body| body.child(div().text_size(px(11.)).text_color(rgb(self.theme.palette().text_muted)).child("已有分组 · 点击选择")).child(choices)))
                 .child(
                     div()
                         .flex()
+                        .justify_end()
+                        .pt_3()
+                        .border_t_1()
+                        .border_color(rgb(self.theme.palette().border))
                         .gap_2()
                         .child(
-                            Button::new("跟随 worktree 分支")
-                                .kind(ButtonKind::Gray)
-                                .theme(self.theme)
-                                .render()
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.set_project_group(None, cx)),
-                                ),
-                        )
-                        .child(
                             Button::new("取消")
-                                .kind(ButtonKind::Gray)
+                                .kind(ButtonKind::Plain)
                                 .theme(self.theme)
                                 .render()
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -371,10 +417,10 @@ impl AgentWorkspace {
                                     cx.notify();
                                 })),
                         )
-                        .child(Button::new("保存").theme(self.theme).render().on_click(
+                        .child(Button::new("保存").theme(self.theme).render().debug_selector(|| "save-project-group".into()).on_click(
                             cx.listener(|this, _, _, cx| {
                                 let name = this.project_grouping.name.read(cx).value().to_string();
-                                this.set_project_group(Some(name), cx);
+                                this.set_project_group(if this.project_grouping.automatic { None } else { Some(name) }, cx);
                             }),
                         )),
                 );
@@ -382,7 +428,7 @@ impl AgentWorkspace {
         Dialog::new("project-group-dialog", body)
             .width(520.)
             .theme(self.theme)
-            .focus_handles(vec![self.project_grouping.name.focus_handle(cx)])
+            .focus_handles(if automatic { vec![] } else { vec![self.project_grouping.name.focus_handle(cx)] })
             .on_close(move |_, _, cx| {
                 let _ = weak.update(cx, |this, cx| {
                     this.project_grouping.editing = None;

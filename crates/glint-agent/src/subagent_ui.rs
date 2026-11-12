@@ -142,6 +142,9 @@ impl AgentWorkspace {
     }
 
     pub fn subagent_waiting_label(&self) -> &'static str {
+        if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+            return "正在等待你的回答…";
+        }
         let traces = self.all_subagents();
         if traces
             .iter()
@@ -409,6 +412,9 @@ impl AgentWorkspace {
                 .theme(self.theme),
             );
         }
+        if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+            body = body.child(self.question_panel(cx));
+        }
         let footer = div()
             .w_full()
             .flex_shrink_0()
@@ -418,7 +424,6 @@ impl AgentWorkspace {
             .flex_col()
             .items_center()
             .gap_2()
-            .child(self.question_panel(cx))
             .when(self.active_run().approval.is_some(), |body| {
                 body.child(self.approval_panel(cx))
             })

@@ -2560,6 +2560,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferroni"
+version = "2.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8775b4fc21a3de1c772ef5273c45c94ee6a35030f5cc5e0eb0b6d51f3f5a49dd"
+dependencies = [
+ "aho-corasick",
+ "bitflags 2.13.2",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+ "smallvec",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3565,6 +3579,7 @@ dependencies = [
  "gpui-ce",
  "gpui_ce_platform",
  "image",
+ "irosashi",
  "mermaid-rs-renderer",
  "objc2 0.6.4",
  "pulldown-cmark",
@@ -4521,6 +4536,19 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+
+[[package]]
+name = "irosashi"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0e4dc2fdb4a196effcce35e4406b6008270e64556ec7eb6556a5fe8f3ff14f0"
+dependencies = [
+ "bitflags 2.13.2",
+ "ferroni",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "is-docker"

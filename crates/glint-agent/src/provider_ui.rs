@@ -46,6 +46,12 @@ fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
         .ok_or_else(|| "请输入正数 token 数，可用 256K、1M，或留空自动获取".into())
 }
 
+/// Index of the \"窗口外观\" segment that matches the current window theme. Every light
+/// preset selects 浅色 and every dark preset selects 深色; only the two anchors are offered.
+fn appearance_segment(theme: ThemePreset) -> usize {
+    usize::from(theme.is_dark())
+}
+
 fn available_model_row(
     model: &str,
     added: bool,
@@ -110,6 +116,8 @@ pub enum ProviderTab {
 }
 
 pub struct Settings {
+    pub terminal_shortcut_recording: bool,
+    pub terminal_shortcut_message: Option<String>,
     pub compaction_threshold: Entity<TextEntry>,
     compaction_message: Option<String>,
     pub discovered: Vec<discovery::DiscoveredProvider>,
@@ -155,6 +163,8 @@ impl Settings {
             })
         };
         Self {
+            terminal_shortcut_recording: false,
+            terminal_shortcut_message: None,
             compaction_threshold: entry("1–99，例如 75", "75"),
             compaction_message: None,
             selected,
@@ -1588,46 +1598,92 @@ impl AgentWorkspace {
             }
             Section::Appearance => {
                 page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("主题"));
-                card = card
-                    .child(row(
-                        "窗口外观",
-                        "选择当前窗口使用的主题。".into(),
-                        self.theme.name().into(),
-                    ))
-                    .child(div().border_t_1().border_color(rgb(p.border)))
-                    .child(
-                        div().py_4().flex().gap_3().children(
-                            [
-                                ("浅色", ThemePreset::Moonstone),
-                                ("深色", ThemePreset::DarkObsidian),
-                            ]
-                            .into_iter()
-                            .map(|(label, theme)| {
-                                Button::new(label)
-                                    .kind(if self.theme == theme {
-                                        ButtonKind::Tinted
-                                    } else {
-                                        ButtonKind::Glass
-                                    })
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.theme = theme;
-                                        this.composer.update(cx, |composer, cx| {
-                                            composer.set_theme(theme, cx)
-                                        });
-                                        this.search
-                                            .update(cx, |entry, cx| entry.set_theme(theme, cx));
-                                        this.provider_settings.set_theme(theme, cx);
-                                        this.skills_ui.set_theme(theme, cx);
-                                        this.mcp_ui.set_theme(theme, cx);
-                                        this.sync_skill_context(cx);
-                                        cx.notify();
-                                    }))
-                            }),
-                        ),
-                    );
-                page = page.child(card).child(self.code_font_settings(cx));
+                card = card.child(
+                    div()
+                        .py_4()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child("窗口外观")
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(format!(
+                                            "选择当前窗口使用的主题，当前为{}。",
+                                            self.theme.name()
+                                        )),
+                                ),
+                        )
+                        .child({
+                            let weak = cx.entity().downgrade();
+                            SegmentedControl::new([
+                                SegmentOption::new("浅色").debug_selector("theme-appearance-light"),
+                                SegmentOption::new("深色").debug_selector("theme-appearance-dark"),
+                            ])
+                            .id("theme-appearance")
+                            .selected(appearance_segment(self.theme))
+                            .theme(self.theme)
+                            .on_change(move |index, _, cx| {
+                                let theme = if index == 1 {
+                                    ThemePreset::DarkObsidian
+                                } else {
+                                    ThemePreset::Moonstone
+                                };
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.theme = theme;
+                                    this.composer
+                                        .update(cx, |composer, cx| composer.set_theme(theme, cx));
+                                    this.search
+                                        .update(cx, |entry, cx| entry.set_theme(theme, cx));
+                                    this.provider_settings.set_theme(theme, cx);
+                                    this.skills_ui.set_theme(theme, cx);
+                                    this.mcp_ui.set_theme(theme, cx);
+                                    this.sync_skill_context(cx);
+                                    cx.notify();
+                                });
+                            })
+                            .render()
+                        }),
+                );
+                page = page.child(card)
+                    .child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("Git 工作区"))
+                    .child(div().py_4().flex().items_center().gap_3()
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
+                            .child("文件展示形态")
+                            .child(div().text_size(px(12.)).text_color(rgb(p.text_muted))
+                                .child("列表显示完整路径；树形目录按文件夹分组，可展开或折叠。")))
+                        .child({
+                            let weak = cx.entity().downgrade();
+                            SegmentedControl::new([
+                                SegmentOption::new("列表").debug_selector("workspace-display-list"),
+                                SegmentOption::new("树形目录").debug_selector("workspace-display-tree"),
+                            ])
+                            .id("workspace-display-mode")
+                            .selected(usize::from(self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree))
+                            .theme(self.theme)
+                            .on_change(move |index, _, cx| {
+                                let mode = if index == 1 {
+                                    crate::workspace_tree::DisplayMode::Tree
+                                } else {
+                                    crate::workspace_tree::DisplayMode::List
+                                };
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.history.workspace_display = mode;
+                                    this.save(cx);
+                                    cx.notify();
+                                });
+                            })
+                            .render()
+                        }))
+                    .child(self.code_font_settings(cx));
             }
             Section::Storage => {
                 page = page.child(
@@ -1667,6 +1723,67 @@ impl AgentWorkspace {
                 } else {
                     "Ctrl"
                 };
+                let keycaps = |label: String| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .children(
+                            label
+                                .split(" + ")
+                                .map(|key| {
+                                    div()
+                                        .min_w(px(28.))
+                                        .h(px(28.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(rgb(p.border))
+                                        .bg(rgb(p.panel))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(p.text))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(key.to_owned())
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                };
+                let shortcut_card = || {
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .px_4()
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.surface))
+                };
+                let group_title = |title: &str, caption: &str| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title.to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(caption.to_owned()),
+                        )
+                };
+                // Keep shortcut rows independent of the generic settings row's description layout.
+                let mut common = shortcut_card();
                 for (index, (title, key)) in [
                     ("发送消息", "Enter".into()),
                     ("换行", "Shift + Enter".into()),
@@ -1677,12 +1794,155 @@ impl AgentWorkspace {
                 .into_iter()
                 .enumerate()
                 {
-                    if index > 0 {
-                        card = card.child(div().border_t_1().border_color(rgb(p.border)));
-                    }
-                    card = card.child(row(title, "".into(), key));
+                    common = common.child(
+                        div()
+                            .h(px(52.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .when(index > 0, |row| {
+                                row.border_t_1().border_color(rgb(p.border))
+                            })
+                            .child(div().flex_1().min_w_0().text_size(px(13.)).child(title))
+                            .child(keycaps(key)),
+                    );
                 }
-                page = page.child(card);
+                let recording = self.provider_settings.terminal_shortcut_recording;
+                let terminal_label =
+                    crate::shortcuts::terminal_shortcut_label(&self.history.terminal_shortcut);
+                let project = shortcut_card()
+                    .child(
+                        div()
+                            .py_4()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(180.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_size(px(13.)).child("打开项目终端"))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child("在当前项目目录打开并聚焦终端"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .id("terminal-shortcut-trigger")
+                                            .debug_selector(|| "record-terminal-shortcut".into())
+                                            .cursor_pointer()
+                                            .rounded(px(6.))
+                                            .p_1()
+                                            .bg(rgb(if recording {
+                                                p.accent_tint
+                                            } else {
+                                                p.surface
+                                            }))
+                                            .hover(|style| style.bg(rgb(p.accent_tint)))
+                                            .child(if recording {
+                                                div()
+                                                    .h(px(28.))
+                                                    .px_2()
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(p.accent))
+                                                    .child("请按组合键…")
+                                            } else {
+                                                keycaps(terminal_label)
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.provider_settings
+                                                    .terminal_shortcut_recording = true;
+                                                this.provider_settings.terminal_shortcut_message =
+                                                    None;
+                                                window.focus(&this.focus, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("恢复默认")
+                                            .kind(ButtonKind::Plain)
+                                            .size(ButtonSize::Small)
+                                            .theme(self.theme)
+                                            .render()
+                                            .debug_selector(|| "reset-terminal-shortcut".into())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.history.terminal_shortcut =
+                                                    crate::shortcuts::default_terminal_shortcut();
+                                                this.provider_settings
+                                                    .terminal_shortcut_recording = false;
+                                                this.provider_settings.terminal_shortcut_message =
+                                                    None;
+                                                this.save(cx);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(rgb(p.border))
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(if recording {
+                                "按下包含 Ctrl、Alt 或 Command 的组合键，Esc 取消。"
+                            } else {
+                                "点击按键修改快捷键，更改后立即生效。"
+                            }),
+                    )
+                    .when_some(
+                        self.provider_settings.terminal_shortcut_message.clone(),
+                        |card, message| {
+                            card.child(
+                                div()
+                                    .pb_3()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(self.theme.color(0xd9342b)))
+                                    .child(message),
+                            )
+                        },
+                    );
+                page = page
+                    .debug_selector(|| "shortcuts-settings-page".into())
+                    .child(
+                        div()
+                            .mt(px(-12.))
+                            .text_size(px(12.))
+                            .text_color(rgb(p.text_muted))
+                            .child("用键盘更快地发送消息、切换会话和进入项目。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(group_title("消息与会话", "默认快捷键"))
+                            .child(common),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(group_title("项目", "支持自定义"))
+                            .child(project),
+                    );
             }
             _ => {}
         }
@@ -1754,6 +2014,55 @@ mod context_tests {
                     .threshold_percent,
                 75
             );
+        });
+    }
+
+    #[test]
+    fn appearance_segments_map_every_preset_to_light_or_dark() {
+        for theme in ThemePreset::ALL {
+            assert_eq!(
+                appearance_segment(theme),
+                usize::from(theme.is_dark()),
+                "{}",
+                theme.name()
+            );
+        }
+        assert_eq!(appearance_segment(ThemePreset::Sage), 0);
+        assert_eq!(appearance_segment(ThemePreset::Moonstone), 0);
+        assert_eq!(appearance_segment(ThemePreset::DarkLinen), 1);
+        assert_eq!(appearance_segment(ThemePreset::DarkObsidian), 1);
+    }
+
+    #[gpui::test]
+    fn appearance_segments_switch_the_window_theme(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            h.theme = ThemePreset::Moonstone;
+            h.page = crate::Page::Settings;
+            h.provider_settings.section = Section::Appearance;
+            h
+        });
+        window.simulate_resize(size(px(1440.), px(1200.)));
+        window.run_until_parked();
+        let dark = window.debug_bounds("theme-appearance-dark").unwrap();
+        window.simulate_click(dark.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        host.read_with(window, |h, _| {
+            assert!(h.theme == ThemePreset::DarkObsidian);
+            assert!(h.theme.is_dark());
+        });
+        let light = window.debug_bounds("theme-appearance-light").unwrap();
+        window.simulate_click(light.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        host.read_with(window, |h, _| {
+            assert!(h.theme == ThemePreset::Moonstone);
+            assert!(!h.theme.is_dark());
         });
     }
 

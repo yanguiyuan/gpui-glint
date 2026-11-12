@@ -264,6 +264,7 @@ impl SearchInput {
 pub struct SegmentOption {
     pub label: SharedString,
     pub count: Option<SharedString>,
+    selector: Option<SharedString>,
 }
 
 impl SegmentOption {
@@ -271,11 +272,18 @@ impl SegmentOption {
         Self {
             label: label.into(),
             count: None,
+            selector: None,
         }
     }
 
     pub fn count(mut self, count: impl Into<SharedString>) -> Self {
         self.count = Some(count.into());
+        self
+    }
+
+    /// Expose this segment's bounds to tests through `Window::debug_bounds`.
+    pub fn debug_selector(mut self, selector: impl Into<SharedString>) -> Self {
+        self.selector = Some(selector.into());
         self
     }
 }
@@ -394,6 +402,9 @@ impl SegmentedControl {
 
             if selected {
                 button = button.shadow_sm();
+            }
+            if let Some(selector) = option.selector {
+                button = button.debug_selector(move || selector.to_string());
             }
             if let Some(on_change) = self.on_change.clone() {
                 button = button

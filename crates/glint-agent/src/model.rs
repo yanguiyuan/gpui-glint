@@ -220,6 +220,12 @@ impl Session {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct History {
     #[serde(default)]
+    pub removed_projects: std::collections::HashSet<std::path::PathBuf>,
+    #[serde(default)]
+    pub workspace_display: crate::workspace_tree::DisplayMode,
+    #[serde(default = "crate::shortcuts::default_terminal_shortcut")]
+    pub terminal_shortcut: String,
+    #[serde(default)]
     pub quick_replies_enabled: bool,
     #[serde(default)]
     pub partner_models: std::collections::HashMap<Uuid, crate::partner_model::Selection>,
@@ -248,6 +254,9 @@ impl Default for History {
     fn default() -> Self {
         let session = Session::new();
         Self {
+            terminal_shortcut: crate::shortcuts::default_terminal_shortcut(),
+            workspace_display: Default::default(),
+            removed_projects: Default::default(),
             partner_models: Default::default(),
             quick_replies_enabled: false,
             compaction_settings: Default::default(),
@@ -285,9 +294,10 @@ impl History {
         if !history.sessions.iter().any(|s| s.id == history.active) {
             history.active = history.sessions[0].id;
         }
+        history.projects.retain(|path| !history.removed_projects.contains(path));
         for session in &history.sessions {
             if let Some(project) = &session.project {
-                if !history.projects.contains(project) {
+                if !history.projects.contains(project) && !history.removed_projects.contains(project) {
                     history.projects.push(project.clone());
                 }
             }

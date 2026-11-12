@@ -1,0 +1,24 @@
+{
+  "id": "glint.syntax.json",
+  "name": "JSON",
+  "version": "0.1.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": [],
+  "hooks": [],
+  "contributions": [
+    {
+      "id": "json",
+      "kind": "syntax.language",
+      "title": "json",
+      "data": {
+        "language": "json",
+        "extensions": [
+          "json"
+        ],
+        "aliases": [],
+        "grammar": "json.tmLanguage.json"
+      }
+    }
+  ]
+}
