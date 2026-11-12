@@ -12,6 +12,18 @@ if ($api.Stage -eq $workbench.Stage -or $api.Output -eq $workbench.Output -or $a
     throw 'Products must have independent staging, output and Windows identities.'
 }
 foreach ($plan in @($api, $workbench)) {
+    # Match the verbatim path used by agent terminal working directories on Windows.
+    $extendedScript = if ($repo.StartsWith('\\')) {
+        '\\?\UNC\' + $repo.Substring(2) + '\packaging\windows\build-windows.ps1'
+    } else {
+        '\\?\' + $repo + '\packaging\windows\build-windows.ps1'
+    }
+    $extendedPlan = & $extendedScript -Product $plan.Product -Plan
+    foreach ($property in @('Stage', 'Output', 'Installer', 'Icon', 'Template')) {
+        if ($extendedPlan.$property -ne $plan.$property) {
+            throw "Verbatim script paths must preserve $property for $($plan.Product)."
+        }
+    }
     if (-not (Test-Path -LiteralPath $plan.Icon)) { throw "Missing product icon: $($plan.Icon)" }
     if ($plan.Executable -ne "$($plan.Package).exe") { throw 'Wrong product executable.' }
     $rejected = $false

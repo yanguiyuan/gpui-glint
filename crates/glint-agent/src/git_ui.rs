@@ -170,6 +170,13 @@ impl AgentWorkspace {
                 this.git_ui.loading = false;
                 let repository = result.ok().flatten();
                 let changed = repository != this.git_ui.repository;
+                if let (Some(repo), Some(path)) = (&repository, &this.git_ui.project) {
+                    let metadata = project_grouping::metadata(repo);
+                    if this.history.project_metadata.get(path) != Some(&metadata) {
+                        this.history.project_metadata.insert(path.clone(), metadata);
+                        this.save(cx);
+                    }
+                }
                 this.git_ui.repository = repository;
                 if changed && this.git_ui.open {
                     this.refresh_git_graph(cx);
@@ -834,6 +841,7 @@ impl AgentWorkspace {
     }
 
     fn open_worktree_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.refresh_project_metadata(vec![path.clone()], cx);
         // Preserve the source session even when it has only a draft/attachments.
         let partner = self.history.active().partner_id;
         let existing = self

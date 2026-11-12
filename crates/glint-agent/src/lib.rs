@@ -10,6 +10,7 @@ mod atomic_file;
 mod channels;
 mod chatgpt;
 mod child_process;
+mod vault_environment;
 mod code_fonts;
 mod code_fonts_ui;
 mod code_mode;
@@ -28,6 +29,7 @@ mod file_preview;
 mod generation;
 mod git_project;
 mod git_ui;
+mod project_grouping;
 mod images;
 mod mcp;
 mod mcp_ui;
@@ -182,6 +184,7 @@ pub struct AgentWorkspace {
     show_sessions: bool,
     show_auxiliary_sidebar: bool,
     project_picker_open: bool,
+    project_grouping: project_grouping::State,
     outline: Entity<outline::ConversationOutline>,
     titles: Entity<titles::TitleGenerator>,
     quick_reply_jobs: std::collections::HashMap<Uuid, Task<()>>,
@@ -406,6 +409,11 @@ impl AgentWorkspace {
                     }
                 }
                 if let GroupListEvent::HeaderAction { group, index } = event {
+                    if *index == 1 {
+                        if let Some(path) = this.history.projects.iter().find(|path| format!("project:{}", path.display()) == group.as_ref()).cloned() {
+                            this.edit_project_group(path, cx);
+                        }
+                    }
                     if let Some(key) = group.strip_prefix("partner:") {
                         this.partner_group_action(key, *index, cx);
                     }
@@ -642,9 +650,13 @@ impl AgentWorkspace {
             schedule_editor,
 
             host_owns_vault: vault.is_some(),
-            vault: vault.unwrap_or_else(|| {
-                cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx))
-            }),
+            vault: {
+                let vault = vault.unwrap_or_else(|| {
+                    cx.new(|cx| glint_vault::VaultPage::new(glint_vault::default_path(), theme, cx))
+                });
+                vault_environment::bind(vault.read(cx).environment());
+                vault
+            },
             runs: Default::default(),
             idle_run: Default::default(),
             scheduler_task: None,
@@ -683,6 +695,7 @@ impl AgentWorkspace {
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
+            project_grouping: project_grouping::State::new(cx),
             git_ui: git_ui::State::new(theme, cx),
             outline,
             titles,
@@ -722,6 +735,7 @@ impl AgentWorkspace {
             },
         ));
         workspace.start_storage(cx);
+        workspace.refresh_project_metadata(workspace.history.projects.clone(), cx);
         workspace.restore_code_font(cx);
         workspace.restore_draft(cx);
         workspace.refresh_calendar(cx);
@@ -2864,6 +2878,9 @@ impl Render for AgentWorkspace {
             })
             .when(self.git_ui.dialog.is_some(), |root| {
                 root.child(self.worktree_dialog(cx))
+            })
+            .when(self.project_grouping.editing.is_some(), |root| {
+                root.child(self.project_group_dialog(cx))
             })
             .children(command_overlay)
             .children(image_lightbox)

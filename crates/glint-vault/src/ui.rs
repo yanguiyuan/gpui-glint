@@ -26,6 +26,7 @@ pub enum VaultEvent {
 /// Embeddable page. The host owns navigation; this entity owns all decrypted data.
 /// Unlock lasts until explicit locking or application exit; hiding preserves it.
 pub struct VaultPage {
+    environment: crate::Environment,
     store: VaultStore,
     toasts: Entity<ToastHost>,
     vault: Option<Vault>,
@@ -55,6 +56,14 @@ pub struct VaultPage {
 }
 impl gpui::EventEmitter<VaultEvent> for VaultPage {}
 impl VaultPage {
+    pub fn environment(&self) -> crate::Environment {
+        self.environment.clone()
+    }
+
+    fn sync_environment(&self) {
+        self.environment.replace(self.vault.as_ref().map(Vault::entries).unwrap_or(&[]));
+    }
+
     pub fn new(path: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
         let store = VaultStore::new(path);
         let initialized = store.initialized();
@@ -69,6 +78,7 @@ impl VaultPage {
             "密码",
             "https://example.com",
             "备注",
+            "例如：WORK_MAIL（留空不注入）",
         ]
         .into_iter()
         .enumerate()
@@ -83,6 +93,7 @@ impl VaultPage {
         subscriptions.push(cx.on_release(|this, cx| {
             this.clear_clipboard(cx);
             this.vault = None;
+            this.environment.clear();
             this.bridge = None;
             this.browser_pending = None;
         }));
@@ -112,6 +123,7 @@ impl VaultPage {
             }
         });
         let mut page = Self {
+            environment: crate::Environment::default(),
             toasts: cx.new(|_| ToastHost::new().theme(theme)),
             store,
             vault: None,
@@ -193,6 +205,7 @@ impl VaultPage {
         }
     }
     pub fn lock(&mut self, cx: &mut Context<Self>) {
+        self.environment.clear();
         self.unlock_task = None;
         self.reply_browser(false, cx);
         self.bridge = None;
@@ -245,6 +258,7 @@ impl VaultPage {
                 match result {
                     Ok(vault) => {
                         this.vault = Some(vault);
+                        this.sync_environment();
                         this.notice = None;
                         match Bridge::start(this.store.path()) {
                             Ok(bridge) => this.bridge = Some(bridge),
@@ -273,6 +287,7 @@ impl VaultPage {
             password: self.fields[2].read(cx).value().to_string(),
             website: self.fields[3].read(cx).value().to_string(),
             notes: self.fields[4].read(cx).value().to_string(),
+            env_identifier: self.fields[5].read(cx).value().to_string(),
             updated_at: String::new(),
         }
     }
@@ -293,12 +308,14 @@ impl VaultPage {
                 || draft.password != previous.password
                 || draft.website != previous.website
                 || draft.notes != previous.notes
+                || draft.env_identifier != previous.env_identifier
         } else {
             !draft.title.is_empty()
                 || !draft.username.is_empty()
                 || !draft.password.is_empty()
                 || !draft.website.is_empty()
                 || !draft.notes.is_empty()
+                || !draft.env_identifier.is_empty()
         }
     }
     fn select(&mut self, id: Option<String>, discard: bool, cx: &mut Context<Self>) {
@@ -324,6 +341,7 @@ impl VaultPage {
             &entry.password,
             &entry.website,
             &entry.notes,
+            &entry.env_identifier,
         ]) {
             field.update(cx, |field, cx| field.set_value(value.clone(), cx));
         }
@@ -341,6 +359,10 @@ impl VaultPage {
         if let Some(vault) = self.vault.as_mut() {
             match vault.upsert(draft) {
                 Ok(id) => {
+                    self.sync_environment();
+                    self.fields[5].update(cx, |field, cx| {
+                        field.set_value(field.value().trim().to_ascii_uppercase(), cx);
+                    });
                     self.selected = Some(id);
                     self.notice = None;
                     self.toasts.update(cx, |host, cx| {
@@ -397,6 +419,7 @@ impl VaultPage {
         let result = self.vault.as_mut().map(Vault::refresh);
         match result {
             Some(Ok(true)) => {
+                self.sync_environment();
                 let selected = self.selected.clone();
                 if selected.as_ref().is_some_and(|id| {
                     self.vault
@@ -855,6 +878,7 @@ impl Render for VaultPage {
                                 {
                                     match vault.delete(&id) {
                                         Ok(()) => {
+                                            this.sync_environment();
                                             this.select(None, true, cx);
                                             this.editing = false;
                                         }
@@ -953,6 +977,8 @@ impl Render for VaultPage {
                                     ),
                             )
                             .child(self.field(3, "网站"))
+                            .child(self.field(5, "环境变量标识（可选，自动转大写）"))
+                            .child(div().text_size(px(12.)).child("解锁后注入新启动的本地 Agent 终端 / 命令：GLINT_标识_PWD。修改或锁定后，已启动的进程需重启。"))
                             .child(self.field(4, "备注"))
                             .child(
                                 div()
@@ -1080,6 +1106,41 @@ impl Render for VaultPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn environment_tracks_saved_edits_and_lock(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.sqlite3");
+        let store = VaultStore::new(path.clone());
+        let vault = store.create("a safe test master password").unwrap();
+        let (page, window) =
+            cx.add_window_view(|_, cx| VaultPage::new(path, ThemePreset::Moonstone, cx));
+        page.update(window, |this, cx| {
+            this.vault = Some(vault);
+            let environment = this.environment();
+            this.select(None, true, cx);
+            for (index, value) in [(0, "Work"), (2, "first-secret"), (5, " work_mail ")] {
+                this.fields[index].update(cx, |field, cx| field.set_value(value, cx));
+            }
+            assert!(this.dirty(cx));
+            assert!(environment.snapshot().is_empty());
+            this.save(cx);
+            assert!(!this.dirty(cx));
+            assert_eq!(environment.snapshot()[0].0, "GLINT_WORK_MAIL_PWD");
+            assert_eq!(environment.snapshot()[0].1, "first-secret");
+            this.fields[2].update(cx, |field, cx| field.set_value("updated-secret", cx));
+            this.save(cx);
+            assert_eq!(environment.snapshot()[0].1, "updated-secret");
+            this.fields[5].update(cx, |field, cx| field.set_value("", cx));
+            this.save(cx);
+            assert!(environment.snapshot().is_empty());
+            this.fields[5].update(cx, |field, cx| field.set_value("WORK", cx));
+            this.save(cx);
+            assert!(!environment.snapshot().is_empty());
+            this.lock(cx);
+            assert!(environment.snapshot().is_empty());
+        });
+    }
+
     #[gpui::test]
     fn browser_lists_all_entries_by_default_and_matching_is_optional(
         cx: &mut gpui::TestAppContext,

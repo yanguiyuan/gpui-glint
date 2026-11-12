@@ -36,6 +36,7 @@ fn readonly(call: &ToolCall) -> bool {
             | "skill_read"
             | "todo_read"
             | "partner_list"
+            | "vault_list_entries"
             | "schedule_list"
             | "command_poll"
     ) && !crate::tools::needs_approval(call)

@@ -132,6 +132,7 @@ impl GroupListItem {
 pub struct GroupListGroup {
     pub header: GroupListHeader,
     pub items: Vec<GroupListItem>,
+    pub children: Vec<GroupListGroup>,
 }
 
 impl GroupListGroup {
@@ -139,12 +140,26 @@ impl GroupListGroup {
         Self {
             header,
             items: Vec::new(),
+            children: Vec::new(),
         }
     }
 
     pub fn item(mut self, item: GroupListItem) -> Self {
         self.items.push(item);
         self
+    }
+}
+
+fn contains_item(groups: &[GroupListGroup], id: &SharedString) -> bool {
+    groups.iter().any(|group| group.items.iter().any(|item| &item.id == id) || contains_item(&group.children, id))
+}
+
+fn visible_groups<'a>(groups: &'a [GroupListGroup], collapsed: &HashSet<SharedString>, depth: usize, output: &mut Vec<(&'a GroupListGroup, usize)>) {
+    for group in groups {
+        output.push((group, depth));
+        if !collapsed.contains(&group.header.id) {
+            visible_groups(&group.children, collapsed, depth + 1, output);
+        }
     }
 }
 
@@ -270,10 +285,7 @@ impl GroupList {
     ) {
         self.groups = groups.into_iter().collect();
         if self.confirming.as_ref().is_some_and(|id| {
-            !self
-                .groups
-                .iter()
-                .any(|group| group.items.iter().any(|item| &item.id == id))
+            !contains_item(&self.groups, id)
         }) {
             self.confirming = None;
         }
@@ -312,12 +324,18 @@ impl Render for GroupList {
             .gap(px(10.))
             .text_size(px(13.));
 
-        for group in &self.groups {
+        let mut visible = Vec::new();
+        visible_groups(&self.groups, &self.collapsed, 0, &mut visible);
+        for (group, depth) in visible {
             let group_id = group.header.id.clone();
             let header_key = SharedString::from(format!("h:{}", group_id));
             let header_hovered = self.hovered.as_ref() == Some(&header_key);
             let mut header = div()
                 .id(header_key.clone())
+                .debug_selector({
+                    let id = group_id.clone();
+                    move || format!("group-list-header:{id}").into()
+                })
                 .w_full()
                 .h(px(32.))
                 .px(px(10.))
@@ -408,7 +426,7 @@ impl Render for GroupList {
                     );
                 }
             }
-            let mut section = div().flex().flex_col().gap(px(2.)).child(header);
+            let mut section = div().ml(px(depth as f32 * 14.)).flex().flex_col().gap(px(2.)).child(header);
 
             if self.collapsed.contains(&group_id) {
                 root = root.child(section);
@@ -638,6 +656,36 @@ impl Render for GroupList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn nested_groups_collapse_independently_and_preserve_confirmation(cx: &mut gpui::TestAppContext) {
+        let groups = || {
+            let mut parent = GroupListGroup::new(GroupListHeader::new("feature", "Feature"));
+            parent.children.push(GroupListGroup::new(GroupListHeader::new("idl", "idl"))
+                .item(GroupListItem::new("session", "Session").action(Icon::Trash).confirm_action("Delete?")));
+            vec![parent]
+        };
+        let (list, window) = cx.add_window_view(|_, _| GroupList::new(groups()));
+        list.update(window, |_, cx| cx.notify());
+        assert!(window.debug_bounds("group-list-label:session").is_some());
+        list.update(window, |list, cx| {
+            list.confirming = Some("session".into());
+            list.set_groups(groups(), cx);
+            assert!(list.confirming.is_some());
+            list.toggle_group("feature", cx);
+        });
+        assert!(window.debug_bounds("group-list-header:idl").is_none());
+        assert!(window.debug_bounds("group-list-label:session").is_none());
+        list.update(window, |list, cx| {
+            list.confirming = None;
+            list.toggle_group("feature", cx);
+            list.toggle_group("idl", cx);
+        });
+        assert!(window.debug_bounds("group-list-header:idl").is_some());
+        assert!(window.debug_bounds("group-list-label:session").is_none());
+        list.update(window, |list, cx| list.toggle_group("idl", cx));
+        assert!(window.debug_bounds("group-list-label:session").is_some());
+    }
 
     #[gpui::test]
     fn action_popover_only_emits_after_confirmation(cx: &mut gpui::TestAppContext) {

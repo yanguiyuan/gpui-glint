@@ -348,7 +348,12 @@ impl Session {
             size: Arc::new(Mutex::new(size)),
             colors: Arc::new(Mutex::new(TerminalColors::for_theme(theme))),
         };
-        let (options, label) = shell_options_with_command(root, command.zip(completion.as_deref()))?;
+        let (mut options, label) = shell_options_with_command(root, command.zip(completion.as_deref()))?;
+        if label != "SSH" {
+            crate::vault_environment::with_variables(|name, value| {
+                options.env.insert(name.to_owned(), value.to_owned());
+            });
+        }
         let pty =
             tty::new(&options, size, 0).map_err(|error| format!("无法启动项目终端：{error}"))?;
         let term = Arc::new(FairMutex::new(Term::new(
@@ -527,6 +532,14 @@ impl TerminalView {
     }
     pub(super) fn busy(&self) -> bool {
         self.error.is_none() && !self.session.as_ref().is_some_and(|s| s.listener.exited.load(Ordering::Acquire))
+    }
+    pub(super) fn completed_successfully(&self) -> bool {
+        self.error.is_none()
+            && !self.stop_requested
+            && self.session.as_ref().is_some_and(|session| {
+                session.listener.exited.load(Ordering::Acquire)
+                    && *session.listener.exit_code.lock().unwrap() == Some(0)
+            })
     }
     pub(super) fn status(&self) -> String {
         if self.error.is_some() { return "启动失败".into(); }
@@ -1663,7 +1676,7 @@ impl AgentWorkspace {
 
 /// Both dock positions and project actions use this same PTY view and frame.
 pub(super) fn terminal_panel(
-    terminal: Option<Entity<TerminalView>>, title: String, controls: gpui::Div,
+    terminal: Option<Entity<TerminalView>>, title: impl IntoElement, controls: gpui::Div,
     theme: ThemePreset, bottom: bool, width: f32,
 ) -> gpui::Div {
     let p = theme.palette();

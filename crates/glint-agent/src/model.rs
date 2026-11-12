@@ -232,6 +232,11 @@ pub struct History {
     #[serde(default)]
     pub projects: Vec<std::path::PathBuf>,
     #[serde(default)]
+    pub project_metadata: std::collections::HashMap<std::path::PathBuf, crate::project_grouping::Metadata>,
+    /// An empty override explicitly disables automatic worktree grouping.
+    #[serde(default)]
+    pub project_group_overrides: std::collections::HashMap<std::path::PathBuf, String>,
+    #[serde(default)]
     pub group_by_project: bool,
     #[serde(default)]
     pub group_by_partner: bool,
@@ -249,6 +254,8 @@ impl Default for History {
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
             projects: vec![],
+            project_metadata: Default::default(),
+            project_group_overrides: Default::default(),
             group_by_project: true,
             group_by_partner: false,
             active: session.id,

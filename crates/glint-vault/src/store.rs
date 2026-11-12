@@ -21,6 +21,8 @@ pub struct Entry {
     pub website: String,
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub env_identifier: String,
     pub notes: String,
     pub updated_at: String,
 }
@@ -28,6 +30,17 @@ impl Entry {
     fn validate(&self) -> Result<(), String> {
         if self.title.trim().is_empty() {
             return Err("请输入条目名称".into());
+        }
+        if self.env_identifier.len() > 128
+            || !self
+                .env_identifier
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err("环境变量标识只能包含英文字母、数字和下划线，最多 128 个字符".into());
+        }
+        if !self.env_identifier.is_empty() && self.password.contains('\0') {
+            return Err("用于环境变量的密码不能包含空字符".into());
         }
         if self.title.len() > 1024
             || self.website.len() > 4096
@@ -326,7 +339,16 @@ impl Vault {
 
     pub fn upsert(&mut self, mut entry: Entry) -> Result<String, String> {
         entry.title = entry.title.trim().to_owned();
+        entry.env_identifier = entry.env_identifier.trim().to_ascii_uppercase();
         entry.validate()?;
+        if !entry.env_identifier.is_empty()
+            && self.entries.iter().any(|other| {
+                other.id != entry.id
+                    && other.env_identifier.eq_ignore_ascii_case(&entry.env_identifier)
+            })
+        {
+            return Err("环境变量标识已被其他密码使用".into());
+        }
         entry.updated_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "系统时间无效")?
@@ -424,12 +446,46 @@ mod tests {
             title: title.into(),
             username: "private-user@example.com".into(),
             password: password.into(),
+            env_identifier: String::new(),
             website: "https://example.com/login".into(),
             notes: "private notes".into(),
             id: String::new(),
             updated_at: String::new(),
         }
     }
+    #[test]
+    fn environment_identifiers_are_optional_normalized_unique_and_persisted() {
+        let legacy = entry("Legacy", "secret");
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json.as_object_mut().unwrap().remove("env_identifier");
+        assert!(serde_json::from_value::<Entry>(json).unwrap().env_identifier.is_empty());
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = VaultStore::new(directory.path().join("vault.sqlite3"));
+        let mut vault = store.create(MASTER).unwrap();
+        let mut named = entry("Named", "secret");
+        named.env_identifier = " work_mail ".into();
+        let id = vault.upsert(named).unwrap();
+        assert_eq!(vault.entries()[0].env_identifier, "WORK_MAIL");
+        let mut duplicate = entry("Duplicate", "other-secret");
+        duplicate.env_identifier = "work_mail".into();
+        assert!(vault.upsert(duplicate).is_err());
+        for invalid in ["bad-name", "a=b", "中文", "a\0b"] {
+            let mut draft = entry("Invalid", "secret");
+            draft.env_identifier = invalid.into();
+            assert!(vault.upsert(draft).is_err());
+        }
+        let mut invalid = entry("Invalid password", "a\0b");
+        invalid.env_identifier = "NUL".into();
+        assert!(vault.upsert(invalid).is_err());
+        let mut renamed = vault.entries()[0].clone();
+        renamed.env_identifier = "NEW_NAME".into();
+        vault.upsert(renamed).unwrap();
+        vault.upsert(legacy).unwrap();
+        let restored = store.unlock(MASTER).unwrap();
+        assert_eq!(restored.entries().iter().find(|e| e.id == id).unwrap().env_identifier, "NEW_NAME");
+    }
+
     #[test]
     fn encrypted_round_trip_wrong_password_tampering_and_private_file() {
         let directory = tempfile::tempdir().unwrap();

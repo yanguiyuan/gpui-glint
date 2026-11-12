@@ -362,7 +362,11 @@ impl AgentWorkspace {
             .rounded(px(5.))
             .text_color(rgb(p.accent))
             .bg(rgb(p.accent_tint))
-            .child(if busy { Icon::Pulse } else { Icon::Play }.render(15.))
+            .child(
+                if busy { Icon::Pulse } else { Icon::Play }
+                    .render(15.)
+                    .when(!busy, |icon| icon.text_color(rgb(self.theme.color(0x16833a)))),
+            )
             .child(if busy { "运行中" } else { "项目操作" })
             .child(Icon::ChevronDown.render(12.));
         let mut content = div().flex().flex_col().min_w_0();
@@ -475,7 +479,11 @@ impl AgentWorkspace {
                             .rounded(px(6.))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(p.surface_subtle)))
-                            .child(Icon::Play.render(13.).text_color(rgb(p.text_muted)))
+                            .child(
+                                Icon::Play
+                                    .render(13.)
+                                    .text_color(rgb(self.theme.color(0x16833a))),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -737,6 +745,22 @@ impl AgentWorkspace {
             "{} · {status}",
             action.as_ref().map_or("项目操作", |a| a.name.as_str())
         );
+        let completed = terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).completed_successfully());
+        let title = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(completed, |title| {
+                title.child(
+                    Icon::CheckCircle
+                        .render(16.)
+                        .flex_shrink_0()
+                        .text_color(rgb(self.theme.color(0x16833a))),
+                )
+            })
+            .child(div().min_w_0().truncate().child(title));
         let controls = div()
             .flex()
             .items_center()

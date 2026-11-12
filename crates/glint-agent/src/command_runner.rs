@@ -413,6 +413,9 @@ async fn worker(
         }
         command.env("NO_COLOR", "1").env("TERM", "dumb");
         if !remote {
+            crate::vault_environment::with_variables(|name, value| {
+                command.env(name, value);
+            });
             // A Finder-launched application only has launchd's minimal PATH, but
             // children (cargo -> rustc, build scripts, hooks) need the toolchains
             // the user's shell configuration adds.

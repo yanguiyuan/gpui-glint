@@ -1,6 +1,8 @@
 //! Encrypted local storage and a native page shared by standalone and host apps.
 pub mod browser;
 pub mod store;
+mod environment;
+pub use environment::{EntrySummary, Environment};
 mod ui;
 pub use ui::{VaultEvent, VaultPage};
 

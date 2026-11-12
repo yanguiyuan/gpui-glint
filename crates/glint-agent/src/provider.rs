@@ -296,6 +296,10 @@ impl<T> Drop for Job<T> {
 }
 
 impl<T: Send + 'static> Job<T> {
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+
     pub fn start(
         future: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
     ) -> Result<Self, String> {

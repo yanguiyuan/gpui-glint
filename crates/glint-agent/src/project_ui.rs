@@ -7,6 +7,7 @@ impl AgentWorkspace {
         if !self.history.projects.contains(&path) {
             self.history.projects.push(path.clone());
         }
+        self.refresh_project_metadata(vec![path.clone()], cx);
         // Preserve older standalone conversations by migrating them into the
         // first project chosen after the project-only workflow is enabled.
         for session in &mut self.history.sessions {
@@ -42,7 +43,7 @@ impl AgentWorkspace {
             .active()
             .project
             .as_ref()
-            .map(|path| ssh_project::label(path))
+            .map(|path| project_grouping::repository_label(&self.history, path))
             .unwrap_or_else(|| "选择项目".into());
         let trigger = div()
             .flex()
@@ -59,7 +60,7 @@ impl AgentWorkspace {
         let mut content = div().flex().flex_col().gap_1();
         for path in &self.history.projects {
             let path = path.clone();
-            let label = ssh_project::label(&path);
+            let label = project_grouping::project_label(&self.history, &path);
             content = content.child(
                 div()
                     .id(SharedString::from(format!(
@@ -80,6 +81,18 @@ impl AgentWorkspace {
                     ),
             );
         }
+        content = content.child(
+            Button::new("设置当前项目分组…")
+                .icon(Icon::Folders)
+                .kind(ButtonKind::Plain)
+                .theme(self.theme)
+                .render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(path) = this.history.active().project.clone() {
+                        this.edit_project_group(path, cx);
+                    }
+                })),
+        );
         content = content.child(
             Button::new("打开项目目录…")
                 .icon(Icon::Plus)
@@ -236,6 +249,10 @@ pub fn session_groups_with_partners(
         .filter(|session| {
             query.is_empty()
                 || session.title.to_lowercase().contains(&query)
+                || session.project.as_ref().is_some_and(|path| {
+                    project_grouping::project_label(history, path).to_lowercase().contains(&query)
+                        || project_grouping::group_name(history, path).is_some_and(|name| name.to_lowercase().contains(&query))
+                })
                 || session
                     .messages
                     .iter()
@@ -251,9 +268,9 @@ pub fn session_groups_with_partners(
                 continue;
             }
             groups.push(GroupListGroup::new(
-                GroupListHeader::new(id, ssh_project::label(path))
+                GroupListHeader::new(id, project_grouping::project_label(history, path))
                     .icon(Icon::Folder)
-                    .actions([Icon::Plus]),
+                    .actions([Icon::Plus, Icon::Settings]),
             ));
         }
     }
@@ -262,7 +279,7 @@ pub fn session_groups_with_partners(
             match &session.project {
                 Some(path) => (
                     format!("project:{}", path.display()),
-                    ssh_project::label(path),
+                    project_grouping::project_label(history, path),
                     Icon::Folder,
                 ),
                 None => continue,
@@ -295,7 +312,31 @@ pub fn session_groups_with_partners(
         }
         groups[index].items.push(item);
     }
-    groups
+    if history.group_by_project {
+        nest_project_groups(history, groups)
+    } else {
+        groups
+    }
+}
+
+fn nest_project_groups(history: &History, groups: Vec<GroupListGroup>) -> Vec<GroupListGroup> {
+    let mut result: Vec<GroupListGroup> = Vec::new();
+    for mut group in groups {
+        let Some(path) = group.header.id.strip_prefix("project:").map(PathBuf::from) else {
+            result.push(group); continue;
+        };
+        let Some(name) = project_grouping::group_name(history, &path) else {
+            result.push(group); continue;
+        };
+        group.header.label = project_grouping::repository_label(history, &path).into();
+        let id = format!("project-group:{name}");
+        let index = result.iter().position(|parent| parent.header.id.as_ref() == id).unwrap_or_else(|| {
+            result.push(GroupListGroup::new(GroupListHeader::new(id, name.to_owned()).icon(Icon::Folders)));
+            result.len() - 1
+        });
+        result[index].children.push(group);
+    }
+    result
 }
 
 fn partner_session_groups(
@@ -368,6 +409,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worktree_groups_keep_repository_and_session_identity_across_repositories() {
+        let mut history = History::default();
+        let idl = PathBuf::from("/worktree/idl/feat/chat-governance-openapi");
+        let kim = PathBuf::from("/worktree/kim/feat/chat-governance-openapi");
+        for (path, name) in [(&idl, "idl"), (&kim, "kim")] {
+            history.new_session_for(Some(path.clone()));
+            history.project_metadata.insert(path.clone(), project_grouping::Metadata {
+                repository_name: name.into(), branch: "feat/chat-governance-openapi".into(), linked_worktree: true,
+            });
+        }
+        let active = history.active;
+        let groups = session_groups(&history, "", Some(active));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].header.label.as_ref(), "feat/chat-governance-openapi");
+        assert_eq!(groups[0].children.len(), 2);
+        assert_eq!(groups[0].children[0].header.label.as_ref(), "idl");
+        assert_eq!(groups[0].children[1].header.label.as_ref(), "kim");
+        assert_ne!(groups[0].children[0].header.id, groups[0].children[1].header.id);
+        assert_eq!(groups[0].children[1].items[0].id.as_ref(), active.to_string());
+        assert_eq!(groups[0].children[1].items[0].icon, Some(Icon::Spinner));
+        assert_eq!(session_groups(&history, "idl", None)[0].children[0].items.len(), 1);
+        assert_eq!(session_groups(&history, "chat-governance", None)[0].children.iter().map(|group| group.items.len()).sum::<usize>(), 2);
+        history.project_group_overrides.insert(idl.clone(), "custom".into());
+        assert_eq!(session_groups(&history, "", None).len(), 2);
+        history.project_group_overrides.insert(kim, String::new());
+        let ungrouped = session_groups(&history, "", None);
+        assert!(ungrouped[1].header.label.contains("kim"));
+        assert!(ungrouped[1].children.is_empty());
+    }
+
+    #[test]
     fn companion_groups_include_empty_partners_and_cross_project_sessions_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let repo = partners::Repository::new(dir.path().join("sessions.json"));
@@ -434,7 +506,7 @@ mod tests {
         let groups = session_groups(&history, "", None);
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|group| group.items.is_empty()));
-        assert!(groups.iter().all(|group| group.header.actions.len() == 1));
+        assert!(groups.iter().all(|group| group.header.actions.len() == 2));
         history.new_session_for(Some("/project/a".into()));
         assert_eq!(
             history.active().project.as_deref(),

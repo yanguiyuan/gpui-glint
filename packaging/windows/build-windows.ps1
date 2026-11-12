@@ -8,8 +8,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Build this installer on Windows.' }
-$repo = (Resolve-Path "$PSScriptRoot\..\..").Path
-$products = Import-PowerShellDataFile "$PSScriptRoot\products.psd1"
+# Agent terminals can launch scripts through a verbatim Windows path. Windows
+# PowerShell 5.1 providers do not resolve that prefix (even with -LiteralPath).
+$scriptDirectory = $PSScriptRoot
+if ($scriptDirectory.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+    $scriptDirectory = '\\' + $scriptDirectory.Substring(8)
+} elseif ($scriptDirectory.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+    $scriptDirectory = $scriptDirectory.Substring(4)
+}
+$repo = [IO.Path]::GetFullPath((Join-Path $scriptDirectory '..\..'))
+$products = Import-PowerShellDataFile "$scriptDirectory\products.psd1"
 $config = $products[$Product]
 $package = $config.Package
 $executable = "$package.exe"
@@ -35,10 +43,10 @@ if ($Plan) {
         Stage = $stage; Output = $output; Installer = $installer
         Icon = Join-Path $repo $config.Icon; IconName = $iconName
         Executable = $executable; Defines = $defines
-        Template = Join-Path $PSScriptRoot 'setup.iss'
+        Template = Join-Path $scriptDirectory 'setup.iss'
     }
 }
-. "$PSScriptRoot\msvc.ps1"
+. "$scriptDirectory\msvc.ps1"
 $vcvars = Get-Vcvars64Path
 if (-not $IsccPath) {
     $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
@@ -54,7 +62,7 @@ if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
     throw 'Inno Setup compiler not found. Install Inno Setup 6 or pass -IsccPath.'
 }
 New-Item -ItemType Directory -Force $stage, $output | Out-Null
-. "$PSScriptRoot\webview2.ps1"
+. "$scriptDirectory\webview2.ps1"
 Get-WebView2Bootstrapper -Destination "$stage\MicrosoftEdgeWebview2Setup.exe" -SourcePath $WebView2BootstrapperPath
 Push-Location $repo
 $previousFlags = $env:RUSTFLAGS
@@ -67,7 +75,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
     Copy-Item "$repo\target\x86_64-pc-windows-msvc\release\$executable" $stage
     Copy-Item (Join-Path $repo $config.Icon) (Join-Path $stage $iconName)
-    & $IsccPath @defines "$PSScriptRoot\setup.iss"
+    & $IsccPath @defines "$scriptDirectory\setup.iss"
     if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
     if (-not (Test-Path $installer)) { throw 'Installer output is missing.' }
     $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
