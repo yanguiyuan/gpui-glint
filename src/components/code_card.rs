@@ -3608,6 +3608,8 @@ impl Render for CodeCard {
         }
         let mut source = div()
             .id("code-card-source")
+            // Expose the body bounds to tests through `Window::debug_bounds`.
+            .debug_selector(|| "code-card-source".into())
             .capture_key_down(cx.listener(Self::completion_key))
             .key_context("GlassCodeCard")
             .track_focus(&self.focus_handle)
@@ -3661,7 +3663,10 @@ impl Render for CodeCard {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .when(self.hovered_preview_link, |source| source.cursor_pointer())
-            .min_h(if rich_mode {
+            // Static previews hug their content. Only editable cards reserve the
+            // editor minimum, so a one-line read-only block like a chat code
+            // snippet does not render with an empty half-card below the text.
+            .min_h(if rich_mode || self.read_only {
                 line_height
             } else {
                 px(if self.prose { 27. } else { 89. })
@@ -3904,6 +3909,50 @@ mod tests {
         editor.read_with(window, |editor, _| {
             assert_eq!(editor.content(), "前 src/main.rs 后")
         });
+    }
+
+    #[gpui::test]
+    fn read_only_code_card_hugs_content_instead_of_editor_minimum(cx: &mut gpui::TestAppContext) {
+        struct Host(Entity<CodeCard>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(600.)).flex().flex_col().child(self.0.clone())
+            }
+        }
+        // Body height = 13px top/bottom padding + one 21px row per source line.
+        let one_line = px(26.) + px(LINE_HEIGHT);
+        let body_height = |lines: usize| one_line + px(LINE_HEIGHT * (lines as f32 - 1.));
+        for (content, lines, read_only) in [
+            ("6a57e7e..2d6a26f  main -> main", 1, true),
+            ("a\nb\nc\nd", 4, true),
+            ("6a57e7e..2d6a26f  main -> main", 1, false),
+        ] {
+            let editor = cx.new(|cx| {
+                let card = CodeCard::new(cx, "text", content).show_header(false);
+                if read_only {
+                    card.read_only(true)
+                } else {
+                    card
+                }
+            });
+            let (_, window) = cx.add_window_view(|_, _| Host(editor));
+            window.run_until_parked();
+            let body = window
+                .debug_bounds("code-card-source")
+                .expect("code card body bounds")
+                .size
+                .height;
+            // Editable cards keep the 89px editor minimum; previews hug content.
+            let expected = if read_only {
+                body_height(lines)
+            } else {
+                px(89.).max(body_height(lines))
+            };
+            assert!(
+                (body - expected).abs() < px(0.5),
+                "read_only={read_only} lines={lines}: body height {body:?}, expected {expected:?}"
+            );
+        }
     }
 
     #[gpui::test]
