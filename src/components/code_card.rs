@@ -2292,7 +2292,7 @@ enum EditorLineShape {
     Rich(std::sync::Arc<gpui::WrappedLine>),
 }
 #[derive(Clone)]
-struct EditorLine {
+pub(super) struct EditorLine {
     shape: EditorLineShape,
     source_len: usize,
     tabs: Vec<(usize, Range<usize>)>,
@@ -2307,7 +2307,7 @@ impl std::ops::Deref for EditorLine {
     }
 }
 impl EditorLine {
-    fn shape(
+    pub(super) fn shape(
         window: &Window,
         rich: bool,
         text: SharedString,
@@ -2373,10 +2373,10 @@ impl EditorLine {
             index + (display.end - source - 1)
         }
     }
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.source_len
     }
-    fn x_for_index(&self, index: usize) -> Pixels {
+    pub(super) fn x_for_index(&self, index: usize) -> Pixels {
         gpui::LineLayout::x_for_index(self, Self::display_index(&self.tabs, index))
     }
     fn closest_index_for_x(&self, x: Pixels) -> usize {
@@ -2394,7 +2394,7 @@ impl EditorLine {
         }
         index - (display.end - source - 1)
     }
-    fn paint(
+    pub(super) fn paint(
         &self,
         origin: gpui::Point<Pixels>,
         height: Pixels,
@@ -2411,7 +2411,7 @@ impl EditorLine {
         }
         .unwrap();
     }
-    fn paint_background(
+    pub(super) fn paint_background(
         &self,
         origin: gpui::Point<Pixels>,
         height: Pixels,

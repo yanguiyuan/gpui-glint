@@ -1,6 +1,9 @@
 //! Explicit, snapshot-checked resolution of text conflicts in the Git sidebar.
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! { static GIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub root: PathBuf,
@@ -9,6 +12,28 @@ pub struct Conflict {
     pub original: String,
     pub limitation: Option<String>,
     index: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind { BothModified, BothAdded, DeletedByUs, DeletedByThem, BothDeleted, AddedByUs, AddedByThem, Other }
+
+impl Conflict {
+    pub fn kind(&self) -> ConflictKind {
+        let stages = self.index.split(|b| *b == 0).filter_map(|record| {
+            let header = record.split(|b| *b == b'\t').next()?;
+            header.last().copied()
+        }).fold(0_u8, |mask, stage| match stage { b'1'..=b'3' => mask | (1 << (stage - b'1')), _ => mask });
+        match stages {
+            7 => ConflictKind::BothModified,
+            6 => ConflictKind::BothAdded,
+            5 => ConflictKind::DeletedByUs,
+            3 => ConflictKind::DeletedByThem,
+            1 => ConflictKind::BothDeleted,
+            2 => ConflictKind::AddedByUs,
+            4 => ConflictKind::AddedByThem,
+            _ => ConflictKind::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -68,8 +93,11 @@ pub fn hunks(text: &str) -> Result<Vec<Hunk>, String> {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    #[cfg(test)]
+    GIT_CALLS.with(|count| count.set(count.get() + 1));
     let output = crate::child_process::command("git")
         .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .output()
@@ -103,15 +131,24 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
     )
     .canonicalize()
     .map_err(|e| e.to_string())?;
-    let paths = git(
+    let entries = git(
         &root,
-        &["diff", "--name-only", "--diff-filter=U", "-z", "--"],
+        &["ls-files", "--unmerged", "-z"],
     )?;
+    // One index snapshot covers every conflict. Keep each complete raw record
+    // so save() can still compare it against a fresh path-scoped snapshot.
+    let mut indexes = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    for record in entries.split(|b| *b == 0).filter(|record| !record.is_empty()) {
+        let tab = record.iter().position(|b| *b == b'\t').ok_or("Git 冲突索引格式无效")?;
+        let label = std::str::from_utf8(&record[tab + 1..]).map_err(|_| "冲突路径不是 UTF-8")?;
+        let snapshot = indexes.entry(label.to_owned()).or_default();
+        snapshot.extend_from_slice(record);
+        snapshot.push(0);
+    }
     let mut files = Vec::new();
     let mut notes = Vec::new();
-    for path in paths.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let label = std::str::from_utf8(path).map_err(|_| "冲突路径不是 UTF-8")?;
-        let path = root.join(label);
+    for (label, index) in indexes {
+        let path = root.join(&label);
         let snapshot: Result<Conflict, String> = (|| {
             let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
             if !meta.is_file() || meta.file_type().is_symlink() {
@@ -137,7 +174,6 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
             if original.contains('\0') {
                 return Err("二进制冲突暂不支持文本解决".into());
             }
-            let index = index(&root, label)?;
             if index
                 .split(|b| *b == 0)
                 .filter(|r| !r.is_empty())
@@ -148,7 +184,7 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
             Ok(Conflict {
                 root: root.clone(),
                 path,
-                label: label.into(),
+                label: label.clone(),
                 original,
                 limitation,
                 index,
@@ -322,11 +358,18 @@ pub(crate) mod tests {
         );
     }
     pub(crate) fn conflicted() -> tempfile::TempDir {
+        vendor_update(0, 1)
+    }
+
+    pub(crate) fn vendor_update(tracked: usize, conflicts: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         checked(root, &["init", "-b", "main"]);
         checked(root, &["config", "core.autocrlf", "false"]);
-        let path = root.join("冲突 [1].txt");
+        std::fs::create_dir_all(root.join("vendor/tracked")).unwrap();
+        for i in 0..tracked {
+            std::fs::write(root.join(format!("vendor/tracked/{i}.go")), "package before\n").unwrap();
+        }
         for (branch, content) in [
             ("main", "base\n"),
             ("feature", "theirs\n"),
@@ -337,12 +380,42 @@ pub(crate) mod tests {
             } else if content == "ours\n" {
                 checked(root, &["checkout", branch]);
             }
-            std::fs::write(&path, content).unwrap();
+            for i in 0..conflicts {
+                let label = if i == 0 { "冲突 [1].txt".to_owned() } else { format!("vendor/group_{}/conflict-{i}.go", i % 3) };
+                let path = root.join(label);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, content).unwrap();
+            }
             checked(root, &["add", "."]);
             checked(root, &["commit", "-m", content]);
         }
         assert!(!command(root, &["merge", "feature"]).status.success());
+        for i in 0..tracked {
+            std::fs::write(root.join(format!("vendor/tracked/{i}.go")), "package after\n").unwrap();
+        }
         dir
+    }
+
+    #[test]
+    fn large_vendor_update_lists_metadata_and_reads_conflicts_with_two_git_processes() {
+        let dir = vendor_update(6926, 161);
+        let started = std::time::Instant::now();
+        let inventory = crate::workspace_diff::inventory(dir.path()).unwrap();
+        let listing_time = started.elapsed();
+        assert_eq!(inventory.files.len(), 6926);
+        assert!(inventory.has_conflicts);
+        assert!(inventory.files.iter().all(|file| file.before.is_none() && file.after.is_empty()));
+        let calls = GIT_CALLS.with(|count| count.get());
+        let started = std::time::Instant::now();
+        let (files, notes) = load(dir.path()).unwrap();
+        let conflict_time = started.elapsed();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(files.len(), 161);
+        assert_eq!(GIT_CALLS.with(|count| count.get()) - calls, 2);
+        for file in [files.first().unwrap(), files.last().unwrap()] {
+            assert_eq!(file.index, index(&file.root, &file.label).unwrap(), "batched snapshots preserve stale-index guards");
+        }
+        eprintln!("7087 changes (6926 tracked + 161 conflicts): inventory={listing_time:?}, conflicts={conflict_time:?}, conflict Git processes=2 (previously 163)");
     }
 
     #[test]
@@ -353,6 +426,7 @@ pub(crate) mod tests {
         assert!(notes.is_empty());
         assert_eq!(files.len(), 1);
         let file = &files[0];
+        assert_eq!(file.kind(), ConflictKind::BothModified);
         assert_eq!(hunks(&file.original).unwrap().len(), 1);
         assert!(save(file, &file.original).unwrap_err().contains("冲突标记"));
         save(file, "merged\n").unwrap();

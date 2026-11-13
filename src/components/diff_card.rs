@@ -8,12 +8,12 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Render, ScrollHandle,
-    ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun,
+    SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun,
     Window, div, px, rgb,
 };
 
 use super::Icon;
-use super::code_card::CodeColors;
+use super::code_card::{CodeColors, EditorLine};
 use super::scroll_chain::ChainScroll;
 use crate::theme::ThemePreset;
 
@@ -1296,7 +1296,7 @@ struct DiffLineElement {
 }
 
 struct DiffLinePrepaint {
-    line: Option<ShapedLine>,
+    line: Option<EditorLine>,
 }
 
 impl IntoElement for DiffLineElement {
@@ -1345,7 +1345,9 @@ impl Element for DiffLineElement {
         for run in &mut runs {
             run.font = style.font();
         }
-        let line = window.text_system().shape_line(
+        let line = EditorLine::shape(
+            window,
+            false,
             self.text.clone(),
             style.font_size.to_pixels(window.rem_size()),
             &runs,
@@ -1368,21 +1370,15 @@ impl Element for DiffLineElement {
             line.paint_background(
                 bounds.origin,
                 px(LINE_HEIGHT),
-                gpui::TextAlign::Left,
-                None,
                 window,
                 cx,
-            )
-            .ok();
+            );
             line.paint(
                 bounds.origin,
                 px(LINE_HEIGHT),
-                gpui::TextAlign::Left,
-                None,
                 window,
                 cx,
-            )
-            .ok();
+            );
         }
     }
 }
@@ -1390,6 +1386,22 @@ impl Element for DiffLineElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn tabs_keep_indentation_and_source_offsets_in_diff_lines(cx: &mut gpui::TestAppContext) {
+        let (_, window) = cx.add_window_view(|_, cx| DiffCard::new(cx, "go", "\treturn nil", "\t\treturn err"));
+        window.update(|window, cx| {
+            let text: SharedString = "\t \t中文 return".into();
+            let mut element = DiffLineElement { runs: dim_runs(&text, 0x555555), text: text.clone() };
+            let mut spaces = DiffLineElement { runs: dim_runs("        中文 return", 0x555555), text: "        中文 return".into() };
+            let tabbed = element.prepaint(None, None, Bounds::default(), &mut (), window, cx).line.unwrap();
+            let spaced = spaces.prepaint(None, None, Bounds::default(), &mut (), window, cx).line.unwrap();
+            assert!(tabbed.x_for_index(1) > tabbed.x_for_index(0));
+            assert_eq!(tabbed.x_for_index(3), spaced.x_for_index(8));
+            assert_eq!(tabbed.len(), text.len());
+            assert_eq!(element.text, text, "display expansion must not alter copy/source data");
+        });
+    }
 
     #[gpui::test]
     fn clickable_title_emits_navigation_without_folding_diff(cx: &mut gpui::TestAppContext) {

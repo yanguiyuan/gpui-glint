@@ -17,7 +17,21 @@ pub struct Source {
     old_path: String,
     head: Option<String>,
     pub stats: Option<(usize, usize)>,
+    pub status: FileStatus,
     untracked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileStatus { Added, Modified, Deleted, Renamed, Untracked }
+
+impl FileStatus {
+    fn from_status(status: &[u8]) -> Self {
+        if status == b"??" { Self::Untracked }
+        else if status.contains(&b'D') { Self::Deleted }
+        else if status.contains(&b'R') { Self::Renamed }
+        else if status.contains(&b'A') || status.contains(&b'C') { Self::Added }
+        else { Self::Modified }
+    }
 }
 
 pub struct Inventory {
@@ -110,6 +124,7 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
                 old_path: old_path.into(),
                 head: head.clone(),
                 stats,
+                status: FileStatus::from_status(&field[..2]),
                 untracked: field[..2] == *b"??",
             },
         );
@@ -314,11 +329,13 @@ pub(crate) mod tests {
     #[test]
     fn lazy_reads_preserve_staged_rename_delete_unborn_and_binary_semantics() {
         let dir = many_files(1);
+        assert_eq!(inventory(dir.path()).unwrap().sources.values().next().unwrap().status, FileStatus::Modified);
         git_ok(dir.path(), &["mv", "vendor/0000.rs", "renamed 中文 [1].rs"]);
         let mut data = inventory(dir.path()).unwrap();
         let counts = statistics(&data.root, data.head.as_deref()).unwrap();
         apply_statistics(&mut data.files, &mut data.sources, &counts);
         let file = &data.files[0];
+        assert_eq!(data.sources[&file.path].status, FileStatus::Renamed);
         assert_eq!(file.label, "renamed 中文 [1].rs");
         assert!(data.sources[&file.path].stats.is_none());
         assert_eq!(load(&data.sources[&file.path]).unwrap().added, 1);
@@ -326,13 +343,17 @@ pub(crate) mod tests {
         git_ok(dir.path(), &["commit", "-m", "rename"]);
         std::fs::remove_file(dir.path().join("renamed 中文 [1].rs")).unwrap();
         let data = inventory(dir.path()).unwrap();
+        assert_eq!(data.sources[&data.files[0].path].status, FileStatus::Deleted);
         assert_eq!(load(&data.sources[&data.files[0].path]).unwrap().removed, 2);
 
         let unborn = tempfile::tempdir().unwrap();
         git_ok(unborn.path(), &["init"]);
         std::fs::write(unborn.path().join("first.txt"), "first\n").unwrap();
         let data = inventory(unborn.path()).unwrap();
+        assert_eq!(data.sources[&data.files[0].path].status, FileStatus::Untracked);
         assert_eq!(load(&data.sources[&data.files[0].path]).unwrap().added, 1);
+        git_ok(unborn.path(), &["add", "first.txt"]);
+        assert_eq!(inventory(unborn.path()).unwrap().sources.values().next().unwrap().status, FileStatus::Added);
         std::fs::write(unborn.path().join("first.txt"), [0, 1, 2]).unwrap();
         assert!(
             load(&data.sources[&data.files[0].path])

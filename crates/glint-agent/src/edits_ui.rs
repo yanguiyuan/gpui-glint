@@ -11,6 +11,33 @@ use std::{
 };
 
 type ListLink = Rc<RefCell<Option<(gpui::ListState, usize)>>>;
+
+fn file_status_style(status: crate::workspace_diff::FileStatus, theme: ThemePreset) -> (&'static str, u32) {
+    use crate::workspace_diff::FileStatus;
+    let dark = theme.is_dark();
+    match status {
+        FileStatus::Added => ("新增", if dark { 0x4bc26b } else { 0x257235 }),
+        FileStatus::Modified => ("修改", if dark { 0xe5c07b } else { 0x966300 }),
+        FileStatus::Deleted => ("删除", if dark { 0xff7b72 } else { 0xb42318 }),
+        FileStatus::Renamed => ("重命名", if dark { 0x79b8ff } else { 0x0969da }),
+        FileStatus::Untracked => ("未跟踪", if dark { 0xa8b0bd } else { 0x6e7781 }),
+    }
+}
+
+fn conflict_status_style(kind: crate::merge_conflicts::ConflictKind, theme: ThemePreset) -> (&'static str, u32) {
+    use crate::merge_conflicts::ConflictKind;
+    let dark = theme.is_dark();
+    match kind {
+        ConflictKind::BothModified => ("双方修改", if dark { 0xfb923c } else { 0xb45309 }),
+        ConflictKind::BothAdded => ("双方新增", if dark { 0xc4b5fd } else { 0x7c3aed }),
+        ConflictKind::DeletedByUs => ("当前侧删除", if dark { 0xff7b72 } else { 0xb42318 }),
+        ConflictKind::DeletedByThem => ("传入侧删除", if dark { 0xfda4af } else { 0xbe185d }),
+        ConflictKind::BothDeleted => ("双方删除", if dark { 0xf87171 } else { 0x991b1b }),
+        ConflictKind::AddedByUs => ("当前侧新增", if dark { 0x4bc26b } else { 0x257235 }),
+        ConflictKind::AddedByThem => ("传入侧新增", if dark { 0x5eead4 } else { 0x0f766e }),
+        ConflictKind::Other => ("冲突", if dark { 0xfb923c } else { 0xb45309 }),
+    }
+}
 struct VirtualFiles {
     files: Rc<Vec<Change>>,
     rows: Option<Rc<Vec<crate::workspace_tree::Row>>>,
@@ -18,6 +45,8 @@ struct VirtualFiles {
     state: gpui::ListState,
     expanded: bool,
     measured_width: gpui::Pixels,
+    prefix: usize,
+    conflict_rows: Rc<Vec<crate::workspace_tree::Row>>,
 }
 fn watch_row<V: 'static>(view: &Entity<V>, link: ListLink, cx: &mut Context<AgentWorkspace>) {
     cx.observe(view, move |_, _, cx| {
@@ -48,6 +77,7 @@ pub struct State {
     workspace_notes: Vec<String>,
     workspace_error: Option<String>,
     workspace_task: Option<Task<()>>,
+    workspace_conflicts_task: Option<Task<()>>,
     workspace_stats_task: Option<Task<()>>,
     workspace_revision: u64,
     conflicts: Vec<Entity<ConflictView>>,
@@ -55,11 +85,54 @@ pub struct State {
     sidebar_scroll: ScrollHandle,
     detail_scrolls: RefCell<HashMap<String, ScrollHandle>>,
     navigation_scroll: gpui::UniformListScrollHandle,
+    pub(super) navigation_width: Option<f32>,
+    pub(super) navigation_resize: Option<(gpui::Pixels, f32)>,
+    pub(super) navigation_maximum: Cell<f32>,
+    conflict_tree_cache: RefCell<Option<(String, Vec<gpui::EntityId>, Rc<Vec<crate::workspace_tree::Row>>)>>,
     reveal_revision: u64,
     reveal_pending: Cell<bool>,
 }
 
 impl AgentWorkspace {
+    fn conflict_rows(&self, conflicts: &[Entity<ConflictView>], scope: &str, cx: &App) -> Rc<Vec<crate::workspace_tree::Row>> {
+        if self.history.workspace_display != crate::workspace_tree::DisplayMode::Tree {
+            return Rc::new((0..conflicts.len()).map(|index| crate::workspace_tree::Row::File { index, depth: 0 }).collect());
+        }
+        let ids = conflicts.iter().map(|view| view.entity_id()).collect::<Vec<_>>();
+        let mut cache = self.edits_ui.conflict_tree_cache.borrow_mut();
+        if cache.as_ref().is_none_or(|(key, cached, _)| key != scope || *cached != ids) {
+            let files = conflicts.iter().map(|view| {
+                let file = &view.read(cx).file;
+                Change::preview(file.path.clone(), file.label.clone(), None, "".into(), Some((0, 0)))
+            }).collect::<Vec<_>>();
+            let empty = Default::default();
+            let collapsed = self.edits_ui.collapsed_directories.get(scope).unwrap_or(&empty);
+            *cache = Some((scope.into(), ids, Rc::new(crate::workspace_tree::rows(&files, collapsed))));
+        }
+        cache.as_ref().unwrap().2.clone()
+    }
+
+    fn conflict_directory_row(&self, row: &crate::workspace_tree::Row, scope: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let crate::workspace_tree::Row::Directory { path, label, depth, count, collapsed } = row else { unreachable!() };
+        let p = self.theme.palette();
+        let path = path.clone();
+        let scope = scope.to_owned();
+        let selector = format!("conflict-directory:{path}");
+        div().id(SharedString::from(format!("{scope}:{path}"))).debug_selector(move || selector.clone()).w_full()
+            .h(px(34.)).pr_3().pl(px(12. + *depth as f32 * 16.)).flex().items_center().gap_2()
+            .cursor_pointer().hover(|style| style.bg(rgb(p.surface_subtle)))
+            .child(if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown }.render(12.))
+            .child(Icon::Folder.render(14.))
+            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label.clone()))
+            .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(count.to_string()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let collapsed = this.edits_ui.collapsed_directories.entry(scope.clone()).or_default();
+                if !collapsed.remove(&path) { collapsed.insert(path.clone()); }
+                this.edits_ui.conflict_tree_cache.borrow_mut().take();
+                cx.notify();
+            })).into_any_element()
+    }
+
     pub(super) fn open_workspace_diff(&mut self, cx: &mut Context<Self>) {
         if self.history.active().project.is_none() { return; }
         self.page = crate::Page::Chat;
@@ -329,6 +402,8 @@ impl AgentWorkspace {
             if view.detail != self.edits_ui.expanded { view.detail = self.edits_ui.expanded; cx.notify(); }
             if view.tree_depth != tree_depth { view.tree_depth = tree_depth; cx.notify(); }
             view.source = if self.edits_ui.workspace_mode { self.edits_ui.workspace_sources.get(&file.path).cloned() } else { None };
+            let status = view.source.as_ref().map(|source| source.status);
+            if view.status != status { view.status = status; cx.notify(); }
             if view.side_by_side != self.edits_ui.expanded {
                 view.side_by_side = self.edits_ui.expanded;
                 if let Some(card) = &view.card { card.update(cx, |card, cx| card.set_side_by_side(view.side_by_side, cx)); }
@@ -357,12 +432,19 @@ impl AgentWorkspace {
         } else { None };
         let row_count = rows.as_ref().map_or(files.len(), |rows| rows.len());
         let conflicts = self.edits_ui.conflicts.clone();
+        let conflict_scope = format!("{scope}:conflicts");
+        let conflict_rows = self.conflict_rows(&conflicts, &conflict_scope, cx);
         let notes = self.edits_ui.workspace_notes.clone();
-        let prefix = if conflicts.is_empty() { 0 } else { conflicts.len() + 1 };
+        let prefix = if conflicts.is_empty() { 0 } else { conflict_rows.len() + 1 };
         let count = prefix + row_count + notes.len();
         let mut cached = self.edits_ui.virtual_files.borrow_mut();
         let same_rows = cached.as_ref().is_some_and(|cache| cache.rows == rows);
         if let Some(cache) = cached.as_mut() {
+            if cache.scope == scope && cache.conflict_rows != conflict_rows {
+                cache.state.splice(0..cache.prefix, prefix);
+                cache.prefix = prefix;
+                cache.conflict_rows = conflict_rows.clone();
+            }
             if cache.scope == scope && !same_rows && cache.files.len() == files.len()
                 && cache.files.iter().zip(files.iter()).all(|(a,b)| a.id == b.id) {
                 if let (Some(old), Some(new)) = (&cache.rows, &rows) {
@@ -385,7 +467,7 @@ impl AgentWorkspace {
         if cached.as_ref().is_none_or(|cache| cache.rows != rows || cache.scope != scope || !Rc::ptr_eq(&cache.files, &files)) {
             let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
             state.reset_with_uniform_height(count, px(49.));
-            *cached = Some(VirtualFiles { files: files.clone(), rows: rows.clone(), scope: scope.clone(), state, expanded: self.edits_ui.expanded, measured_width: px(0.) });
+            *cached = Some(VirtualFiles { files: files.clone(), rows: rows.clone(), scope: scope.clone(), state, expanded: self.edits_ui.expanded, measured_width: px(0.), prefix, conflict_rows: conflict_rows.clone() });
         }
         let cached = cached.as_mut().unwrap();
         if cached.expanded != self.edits_ui.expanded {
@@ -406,8 +488,14 @@ impl AgentWorkspace {
                         .into_any_element();
                 }
                 if index < prefix {
-                    let view = &conflicts[index - 1];
+                    let (file_index, depth) = match &conflict_rows[index - 1] {
+                        crate::workspace_tree::Row::Directory { .. } => return this.conflict_directory_row(&conflict_rows[index - 1], &conflict_scope, cx),
+                        crate::workspace_tree::Row::File { index, depth } => (*index, *depth),
+                    };
+                    let view = &conflicts[file_index];
                     view.update(cx, |view, cx| {
+                        let depth = (this.history.workspace_display == crate::workspace_tree::DisplayMode::Tree).then_some(depth);
+                        if view.tree_depth != depth { view.tree_depth = depth; cx.notify(); }
                         *view.list_link.borrow_mut() = Some((link_state.clone(), index));
                         if view.theme != this.theme {
                             view.theme = this.theme;
@@ -519,7 +607,7 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
-        let virtualized = !self.edits_ui.expanded && workspace_mode && (files.len() > 128 || (!files.is_empty() && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
+        let virtualized = !self.edits_ui.expanded && workspace_mode && (files.len() + self.edits_ui.conflicts.len() > 128 || ((!files.is_empty() || !self.edits_ui.conflicts.is_empty()) && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
         if virtualized {
             list = div().id("edited-files-scroll").flex_1().min_h_0().flex().flex_col()
                 .child(self.virtual_workspace_files(files.clone(), scope.clone(), cx));
@@ -527,6 +615,7 @@ impl AgentWorkspace {
         if !self.edits_ui.expanded && !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
             for view in &self.edits_ui.conflicts {
                 view.update(cx, |view, cx| {
+                    if view.tree_depth.take().is_some() { cx.notify(); }
                     view.list_link.borrow_mut().take();
                     if view.theme != self.theme {
                         view.theme = self.theme;
@@ -579,7 +668,8 @@ impl AgentWorkspace {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(if workspace_mode && self.edits_ui.workspace_task.is_some() && files.is_empty() { "文件变更 · 读取中".into() } else { format!("文件变更 · {}", files.len() + if workspace_mode && root_matches { self.edits_ui.conflicts.len() } else { 0 }) }),
+                            .child(if workspace_mode && files.is_empty() && (self.edits_ui.workspace_task.is_some()
+                                || (self.edits_ui.workspace_conflicts_task.is_some() && self.edits_ui.conflicts.is_empty())) { "文件变更 · 读取中".into() } else { format!("文件变更 · {}", files.len() + if workspace_mode && root_matches { self.edits_ui.conflicts.len() } else { 0 }) }),
                     )
                     .when(!workspace_mode, |header| {
                         header.child(
@@ -673,6 +763,8 @@ impl AgentWorkspace {
                 Some("项目已切换，请刷新工作区变更。".to_owned())
             } else if self.edits_ui.workspace_task.is_some() {
                 Some("正在读取 Git 工作区文件清单…".to_owned())
+            } else if self.edits_ui.workspace_conflicts_task.is_some() {
+                Some("文件清单已就绪，正在读取冲突详情…".to_owned())
             } else if self.edits_ui.workspace_stats_task.is_some() {
                 Some("文件清单已就绪，正在后台统计改动行数…".to_owned())
             } else {
@@ -699,7 +791,7 @@ impl AgentWorkspace {
                 }
             }
         }
-        if files.is_empty() && (!workspace_mode || self.edits_ui.conflicts.is_empty() && self.edits_ui.workspace_task.is_none() && self.edits_ui.workspace_error.is_none()) {
+        if files.is_empty() && (!workspace_mode || self.edits_ui.conflicts.is_empty() && self.edits_ui.workspace_task.is_none() && self.edits_ui.workspace_conflicts_task.is_none() && self.edits_ui.workspace_error.is_none()) {
             list = list.child(
                 div()
                     .p_4()
@@ -757,6 +849,7 @@ impl AgentWorkspace {
             detail = detail.track_scroll(&scroll);
             if let Some(view) = conflicts.iter().find(|view| &view.read(cx).file.path == path) {
                 view.update(cx, |view, cx| {
+                    if view.tree_depth.take().is_some() { cx.notify(); }
                     view.list_link.borrow_mut().take();
                     if !view.expanded { view.expanded = true; cx.notify(); }
                     if view.theme != self.theme {
@@ -774,22 +867,39 @@ impl AgentWorkspace {
         if self.edits_ui.workspace_mode {
             detail = detail.children(self.edits_ui.workspace_notes.iter().map(|note| div().px_3().py_1().text_size(px(11.)).text_color(rgb(p.text_muted)).child(note.clone())));
         }
-        let prefix = conflicts.len();
-        let count = prefix + rows.len();
+        let conflict_scope = format!("{scope}:conflicts");
+        let conflict_rows = self.conflict_rows(&conflicts, &conflict_scope, cx);
+        let prefix = if conflicts.is_empty() { 0 } else { conflict_rows.len() + 1 };
+        let tracked_header = usize::from(prefix > 0 && !rows.is_empty());
+        let count = prefix + tracked_header + rows.len();
         let navigation_files = files.clone();
-        let navigation = gpui::uniform_list("expanded-diff-files", count, cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+        let navigation = gpui::uniform_list("expanded-diff-files", count, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
             range.map(|index| {
+                if prefix > 0 && index == 0 {
+                    return div().w_full().h(px(34.)).px_3().flex().items_center().gap_2()
+                        .font_weight(FontWeight::SEMIBOLD).child(Icon::GitConflict.render(13.))
+                        .child(format!("冲突 · {}", conflicts.len())).into_any_element();
+                }
+                if tracked_header > 0 && index == prefix {
+                    return div().w_full().h(px(34.)).px_3().flex().items_center()
+                        .font_weight(FontWeight::SEMIBOLD).child(format!("文件变更 · {}", navigation_files.len())).into_any_element();
+                }
                 let (path, label, depth, icon, counts) = if index < prefix {
-                    let file = &conflicts[index].read(cx).file;
-                    (file.path.clone(), file.label.clone(), 0, Icon::GitConflict, "冲突".to_owned())
+                    let (file_index, depth) = match &conflict_rows[index - 1] {
+                        Row::Directory { .. } => return this.conflict_directory_row(&conflict_rows[index - 1], &conflict_scope, cx),
+                        Row::File { index, depth } => (*index, *depth),
+                    };
+                    let file = &conflicts[file_index].read(cx).file;
+                    let label = if tree { file.label.rsplit('/').next().unwrap_or(&file.label).to_owned() } else { file.label.clone() };
+                    (file.path.clone(), label, depth, Icon::GitConflict, conflict_status_style(file.kind(), this.theme).0.to_owned())
                 } else {
-                    match &rows[index - prefix] {
+                    match &rows[index - prefix - tracked_header] {
                         Row::Directory { path, label, depth, count, collapsed } => {
                             let path = path.clone();
                             let directory_scope = scope.clone();
                             let selector = format!("diff-navigation-directory:{path}");
                             return div().id(SharedString::from(format!("diff-directory:{scope}:{path}")))
-                                .debug_selector(move || selector.clone()).h(px(34.)).pr_3().pl(px(10. + *depth as f32 * 16.))
+                                .debug_selector(move || selector.clone()).w_full().h(px(34.)).pr_3().pl(px(10. + *depth as f32 * 16.))
                                 .flex().items_center().gap_2().cursor_pointer().hover(|style| style.bg(rgb(p.surface_subtle)))
                                 .child(if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown }.render(12.))
                                 .child(Icon::Folder.render(14.))
@@ -811,38 +921,70 @@ impl AgentWorkspace {
                 };
                 let selector = format!("diff-navigation-file:{}", path.display());
                 let active = selected.as_ref() == Some(&path);
+                let status = if index < prefix {
+                    let Row::File { index, .. } = &conflict_rows[index - 1] else { unreachable!() };
+                    Some(conflict_status_style(conflicts[*index].read(cx).file.kind(), this.theme))
+                } else {
+                    this.edits_ui.workspace_sources.get(&path).map(|source| file_status_style(source.status, this.theme))
+                };
+                let color = status.map_or(p.text_muted, |(_, color)| color);
                 div().id(SharedString::from(selector.clone())).debug_selector(move || selector.clone())
-                    .h(px(34.)).pr_3().pl(px(26. + depth as f32 * 16.))
+                    .w_full().h(px(34.)).pr_3().pl(px(26. + depth as f32 * 16.))
                     .flex().items_center().gap_2().cursor_pointer()
                     .when(active, |row| row.bg(rgb(p.accent_tint)).text_color(rgb(p.accent)))
                     .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(icon.render(14.).flex_shrink_0())
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
-                    .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(counts))
+                    .child(icon.render(14.).flex_shrink_0().when(status.is_some(), |icon| icon.text_color(rgb(color))))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).when(status.is_some(), |label| label.text_color(rgb(color))).child(label))
+                    .when_some(status.filter(|_| index >= prefix), |row, (label, _)| row.child(div().text_size(px(10.)).text_color(rgb(color)).child(label)))
+                    .child(div().text_size(px(10.)).text_color(rgb(color)).child(counts))
                     .on_click(cx.listener(move |this, _, _, cx| { this.edits_ui.selected = Some(path.clone()); cx.notify(); }))
                     .into_any_element()
             }).collect::<Vec<_>>()
         })).size_full().track_scroll(&self.edits_ui.navigation_scroll);
-        div().id("expanded-diff-layout").debug_selector(|| "expanded-diff-layout".into()).flex_1().min_h_0().flex()
-            .child(div().debug_selector(|| "expanded-diff-navigation".into()).w(px(260.)).flex_shrink_0().h_full().border_r_1().border_color(rgb(p.border)).child(navigation))
+        let weak = cx.entity().downgrade();
+        div()
+            .on_children_prepainted(move |bounds, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let width: f32 = bounds.iter().map(|bounds| f32::from(bounds.size.width)).sum();
+                    let maximum = (width - 320.).clamp(180., 800.);
+                    this.edits_ui.navigation_maximum.set(maximum);
+                    if this.edits_ui.navigation_width.unwrap_or(260.) > maximum {
+                        this.edits_ui.navigation_width = Some(maximum);
+                        let id = cx.entity_id();
+                        cx.defer(move |cx| cx.notify(id));
+                    }
+                });
+            })
+            .id("expanded-diff-layout").debug_selector(|| "expanded-diff-layout".into()).flex_1().min_h_0().flex()
+            .child(div().debug_selector(|| "expanded-diff-navigation".into()).w(px(self.edits_ui.navigation_width.unwrap_or(260.))).flex_shrink_0().h_full().child(navigation))
+            .child(div().id("diff-navigation-resize").debug_selector(|| "diff-navigation-resize".into())
+                .w(px(5.)).h_full().flex_shrink_0().cursor(gpui::CursorStyle::ResizeLeftRight)
+                .bg(rgb(p.border)).hover(|style| style.bg(rgb(p.accent)))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.edits_ui.navigation_resize = Some((event.position.x, this.edits_ui.navigation_width.unwrap_or(260.)));
+                    cx.stop_propagation();
+                    cx.notify();
+                })))
             .child(detail)
     }
 
     fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
+        let root = self.history.active().project.clone();
+        if self.edits_ui.workspace_task.is_some() && self.edits_ui.workspace_root == root { return; }
         self.edits_ui.workspace_revision += 1;
         let revision = self.edits_ui.workspace_revision;
         self.edits_ui.workspace_stats_task = None;
-        let root = self.history.active().project.clone();
+        self.edits_ui.workspace_conflicts_task = None;
         if self.edits_ui.workspace_root != root {
             self.edits_ui.conflicts.clear();
             self.edits_ui.file_views.borrow_mut().retain(|key, _| !key.starts_with("workspace:"));
+            self.edits_ui.workspace_files = Rc::new(Vec::new());
+            self.edits_ui.workspace_sources = Rc::new(HashMap::new());
+            self.edits_ui.virtual_files.borrow_mut().take();
+            self.edits_ui.workspace_notes.clear();
         }
         self.edits_ui.workspace_root = root.clone();
         self.edits_ui.workspace_error = None;
-        self.edits_ui.workspace_files = Rc::new(Vec::new());
-        self.edits_ui.workspace_sources = Rc::new(HashMap::new());
-        self.edits_ui.virtual_files.borrow_mut().take();
-        self.edits_ui.workspace_notes.clear();
         let Some(root) = root else {
             self.edits_ui.workspace_files = Rc::new(Vec::new());
             self.edits_ui.workspace_notes.clear();
@@ -856,11 +998,10 @@ impl AgentWorkspace {
             if crate::ssh_project::is_remote(&root) {
                 provider::Job::start(async move { edits::remote_workspace_changes(&root).await })?
                     .result()
-                    .await.map(|(files, notes)| (files, notes, Vec::new(), HashMap::new(), None))
+                    .await.map(|(files, notes)| (files, notes, HashMap::new(), None))
             } else {
                 let inventory = crate::workspace_diff::inventory(&root)?;
-                let (conflicts, notes) = if inventory.has_conflicts { crate::merge_conflicts::load(&root)? } else { (Vec::new(), Vec::new()) };
-                Ok((inventory.files, notes, conflicts, inventory.sources, Some((inventory.root, inventory.head))))
+                Ok((inventory.files, Vec::new(), inventory.sources, Some((inventory.root, inventory.head, inventory.has_conflicts))))
             }
         });
         self.edits_ui.workspace_task = Some(cx.spawn(async move |weak, cx| {
@@ -873,29 +1014,24 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 match result {
-                    Ok((files, notes, conflicts, sources, statistics)) => {
+                    Ok((files, notes, sources, statistics)) => {
                         let valid: std::collections::HashSet<_> = files.iter().map(|file| file.path.clone()).collect();
                         this.edits_ui.file_views.borrow_mut().retain(|key, view| !key.starts_with("workspace:") || valid.contains(&view.read(cx).file.path));
                         this.edits_ui.workspace_files = Rc::new(files);
                         this.edits_ui.workspace_sources = Rc::new(sources);
                         this.edits_ui.workspace_notes = notes;
-                        let workspace = cx.entity().downgrade();
-                        this.edits_ui.conflicts = conflicts.into_iter().map(|file| {
-                            this.edits_ui.conflicts.iter().find(|view| view.read(cx).file == file).cloned()
-                                .unwrap_or_else(|| {
-                                    let view = cx.new(|cx| ConflictView::new(file, requested_root.clone(), workspace.clone(), this.theme, cx));
-                                    watch_row(&view, view.read(cx).list_link.clone(), cx);
-                                    view
-                                })
-                        }).collect();
-                        if let Some((root, head)) = statistics {
+                        if let Some((root, head, has_conflicts)) = statistics {
+                            if has_conflicts {
+                                this.start_workspace_conflicts(root.clone(), revision, cx);
+                            } else {
+                                this.edits_ui.conflicts.clear();
+                            }
                             this.start_workspace_statistics(root, head, revision, cx);
+                        } else {
+                            this.edits_ui.conflicts.clear();
                         }
                     }
                     Err(error) => {
-                        this.edits_ui.conflicts.clear();
-                        this.edits_ui.workspace_files = Rc::new(Vec::new());
-                        this.edits_ui.workspace_notes.clear();
                         this.edits_ui.workspace_error = Some(error);
                     }
                 }
@@ -903,6 +1039,34 @@ impl AgentWorkspace {
             });
         }));
         cx.notify();
+    }
+
+    fn start_workspace_conflicts(&mut self, root: PathBuf, revision: u64, cx: &mut Context<Self>) {
+        let work_root = root.clone();
+        let work = cx.background_executor().spawn(async move { crate::merge_conflicts::load(&work_root) });
+        self.edits_ui.workspace_conflicts_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.edits_ui.workspace_revision != revision || this.history.active().project != this.edits_ui.workspace_root { return; }
+                if let Some(task) = this.edits_ui.workspace_conflicts_task.take() { task.detach(); }
+                match result {
+                    Ok((files, notes)) => {
+                        let workspace = cx.entity().downgrade();
+                        this.edits_ui.conflicts = files.into_iter().map(|file| {
+                            this.edits_ui.conflicts.iter().find(|view| view.read(cx).file == file).cloned()
+                                .unwrap_or_else(|| {
+                                    let view = cx.new(|cx| ConflictView::new(file, root.clone(), workspace.clone(), this.theme, cx));
+                                    watch_row(&view, view.read(cx).list_link.clone(), cx);
+                                    view
+                                })
+                        }).collect();
+                        this.edits_ui.workspace_notes.extend(notes);
+                    }
+                    Err(error) => this.edits_ui.workspace_error = Some(format!("冲突详情读取失败，可继续查看其他文件：{error}")),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn start_workspace_statistics(&mut self, root: PathBuf, head: Option<String>, revision: u64, cx: &mut Context<Self>) {
@@ -925,6 +1089,7 @@ impl AgentWorkspace {
 
 /// Drafts stay in memory until the user explicitly saves and stages the file.
 struct ConflictView {
+    tree_depth: Option<usize>,
     list_link: ListLink,
     file: crate::merge_conflicts::Conflict,
     project: PathBuf,
@@ -1046,6 +1211,7 @@ impl ConflictView {
         .detach();
         Self {
             list_link: Default::default(),
+            tree_depth: None,
             file,
             project,
             workspace,
@@ -1300,11 +1466,12 @@ impl Render for ConflictView {
         } else {
             DiffColors::LIGHT
         };
+        let (status_label, status_color) = conflict_status_style(self.file.kind(), self.theme);
         let busy = self.task.is_some();
         let badge = if self.count > 0 {
-            format!("冲突 · {}", self.count)
+            format!("{status_label} · {}", self.count)
         } else {
-            "冲突".to_owned()
+            status_label.to_owned()
         };
         let mut row = div()
             .w_full()
@@ -1316,8 +1483,10 @@ impl Render for ConflictView {
             .child(
                 div()
                     .id("conflict-disclosure")
+                    .w_full()
                     .debug_selector(|| "merge-conflict-disclosure".into())
                     .px_3()
+                    .pl(px(12. + self.tree_depth.unwrap_or(0) as f32 * 16.))
                     .py_3()
                     .flex()
                     .items_center()
@@ -1336,16 +1505,17 @@ impl Render for ConflictView {
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.))
-                            .child(self.file.label.clone()),
+                            .text_color(rgb(status_color))
+                            .child(if self.tree_depth.is_some() { self.file.label.rsplit('/').next().unwrap_or(&self.file.label).to_owned() } else { self.file.label.clone() }),
                     )
                     .child(
                         div()
                             .px(px(6.))
                             .py(px(2.))
                             .rounded(px(5.))
-                            .bg(rgb(colors.deleted_row))
+                            .bg(rgb(p.surface_subtle))
                             .text_size(px(11.))
-                            .text_color(rgb(colors.deleted_marker))
+                            .text_color(rgb(status_color))
                             .flex()
                             .items_center()
                             .gap(px(4.))
@@ -1493,6 +1663,7 @@ impl Render for ConflictView {
 /// Each file owns its disclosure state. Closed files never construct a diff;
 /// opening another file leaves all existing disclosures and scroll positions intact.
 struct FileDiff {
+    status: Option<crate::workspace_diff::FileStatus>,
     detail: bool,
     tree_depth: Option<usize>,
     list_link: ListLink,
@@ -1515,6 +1686,7 @@ impl FileDiff {
     fn new(file: Change, theme: ThemePreset) -> Self {
         Self {
             detail: false,
+            status: None,
             tree_depth: None,
             list_link: Default::default(),
             source: None,
@@ -1624,6 +1796,7 @@ impl Render for FileDiff {
             })
             .filter(|(count, _)| *count > 0);
         let whitespace_selector = format!("whitespace-toggle:{}", self.file.label);
+        let status = self.status.map(|status| file_status_style(status, self.theme));
         let mut row = div()
             .w_full()
             .flex_shrink_0()
@@ -1655,7 +1828,7 @@ impl Render for FileDiff {
                     .child(
                         Icon::for_language(edits::language(&self.file.path))
                             .render(15.)
-                            .text_color(rgb(p.text_muted)),
+                            .text_color(rgb(status.map_or(p.text_muted, |(_, color)| color))),
                     )
                     .child(
                         div()
@@ -1663,10 +1836,12 @@ impl Render for FileDiff {
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.))
+                            .when_some(status, |label, (_, color)| label.text_color(rgb(color)))
                             .child(if self.tree_depth.is_some() {
                                 self.file.label.rsplit('/').next().unwrap_or(&self.file.label).to_owned()
                             } else { self.file.label.clone() }),
                     )
+                    .when_some(status, |header, (label, color)| header.child(div().text_size(px(11.)).text_color(rgb(color)).child(label)))
                     .child(if let Some(loaded) = &self.loaded {
                         counts(loaded.added, loaded.removed)
                     } else if self.source.as_ref().is_some_and(|source| source.stats.is_none()) {
@@ -2059,6 +2234,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn conflict_tree_keeps_drafts_and_full_width_rows_in_both_layouts(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::merge_conflicts::tests::vendor_update(1, 4);
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let (conflicts, _) = crate::merge_conflicts::load(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.open = true;
+            host.edits_ui.expanded = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            let weak = cx.entity().downgrade();
+            host.edits_ui.conflicts = conflicts.into_iter().map(|file| cx.new(|cx| ConflictView::new(file, root.clone(), weak.clone(), host.theme, cx))).collect();
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        window.run_until_parked();
+        let path = root.join("vendor/group_1/conflict-1.go");
+        let selector = Box::leak(format!("diff-navigation-file:{}", path.display()).into_boxed_str());
+        let row = window.debug_bounds(selector).unwrap();
+        let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
+        assert_eq!(row.size.width, navigation.size.width, "hover and selection cover the complete navigation row");
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        let draft = host.read_with(window, |host, cx| host.edits_ui.conflicts.iter().find(|view| view.read(cx).file.path == path).unwrap().read(cx).editor.clone());
+        draft.update(window, |editor, cx| editor.sync_content("draft survives folder collapse", cx));
+        for expanded in [true, false] {
+            host.update(window, |host, cx| {
+                host.edits_ui.expanded = expanded;
+                if !expanded { for view in &host.edits_ui.conflicts { view.update(cx, |view, cx| { view.expanded = false; cx.notify(); }); } }
+                cx.notify();
+            });
+            window.run_until_parked();
+            let folder = window.debug_bounds("conflict-directory:vendor").unwrap();
+            window.simulate_click(folder.center(), Default::default());
+            window.run_until_parked();
+            assert!(window.debug_bounds("conflict-directory:vendor/group_1").is_none());
+            draft.read_with(window, |editor, _| assert_eq!(editor.content(), "draft survives folder collapse"));
+            let folder = window.debug_bounds("conflict-directory:vendor").unwrap();
+            window.simulate_click(folder.center(), Default::default());
+            window.run_until_parked();
+            assert!(window.debug_bounds("conflict-directory:vendor/group_1").is_some());
+        }
+    }
+
+    #[gpui::test]
     fn expanded_diff_navigation_switches_one_file_and_restores_compact_layout(cx: &mut gpui::TestAppContext) {
         let data = tempfile::tempdir().unwrap();
         std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
@@ -2077,6 +2305,16 @@ mod tests {
         let detail = window.debug_bounds("expanded-diff-content").unwrap();
         assert!(navigation.right() <= detail.left());
         assert!(detail.size.width > navigation.size.width);
+        let resize = window.debug_bounds("diff-navigation-resize").unwrap();
+        let target = point(resize.center().x + px(180.), resize.center().y + px(60.));
+        window.simulate_mouse_down(resize.center(), gpui::MouseButton::Left, Default::default());
+        window.simulate_mouse_move(target, gpui::MouseButton::Left, Default::default());
+        window.simulate_mouse_up(target, gpui::MouseButton::Left, Default::default());
+        window.run_until_parked();
+        let wider = window.debug_bounds("expanded-diff-navigation").unwrap();
+        assert!(wider.size.width > navigation.size.width + px(100.));
+        assert!(window.debug_bounds("expanded-diff-content").unwrap().size.width >= px(300.));
+        host.read_with(window, |host, _| assert!(host.edits_ui.navigation_resize.is_none()));
         assert!(window.debug_bounds("edit-file:src/first.rs").is_some());
         assert!(window.debug_bounds("edit-file:src/second.rs").is_none());
         host.read_with(window, |host, _| assert_eq!(host.edits_ui.file_views.borrow().len(), 1, "only the selected file loads its Diff"));

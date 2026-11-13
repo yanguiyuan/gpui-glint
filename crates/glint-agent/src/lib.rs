@@ -2740,6 +2740,16 @@ impl Render for AgentWorkspace {
             .track_focus(&self.focus)
             .on_mouse_move(
                 cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start, width)) = this.edits_ui.navigation_resize {
+                        if event.dragging() {
+                            this.edits_ui.navigation_width = Some((width + f32::from(event.position.x - start))
+                                .clamp(180., this.edits_ui.navigation_maximum.get().max(180.)));
+                        } else {
+                            this.edits_ui.navigation_resize = None;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
                     if let Some((start, width)) = this.right_sidebar_resize {
                         if event.dragging() {
                             this.right_sidebar_width =
@@ -2755,6 +2765,7 @@ impl Render for AgentWorkspace {
             .on_mouse_up(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.edits_ui.navigation_resize.take().is_some() { cx.notify(); }
                     if this.right_sidebar_resize.take().is_some() {
                         cx.notify();
                     }
@@ -2763,6 +2774,7 @@ impl Render for AgentWorkspace {
             .on_mouse_up_out(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.edits_ui.navigation_resize.take().is_some() { cx.notify(); }
                     if this.right_sidebar_resize.take().is_some() {
                         cx.notify();
                     }
