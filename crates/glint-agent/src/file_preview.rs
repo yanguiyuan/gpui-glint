@@ -266,6 +266,28 @@ impl PathCache {
 pub struct Decorated {
     pub markdown: String,
     pub paths: std::collections::HashSet<String>,
+    pub replacements: Vec<(Range<usize>, String)>,
+}
+
+pub fn apply_decorations(source: &str, replacements: &[(Range<usize>, String)]) -> String {
+    let mut result = source.to_owned();
+    for (range, replacement) in replacements.iter().rev() {
+        result.replace_range(range.clone(), replacement);
+    }
+    result
+}
+
+/// Keep verified links while new tokens arrive, but re-check Markdown context:
+/// a growing path or a newly opened code fence must not inherit an old link.
+pub fn retain_decorations(previous: &str, source: &str, replacements: &mut Vec<(Range<usize>, String)>) {
+    let previous_candidates = candidates(previous);
+    let candidates = candidates(source);
+    replacements.retain(|(range, _)| {
+        source.get(range.clone()) == previous.get(range.clone())
+            && candidates.iter().any(|candidate| candidate.range == *range
+                && previous_candidates.iter().any(|old| old.range == *range
+                    && old.value == candidate.value && old.explicit == candidate.explicit))
+    });
 }
 #[cfg(test)]
 pub async fn decorate(source: String, root: Option<PathBuf>) -> Result<String, String> {
@@ -382,13 +404,11 @@ pub async fn decorate_cached(
             format!("[{label}]({})", target.link()),
         ));
     }
-    let mut result = source;
-    for (range, replacement) in replacements.into_iter().rev() {
-        result.replace_range(range, &replacement);
-    }
+    let result = apply_decorations(&source, &replacements);
     Ok(Decorated {
         markdown: result,
         paths: dependencies,
+        replacements,
     })
 }
 enum Loaded {
@@ -1517,6 +1537,31 @@ mod tests {
             assert!(h.right_sidebar_resize.is_none());
         });
         assert_eq!(std::fs::read_to_string(path).unwrap(), "read only\n");
+    }
+
+    #[tokio::test]
+    async fn streamed_paths_keep_verified_links_and_drop_changed_markdown_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let source = "查看 `a.rs`，继续说明。";
+        let decorated = decorate_cached(source.into(), Some(dir.path().into()), Default::default()).await.unwrap();
+        assert_eq!(decorated.replacements.len(), 1);
+        let mut replacements = decorated.replacements.clone();
+        let appended = format!("{source}\n\n新的总结 **结果**");
+        retain_decorations(source, &appended, &mut replacements);
+        assert_eq!(apply_decorations(&appended, &replacements), format!("{}\n\n新的总结 **结果**", decorated.markdown));
+        let changed = "查看 `a.rsx`，继续说明。";
+        retain_decorations(source, changed, &mut replacements);
+        assert!(replacements.is_empty());
+        let code = "a.rs";
+        let decorated = decorate_cached(code.into(), Some(dir.path().into()), Default::default()).await.unwrap();
+        let mut replacements = decorated.replacements;
+        // Same byte range, but the line now belongs to a setext heading.
+        // It is still a path candidate and can keep its link.
+        retain_decorations(code, "a.rs\n----", &mut replacements);
+        assert_eq!(replacements.len(), 1);
+        retain_decorations(code, "a.rsx", &mut replacements);
+        assert!(replacements.is_empty());
     }
 
     #[tokio::test]

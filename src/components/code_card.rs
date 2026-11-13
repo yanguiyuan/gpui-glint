@@ -624,6 +624,23 @@ impl CodeCard {
         self.prose = true;
         self
     }
+
+    /// Update a streamed preview without replacing its entity or scroll state.
+    pub(super) fn sync_rich_text(&mut self, markdown: &str, cx: &mut Context<Self>) {
+        let rich = RichText::parse(markdown);
+        self.content = rich.text.clone().into();
+        let clamp = |offset: usize| {
+            let mut offset = offset.min(self.content.len());
+            while !self.content.is_char_boundary(offset) { offset -= 1; }
+            offset
+        };
+        self.selected_range = clamp(self.selected_range.start)..clamp(self.selected_range.end);
+        self.rich = Some(rich);
+        self.layout_revision += 1;
+        self.line_cache = None;
+        self.last_lines.clear();
+        cx.notify();
+    }
     fn apply_format(
         &mut self,
         format: Option<Format>,

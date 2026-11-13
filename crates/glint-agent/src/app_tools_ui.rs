@@ -10,6 +10,7 @@ pub struct MarkdownView {
     last_used: std::time::Instant,
     pub(super) links_source: Option<SharedString>,
     render_source: SharedString,
+    link_replacements: Vec<(std::ops::Range<usize>, String)>,
     pub(super) links_revision: u64,
     pub(super) links_task: Option<Task<()>>,
     _link_subscription: Subscription,
@@ -1093,6 +1094,7 @@ impl AgentWorkspace {
                 last_used: std::time::Instant::now(),
                 links_source: None,
                 render_source: source,
+                link_replacements: Vec::new(),
                 links_revision: 0,
                 links_task: None,
                 _link_subscription: subscription,
@@ -1100,15 +1102,19 @@ impl AgentWorkspace {
         });
         view.last_used = std::time::Instant::now();
         if view.source.as_ref() != text || view.theme != theme {
+            let changed = view.source.as_ref() != text;
+            if changed {
+                file_preview::retain_decorations(&view.source, text, &mut view.link_replacements);
+                view.render_source = file_preview::apply_decorations(text, &view.link_replacements).into();
+            }
             view.editor.update(cx, |editor, cx| {
                 editor.set_theme(theme, cx);
-                if view.source.as_ref() != text {
-                    editor.set_markdown(text, cx);
+                if changed {
+                    editor.sync_preview_markdown(&view.render_source, cx);
                 }
             });
-            if view.source.as_ref() != text {
+            if changed {
                 view.source = SharedString::from(text.to_owned());
-                view.render_source = view.source.clone();
             }
             view.theme = theme;
         }
@@ -1153,10 +1159,11 @@ impl AgentWorkspace {
                         }
                         if let Ok(result) = result {
                             view.paths = result.paths;
+                            view.link_replacements = result.replacements;
                             let markdown = result.markdown;
                             if view.render_source.as_ref() != markdown {
                                 view.editor
-                                    .update(cx, |editor, cx| editor.set_markdown(&markdown, cx));
+                                    .update(cx, |editor, cx| editor.sync_preview_markdown(&markdown, cx));
                                 view.render_source = markdown.into();
                             }
                         }
@@ -1702,6 +1709,35 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn streamed_answer_and_thinking_keep_path_decorations_between_lookups(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+        host.update(window, |host, cx| {
+            let source = "查看 `src/main.rs`。";
+            for (key, scrollable) in [("stream-answer", false), ("stream-thinking:thinking", true)] {
+                let editor = host.markdown_preview(key.into(), source, scrollable, cx);
+                let range = source.find('`').unwrap()..source.rfind('`').unwrap() + 1;
+                {
+                    let mut cache = host.markdown_views.borrow_mut();
+                    let view = cache.get_mut(key).unwrap();
+                    view.link_replacements = vec![(range, "[`src/main.rs`](glint-preview:verified)".into())];
+                    view.render_source = file_preview::apply_decorations(source, &view.link_replacements).into();
+                    editor.update(cx, |editor, cx| editor.sync_preview_markdown(&view.render_source, cx));
+                }
+                for suffix in ["继续", "继续补充总结", "继续补充总结\n\n下一段"] {
+                    let updated = host.markdown_preview(key.into(), &format!("{source}{suffix}"), scrollable, cx);
+                    assert_eq!(updated.entity_id(), editor.entity_id());
+                    let cache = host.markdown_views.borrow();
+                    let view = &cache[key];
+                    assert!(view.render_source.contains("glint-preview:verified"));
+                    assert!(view.render_source.ends_with(suffix));
+                }
+            }
+        });
+    }
 
     #[gpui::test]
     fn thinking_toggle_survives_a_stream_update_during_click(cx: &mut gpui::TestAppContext) {
