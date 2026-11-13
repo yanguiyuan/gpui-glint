@@ -99,6 +99,8 @@ impl TerminalColors {
 gpui::actions!(project_terminal, [Paste, Copy, CopyOrInterrupt]);
 pub(super) struct StatusChanged;
 impl gpui::EventEmitter<StatusChanged> for TerminalView {}
+pub(super) struct WorkspaceActivity;
+impl gpui::EventEmitter<WorkspaceActivity> for TerminalView {}
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         gpui::KeyBinding::new("ctrl-c", CopyOrInterrupt, Some("ProjectTerminal")),
@@ -474,6 +476,7 @@ pub(super) struct TerminalView {
     dragging: bool,
     exit_notified: bool,
     stop_requested: bool,
+    command_output: bool,
 }
 impl TerminalView {
     fn new(root: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
@@ -485,6 +488,7 @@ impl TerminalView {
     fn new_with_command(root: PathBuf, theme: ThemePreset, command: Option<String>, cx: &mut Context<Self>) -> Self {
         let configured_font = gpui_glint::code_font::family();
         let (font, cell_width) = terminal_font(cx.text_system(), &configured_font);
+        let command_output = command.is_some();
         let start = cx
             .background_executor()
             .spawn(async move { Session::start_command(&root, theme, command.as_deref()) });
@@ -518,6 +522,7 @@ impl TerminalView {
             while receiver.recv().await.is_ok() {
                 if weak
                     .update(cx, |this, cx| {
+                        if this.command_output { cx.emit(WorkspaceActivity); }
                         if !this.exit_notified
                             && this
                                 .session
@@ -549,6 +554,7 @@ impl TerminalView {
             dragging: false,
             exit_notified: false,
             stop_requested: false,
+            command_output,
         }
     }
     pub(super) fn busy(&self) -> bool {
@@ -606,6 +612,8 @@ impl TerminalView {
                 .lock()
                 .mode()
                 .contains(TermMode::BRACKETED_PASTE);
+            self.command_output = !bracketed && text.contains(['\r', '\n']);
+            if self.command_output { cx.emit(WorkspaceActivity); }
             session.input(if bracketed {
                 format!("\x1b[200~{text}\x1b[201~").into_bytes()
             } else {
@@ -633,6 +641,8 @@ impl TerminalView {
             if let Some(text) = selected {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             } else {
+                self.command_output = true;
+                cx.emit(WorkspaceActivity);
                 session.input(vec![3]);
             }
         }
@@ -643,6 +653,8 @@ impl TerminalView {
             return;
         }
         let key = &event.keystroke;
+        self.command_output = key.key == "enter";
+        if self.command_output { cx.emit(WorkspaceActivity); }
         if (key.modifiers.platform || key.modifiers.control) && key.key == "v" {
             self.paste(&Paste, window, cx);
             cx.stop_propagation();
@@ -1574,6 +1586,8 @@ impl EntityInputHandler for TerminalView {
     ) {
         self.preedit.clear();
         if let Some(session) = &self.session {
+            self.command_output = text.contains(['\r', '\n']);
+            if self.command_output { cx.emit(WorkspaceActivity); }
             session.input(text.as_bytes().to_vec());
         }
         cx.notify();
@@ -1662,8 +1676,9 @@ impl AgentWorkspace {
                 return;
             }
             let terminal = cx.new(|cx| TerminalView::new(root.clone(), self.theme, cx));
-            cx.subscribe(&terminal, |_, _, _: &StatusChanged, cx| cx.notify())
-                .detach();
+            cx.subscribe(&terminal, |_, _, _: &StatusChanged, cx| cx.notify()).detach();
+            let project = root.clone();
+            cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| this.workspace_terminal_activity(&project, cx)).detach();
             self.terminal_ui.terminals.insert(root.clone(), terminal);
         }
         self.page = crate::Page::Chat;

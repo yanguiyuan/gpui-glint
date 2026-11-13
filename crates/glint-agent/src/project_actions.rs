@@ -266,6 +266,8 @@ impl AgentWorkspace {
             cx.notify()
         })
         .detach();
+        let project = root.clone();
+        cx.subscribe(&terminal, move |this, _, _: &terminal_ui::WorkspaceActivity, cx| this.workspace_terminal_activity(&project, cx)).detach();
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         self.project_actions
             .runs

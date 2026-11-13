@@ -1,7 +1,7 @@
 use super::*;
 use crate::edits::Change;
 use gpui_glint::components::{
-    ChainScroll, CodeCard, CodeCardEvent, DiffCard, DiffCardEvent, DiffColors,
+    ChainScroll, CodeCard, CodeCardEvent, DiffCard, DiffCardEvent, DiffColors, Tooltip, Scrollbar, ScrollbarState,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -38,6 +38,35 @@ fn conflict_status_style(kind: crate::merge_conflicts::ConflictKind, theme: Them
         ConflictKind::Other => ("冲突", if dark { 0xfb923c } else { 0xb45309 }),
     }
 }
+#[derive(Clone)]
+enum GitRow {
+    Group(bool, usize),
+    Directory(bool, crate::workspace_tree::Row),
+    File(bool, usize, usize),
+}
+
+enum StageTarget {
+    Files(Vec<crate::workspace_diff::Source>),
+    Group(bool),
+}
+
+struct StageRequest {
+    sources: Vec<crate::workspace_diff::Source>,
+    staged: bool,
+    project: Option<PathBuf>,
+}
+
+impl GitRow {
+    fn key(&self, files: &[Change]) -> String {
+        match self {
+            Self::Group(staged, _) => format!("group:{staged}"),
+            Self::Directory(staged, crate::workspace_tree::Row::Directory { path, .. }) => format!("dir:{staged}:{path}"),
+            Self::File(staged, index, _) => format!("file:{staged}:{}", files[*index].path.display()),
+            _ => unreachable!(),
+        }
+    }
+}
+
 struct VirtualFiles {
     files: Rc<Vec<Change>>,
     rows: Option<Rc<Vec<crate::workspace_tree::Row>>>,
@@ -68,6 +97,14 @@ pub struct State {
     summaries: RefCell<HashMap<String, (Vec<Uuid>, Entity<Summary>)>>,
     diffs: RefCell<HashMap<String, (Uuid, Entity<DiffCard>)>>,
     workspace_mode: bool,
+    selected_staged: bool,
+    stage_task: Option<Task<()>>,
+    stage_queue: std::collections::VecDeque<StageRequest>,
+    stage_pending: std::collections::HashSet<PathBuf>,
+    stage_refresh_pending: bool,
+    grouped_rows: RefCell<Option<(Rc<Vec<Change>>, bool, Rc<Vec<GitRow>>)>>,
+    grouped_list: RefCell<Option<(Rc<Vec<GitRow>>, Vec<gpui::EntityId>, gpui::ListState, Rc<Vec<Change>>)>>,
+    grouped_width: Cell<gpui::Pixels>,
     workspace_root: Option<PathBuf>,
     workspace_files: Rc<Vec<Change>>,
     workspace_sources: Rc<HashMap<PathBuf, crate::workspace_diff::Source>>,
@@ -77,6 +114,14 @@ pub struct State {
     workspace_notes: Vec<String>,
     workspace_error: Option<String>,
     workspace_task: Option<Task<()>>,
+    workspace_background_refresh: bool,
+    workspace_resync_pending: bool,
+    workspace_watch_root: Option<PathBuf>,
+    workspace_stamp: Option<crate::workspace_diff::RepositoryStamp>,
+    workspace_conflict_versions: Vec<(Vec<u8>, Option<crate::workspace_diff::FileStamp>)>,
+    workspace_watch_task: Option<Task<()>>,
+    workspace_probe_task: Option<Task<()>>,
+    workspace_sync_debounce: Option<Task<()>>,
     workspace_conflicts_task: Option<Task<()>>,
     workspace_stats_task: Option<Task<()>>,
     workspace_revision: u64,
@@ -84,6 +129,7 @@ pub struct State {
     file_views: RefCell<HashMap<String, Entity<FileDiff>>>,
     sidebar_scroll: ScrollHandle,
     detail_scrolls: RefCell<HashMap<String, ScrollHandle>>,
+    detail_scrollbars: RefCell<HashMap<String, ScrollbarState>>,
     navigation_scroll: gpui::UniformListScrollHandle,
     pub(super) navigation_width: Option<f32>,
     pub(super) navigation_resize: Option<(gpui::Pixels, f32)>,
@@ -129,6 +175,7 @@ impl AgentWorkspace {
                 let collapsed = this.edits_ui.collapsed_directories.entry(scope.clone()).or_default();
                 if !collapsed.remove(&path) { collapsed.insert(path.clone()); }
                 this.edits_ui.conflict_tree_cache.borrow_mut().take();
+                this.edits_ui.grouped_list.borrow_mut().take();
                 cx.notify();
             })).into_any_element()
     }
@@ -398,10 +445,21 @@ impl AgentWorkspace {
         let workspace = cx.entity().downgrade();
         view.update(cx, |view, cx| {
             *view.list_link.borrow_mut() = link;
-            view.set_file(file, self.theme, cx);
+            let mut display_file = file.clone();
+            if let Some(source) = self.edits_ui.workspace_sources.get(&file.path) {
+                let stats = if scope.ends_with(":staged") { source.staged_stats } else if scope.ends_with(":unstaged") { source.unstaged_stats } else { source.stats };
+                if let Some((a, r)) = stats { display_file.added = a; display_file.removed = r; }
+            }
+            view.set_file(&display_file, self.theme, cx);
             if view.detail != self.edits_ui.expanded { view.detail = self.edits_ui.expanded; cx.notify(); }
             if view.tree_depth != tree_depth { view.tree_depth = tree_depth; cx.notify(); }
-            view.source = if self.edits_ui.workspace_mode { self.edits_ui.workspace_sources.get(&file.path).cloned() } else { None };
+            view.source = if self.edits_ui.workspace_mode {
+                self.edits_ui.workspace_sources.get(&file.path).map(|source| {
+                    if scope.ends_with(":staged") { source.for_layer(true) }
+                    else if scope.ends_with(":unstaged") { source.for_layer(false) }
+                    else { source.clone() }
+                })
+            } else { None };
             let status = view.source.as_ref().map(|source| source.status);
             if view.status != status { view.status = status; cx.notify(); }
             if view.side_by_side != self.edits_ui.expanded {
@@ -607,12 +665,13 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
-        let virtualized = !self.edits_ui.expanded && workspace_mode && (files.len() + self.edits_ui.conflicts.len() > 128 || ((!files.is_empty() || !self.edits_ui.conflicts.is_empty()) && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
+        let grouped = workspace_mode && root_matches && self.edits_ui.workspace_sources.len() > 0;
+        let virtualized = !grouped && !self.edits_ui.expanded && workspace_mode && (files.len() + self.edits_ui.conflicts.len() > 128 || ((!files.is_empty() || !self.edits_ui.conflicts.is_empty()) && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
         if virtualized {
             list = div().id("edited-files-scroll").flex_1().min_h_0().flex().flex_col()
                 .child(self.virtual_workspace_files(files.clone(), scope.clone(), cx));
         }
-        if !self.edits_ui.expanded && !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
+        if !grouped && !self.edits_ui.expanded && !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
             for view in &self.edits_ui.conflicts {
                 view.update(cx, |view, cx| {
                     if view.tree_depth.take().is_some() { cx.notify(); }
@@ -634,12 +693,30 @@ impl AgentWorkspace {
             && !self.any_run_busy()
             && self.edits_ui.undo_task.is_none()
             && self.queued_requests.is_empty();
-        if !self.edits_ui.expanded && !virtualized {
+        if !grouped && !self.edits_ui.expanded && !virtualized {
             for (index, file) in files.iter().enumerate() {
                 let view = self.file_row(file, &scope, None, None, can_undo, reveal_index == Some(index), cx);
                 list = list.child(view);
             }
         }
+        if grouped && !self.edits_ui.expanded {
+            list = self.grouped_workspace_files(files.clone(), scope.clone(), cx);
+        }
+        let workspace_status = if !workspace_mode {
+            None
+        } else if !root_matches {
+            Some("项目已切换，请刷新工作区变更。".to_owned())
+        } else if self.edits_ui.stage_task.is_some() {
+            Some("正在更新暂存区…".to_owned())
+        } else if self.edits_ui.workspace_task.is_some() {
+            Some("正在读取 Git 工作区文件清单…".to_owned())
+        } else if self.edits_ui.workspace_conflicts_task.is_some() {
+            Some("文件清单已就绪，正在读取冲突详情…".to_owned())
+        } else if self.edits_ui.workspace_stats_task.is_some() {
+            Some("文件清单已就绪，正在后台统计改动行数…".to_owned())
+        } else {
+            self.edits_ui.workspace_error.clone()
+        };
         let source_weak = cx.entity().downgrade();
         let mut body = div()
             .when(self.edits_ui.expanded, |body| body.w_full())
@@ -708,8 +785,10 @@ impl AgentWorkspace {
             )
             .child(
                 div()
+                    .debug_selector(|| "diff-source-toolbar".into())
+                    .h(px(48.))
+                    .flex_shrink_0()
                     .px_2()
-                    .py_2()
                     .flex()
                     .items_center()
                     .gap_1()
@@ -733,7 +812,16 @@ impl AgentWorkspace {
                         })
                         .render(),
                     )
-                    .child(div().flex_1())
+                    .child(
+                        div().flex_1().min_w_0().overflow_hidden()
+                            .when_some(workspace_status, |slot, status| {
+                                slot.child(Tooltip::new(
+                                    div().w_full().min_w_0().truncate().text_size(px(11.))
+                                        .text_color(rgb(p.text_muted)).child(status.clone()),
+                                    status,
+                                ).theme(self.theme).render(cx).w_full().min_w_0())
+                            }),
+                    )
                     .when(workspace_mode, |row| {
                         row.child(
                             Button::new("刷新")
@@ -759,26 +847,6 @@ impl AgentWorkspace {
             );
         }
         if workspace_mode {
-            let status = if !root_matches {
-                Some("项目已切换，请刷新工作区变更。".to_owned())
-            } else if self.edits_ui.workspace_task.is_some() {
-                Some("正在读取 Git 工作区文件清单…".to_owned())
-            } else if self.edits_ui.workspace_conflicts_task.is_some() {
-                Some("文件清单已就绪，正在读取冲突详情…".to_owned())
-            } else if self.edits_ui.workspace_stats_task.is_some() {
-                Some("文件清单已就绪，正在后台统计改动行数…".to_owned())
-            } else {
-                self.edits_ui.workspace_error.clone()
-            };
-            if let Some(status) = status {
-                body = body.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_color(rgb(p.text_muted))
-                        .child(status),
-                );
-            }
             if root_matches && !virtualized {
                 for note in &self.edits_ui.workspace_notes {
                     list = list.child(
@@ -808,12 +876,14 @@ impl AgentWorkspace {
         }
         body.child(list).child(
             div()
+                .debug_selector(|| "diff-panel-footer".into())
+                .flex_shrink_0()
                 .px_3()
                 .py_2()
                 .text_size(px(10.))
                 .text_color(rgb(p.text_muted))
                 .child(if workspace_mode {
-                    "当前文件相对 HEAD 的变更，包含已有修改和未跟踪文件；点击刷新更新。"
+                    "未暂存：暂存区 → 工作区；已暂存：HEAD → 暂存区。勾选暂存，取消勾选移出暂存区。"
                 } else {
                     "会话内文件工具的累计净变更，含子代理。"
                 }),
@@ -821,6 +891,9 @@ impl AgentWorkspace {
     }
 
     fn expanded_edit_files(&self, files: Rc<Vec<Change>>, scope: String, can_undo: bool, root_matches: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        if self.edits_ui.workspace_mode && root_matches && !self.edits_ui.workspace_sources.is_empty() {
+            return self.grouped_workspace_files(files, scope, cx);
+        }
         use crate::workspace_tree::Row;
         let p = self.theme.palette();
         let tree = self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree;
@@ -841,12 +914,15 @@ impl AgentWorkspace {
             .cloned()
             .or_else(|| conflicts.first().map(|view| view.read(cx).file.path.clone()))
             .or_else(|| files.first().map(|file| file.path.clone()));
+        let mut detail_bar = None;
         let mut detail = div().id("expanded-diff-content").debug_selector(|| "expanded-diff-content".into())
             .flex_1().min_w_0().min_h_0().overflow_y_scroll();
         if let Some(path) = &selected {
             let scroll_key = format!("{scope}:{}", path.display());
-            let scroll = self.edits_ui.detail_scrolls.borrow_mut().entry(scroll_key).or_default().clone();
-            detail = detail.track_scroll(&scroll);
+            let scroll = self.edits_ui.detail_scrolls.borrow_mut().entry(scroll_key.clone()).or_default().clone();
+            let state = self.edits_ui.detail_scrollbars.borrow_mut().entry(scroll_key).or_default().clone();
+            detail_bar = Some(Scrollbar::vertical(&scroll, &state).theme(self.theme).render().debug_selector(|| "diff-detail-vertical-scrollbar".into()).absolute().right_0().top_0());
+            detail = detail.track_scroll(&scroll).pr(px(12.));
             if let Some(view) = conflicts.iter().find(|view| &view.read(cx).file.path == path) {
                 view.update(cx, |view, cx| {
                     if view.tree_depth.take().is_some() { cx.notify(); }
@@ -859,7 +935,8 @@ impl AgentWorkspace {
                 });
                 detail = detail.child(view.clone());
             } else if let Some(file) = files.iter().find(|file| &file.path == path) {
-                detail = detail.child(self.file_row(file, &scope, None, None, can_undo, false, cx));
+                detail_bar = None;
+                detail = detail.overflow_hidden().pr_0().flex().flex_col().child(self.file_row(file, &scope, None, None, can_undo, false, cx));
             }
         } else {
             detail = detail.child(div().p_4().text_color(rgb(p.text_muted)).child("选择左侧文件查看 Diff。"));
@@ -965,12 +1042,422 @@ impl AgentWorkspace {
                     cx.stop_propagation();
                     cx.notify();
                 })))
-            .child(detail)
+            .child(div().relative().flex_1().min_w_0().min_h_0().flex().child(detail).children(detail_bar))
+    }
+
+    fn stage_workspace_files(&mut self, sources: Vec<crate::workspace_diff::Source>, staged: bool, cx: &mut Context<Self>) {
+        if self.edits_ui.workspace_task.is_some() {
+            if !self.edits_ui.workspace_background_refresh { return; }
+            self.edits_ui.workspace_task = None;
+            self.edits_ui.workspace_revision += 1;
+            self.edits_ui.workspace_background_refresh = false;
+            self.edits_ui.workspace_resync_pending = true;
+        }
+        let sources: Vec<_> = sources.into_iter().filter(|source| {
+            !source.overlaps(&self.edits_ui.stage_pending)
+        }).collect();
+        if sources.is_empty() { return; }
+        for source in &sources { self.edits_ui.stage_pending.extend(source.affected_paths()); }
+        self.edits_ui.stage_queue.push_back(StageRequest { sources, staged, project: self.history.active().project.clone() });
+        self.edits_ui.workspace_error = None;
+        self.start_next_stage(cx);
+        cx.notify();
+    }
+
+    fn start_next_stage(&mut self, cx: &mut Context<Self>) {
+        if self.edits_ui.stage_task.is_some() { return; }
+        let Some(request) = self.edits_ui.stage_queue.pop_front() else {
+            if std::mem::take(&mut self.edits_ui.stage_refresh_pending) { self.refresh_workspace_edits(cx); }
+            else if std::mem::take(&mut self.edits_ui.workspace_resync_pending) { self.load_workspace_edits(true, cx); }
+            return;
+        };
+        let paths: Vec<_> = request.sources.iter().flat_map(|source| source.affected_paths()).collect();
+        let work = cx.background_executor().spawn(async move {
+            crate::workspace_diff::stage_and_refresh(&request.sources, request.staged)
+        });
+        self.edits_ui.stage_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.edits_ui.stage_task.take() { task.detach(); }
+                for path in &paths { this.edits_ui.stage_pending.remove(path); }
+                if this.history.active().project == request.project && this.edits_ui.workspace_root == request.project {
+                    match result {
+                        Ok(update) => this.apply_stage_update(update, cx),
+                        Err(error) => this.edits_ui.workspace_error = Some(format!("暂存操作失败：{error}；可刷新后重试")),
+                    }
+                }
+                this.start_next_stage(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn apply_stage_update(&mut self, update: crate::workspace_diff::StageUpdate, cx: &mut Context<Self>) {
+        // Acknowledge our own index write, but never swallow an external change
+        // that happened before this request's initial snapshot.
+        if self.edits_ui.workspace_stamp == update.before_stamp {
+            self.edits_ui.workspace_stamp = update.inventory.stamp.clone();
+        }
+        let mut replacements: HashMap<_, _> = update.inventory.files.into_iter().map(|file| (file.path.clone(), file)).collect();
+        let mut files: Vec<_> = self.edits_ui.workspace_files.iter().filter_map(|file| {
+            if update.affected.contains(&file.path) { replacements.remove(&file.path) } else { Some(file.clone()) }
+        }).collect();
+        let mut additions: Vec<_> = replacements.into_values().collect();
+        additions.sort_by(|a, b| a.label.cmp(&b.label));
+        files.extend(additions);
+        let sources = Rc::make_mut(&mut self.edits_ui.workspace_sources);
+        sources.retain(|path, _| !update.affected.contains(path));
+        sources.extend(update.inventory.sources);
+        self.edits_ui.workspace_files = Rc::new(files);
+        self.edits_ui.grouped_rows.borrow_mut().take();
+        self.edits_ui.file_views.borrow_mut().retain(|_, view| {
+            let path = &view.read(cx).file.path;
+            !update.affected.contains(path) || sources.contains_key(path)
+        });
+    }
+
+    fn stage_checkbox(&self, sources: Vec<crate::workspace_diff::Source>, checked: bool, selector: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        self.stage_control(StageTarget::Files(sources), checked, selector, cx)
+    }
+
+    fn stage_control(&self, target: StageTarget, checked: bool, selector: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let weak = cx.entity().downgrade();
+        let available = |source: &crate::workspace_diff::Source| !source.overlaps(&self.edits_ui.stage_pending);
+        let any_available = match &target {
+            StageTarget::Files(sources) => sources.iter().any(available),
+            StageTarget::Group(staged) => self.edits_ui.workspace_sources.values()
+                .any(|source| (if *staged { source.staged } else { source.unstaged }) && available(source)),
+        };
+        let busy = !any_available || self.edits_ui.workspace_task.is_some() && !self.edits_ui.workspace_background_refresh;
+        let mut checkbox = gpui_glint::components::Checkbox::new("").checked(checked).theme(self.theme);
+        if !busy {
+            checkbox = checkbox.on_change(move |staged, _, cx| {
+                cx.stop_propagation();
+                let _ = weak.update(cx, |this, cx| {
+                    let sources = match &target {
+                        StageTarget::Files(sources) => sources.clone(),
+                        StageTarget::Group(group) => this.edits_ui.workspace_sources.values()
+                            .filter(|source| if *group { source.staged } else { source.unstaged }).cloned().collect(),
+                    };
+                    this.stage_workspace_files(sources, staged, cx);
+                });
+            });
+        }
+        div().id(SharedString::from(selector.clone())).debug_selector(move || selector.clone())
+            .flex_shrink_0().p_1().when(busy, |row| row.opacity(0.4)).child(checkbox.render())
+            .on_click(|_, _, cx| cx.stop_propagation())
+    }
+
+    fn git_group_rows(&self, files: Rc<Vec<Change>>, scope: &str) -> Rc<Vec<GitRow>> {
+        let tree = self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree;
+        let mut cache = self.edits_ui.grouped_rows.borrow_mut();
+        if let Some((cached, mode, rows)) = cache.as_mut() {
+            if *mode == tree && (Rc::ptr_eq(cached, &files) || cached.len() == files.len() && cached.iter().zip(files.iter()).all(|(a, b)| a.id == b.id)) {
+                *cached = files.clone();
+                return rows.clone();
+            }
+        }
+        let mut result = Vec::new();
+        for staged in [false, true] {
+            let indices: Vec<_> = files.iter().enumerate().filter_map(|(i, file)| {
+                self.edits_ui.workspace_sources.get(&file.path).filter(|source| if staged { source.staged } else { source.unstaged }).map(|_| i)
+            }).collect();
+            result.push(GitRow::Group(staged, indices.len()));
+            if tree {
+                let group_scope = format!("{scope}:{}", if staged { "staged" } else { "unstaged" });
+                let empty = Default::default();
+                let collapsed = self.edits_ui.collapsed_directories.get(&group_scope).unwrap_or(&empty);
+                let subset: Vec<_> = indices.iter().map(|i| files[*i].clone()).collect();
+                result.extend(crate::workspace_tree::rows(&subset, collapsed).into_iter().map(|row| match row {
+                    crate::workspace_tree::Row::File { index, depth } => GitRow::File(staged, indices[index], depth),
+                    row => GitRow::Directory(staged, row),
+                }));
+            } else { result.extend(indices.into_iter().map(|i| GitRow::File(staged, i, 0))); }
+        }
+        let rows = Rc::new(result);
+        *cache = Some((files, tree, rows.clone()));
+        rows
+    }
+
+    fn git_group_row(&self, row: &GitRow, files: &[Change], scope: &str, link: Option<(gpui::ListState, usize)>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = self.theme.palette();
+        match row {
+            GitRow::Group(staged, count) => {
+                div().w_full().h(px(34.)).px_3().flex().items_center().gap_2().font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} · {count}", if *staged { "已暂存" } else { "未暂存" })).child(div().flex_1())
+                    .child(self.stage_control(StageTarget::Group(*staged), *staged, format!("stage-group:{staged}"), cx)).into_any_element()
+            }
+            GitRow::Directory(staged, row) => {
+                let crate::workspace_tree::Row::Directory { path, label, depth, count, collapsed } = row else { unreachable!() };
+                let path = path.clone();
+                let group_scope = format!("{scope}:{}", if *staged { "staged" } else { "unstaged" });
+                div().id(SharedString::from(format!("git-directory:{group_scope}:{path}"))).w_full().h(px(34.)).pr_3().pl(px(12. + *depth as f32 * 16.))
+                    .flex().items_center().gap_2().cursor_pointer().hover(|style| style.bg(rgb(p.surface_subtle)))
+                    .child(if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown }.render(12.))
+                    .child(Icon::Folder.render(14.)).child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label.clone()))
+                    .child(div().text_size(px(10.)).child(count.to_string()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let collapsed = this.edits_ui.collapsed_directories.entry(group_scope.clone()).or_default();
+                        if !collapsed.remove(&path) { collapsed.insert(path.clone()); }
+                        this.edits_ui.grouped_rows.borrow_mut().take(); cx.notify();
+                    })).into_any_element()
+            }
+            GitRow::File(staged, index, depth) => {
+                let file = &files[*index];
+                let source = self.edits_ui.workspace_sources[&file.path].for_layer(*staged);
+                let group_scope = format!("{scope}:{}", if *staged { "staged" } else { "unstaged" });
+                if !self.edits_ui.expanded {
+                    return self.file_row(file, &group_scope, link, (self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree).then_some(*depth), false, false, cx).into_any_element();
+                }
+                let (status, color) = file_status_style(source.status, self.theme);
+                let path = file.path.clone(); let staged = *staged;
+                let label = if self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree { file.label.rsplit('/').next().unwrap_or(&file.label) } else { &file.label };
+                let selected = self.edits_ui.selected.as_ref().filter(|path| self.edits_ui.workspace_sources.contains_key(*path))
+                    .or_else(|| if self.edits_ui.conflicts.is_empty() { files.first().map(|file| &file.path) } else { None });
+                let original_source = &self.edits_ui.workspace_sources[&path];
+                let selected_layer = if self.edits_ui.selected_staged { original_source.staged } else { !original_source.unstaged };
+                let active = selected == Some(&path) && selected_layer == staged;
+                let selector = format!("diff-navigation-file:{}:{staged}", path.display());
+                div().id(SharedString::from(selector.clone())).debug_selector(move || selector.clone())
+                    .w_full().h(px(34.)).pr_2().pl(px(26. + *depth as f32 * 16.)).flex().items_center().gap_2().cursor_pointer()
+                    .when(active, |row| row.bg(rgb(p.accent_tint))).hover(|row| row.bg(rgb(p.surface_subtle)))
+                    .child(Icon::for_language(edits::language(&path)).render(14.).text_color(rgb(color)))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(rgb(color)).child(label.to_owned()))
+                    .child(div().text_size(px(10.)).text_color(rgb(color)).child(status))
+                    .when_some(source.stats, |row, (a, r)| row.child(counts(a, r)))
+                    .child(self.stage_checkbox(vec![source], staged, format!("stage-file:{}:{staged}", path.display()), cx))
+                    .on_click(cx.listener(move |this, _, _, cx| { this.edits_ui.selected = Some(path.clone()); this.edits_ui.selected_staged = staged; cx.notify(); }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn grouped_workspace_files(&self, files: Rc<Vec<Change>>, scope: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = self.theme.palette();
+        let rows = self.git_group_rows(files.clone(), &scope);
+        let conflicts = self.edits_ui.conflicts.clone();
+        let conflict_scope = format!("{scope}:conflicts");
+        let conflict_rows = self.conflict_rows(&conflicts, &conflict_scope, cx);
+        let prefix = if conflicts.is_empty() { 0 } else { conflict_rows.len() + 1 };
+        let count = prefix + rows.len();
+        let render_row = {
+            let files = files.clone(); let scope = scope.clone(); let rows = rows.clone(); let conflicts = conflicts.clone();
+            move |this: &AgentWorkspace, index: usize, link: Option<(gpui::ListState, usize)>, cx: &mut Context<AgentWorkspace>| {
+                if prefix > 0 && index == 0 {
+                    return div().w_full().h(px(34.)).px_3().flex().items_center().gap_2().font_weight(FontWeight::SEMIBOLD)
+                        .child(Icon::GitConflict.render(13.)).child(format!("待解决冲突 · {}", conflicts.len())).into_any_element();
+                }
+                if index < prefix {
+                    let (i, depth) = match &conflict_rows[index - 1] {
+                        crate::workspace_tree::Row::Directory { .. } => return this.conflict_directory_row(&conflict_rows[index - 1], &conflict_scope, cx),
+                        crate::workspace_tree::Row::File { index, depth } => (*index, *depth),
+                    };
+                    let view = &conflicts[i];
+                    if !this.edits_ui.expanded {
+                        view.update(cx, |view, cx| {
+                            *view.list_link.borrow_mut() = link;
+                            let depth = (this.history.workspace_display == crate::workspace_tree::DisplayMode::Tree).then_some(depth);
+                            if view.tree_depth != depth { view.tree_depth = depth; cx.notify(); }
+                            if view.theme != this.theme { view.theme = this.theme; view.editor.update(cx, |editor, cx| editor.set_theme(this.theme, cx)); cx.notify(); }
+                        });
+                        return view.clone().into_any_element();
+                    }
+                    let file = &view.read(cx).file;
+                    let path = file.path.clone();
+                    let label = if this.history.workspace_display == crate::workspace_tree::DisplayMode::Tree { file.label.rsplit('/').next().unwrap_or(&file.label) } else { &file.label };
+                    let selector = format!("diff-navigation-file:{}", path.display());
+                    return div().id(SharedString::from(selector.clone())).debug_selector(move || selector.clone())
+                        .w_full().h(px(34.)).pr_3().pl(px(26. + depth as f32 * 16.)).flex().items_center().gap_2().cursor_pointer()
+                        .when(this.edits_ui.selected.as_ref() == Some(&path), |row| row.bg(rgb(p.accent_tint)))
+                        .child(Icon::GitConflict.render(14.)).child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label.to_owned()))
+                        .on_click(cx.listener(move |this, _, _, cx| { this.edits_ui.selected = Some(path.clone()); cx.notify(); })).into_any_element();
+                }
+                this.git_group_row(&rows[index - prefix], &files, &scope, link, cx)
+            }
+        };
+        if !self.edits_ui.expanded {
+            let ids = conflicts.iter().map(|view| view.entity_id()).collect::<Vec<_>>();
+            let mut cache = self.edits_ui.grouped_list.borrow_mut();
+            if cache.as_ref().is_none_or(|(_, cached_ids, state, _)| *cached_ids != ids || state.item_count() < prefix) {
+                let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
+                state.reset_with_uniform_height(count, px(49.));
+                self.edits_ui.grouped_width.set(px(0.));
+                *cache = Some((rows.clone(), ids, state, files.clone()));
+            } else if let Some((old_rows, _, state, old_files)) = cache.as_mut() {
+                if !Rc::ptr_eq(old_rows, &rows) {
+                    let old_keys: Vec<_> = old_rows.iter().map(|row| row.key(old_files)).collect();
+                    let new_keys: Vec<_> = rows.iter().map(|row| row.key(&files)).collect();
+                    let common = old_keys.iter().zip(&new_keys).take_while(|(a, b)| a == b).count();
+                    let suffix = old_keys[common..].iter().rev().zip(new_keys[common..].iter().rev()).take_while(|(a, b)| a == b).count();
+                    if common + suffix < old_keys.len() || common + suffix < new_keys.len() {
+                        let top = state.logical_scroll_top();
+                        let anchor = top.item_ix.checked_sub(prefix).and_then(|index| old_keys.get(index))
+                            .and_then(|key| new_keys.iter().position(|candidate| candidate == key));
+                        state.splice(prefix + common..prefix + old_keys.len() - suffix, new_keys.len() - common - suffix);
+                        state.clone().with_uniform_item_height(px(49.));
+                        if let Some(index) = anchor {
+                            state.scroll_to(gpui::ListOffset { item_ix: prefix + index, offset_in_item: top.offset_in_item });
+                        }
+                    }
+                    *old_rows = rows.clone();
+                }
+                *old_files = files.clone();
+            }
+            let state = cache.as_ref().unwrap().2.clone(); let link = state.clone();
+            let weak = cx.entity().downgrade();
+            let list = gpui::list(state, move |index, _, cx| weak.update(cx, |this, cx| render_row(this, index, Some((link.clone(), index)), cx)).unwrap_or_else(|_| div().into_any_element())).flex_1().min_h_0().w_full();
+            let weak = cx.entity().downgrade();
+            return div().flex_1().min_h_0().flex().flex_col()
+                .on_children_prepainted(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some((_, _, state, _)) = &*this.edits_ui.grouped_list.borrow() {
+                            let width = state.viewport_bounds().size.width;
+                            if width > px(0.) && this.edits_ui.grouped_width.replace(width) != width {
+                                state.clone().with_uniform_item_height(px(49.));
+                                let id = cx.entity_id(); cx.defer(move |cx| cx.notify(id));
+                            }
+                        }
+                    });
+                }).id("grouped-workspace-files").child(list);
+        }
+        let selected = self.edits_ui.selected.clone().filter(|path| files.iter().any(|file| &file.path == path) || conflicts.iter().any(|view| &view.read(cx).file.path == path))
+            .or_else(|| conflicts.first().map(|view| view.read(cx).file.path.clone())).or_else(|| files.first().map(|file| file.path.clone()));
+        let mut detail_bar = None;
+        let mut detail = div().id("expanded-diff-content").debug_selector(|| "expanded-diff-content".into()).flex_1().min_w_0().min_h_0().overflow_y_scroll();
+        if let Some(path) = selected {
+            let scroll_key = format!("{scope}:{}:{}", path.display(), self.edits_ui.selected_staged);
+            let scroll = self.edits_ui.detail_scrolls.borrow_mut().entry(scroll_key.clone()).or_default().clone();
+            let state = self.edits_ui.detail_scrollbars.borrow_mut().entry(scroll_key).or_default().clone();
+            detail_bar = Some(Scrollbar::vertical(&scroll, &state).theme(self.theme).render().debug_selector(|| "diff-detail-vertical-scrollbar".into()).absolute().right_0().top_0());
+            detail = detail.track_scroll(&scroll).pr(px(12.));
+            if let Some(view) = conflicts.iter().find(|view| view.read(cx).file.path == path) {
+                view.update(cx, |view, cx| {
+                    if view.tree_depth.take().is_some() || !view.expanded || view.theme != self.theme { cx.notify(); }
+                    view.list_link.borrow_mut().take(); view.expanded = true; view.theme = self.theme;
+                    view.editor.update(cx, |editor, cx| editor.set_theme(self.theme, cx));
+                });
+                detail = detail.child(view.clone());
+            } else if let Some(file) = files.iter().find(|file| file.path == path) {
+                let source = &self.edits_ui.workspace_sources[&file.path];
+                let staged = if self.edits_ui.selected_staged { source.staged } else { !source.unstaged };
+                let group_scope = format!("{scope}:{}", if staged { "staged" } else { "unstaged" });
+                detail_bar = None;
+                detail = detail.overflow_hidden().pr_0().flex().flex_col().child(self.file_row(file, &group_scope, None, None, false, false, cx));
+            }
+        }
+        detail = detail.children(self.edits_ui.workspace_notes.iter().map(|note| div().px_3().text_size(px(11.)).child(note.clone())));
+        let navigation = gpui::uniform_list("expanded-diff-files", count, cx.processor(move |this, range: std::ops::Range<usize>, _, cx| range.map(|index| render_row(this, index, None, cx)).collect::<Vec<_>>())).size_full().track_scroll(&self.edits_ui.navigation_scroll);
+        let weak = cx.entity().downgrade();
+        div()
+            .on_children_prepainted(move |bounds, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let width: f32 = bounds.iter().map(|bounds| f32::from(bounds.size.width)).sum();
+                    let maximum = (width - 320.).clamp(180., 800.);
+                    this.edits_ui.navigation_maximum.set(maximum);
+                    if this.edits_ui.navigation_width.unwrap_or(260.) > maximum {
+                        this.edits_ui.navigation_width = Some(maximum);
+                        let id = cx.entity_id();
+                        cx.defer(move |cx| cx.notify(id));
+                    }
+                });
+            })
+            .id("expanded-diff-layout").debug_selector(|| "expanded-diff-layout".into()).flex_1().min_h_0().flex()
+            .child(div().debug_selector(|| "expanded-diff-navigation".into()).w(px(self.edits_ui.navigation_width.unwrap_or(260.))).flex_shrink_0().h_full().child(navigation))
+            .child(div().id("diff-navigation-resize").debug_selector(|| "diff-navigation-resize".into())
+                .w(px(5.)).h_full().flex_shrink_0().cursor(gpui::CursorStyle::ResizeLeftRight)
+                .bg(rgb(p.border)).hover(|style| style.bg(rgb(p.accent)))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.edits_ui.navigation_resize = Some((event.position.x, this.edits_ui.navigation_width.unwrap_or(260.)));
+                    cx.stop_propagation();
+                    cx.notify();
+                })))
+            .child(div().relative().flex_1().min_w_0().min_h_0().flex().child(detail).children(detail_bar))
+    }
+    fn workspace_watch_active(&self) -> bool {
+        self.edits_ui.open && self.edits_ui.workspace_mode
+            && self.edits_ui.workspace_root == self.history.active().project
+            && self.edits_ui.workspace_watch_root.is_some()
+    }
+
+    pub(super) fn sync_workspace_watch(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace_watch_active() {
+            self.edits_ui.workspace_watch_task = None;
+            self.edits_ui.workspace_probe_task = None;
+            self.edits_ui.workspace_sync_debounce = None;
+            return;
+        }
+        if self.edits_ui.workspace_watch_task.is_some() { return; }
+        self.edits_ui.workspace_watch_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if !weak.update(cx, |this, cx| {
+                    if !this.workspace_watch_active() { return false; }
+                    this.probe_workspace_repository(cx);
+                    true
+                }).unwrap_or(false) { break; }
+            }
+        }));
+    }
+
+    fn probe_workspace_repository(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace_watch_active() || self.edits_ui.workspace_probe_task.is_some()
+            || self.edits_ui.workspace_task.is_some() || self.edits_ui.stage_task.is_some() { return; }
+        let root = self.edits_ui.workspace_watch_root.clone().unwrap();
+        let project = self.history.active().project.clone();
+        let observed = self.edits_ui.workspace_stamp.clone();
+        let work = cx.background_executor().spawn(async move { crate::workspace_diff::repository_stamp(&root) });
+        self.edits_ui.workspace_probe_task = Some(cx.spawn(async move |weak, cx| {
+            let stamp = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.edits_ui.workspace_probe_task.take() { task.detach(); }
+                if !this.workspace_watch_active() || this.history.active().project != project || this.edits_ui.stage_task.is_some()
+                    || this.edits_ui.workspace_stamp != observed { return; }
+                if this.edits_ui.workspace_stamp != stamp {
+                    this.edits_ui.workspace_stamp = stamp;
+                    this.load_workspace_edits(true, cx);
+                }
+            });
+        }));
+    }
+
+    /// Coalesce terminal output bursts (including a final shell prompt). Silent
+    /// commands still trigger once on Enter; long commands trigger again on exit.
+    pub(super) fn workspace_terminal_activity(&mut self, project: &PathBuf, cx: &mut Context<Self>) {
+        if !self.edits_ui.open || !self.edits_ui.workspace_mode || self.history.active().project.as_ref() != Some(project)
+            || crate::ssh_project::is_remote(project) { return; }
+        let project = project.clone();
+        self.edits_ui.workspace_sync_debounce = Some(cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.edits_ui.workspace_sync_debounce.take() { task.detach(); }
+                if this.edits_ui.open && this.edits_ui.workspace_mode && this.history.active().project.as_ref() == Some(&project) {
+                    this.load_workspace_edits(true, cx);
+                }
+            });
+        }));
     }
 
     fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
+        self.load_workspace_edits(false, cx);
+    }
+
+    fn load_workspace_edits(&mut self, background: bool, cx: &mut Context<Self>) {
         let root = self.history.active().project.clone();
-        if self.edits_ui.workspace_task.is_some() && self.edits_ui.workspace_root == root { return; }
+        if self.edits_ui.stage_task.is_some() && self.edits_ui.workspace_root == root {
+            if background { self.edits_ui.workspace_resync_pending = true; }
+            else { self.edits_ui.stage_refresh_pending = true; }
+            return;
+        }
+        if self.edits_ui.workspace_root != root { self.edits_ui.stage_refresh_pending = false; self.edits_ui.workspace_resync_pending = false; }
+        if self.edits_ui.workspace_task.is_some() && self.edits_ui.workspace_root == root {
+            if background { self.edits_ui.workspace_resync_pending = true; }
+            return;
+        }
+        self.edits_ui.workspace_resync_pending = false;
+        // This snapshot also consumes terminal changes already observed before
+        // it started; output arriving during the read schedules the next pass.
+        self.edits_ui.workspace_sync_debounce = None;
+        self.edits_ui.workspace_background_refresh = background;
         self.edits_ui.workspace_revision += 1;
         let revision = self.edits_ui.workspace_revision;
         self.edits_ui.workspace_stats_task = None;
@@ -980,6 +1467,9 @@ impl AgentWorkspace {
             self.edits_ui.file_views.borrow_mut().retain(|key, _| !key.starts_with("workspace:"));
             self.edits_ui.workspace_files = Rc::new(Vec::new());
             self.edits_ui.workspace_sources = Rc::new(HashMap::new());
+            self.edits_ui.workspace_watch_root = None;
+            self.edits_ui.workspace_stamp = None;
+            self.edits_ui.workspace_conflict_versions.clear();
             self.edits_ui.virtual_files.borrow_mut().take();
             self.edits_ui.workspace_notes.clear();
         }
@@ -1001,7 +1491,7 @@ impl AgentWorkspace {
                     .await.map(|(files, notes)| (files, notes, HashMap::new(), None))
             } else {
                 let inventory = crate::workspace_diff::inventory(&root)?;
-                Ok((inventory.files, Vec::new(), inventory.sources, Some((inventory.root, inventory.head, inventory.has_conflicts))))
+                Ok((inventory.files, Vec::new(), inventory.sources, Some((inventory.root, inventory.head, inventory.has_conflicts, inventory.conflict_versions, inventory.stamp))))
             }
         });
         self.edits_ui.workspace_task = Some(cx.spawn(async move |weak, cx| {
@@ -1014,17 +1504,32 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 match result {
-                    Ok((files, notes, sources, statistics)) => {
+                    Ok((mut files, notes, mut sources, statistics)) => {
+                        let old_files: HashMap<_, _> = this.edits_ui.workspace_files.iter().map(|file| (&file.path, file)).collect();
+                        for file in &mut files {
+                            if let (Some(old), Some(source), Some(previous)) = (old_files.get(&file.path), sources.get_mut(&file.path), this.edits_ui.workspace_sources.get(&file.path)) {
+                                if source.same_version(previous) {
+                                    *file = (*old).clone();
+                                    source.staged_stats = previous.staged_stats; source.unstaged_stats = previous.unstaged_stats;
+                                    source.stats_ready = previous.stats_ready;
+                                }
+                            }
+                        }
                         let valid: std::collections::HashSet<_> = files.iter().map(|file| file.path.clone()).collect();
                         this.edits_ui.file_views.borrow_mut().retain(|key, view| !key.starts_with("workspace:") || valid.contains(&view.read(cx).file.path));
                         this.edits_ui.workspace_files = Rc::new(files);
                         this.edits_ui.workspace_sources = Rc::new(sources);
-                        this.edits_ui.workspace_notes = notes;
-                        if let Some((root, head, has_conflicts)) = statistics {
-                            if has_conflicts {
+                        if !background || this.edits_ui.conflicts.is_empty() { this.edits_ui.workspace_notes = notes; }
+                        if let Some((root, head, has_conflicts, conflict_versions, stamp)) = statistics {
+                            this.edits_ui.workspace_watch_root = Some(root.clone());
+                            this.edits_ui.workspace_stamp = stamp;
+                            let changed = conflict_versions != this.edits_ui.workspace_conflict_versions;
+                            this.edits_ui.workspace_conflict_versions = conflict_versions;
+                            if has_conflicts && (!background || changed) {
                                 this.start_workspace_conflicts(root.clone(), revision, cx);
-                            } else {
+                            } else if !has_conflicts {
                                 this.edits_ui.conflicts.clear();
+                                this.edits_ui.workspace_notes.clear();
                             }
                             this.start_workspace_statistics(root, head, revision, cx);
                         } else {
@@ -1035,6 +1540,7 @@ impl AgentWorkspace {
                         this.edits_ui.workspace_error = Some(error);
                     }
                 }
+                if std::mem::take(&mut this.edits_ui.workspace_resync_pending) { this.load_workspace_edits(true, cx); }
                 cx.notify();
             });
         }));
@@ -1052,8 +1558,9 @@ impl AgentWorkspace {
                 match result {
                     Ok((files, notes)) => {
                         let workspace = cx.entity().downgrade();
+                        let existing: HashMap<_, _> = this.edits_ui.conflicts.iter().map(|view| (view.read(cx).file.path.clone(), view.clone())).collect();
                         this.edits_ui.conflicts = files.into_iter().map(|file| {
-                            this.edits_ui.conflicts.iter().find(|view| view.read(cx).file == file).cloned()
+                            existing.get(&file.path).filter(|view| view.read(cx).file == file).cloned()
                                 .unwrap_or_else(|| {
                                     let view = cx.new(|cx| ConflictView::new(file, root.clone(), workspace.clone(), this.theme, cx));
                                     watch_row(&view, view.read(cx).list_link.clone(), cx);
@@ -1069,16 +1576,29 @@ impl AgentWorkspace {
         }));
     }
 
-    fn start_workspace_statistics(&mut self, root: PathBuf, head: Option<String>, revision: u64, cx: &mut Context<Self>) {
-        if self.edits_ui.workspace_files.is_empty() { return; }
-        let work = cx.background_executor().spawn(async move { crate::workspace_diff::statistics(&root, head.as_deref()) });
+    fn start_workspace_statistics(&mut self, root: PathBuf, _head: Option<String>, revision: u64, cx: &mut Context<Self>) {
+        // Large vendor updates stay metadata-only until a file is opened.
+        if self.edits_ui.workspace_files.is_empty() || self.edits_ui.workspace_files.len() > crate::workspace_diff::EAGER_STATS_LIMIT { return; }
+        let paths: Vec<_> = self.edits_ui.workspace_sources.values()
+            .filter(|source| !source.stats_ready && source.status != crate::workspace_diff::FileStatus::Untracked && source.status != crate::workspace_diff::FileStatus::Renamed)
+            .map(|source| source.label.clone()).collect();
+        if paths.is_empty() { return; }
+        let versions: std::collections::HashSet<_> = self.edits_ui.workspace_files.iter().map(|file| file.id).collect();
+        let work = cx.background_executor().spawn(async move { crate::workspace_diff::scoped_statistics(&root, &paths) });
         self.edits_ui.workspace_stats_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.edits_ui.workspace_revision != revision || this.history.active().project != this.edits_ui.workspace_root { return; }
                 if let Some(task) = this.edits_ui.workspace_stats_task.take() { task.detach(); }
                 match result {
-                    Ok(counts) => crate::workspace_diff::apply_statistics(Rc::make_mut(&mut this.edits_ui.workspace_files).as_mut_slice(), Rc::make_mut(&mut this.edits_ui.workspace_sources), &counts),
+                    Ok((staged, unstaged)) => {
+                        let unchanged: std::collections::HashSet<_> = this.edits_ui.workspace_files.iter().filter(|file| versions.contains(&file.id)).map(|file| file.path.clone()).collect();
+                        for source in Rc::make_mut(&mut this.edits_ui.workspace_sources).values_mut().filter(|source| unchanged.contains(&source.path)) {
+                            source.stats_ready = true;
+                            source.staged_stats = (source.status != crate::workspace_diff::FileStatus::Renamed).then(|| staged.get(&source.label).copied()).flatten();
+                            source.unstaged_stats = unstaged.get(&source.label).copied();
+                        }
+                    },
                     Err(error) => this.edits_ui.workspace_error = Some(format!("行数统计失败，可展开文件按需查看：{error}")),
                 }
                 cx.notify();
@@ -1097,6 +1617,7 @@ struct ConflictView {
     theme: ThemePreset,
     language: &'static str,
     expanded: bool,
+    manual_edit: bool,
     /// Conflict hunks in the pristine file, shown in the collapsed badge.
     count: usize,
     /// Editable merged result with line numbers and syntax highlighting.
@@ -1218,6 +1739,7 @@ impl ConflictView {
             theme,
             language,
             expanded: false,
+            manual_edit: false,
             count,
             editor,
             result_scroll: gpui::ScrollHandle::new(),
@@ -1291,132 +1813,40 @@ impl ConflictView {
         cx.notify();
     }
 
-    /// One conflict hunk: header with adopt actions, then highlighted side previews.
-    fn hunk_card(
-        &self,
-        index: usize,
-        hunk: &crate::merge_conflicts::Hunk,
-        colors: &DiffColors,
-        busy: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let p = self.theme.palette();
-        let mut actions = div().flex().flex_wrap().gap_1();
-        for (choice, label) in ["采用当前侧", "采用传入侧", "保留双方"]
-            .into_iter()
-            .enumerate()
-        {
-            actions = actions.child(
-                Button::new(label)
-                    .kind(ButtonKind::Plain)
-                    .theme(self.theme)
-                    .when(busy, |button| button.disabled())
-                    .render()
-                    .debug_selector(move || format!("merge-choice:{index}:{choice}"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, choice, cx))),
-            );
+    /// Actions and both colored sides live in the same source stream.
+    fn hunk_card(&self, index: usize, hunk: &crate::merge_conflicts::Hunk, text: &str, first: usize, busy: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let raw = &text[hunk.range.clone()];
+        let split = raw.split_inclusive('\n').scan(0, |offset, line| {
+            let start = *offset; *offset += line.len(); Some((start, line))
+        }).find(|(_, line)| line.starts_with("=======")).map_or(raw.len(), |(offset, _)| offset);
+        let mut actions = div().flex().flex_wrap().items_center().gap_1().pl(px(64.));
+        for (choice, label) in ["采用当前侧", "采用传入侧", "保留双方"].into_iter().enumerate() {
+            actions = actions.child(Button::new(label).kind(ButtonKind::Plain).theme(self.theme)
+                .when(busy, |button| button.disabled()).render()
+                .debug_selector(move || format!("merge-choice:{index}:{choice}"))
+                .on_click(cx.listener(move |this, _, _, cx| this.choose(index, choice, cx))));
         }
-        div()
-            .debug_selector(move || format!("merge-hunk:{index}"))
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .p_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.panel))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("冲突 {}", index + 1)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!(
-                                "当前 {} 行 · 传入 {} 行",
-                                hunk.ours.lines().count(),
-                                hunk.theirs.lines().count()
-                            )),
-                    )
-                    .child(div().flex_1())
-                    .child(actions),
-            )
-            .child(self.side_section(
-                index,
-                0,
-                "当前侧",
-                "ours",
-                &hunk.ours,
-                colors.deleted_marker,
-                cx,
-            ))
-            .child(self.side_section(
-                index,
-                1,
-                "传入侧",
-                "theirs",
-                &hunk.theirs,
-                colors.added_marker,
-                cx,
-            ))
+        actions = actions.child(Button::new("让 Agent 解决").kind(ButtonKind::Plain).theme(self.theme)
+            .when(busy, |button| button.disabled()).render()
+            .on_click(cx.listener(|this, _, _, cx| this.ask_agent(cx))));
+        let ours = self.side_preview(index, 0, Self::preview_text(&raw[..split]), cx);
+        let theirs = self.side_preview(index, 1, Self::preview_text(&raw[split..]), cx);
+        ours.update(cx, |card, cx| card.set_inline_preview(first, Some(if self.theme.is_dark() { 0x193d32 } else { 0xd9efe3 }), cx));
+        theirs.update(cx, |card, cx| card.set_inline_preview(first + raw[..split].lines().count(), Some(if self.theme.is_dark() { 0x20384f } else { 0xdcedfc }), cx));
+        div().debug_selector(move || format!("merge-hunk:{index}")).flex().flex_col()
+            .child(actions)
+            .child(div().debug_selector(move || format!("merge-side:{index}:0")).child(ours))
+            .child(div().debug_selector(move || format!("merge-side:{index}:1")).child(theirs))
     }
 
-    /// One side of a hunk: colored label row plus a syntax-highlighted preview
-    /// with a matching gutter stripe, mirroring diff row semantics.
-    fn side_section(
-        &self,
-        index: usize,
-        side: usize,
-        label: &str,
-        hint: &str,
-        source: &str,
-        marker: u32,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let p = self.theme.palette();
-        div()
-            .debug_selector(move || format!("merge-side:{index}:{side}"))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(div().size(px(7.)).rounded_full().bg(rgb(marker)))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child(format!("{label}（{hint}）")),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(rgb(p.border))
-                    .overflow_hidden()
-                    .child(div().w(px(3.)).flex_shrink_0().bg(rgb(marker)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(self.side_preview(index, side, source, cx)),
-                    ),
-            )
+    fn preview_text(text: &str) -> &str {
+        text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text)
+    }
+
+    fn context_preview(&self, index: usize, text: &str, first: usize, cx: &mut Context<Self>) -> Entity<CodeCard> {
+        let card = self.side_preview(usize::MAX, index, Self::preview_text(text), cx);
+        card.update(cx, |card, cx| card.set_inline_preview(first, None, cx));
+        card
     }
 
     /// Cached read-only highlighted preview for one hunk side.
@@ -1429,6 +1859,7 @@ impl ConflictView {
     ) -> Entity<CodeCard> {
         let cached = self.sides.borrow_mut().get(&(index, side)).cloned();
         if let Some(card) = cached {
+            card.update(cx, |card, cx| card.set_theme(self.theme, cx));
             if card.read(cx).content() != text {
                 card.update(cx, |card, cx| card.sync_content(text, cx));
             }
@@ -1558,14 +1989,16 @@ impl Render for ConflictView {
                 );
             }
             let text = self.editor.read(cx).content().to_owned();
-            let mut content = div().px_3().pb_3().flex().flex_col().gap_2()
+            let mut content = div().pb_3().flex().flex_col()
                 .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("当前侧 / 传入侧对应 Git ours / theirs；rebase 时当前侧通常为变基目标。保存会暂存此文件，外部文件变化后刷新会重新读取。"));
+            let mut show_editor = self.manual_edit;
             match crate::merge_conflicts::hunks(&text) {
                 Ok(hunks) => {
                     self.sides
                         .borrow_mut()
-                        .retain(|(hunk, _), _| *hunk < hunks.len());
+                        .retain(|(hunk, context), _| !hunks.is_empty() && ((*hunk == usize::MAX && *context <= hunks.len()) || *hunk < hunks.len()));
                     if hunks.is_empty() {
+                        show_editor = true;
                         content = content.child(
                             div()
                                 .debug_selector(|| "merge-resolved".into())
@@ -1582,16 +2015,29 @@ impl Render for ConflictView {
                                 .child("已无冲突标记，检查无误后保存并标记已解决。"),
                         );
                     } else {
+                        let mut offset = 0;
+                        let mut first = 1;
                         for (index, hunk) in hunks.iter().enumerate() {
-                            content = content.child(self.hunk_card(index, hunk, &colors, busy, cx));
+                            if hunk.range.start > offset {
+                                let context = &text[offset..hunk.range.start];
+                                content = content.child(self.context_preview(index, context, first, cx));
+                                first += context.bytes().filter(|b| *b == b'\n').count();
+                            }
+                            content = content.child(self.hunk_card(index, hunk, &text, first, busy, cx));
+                            first += text[hunk.range.clone()].bytes().filter(|b| *b == b'\n').count();
+                            offset = hunk.range.end;
+                        }
+                        if offset < text.len() {
+                            content = content.child(self.context_preview(hunks.len(), &text[offset..], first, cx));
                         }
                     }
                 }
-                Err(error) => content = content.child(self.notice_banner(error)),
+                Err(error) => { show_editor = true; content = content.child(self.notice_banner(error)); },
             }
             let dirty = !busy && text != self.file.original;
             let mut result_header = div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .child(
@@ -1604,8 +2050,12 @@ impl Render for ConflictView {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(p.text_muted))
-                        .child("可直接编辑，保存会暂存此文件"),
-                );
+                        .child("保存会暂存此文件"),
+                )
+                .child(Button::new(if self.manual_edit { "收起编辑" } else { "手动编辑" })
+                    .kind(ButtonKind::Plain).theme(self.theme).when(busy, |button| button.disabled()).render()
+                    .debug_selector(|| "toggle-merge-editor".into())
+                    .on_click(cx.listener(|this, _, _, cx| { this.manual_edit = !this.manual_edit; cx.notify(); })));
             if dirty {
                 result_header = result_header.child(div().flex_1()).child(
                     Button::new("重置草稿")
@@ -1624,7 +2074,7 @@ impl Render for ConflictView {
             }
             content = content
                 .child(result_header)
-                .when(!busy, |content| {
+                .when(!busy && show_editor, |content| {
                     content.child(
                         div()
                             .debug_selector(|| "merge-result-editor".into())
@@ -1776,6 +2226,7 @@ impl Render for FileDiff {
                                 self.loaded.as_ref().unwrap_or(&self.file).lines(),
                             )
                             .side_by_side(self.side_by_side)
+                            .fill_height(self.detail)
                             .header_visible(false)
                             .theme(self.theme)
                         })
@@ -1785,6 +2236,7 @@ impl Render for FileDiff {
         } else {
             None
         };
+        if let Some(card) = &card { card.update(cx, |card, cx| card.set_fill_height(self.detail, cx)); }
         let whitespace = card
             .as_ref()
             .map(|card| {
@@ -1802,6 +2254,7 @@ impl Render for FileDiff {
             .flex_shrink_0()
             .flex()
             .flex_col()
+            .when(self.detail, |row| row.flex_1().min_h_0())
             .border_b_1()
             .border_color(rgb(p.border))
             .child(
@@ -1809,6 +2262,7 @@ impl Render for FileDiff {
                     .id("file-disclosure")
                     .debug_selector(move || selector.clone())
                     .h(px(48.))
+                    .flex_shrink_0()
                     .px_3()
                     .pl(px(12. + self.tree_depth.unwrap_or(0) as f32 * 16.))
                     .flex()
@@ -1880,6 +2334,13 @@ impl Render for FileDiff {
                                 })),
                         )
                     })
+                    .when_some(self.source.clone().filter(|source| source.layer.is_some()), |header, source| {
+                        let staged = source.layer.unwrap();
+                        let workspace = self.workspace.clone();
+                        let selector = format!("stage-file:{}:{staged}", self.file.path.display());
+                        let checkbox = workspace.and_then(|workspace| workspace.update(cx, |workspace, cx| workspace.stage_checkbox(vec![source], staged, selector, cx)).ok());
+                        header.children(checkbox)
+                    })
                     .when(self.undo_visible, |header| {
                         header.child(
                             Button::new("撤销")
@@ -1920,7 +2381,9 @@ impl Render for FileDiff {
                         .on_click(cx.listener(|this, _, _, cx| { this.load_error = None; cx.notify(); }))));
             }
             let card = card.expect("diff card is ready when expanded without load errors");
-            row = row.child(div().px_2().pb_2().child(card));
+            row = row.child(div().px_2().pb_2()
+                .when(self.detail, |body| body.flex_1().min_h_0().flex().flex_col())
+                .child(card));
         }
         row
     }
@@ -2200,7 +2663,7 @@ mod tests {
             let views = host.edits_ui.file_views.borrow();
             assert!(views.len() < 64, "created {} views", views.len());
             assert!(views.values().all(|view| view.read(cx).loaded.is_none() && view.read(cx).load_task.is_none()));
-            host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.clone()
+            host.edits_ui.grouped_list.borrow().as_ref().unwrap().2.clone()
         });
         // Leave room below the target so the following row remains visible
         // after opening the Diff; off-screen rows are intentionally not rendered.
@@ -2224,7 +2687,7 @@ mod tests {
         });
         window.run_until_parked();
         host.read_with(window, |host, _| {
-            let list_after = host.edits_ui.virtual_files.borrow().as_ref().unwrap().state.logical_scroll_top();
+            let list_after = host.edits_ui.grouped_list.borrow().as_ref().unwrap().2.logical_scroll_top();
             assert!(list_after.item_ix > 2400);
         });
         host.update(window, |_, cx| { list.scroll_to_end(); cx.notify(); });
@@ -2483,6 +2946,222 @@ mod tests {
     }
 
     #[gpui::test]
+    fn expanded_diff_fits_its_slot_and_only_source_rows_scroll(cx: &mut gpui::TestAppContext) {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.edits_ui.open = true; host.edits_ui.expanded = true; host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_files = Rc::new(vec![change("long.rs", &(0..300).map(|i| format!("let row_{i} = \"{}\";\n", "value".repeat(80))).collect::<String>())]);
+            host
+        });
+        for viewport in [size(px(1440.), px(900.)), size(px(900.), px(500.))] {
+            window.simulate_resize(viewport); window.run_until_parked();
+            let detail = window.debug_bounds("expanded-diff-content").unwrap();
+            let body = window.debug_bounds("glass-diff-card-body").unwrap();
+            let horizontal = window.debug_bounds("diff-card-horizontal-scrollbar").unwrap();
+            let footer = window.debug_bounds("diff-panel-footer").unwrap();
+            assert!(body.size.height > px(40.));
+            assert!(horizontal.bottom() <= detail.bottom() + px(1.));
+            assert!(horizontal.bottom() <= footer.top() + px(1.), "horizontal rail stays visible above fixed footer");
+            assert!(window.debug_bounds("diff-detail-vertical-scrollbar").is_none(), "no duplicate outer vertical rail for file diffs");
+            host.read_with(window, |host, _| {
+                assert!(host.edits_ui.detail_scrolls.borrow().values().all(|scroll| scroll.max_offset().y <= px(1.)));
+            });
+            window.simulate_event(gpui::ScrollWheelEvent {
+                position: body.center(), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1000.))), ..Default::default()
+            }); window.run_until_parked();
+            assert_eq!(window.debug_bounds("diff-panel-footer").unwrap(), footer);
+            assert_eq!(window.debug_bounds("diff-card-horizontal-scrollbar").unwrap(), horizontal);
+        }
+    }
+
+    #[gpui::test]
+    fn external_git_add_syncs_groups_without_reloading_unchanged_diff(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(3);
+        let root = repo.path().canonicalize().unwrap();
+        let path = root.join("vendor/0000.rs");
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.open = true; host.edits_ui.workspace_mode = true; host.edits_ui.expanded = true;
+            host.edits_ui.selected = Some(path.clone());
+            host.refresh_workspace_edits(cx);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.))); window.run_until_parked();
+        host.update(window, |host, cx| {
+            let source = host.edits_ui.workspace_sources[&path].clone();
+            host.stage_workspace_files(vec![source], true, cx);
+        });
+        window.run_until_parked();
+        let (id, card, revision) = host.read_with(window, |host, cx| {
+            let view = host.edits_ui.file_views.borrow().values().find(|view| view.read(cx).file.path == path && view.read(cx).source.as_ref().is_some_and(|s| s.layer == Some(true))).unwrap().clone();
+            (view.read(cx).file.id, view.read(cx).card.as_ref().unwrap().entity_id(), host.edits_ui.workspace_revision)
+        });
+        host.update(window, |host, cx| host.probe_workspace_repository(cx)); window.run_until_parked();
+        host.read_with(window, |host, _| assert_eq!(host.edits_ui.workspace_revision, revision, "own index writes do not start full scans"));
+        // This is the same index mutation as `git add .` in the PTY terminal.
+        crate::workspace_diff::tests::git_ok(&root, &["add", "."]);
+        host.update(window, |host, cx| host.probe_workspace_repository(cx)); window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.workspace_error.is_none(), "{:?}", host.edits_ui.workspace_error);
+            assert!(host.edits_ui.workspace_sources.values().all(|source| source.staged && !source.unstaged));
+            let views = host.edits_ui.file_views.borrow();
+            let view = views.values().find(|view| view.read(cx).file.path == path && view.read(cx).source.as_ref().is_some_and(|s| s.layer == Some(true))).unwrap().read(cx);
+            assert_eq!(view.file.id, id); assert_eq!(view.card.as_ref().unwrap().entity_id(), card);
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_vendor_bursts_coalesce_and_keep_thousands_of_files_metadata_only(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(1);
+        let root = repo.path().canonicalize().unwrap();
+        let path = root.join("vendor/0000.rs");
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.open = true; host.edits_ui.workspace_mode = true;
+            host.refresh_workspace_edits(cx);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.))); window.run_until_parked();
+        let original = host.read_with(window, |host, _| host.edits_ui.workspace_files[0].id);
+        let revision = host.read_with(window, |host, _| host.edits_ui.workspace_revision);
+        for group in 0..32 {
+            let directory = root.join(format!("vendor/generated/group-{group}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            for file in 0..128 { std::fs::write(directory.join(format!("file-{file}.go")), "package generated\n").unwrap(); }
+        }
+        host.update(window, |host, cx| {
+            for _ in 0..100 { host.workspace_terminal_activity(&root, cx); }
+        });
+        window.run_until_parked();
+        window.executor().advance_clock(std::time::Duration::from_millis(899));
+        host.read_with(window, |host, _| assert_eq!(host.edits_ui.workspace_revision, revision));
+        let started = std::time::Instant::now();
+        window.executor().advance_clock(std::time::Duration::from_millis(1)); window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert_eq!(host.edits_ui.workspace_revision, revision + 1, "one inventory for the entire output burst");
+            assert_eq!(host.edits_ui.workspace_files.len(), 4097);
+            assert!(host.edits_ui.workspace_files.iter().all(|file| file.before.is_none() && file.after.is_empty()));
+            assert_eq!(host.edits_ui.workspace_files.iter().find(|file| file.path == path).unwrap().id, original);
+            assert!(host.edits_ui.workspace_stats_task.is_none(), "no eager whole-repository numstat for vendor updates");
+            assert!(host.edits_ui.file_views.borrow().len() < 96, "only visible rows construct file views");
+        });
+        eprintln!("4096 generated vendor files: coalesced metadata sync + visible tree frame={:?}", started.elapsed());
+    }
+
+    #[gpui::test]
+    fn staging_queues_other_files_and_preserves_unrelated_diff(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(3);
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let first = inventory.sources[&root.join("vendor/0000.rs")].clone();
+        let second = inventory.sources[&root.join("vendor/0001.rs")].clone();
+        let untouched = root.join("vendor/0002.rs");
+        let untouched_id = inventory.files.iter().find(|file| file.path == untouched).unwrap().id;
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.open = true; host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.))); window.run_until_parked();
+        let row = window.debug_bounds("edit-file:vendor/0002.rs").unwrap();
+        window.simulate_click(row.center(), Default::default()); window.run_until_parked();
+        let (view, card) = host.read_with(window, |host, cx| {
+            let view = host.edits_ui.file_views.borrow().values().find(|view| view.read(cx).file.path == untouched).unwrap().clone();
+            let card = view.read(cx).card.as_ref().unwrap().entity_id();
+            (view, card)
+        });
+        let toolbar = window.debug_bounds("diff-source-toolbar").unwrap();
+        host.update(window, |host, cx| {
+            host.stage_workspace_files(vec![first], true, cx);
+            host.stage_workspace_files(vec![second], true, cx);
+            assert!(host.edits_ui.workspace_task.is_none());
+            assert!(host.edits_ui.stage_task.is_some());
+            assert_eq!(host.edits_ui.stage_queue.len(), 1);
+            assert_eq!(host.edits_ui.stage_pending.len(), 2);
+            assert!(!host.edits_ui.stage_pending.contains(&untouched));
+        });
+        window.run_until_parked();
+        assert_eq!(window.debug_bounds("diff-source-toolbar").unwrap(), toolbar);
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.stage_pending.is_empty());
+            assert!(host.edits_ui.workspace_error.is_none(), "{:?}", host.edits_ui.workspace_error);
+            assert_eq!(host.edits_ui.workspace_revision, 0, "checkboxes do not start full inventory refreshes");
+            assert_eq!(host.edits_ui.workspace_sources.values().filter(|source| source.staged).count(), 2);
+            assert_eq!(host.edits_ui.workspace_files.iter().find(|file| file.path == untouched).unwrap().id, untouched_id);
+            let view = view.read(cx);
+            assert!(view.expanded);
+            assert_eq!(view.card.as_ref().unwrap().entity_id(), card, "unrelated Diff remains mounted");
+        });
+    }
+
+    #[gpui::test]
+    fn grouped_diff_keeps_partial_staging_previews_separate(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(1);
+        crate::workspace_diff::tests::git_ok(repo.path(), &["add", "vendor/0000.rs"]);
+        std::fs::write(repo.path().join("vendor/0000.rs"), "fn before() {}\n// changed 0\n// unstaged\n").unwrap();
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let path = root.join("vendor/0000.rs");
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.open = true; host.edits_ui.workspace_mode = true; host.edits_ui.expanded = true;
+            host.edits_ui.selected = Some(path.clone());
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(900.))); window.run_until_parked();
+        assert!(window.debug_bounds("stage-group:false").is_some());
+        assert!(window.debug_bounds("stage-group:true").is_some());
+        let selector = Box::leak(format!("diff-navigation-file:{}:true", path.display()).into_boxed_str());
+        let staged_row = window.debug_bounds(selector).unwrap();
+        window.simulate_click(staged_row.center(), Default::default()); window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.selected_staged);
+            let views = host.edits_ui.file_views.borrow();
+            assert_eq!(views.len(), 2);
+            for view in views.values() {
+                let view = view.read(cx);
+                let source = view.source.as_ref().unwrap();
+                let loaded = view.loaded.as_ref().unwrap();
+                assert_eq!((loaded.added, loaded.removed), (1, 0));
+                assert_eq!(loaded.after.contains("unstaged"), source.layer == Some(false));
+            }
+        });
+        // A checkbox in the navigation must stage without selecting its row.
+        let selector = Box::leak(format!("stage-file:{}:false", path.display()).into_boxed_str());
+        let checkbox = window.debug_bounds(selector).unwrap();
+        window.simulate_click(checkbox.center(), Default::default()); window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.edits_ui.selected_staged);
+            assert!(host.edits_ui.workspace_sources.values().all(|s| s.staged && !s.unstaged));
+        });
+    }
+
+    #[gpui::test]
     fn conflict_card_renders_highlighted_side_previews(cx: &mut gpui::TestAppContext) {
         let repo = crate::merge_conflicts::tests::conflicted();
         let data = tempfile::tempdir().unwrap();
@@ -2494,10 +3173,11 @@ mod tests {
         let (host, window) = cx.add_window_view(|_, cx| {
             AgentWorkspace::with_path(data.path().join("sessions.json"), cx)
         });
-        let file = crate::merge_conflicts::load(repo.path())
+        let mut file = crate::merge_conflicts::load(repo.path())
             .unwrap()
             .0
             .remove(0);
+        file.original = format!("before\n\n{}\n// after\n", file.original);
         let (view, window) = window.add_window_view(|_, cx| {
             ConflictView::new(
                 file,
@@ -2516,18 +3196,23 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("merge-side:0:0").is_some());
         assert!(window.debug_bounds("merge-side:0:1").is_some());
+        assert!(window.debug_bounds("merge-result-editor").is_none());
+        let toggle = window.debug_bounds("toggle-merge-editor").unwrap();
+        window.simulate_click(toggle.center(), Default::default()); window.run_until_parked();
         assert!(window.debug_bounds("merge-result-editor").is_some());
         view.read_with(window, |view, cx| {
             assert_eq!(view.count, 1);
             let sides = view.sides.borrow();
-            assert_eq!(sides.get(&(0, 0)).unwrap().read(cx).content(), "ours\n");
-            assert_eq!(sides.get(&(0, 1)).unwrap().read(cx).content(), "theirs\n");
+            assert_eq!(sides.get(&(usize::MAX, 0)).unwrap().read(cx).content(), "before\n");
+            assert_eq!(sides.get(&(usize::MAX, 1)).unwrap().read(cx).content(), "\n// after");
+            assert_eq!(sides.get(&(0, 0)).unwrap().read(cx).content(), "<<<<<<< HEAD\nours");
+            assert_eq!(sides.get(&(0, 1)).unwrap().read(cx).content(), "=======\ntheirs\n>>>>>>> feature");
         });
         let button = window.debug_bounds("merge-choice:0:0").unwrap();
         window.simulate_click(button.center(), Default::default());
         window.run_until_parked();
         view.read_with(window, |view, cx| {
-            assert_eq!(view.editor.read(cx).content(), "ours\n");
+            assert_eq!(view.editor.read(cx).content(), "before\n\nours\n\n// after\n");
             assert!(view.sides.borrow().is_empty());
         });
         assert!(window.debug_bounds("merge-resolved").is_some());

@@ -248,6 +248,7 @@ pub struct CodeCard {
     reference_resolver: Option<TextReferenceResolver>,
     reference_cache: Option<(SharedString, Rc<Vec<TextReference>>)>,
     show_header: bool,
+    inline_preview: Option<(usize, Option<u32>)>,
     prose: bool,
     rich: Option<RichText>,
     link_editor: Option<Entity<CodeCard>>,
@@ -573,6 +574,7 @@ impl CodeCard {
             reference_resolver: None,
             reference_cache: None,
             show_header: true,
+            inline_preview: None,
             prose: false,
             rich: None,
             link_editor: None,
@@ -864,6 +866,12 @@ impl CodeCard {
     pub fn read_only(mut self, value: bool) -> Self {
         self.read_only = value;
         self
+    }
+
+    /// Present a read-only slice as part of a continuous, numbered source file.
+    pub fn set_inline_preview(&mut self, first_line: usize, background: Option<u32>, cx: &mut Context<Self>) {
+        let style = Some((first_line.max(1), background));
+        if self.inline_preview != style { self.inline_preview = style; cx.notify(); }
     }
 
     /// Show the language, JSON status and formatting bar. Defaults to true.
@@ -3499,9 +3507,9 @@ impl Render for CodeCard {
             self.reveal_cursor = false;
         }
         let mut gutter = div()
-            .w(px(42.))
+            .w(px(if self.inline_preview.is_some() { 64. } else { 42. }))
             .flex_shrink_0()
-            .py(px(if rich_mode {
+            .py(px(if rich_mode || self.inline_preview.is_some() {
                 0.
             } else if self.prose {
                 3.
@@ -3514,7 +3522,7 @@ impl Render for CodeCard {
             .min_w_full()
             .w(width + px(if rich_mode { 0. } else { 26. }))
             .flex_shrink_0()
-            .py(px(if rich_mode {
+            .py(px(if rich_mode || self.inline_preview.is_some() {
                 0.
             } else if self.prose {
                 3.
@@ -3529,7 +3537,9 @@ impl Render for CodeCard {
                 && self.document_selection.is_none()
                 && self.cursor_offset() >= start
                 && self.cursor_offset() <= start + line.len();
-            let background = if self.prose {
+            let background = if let Some((_, Some(color))) = self.inline_preview {
+                color
+            } else if self.prose {
                 if self.dark {
                     CodeColors::DARK.surface
                 } else {
@@ -3551,7 +3561,7 @@ impl Render for CodeCard {
                     .border_r_1()
                     .border_color(rgb(colors.border))
                     .bg(background)
-                    .child((index + 1).to_string()),
+                    .child((index + self.inline_preview.map_or(1, |(first, _)| first)).to_string()),
             );
             let mut row = div()
                 .relative()
@@ -3839,8 +3849,7 @@ impl Render for CodeCard {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .rounded(px(9.))
-            .border_1()
+            .when(self.inline_preview.is_none(), |card| card.rounded(px(9.)).border_1())
             .border_color(rgb(colors.border))
             .overflow_hidden()
             .bg(rgb(colors.surface))

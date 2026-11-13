@@ -2699,6 +2699,7 @@ impl AgentWorkspace {
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_terminal_theme(cx);
+        self.sync_workspace_watch(cx);
         self.sync_project_actions(cx);
         self.file_preview.view.update(cx, |view, cx| {
             view.set_active(

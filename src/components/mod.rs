@@ -28,6 +28,8 @@ mod rich_text;
 mod search_highlight;
 mod select;
 mod separator;
+mod scrollbar;
+pub use scrollbar::{Scrollbar, ScrollbarState};
 mod shimmer_text;
 mod side_tabs;
 mod tabs;
