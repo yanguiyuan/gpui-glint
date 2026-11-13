@@ -35,6 +35,16 @@ impl HistoryRows {
         self.scroll = scroll;
     }
 
+    pub fn set_rows(&mut self, rows: Vec<AnyView>, cx: &mut Context<Self>) {
+        if self.rows.len() != rows.len()
+            || self.rows.iter().zip(&rows).any(|(a, b)| a.entity_id() != b.entity_id())
+        {
+            self.measured.clear();
+        }
+        self.rows = rows;
+        cx.notify();
+    }
+
     fn visible(bounds: Bounds<Pixels>, scroll: &ScrollHandle) -> bool {
         let viewport = scroll.bounds();
         let offset = scroll.offset().y;

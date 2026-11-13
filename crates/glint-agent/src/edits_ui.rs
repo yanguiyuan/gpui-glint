@@ -53,6 +53,8 @@ pub struct State {
     conflicts: Vec<Entity<ConflictView>>,
     file_views: RefCell<HashMap<String, Entity<FileDiff>>>,
     sidebar_scroll: ScrollHandle,
+    detail_scrolls: RefCell<HashMap<String, ScrollHandle>>,
+    navigation_scroll: gpui::UniformListScrollHandle,
     reveal_revision: u64,
     reveal_pending: Cell<bool>,
 }
@@ -62,7 +64,7 @@ impl AgentWorkspace {
         if self.history.active().project.is_none() { return; }
         self.page = crate::Page::Chat;
         self.git_ui.open = false;
-        self.terminal_ui.open = false;
+        if !self.terminal_ui.bottom { self.terminal_ui.open = false; }
         self.open_edits(None, cx);
         self.edits_ui.workspace_mode = true;
         self.right_sidebar_width = self.right_sidebar_width.max(400.);
@@ -214,7 +216,7 @@ impl AgentWorkspace {
 
     pub fn open_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.file_preview.open = false;
-        self.terminal_ui.open = false;
+        if !self.terminal_ui.bottom { self.terminal_ui.open = false; }
         self.edits_ui.open = true;
         self.edits_ui.workspace_mode = false;
         self.edits_ui.selected = path;
@@ -324,6 +326,7 @@ impl AgentWorkspace {
         view.update(cx, |view, cx| {
             *view.list_link.borrow_mut() = link;
             view.set_file(file, self.theme, cx);
+            if view.detail != self.edits_ui.expanded { view.detail = self.edits_ui.expanded; cx.notify(); }
             if view.tree_depth != tree_depth { view.tree_depth = tree_depth; cx.notify(); }
             view.source = if self.edits_ui.workspace_mode { self.edits_ui.workspace_sources.get(&file.path).cloned() } else { None };
             if view.side_by_side != self.edits_ui.expanded {
@@ -516,12 +519,12 @@ impl AgentWorkspace {
         } else {
             format!("session:{}", self.history.active)
         };
-        let virtualized = workspace_mode && (files.len() > 128 || (!files.is_empty() && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
+        let virtualized = !self.edits_ui.expanded && workspace_mode && (files.len() > 128 || (!files.is_empty() && self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree));
         if virtualized {
             list = div().id("edited-files-scroll").flex_1().min_h_0().flex().flex_col()
                 .child(self.virtual_workspace_files(files.clone(), scope.clone(), cx));
         }
-        if !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
+        if !self.edits_ui.expanded && !virtualized && workspace_mode && root_matches && !self.edits_ui.conflicts.is_empty() {
             for view in &self.edits_ui.conflicts {
                 view.update(cx, |view, cx| {
                     view.list_link.borrow_mut().take();
@@ -542,7 +545,7 @@ impl AgentWorkspace {
             && !self.any_run_busy()
             && self.edits_ui.undo_task.is_none()
             && self.queued_requests.is_empty();
-        if !virtualized {
+        if !self.edits_ui.expanded && !virtualized {
             for (index, file) in files.iter().enumerate() {
                 let view = self.file_row(file, &scope, None, None, can_undo, reveal_index == Some(index), cx);
                 list = list.child(view);
@@ -708,6 +711,9 @@ impl AgentWorkspace {
                     }),
             );
         }
+        if self.edits_ui.expanded {
+            list = self.expanded_edit_files(files, scope, can_undo, root_matches, cx);
+        }
         body.child(list).child(
             div()
                 .px_3()
@@ -720,6 +726,106 @@ impl AgentWorkspace {
                     "会话内文件工具的累计净变更，含子代理。"
                 }),
         )
+    }
+
+    fn expanded_edit_files(&self, files: Rc<Vec<Change>>, scope: String, can_undo: bool, root_matches: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        use crate::workspace_tree::Row;
+        let p = self.theme.palette();
+        let tree = self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree;
+        let rows = if tree {
+            let mut cache = self.edits_ui.tree_cache.borrow_mut();
+            if cache.as_ref().is_none_or(|(key, cached, _)| key != &scope || !Rc::ptr_eq(cached, &files)) {
+                let empty = Default::default();
+                let collapsed = self.edits_ui.collapsed_directories.get(&scope).unwrap_or(&empty);
+                *cache = Some((scope.clone(), files.clone(), Rc::new(crate::workspace_tree::rows(&files, collapsed))));
+            }
+            cache.as_ref().unwrap().2.clone()
+        } else {
+            Rc::new((0..files.len()).map(|index| Row::File { index, depth: 0 }).collect())
+        };
+        let conflicts = if self.edits_ui.workspace_mode && root_matches { self.edits_ui.conflicts.clone() } else { Vec::new() };
+        let selected = self.edits_ui.selected.as_ref()
+            .filter(|path| files.iter().any(|file| &file.path == *path) || conflicts.iter().any(|view| &view.read(cx).file.path == *path))
+            .cloned()
+            .or_else(|| conflicts.first().map(|view| view.read(cx).file.path.clone()))
+            .or_else(|| files.first().map(|file| file.path.clone()));
+        let mut detail = div().id("expanded-diff-content").debug_selector(|| "expanded-diff-content".into())
+            .flex_1().min_w_0().min_h_0().overflow_y_scroll();
+        if let Some(path) = &selected {
+            let scroll_key = format!("{scope}:{}", path.display());
+            let scroll = self.edits_ui.detail_scrolls.borrow_mut().entry(scroll_key).or_default().clone();
+            detail = detail.track_scroll(&scroll);
+            if let Some(view) = conflicts.iter().find(|view| &view.read(cx).file.path == path) {
+                view.update(cx, |view, cx| {
+                    view.list_link.borrow_mut().take();
+                    if !view.expanded { view.expanded = true; cx.notify(); }
+                    if view.theme != self.theme {
+                        view.theme = self.theme;
+                        view.editor.update(cx, |editor, cx| editor.set_theme(self.theme, cx));
+                    }
+                });
+                detail = detail.child(view.clone());
+            } else if let Some(file) = files.iter().find(|file| &file.path == path) {
+                detail = detail.child(self.file_row(file, &scope, None, None, can_undo, false, cx));
+            }
+        } else {
+            detail = detail.child(div().p_4().text_color(rgb(p.text_muted)).child("选择左侧文件查看 Diff。"));
+        }
+        if self.edits_ui.workspace_mode {
+            detail = detail.children(self.edits_ui.workspace_notes.iter().map(|note| div().px_3().py_1().text_size(px(11.)).text_color(rgb(p.text_muted)).child(note.clone())));
+        }
+        let prefix = conflicts.len();
+        let count = prefix + rows.len();
+        let navigation_files = files.clone();
+        let navigation = gpui::uniform_list("expanded-diff-files", count, cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+            range.map(|index| {
+                let (path, label, depth, icon, counts) = if index < prefix {
+                    let file = &conflicts[index].read(cx).file;
+                    (file.path.clone(), file.label.clone(), 0, Icon::GitConflict, "冲突".to_owned())
+                } else {
+                    match &rows[index - prefix] {
+                        Row::Directory { path, label, depth, count, collapsed } => {
+                            let path = path.clone();
+                            let directory_scope = scope.clone();
+                            let selector = format!("diff-navigation-directory:{path}");
+                            return div().id(SharedString::from(format!("diff-directory:{scope}:{path}")))
+                                .debug_selector(move || selector.clone()).h(px(34.)).pr_3().pl(px(10. + *depth as f32 * 16.))
+                                .flex().items_center().gap_2().cursor_pointer().hover(|style| style.bg(rgb(p.surface_subtle)))
+                                .child(if *collapsed { Icon::ChevronRight } else { Icon::ChevronDown }.render(12.))
+                                .child(Icon::Folder.render(14.))
+                                .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label.clone()))
+                                .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(count.to_string()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let collapsed = this.edits_ui.collapsed_directories.entry(directory_scope.clone()).or_default();
+                                    if !collapsed.remove(&path) { collapsed.insert(path.clone()); }
+                                    this.edits_ui.tree_cache.borrow_mut().take();
+                                    cx.notify();
+                                })).into_any_element();
+                        }
+                        Row::File { index, depth } => {
+                            let file = &navigation_files[*index];
+                            let label = if tree { file.label.rsplit('/').next().unwrap_or(&file.label).to_owned() } else { file.label.clone() };
+                            (file.path.clone(), label, *depth, Icon::for_language(edits::language(&file.path)), format!("+{} −{}", file.added, file.removed))
+                        }
+                    }
+                };
+                let selector = format!("diff-navigation-file:{}", path.display());
+                let active = selected.as_ref() == Some(&path);
+                div().id(SharedString::from(selector.clone())).debug_selector(move || selector.clone())
+                    .h(px(34.)).pr_3().pl(px(26. + depth as f32 * 16.))
+                    .flex().items_center().gap_2().cursor_pointer()
+                    .when(active, |row| row.bg(rgb(p.accent_tint)).text_color(rgb(p.accent)))
+                    .hover(|style| style.bg(rgb(p.surface_subtle)))
+                    .child(icon.render(14.).flex_shrink_0())
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
+                    .child(div().text_size(px(10.)).text_color(rgb(p.text_muted)).child(counts))
+                    .on_click(cx.listener(move |this, _, _, cx| { this.edits_ui.selected = Some(path.clone()); cx.notify(); }))
+                    .into_any_element()
+            }).collect::<Vec<_>>()
+        })).size_full().track_scroll(&self.edits_ui.navigation_scroll);
+        div().id("expanded-diff-layout").debug_selector(|| "expanded-diff-layout".into()).flex_1().min_h_0().flex()
+            .child(div().debug_selector(|| "expanded-diff-navigation".into()).w(px(260.)).flex_shrink_0().h_full().border_r_1().border_color(rgb(p.border)).child(navigation))
+            .child(detail)
     }
 
     fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
@@ -1387,6 +1493,7 @@ impl Render for ConflictView {
 /// Each file owns its disclosure state. Closed files never construct a diff;
 /// opening another file leaves all existing disclosures and scroll positions intact.
 struct FileDiff {
+    detail: bool,
     tree_depth: Option<usize>,
     list_link: ListLink,
     source: Option<crate::workspace_diff::Source>,
@@ -1407,6 +1514,7 @@ struct FileDiff {
 impl FileDiff {
     fn new(file: Change, theme: ThemePreset) -> Self {
         Self {
+            detail: false,
             tree_depth: None,
             list_link: Default::default(),
             source: None,
@@ -1477,14 +1585,15 @@ impl FileDiff {
 impl Render for FileDiff {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
-        if self.expanded && self.source.is_some() && self.loaded.is_none() && self.load_task.is_none() && self.load_error.is_none() {
+        let expanded = self.expanded || self.detail;
+        if expanded && self.source.is_some() && self.loaded.is_none() && self.load_task.is_none() && self.load_error.is_none() {
             self.load_diff(cx);
         }
         let selector = format!("edit-file:{}", self.file.label);
         let path = self.file.path.clone();
         let undo_selector = format!("undo-file:{}", path.display());
         let workspace = self.workspace.clone();
-        let card = if self.expanded && self.load_task.is_none() && self.load_error.is_none() {
+        let card = if expanded && self.load_task.is_none() && self.load_error.is_none() {
             Some(
                 self.card
                     .get_or_insert_with(|| {
@@ -1534,7 +1643,7 @@ impl Render for FileDiff {
                     .gap_2()
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(
+                    .when(!self.detail, |header| header.child(
                         if self.expanded {
                             Icon::ChevronDown
                         } else {
@@ -1542,7 +1651,7 @@ impl Render for FileDiff {
                         }
                         .render(13.)
                         .text_color(rgb(p.text_muted)),
-                    )
+                    ))
                     .child(
                         Icon::for_language(edits::language(&self.file.path))
                             .render(15.)
@@ -1615,6 +1724,7 @@ impl Render for FileDiff {
                         )
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if this.detail { return; }
                         this.expanded = !this.expanded;
                         if !this.expanded {
                             this.card = None;
@@ -1625,7 +1735,7 @@ impl Render for FileDiff {
                         cx.notify();
                     })),
             );
-        if self.expanded {
+        if expanded {
             if self.load_task.is_some() {
                 return row.child(div().px_3().py_2().text_color(rgb(p.text_muted)).child("正在加载此文件的 Diff…"));
             }
@@ -1776,7 +1886,7 @@ mod tests {
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = AgentWorkspace::with_path(path.clone(), cx);
             host.edits_ui.open = true;
-            host.edits_ui.expanded = true;
+            host.edits_ui.expanded = false;
             host.edits_ui.workspace_mode = true;
             host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
             host.edits_ui.workspace_files = Rc::new(vec![change("root.rs", "new\n"), change("src/a.rs", "new\n"), change("src/nested/b.rs", "new\n"), change("tests/a.rs", "new\n")]);
@@ -1847,18 +1957,20 @@ mod tests {
         window.simulate_resize(size(px(1440.), px(900.)));
         window.run_until_parked();
         let list = host.read_with(window, |host, _| {
-            assert!(host.edits_ui.file_views.borrow().len() < 64);
-            let cache = host.edits_ui.virtual_files.borrow();
-            assert_eq!(cache.as_ref().unwrap().state.item_count(), 5001);
-            cache.as_ref().unwrap().state.clone()
+            assert_eq!(host.edits_ui.file_views.borrow().len(), 1);
+            assert_eq!(host.edits_ui.tree_cache.borrow().as_ref().unwrap().2.len(), 5001);
+            host.edits_ui.navigation_scroll.clone()
         });
-        host.update(window, |_, cx| { list.scroll_to_reveal_item(4001); cx.notify(); });
+        host.update(window, |_, cx| { list.scroll_to_item(4001, gpui::ScrollStrategy::Top); cx.notify(); });
+        window.run_until_parked();
+        let file = window.debug_bounds("diff-navigation-file:vendor/4000.rs").unwrap();
+        window.simulate_click(file.center(), Default::default());
         window.run_until_parked();
         assert!(window.debug_bounds("edit-file:vendor/4000.rs").is_some());
         host.read_with(window, |host, cx| {
             let views = host.edits_ui.file_views.borrow();
-            assert!(views.len() < 128, "{} views", views.len());
-            assert!(views.values().all(|view| view.read(cx).card.is_none()));
+            assert_eq!(views.len(), 2, "only selected files create Diff views");
+            assert!(views.values().all(|view| view.read(cx).card.is_some()));
         });
     }
 
@@ -1901,7 +2013,7 @@ mod tests {
             let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
             host.edits_ui.open = true;
             host.edits_ui.workspace_mode = true;
-            host.edits_ui.expanded = true;
+            host.edits_ui.expanded = false;
             host.edits_ui.workspace_files = Rc::new(inventory.files);
             host.edits_ui.workspace_sources = Rc::new(inventory.sources);
             host
@@ -1944,6 +2056,54 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("edit-file:vendor/3088.rs").is_some());
         eprintln!("3089 files: first visible frame={initial:?}; only visible file views created; one Diff loaded on disclosure");
+    }
+
+    #[gpui::test]
+    fn expanded_diff_navigation_switches_one_file_and_restores_compact_layout(cx: &mut gpui::TestAppContext) {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.edits_ui.open = true;
+            host.edits_ui.expanded = true;
+            host.edits_ui.workspace_mode = true;
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.workspace_files = Rc::new(vec![change("src/first.rs", "first\n"), change("src/second.rs", "second\n")]);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.run_until_parked();
+        let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
+        let detail = window.debug_bounds("expanded-diff-content").unwrap();
+        assert!(navigation.right() <= detail.left());
+        assert!(detail.size.width > navigation.size.width);
+        assert!(window.debug_bounds("edit-file:src/first.rs").is_some());
+        assert!(window.debug_bounds("edit-file:src/second.rs").is_none());
+        host.read_with(window, |host, _| assert_eq!(host.edits_ui.file_views.borrow().len(), 1, "only the selected file loads its Diff"));
+        let second = window.debug_bounds("diff-navigation-file:src/second.rs").unwrap();
+        window.simulate_click(second.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:src/first.rs").is_none());
+        assert!(window.debug_bounds("edit-file:src/second.rs").is_some());
+        let directory = window.debug_bounds("diff-navigation-directory:src").unwrap();
+        window.simulate_click(directory.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("diff-navigation-file:src/second.rs").is_none());
+        assert!(window.debug_bounds("edit-file:src/second.rs").is_some(), "collapsing navigation must keep the selected Diff visible");
+        host.update(window, |host, cx| {
+            host.edits_ui.expanded = false;
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::List;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("expanded-diff-layout").is_none());
+        assert!(window.debug_bounds("edit-file:src/first.rs").is_some());
+        assert!(window.debug_bounds("edit-file:src/second.rs").is_some());
+        host.read_with(window, |host, cx| {
+            for view in host.edits_ui.file_views.borrow().values() {
+                assert!(!view.read(cx).expanded && !view.read(cx).detail, "detail mode must preserve compact disclosures");
+            }
+        });
     }
 
     #[gpui::test]

@@ -411,7 +411,13 @@ async fn worker(
                 command.env_remove(name);
             }
         }
-        command.env("NO_COLOR", "1").env("TERM", "dumb");
+        // The native log view understands ANSI styling even though pipes are
+        // used for capture. Ask common tools to retain their colored output.
+        command.env_remove("NO_COLOR")
+            .env("TERM", "xterm-256color")
+            .env("FORCE_COLOR", "1")
+            .env("CLICOLOR_FORCE", "1")
+            .env("CARGO_TERM_COLOR", "always");
         if !remote {
             crate::vault_environment::with_variables(|name, value| {
                 command.env(name, value);

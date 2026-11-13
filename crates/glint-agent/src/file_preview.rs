@@ -903,7 +903,7 @@ impl AgentWorkspace {
         );
     }
     fn open_file_preview_mode(&mut self, target: Target, rendered: bool, cx: &mut Context<Self>) {
-        self.terminal_ui.open = false;
+        if !self.terminal_ui.bottom { self.terminal_ui.open = false; }
         self.file_preview.open = true;
         self.edits_ui.open = false;
         self.file_preview.revision += 1;
@@ -1405,6 +1405,8 @@ mod tests {
 
     #[gpui::test]
     fn expanded_preview_keeps_directory_and_switches_files_without_collapsing(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         std::fs::write(root.join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
@@ -1417,6 +1419,7 @@ mod tests {
         host.update(window, |host, cx| {
             host.storage_readable = false;
             host.file_preview.expanded = true;
+            host.history.active_mut().project = Some(root.clone());
             host.open_file_preview(Target { root: Some(root.clone()), path: root.join("a.rs").to_string_lossy().into_owned(), line: None }, cx);
         });
         window.run_until_parked();
@@ -1432,6 +1435,31 @@ mod tests {
             assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("b.rs").to_string_lossy());
         });
         assert!(window.debug_bounds("file-preview-navigation").is_some());
+        window.update(|window, cx| host.update(cx, |host, cx| window.focus(&host.focus, cx)));
+        window.simulate_keystrokes("ctrl-`");
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.open && host.file_preview.expanded);
+            assert!(host.terminal_ui.open && host.terminal_ui.bottom);
+            assert_eq!(host.history.terminal_default_position, crate::terminal_ui::Position::Right);
+            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("b.rs").to_string_lossy());
+        });
+        let terminal = window.debug_bounds("project-terminal-sidebar").unwrap();
+        let navigation = window.debug_bounds("file-preview-navigation").unwrap();
+        assert!(navigation.bottom() <= terminal.top() + px(1.), "preview must fit above the bottom terminal");
+        let first_selector = Box::leak(format!("preview-entry:{}", root.join("a.rs").display()).into_boxed_str());
+        let first = window.debug_bounds(first_selector).unwrap();
+        window.simulate_click(first.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert!(host.terminal_ui.open && host.file_preview.expanded);
+            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("a.rs").to_string_lossy());
+        });
+        let hide = window.debug_bounds("project-terminal-hide").unwrap();
+        window.simulate_click(hide.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, _| assert!(!host.terminal_ui.open && host.file_preview.open && host.file_preview.expanded));
+        assert!(window.debug_bounds("file-preview-navigation").unwrap().size.height > navigation.size.height);
         let collapse = window.debug_bounds("file-preview-expand").unwrap();
         window.simulate_click(collapse.center(), Default::default());
         window.run_until_parked();

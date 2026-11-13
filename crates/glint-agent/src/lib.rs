@@ -16,6 +16,7 @@ mod code_fonts;
 mod code_fonts_ui;
 mod code_mode;
 mod command_runner;
+mod command_output;
 mod executable;
 pub use code_mode::worker_main as run_code_mode_worker;
 mod commands;
@@ -651,7 +652,7 @@ impl AgentWorkspace {
             right_sidebar_width: 480.,
             right_sidebar_resize: None,
             file_preview: file_preview::State::new(cx),
-            terminal_ui: Default::default(),
+            terminal_ui: terminal_ui::State::new(history.terminal_default_position),
             project_actions: project_actions::State::new(&path, cx),
             ssh_ui: ssh_ui::State::new(cx),
             channels: channels::ui::State::new(&path, cx),
@@ -737,7 +738,7 @@ impl AgentWorkspace {
         workspace._subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
             let _ = weak.update(cx, |this, cx| {
                 if this.focus.contains_focused(window, cx) {
-                    this.project_terminal_shortcut(event, window, cx);
+                    this.project_shortcut(event, window, cx);
                 }
             });
         }));
@@ -2787,9 +2788,11 @@ impl Render for AgentWorkspace {
                     })
                     .into_any_element(),
                     content: (if self.page == crate::Page::Chat && self.file_preview.open && self.file_preview.expanded {
-                        self.file_preview_sidebar(cx)
+                        let panel = self.file_preview_sidebar(cx);
+                        self.expanded_project_panel(panel, cx)
                     } else if self.page == crate::Page::Chat && self.edits_ui.open && self.edits_ui.expanded {
-                        self.edits_sidebar(cx)
+                        let panel = self.edits_sidebar(cx);
+                        self.expanded_project_panel(panel, cx)
                     } else if self.page == crate::Page::Channels {
                         div().size_full().child(self.channels_page(cx))
                     } else if self.page == crate::Page::Partners {

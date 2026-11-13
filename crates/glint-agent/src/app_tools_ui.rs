@@ -16,6 +16,7 @@ pub struct MarkdownView {
 }
 
 pub struct ToolPanel {
+    active: bool,
     output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     output_scroll: ScrollHandle,
     signature: String,
@@ -24,6 +25,7 @@ pub struct ToolPanel {
 }
 
 pub struct ProcessPanel {
+    rows: std::rc::Rc<std::cell::RefCell<Option<Entity<crate::history_rows::HistoryRows>>>>,
     signature: u64,
     completed_source: Option<(usize, u64)>,
     theme: ThemePreset,
@@ -775,6 +777,7 @@ impl AgentWorkspace {
                 )
                 .detach();
                 ToolPanel {
+                    active: false,
                     output_panel: None,
                     output_scroll: ScrollHandle::new(),
                     signature: String::new(),
@@ -785,6 +788,12 @@ impl AgentWorkspace {
         if entry.signature != signature || entry.theme != theme {
             let presentation = tool_presentation(record);
             let result: SharedString = presentation.body.into();
+            let command_output = matches!(record.call.name.as_str(), "run_command" | "command_poll" | "command_stop")
+                .then(|| crate::command_output::Output::parse(&result, theme));
+            let result_scroll = entry.output_scroll.clone();
+            if record.result == "执行中…" {
+                scroll_follow::follow_if_at_bottom(&result_scroll);
+            }
             let change = record.change.clone();
             let nested = record.nested_tools.clone();
             let script = if record.call.name == "code_mode" {
@@ -998,12 +1007,18 @@ impl AgentWorkspace {
                             .min_w_0()
                             .flex_shrink_0()
                             .max_h(px(320.))
+                            .relative()
                             .overflow_y_scroll()
+                            .track_scroll(&result_scroll)
                             .text_size(px(12.))
                             .line_height(px(20.))
                             .font_family("monospace")
                             .text_color(rgb(p.text_muted))
-                            .child(div().w_full().min_w_0().child(result.clone()))
+                            .child(div().w_full().min_w_0().child(
+                                if let Some(output) = &command_output { output.render().into_any_element() }
+                                else { div().child(result.clone()).into_any_element() }
+                            ))
+                            .child(crate::command_output::scroll_guard(&result_scroll, 20.))
                             .into_any_element()
                     },
                     cx,
@@ -1233,6 +1248,7 @@ impl AgentWorkspace {
                     let entry = cache
                         .entry(format!("{key}:{index}:thinking"))
                         .or_insert_with(|| ToolPanel {
+                            active: false,
                             output_panel: None,
                             output_scroll: ScrollHandle::new(),
                             signature: String::new(),
@@ -1303,6 +1319,23 @@ impl AgentWorkspace {
                     }
                 }
             }
+            let panel_key = match block {
+                ContentBlock::Thinking(_) => Some(format!("{key}:{index}:thinking")),
+                ContentBlock::ToolCall(call) if !completed.contains(call.id.as_str()) => Some(format!("{key}:tool:{}", call.id)),
+                ContentBlock::ToolResult(record) => Some(format!("{key}:tool:{}", record.call.id)),
+                _ => None,
+            };
+            if let Some(panel_key) = panel_key
+                && let Some(entry) = self.tool_panels.borrow_mut().get_mut(&panel_key)
+            {
+                let active = !complete && index + 1 == blocks.len();
+                // Change the default only on action boundaries. Streaming deltas
+                // must never override a user's manual expansion/collapse.
+                if entry.active != active {
+                    entry.active = active;
+                    entry.panel.update(cx, |panel, cx| panel.set_expanded(active, cx));
+                }
+            }
         }
         rows
     }
@@ -1358,6 +1391,7 @@ impl AgentWorkspace {
             });
         let signature = source_signature ^ self.subagent_revision();
         let entry = cache.entry(key.into()).or_insert_with(|| ProcessPanel {
+            rows: Default::default(),
             signature: 0,
             completed_source: None,
             theme,
@@ -1374,7 +1408,10 @@ impl AgentWorkspace {
             // Build child entities once on expansion, then reuse them while the
             // source is unchanged. Scrolling must not hash every tool result or
             // repeat Markdown/cache lookups; collapsed history stays lazy.
-            let rows = std::cell::RefCell::new(None::<Entity<crate::history_rows::HistoryRows>>);
+            // Keep the ancestor entity stable across deltas: replacing it also
+            // replaces GPUI's element paths and loses in-flight mouse clicks.
+            let rows = entry.rows.clone();
+            let refreshed = std::cell::Cell::new(false);
             let weak = cx.entity().downgrade();
             let process = blocks[..split].to_vec();
             let thinking_ms = thinking_ms.clone();
@@ -1394,7 +1431,7 @@ impl AgentWorkspace {
                     move |_, cx| {
                         let scroll = weak.update(cx, |this, _| this.scroll.clone()).unwrap_or_default();
                         let mut rows = rows.borrow_mut();
-                        let rows = rows.get_or_insert_with(|| {
+                        if !refreshed.replace(true) {
                             let children = weak.update(cx, |this, cx| {
                                 this.transcript_rows(
                                     &content_key,
@@ -1405,8 +1442,13 @@ impl AgentWorkspace {
                                     cx,
                                 )
                             }).unwrap_or_default();
-                            cx.new(|_| crate::history_rows::HistoryRows::new(children, scroll.clone()))
-                        });
+                            if let Some(rows) = rows.as_ref() {
+                                rows.update(cx, |rows, cx| rows.set_rows(children, cx));
+                            } else {
+                                *rows = Some(cx.new(|_| crate::history_rows::HistoryRows::new(children, scroll.clone())));
+                            }
+                        }
+                        let rows = rows.as_ref().unwrap();
                         rows.update(cx, |rows, _| rows.set_scroll(scroll));
                         div().w_full().min_w_0().child(rows.clone()).into_any_element()
                     },
@@ -1593,23 +1635,7 @@ fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset, scroll: &Scro
                     })
             },
         )))
-        .child(gpui::canvas(
-            |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
-            move |_, hitbox: gpui::Hitbox, window, _| {
-                let view = window.current_view();
-                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                    if phase != gpui::DispatchPhase::Capture || !hitbox.should_handle_scroll(window) { return; }
-                    let delta = event.delta.pixel_delta(px(21.));
-                    let offset = scroll.offset();
-                    let next = (offset.y+delta.y).clamp(-scroll.max_offset().y, px(0.));
-                    if next != offset.y {
-                        scroll.set_offset(point(offset.x, next));
-                        cx.stop_propagation();
-                        cx.notify(view);
-                    }
-                });
-            },
-        ).absolute().top_0().left_0().size_full())
+        .child(crate::command_output::scroll_guard(&scroll, 21.))
 }
 
 fn code_mode_output_sections(raw: &str) -> Vec<(Option<String>, String, &'static str)> {
@@ -1676,6 +1702,115 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
+
+    #[gpui::test]
+    fn thinking_toggle_survives_a_stream_update_during_click(cx: &mut gpui::TestAppContext) {
+        struct Preview {
+            host: Entity<AgentWorkspace>,
+            blocks: Vec<generation::ContentBlock>,
+        }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(800.)).child(self.host.update(cx, |host, cx| {
+                    host.response_view("stream-click", &self.blocks, None, &Default::default(), false, cx)
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (preview, window) = cx.add_window_view(|_, cx| Preview {
+            host: cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)),
+            blocks: vec![Thinking("检查文件".into())],
+        });
+        window.run_until_parked();
+        let host = preview.read_with(window, |view, _| view.host.clone());
+        let panel = host.read_with(window, |host, _| host.tool_panels.borrow()["stream-click:0:thinking"].panel.clone());
+        panel.read_with(window, |panel, _| assert!(panel.is_expanded(), "the latest action starts expanded"));
+        panel.update(window, |panel, cx| panel.set_expanded(true, cx));
+        window.run_until_parked();
+        let position = window.debug_bounds("streaming-summary").unwrap().center();
+        window.simulate_mouse_down(position, gpui::MouseButton::Left, Default::default());
+        preview.update(window, |view, cx| {
+            view.blocks[0] = Thinking("继续检查文件".into());
+            cx.notify();
+        });
+        window.run_until_parked();
+        window.simulate_mouse_up(position, gpui::MouseButton::Left, Default::default());
+        window.run_until_parked();
+        panel.read_with(window, |panel, _| assert!(!panel.is_expanded(), "streaming must preserve the pending click"));
+        preview.update(window, |view, cx| {
+            view.blocks[0] = Thinking("继续检查文件，保留手动折叠".into());
+            cx.notify();
+        });
+        window.run_until_parked();
+        panel.read_with(window, |panel, _| assert!(!panel.is_expanded()));
+        let call = tools::ToolCall { id: "next-command".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"cargo","args":["check"]}) };
+        preview.update(window, |view, cx| {
+            view.blocks.push(generation::ContentBlock::ToolCall(call.clone()));
+            cx.notify();
+        });
+        window.run_until_parked();
+        let command = host.read_with(window, |host, _| host.tool_panels.borrow()["stream-click:tool:next-command"].panel.clone());
+        command.read_with(window, |panel, _| assert!(panel.is_expanded()));
+        preview.update(window, |view, cx| {
+            view.blocks.push(generation::ContentBlock::ToolResult(tools::rejected(call, "finished".into())));
+            cx.notify();
+        });
+        window.run_until_parked();
+        command.read_with(window, |panel, _| assert!(panel.is_expanded(), "keep the result visible until the next action"));
+        preview.update(window, |view, cx| {
+            view.blocks.push(Thinking("检查结果".into()));
+            cx.notify();
+        });
+        window.run_until_parked();
+        command.read_with(window, |panel, _| assert!(!panel.is_expanded()));
+        host.read_with(window, |host, cx| assert!(host.tool_panels.borrow()["stream-click:3:thinking"].panel.read(cx).is_expanded()));
+    }
+
+    #[gpui::test]
+    fn command_output_scrolls_before_the_outer_conversation(cx: &mut gpui::TestAppContext) {
+        struct Preview {
+            host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+            outer: ScrollHandle,
+        }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().id("command-scroll-outer").h(px(400.)).w(px(600.)).overflow_y_scroll().track_scroll(&self.outer)
+                    .child(div().flex().flex_col()
+                        .child(div().h(px(300.)).flex_shrink_0())
+                        .child(self.panel.clone())
+                        .child(div().h(px(500.)).flex_shrink_0()))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+            let record = tools::rejected(tools::ToolCall { id: "scroll".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"cargo"}) }, "\x1b[32mChecking crate\x1b[0m\n".repeat(100));
+            let panel = host.update(cx, |host, cx| host.tool_panel("scroll", &record, cx));
+            panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
+            Preview { host, panel, outer: ScrollHandle::new() }
+        });
+        preview.update(window, |view, cx| { view.outer.set_offset(point(px(0.), px(-250.))); cx.notify(); });
+        window.run_until_parked();
+        let (outer, inner) = preview.read_with(window, |view, cx| {
+            (view.outer.clone(), view.host.read(cx).tool_panels.borrow()["scroll:tool:scroll"].output_scroll.clone())
+        });
+        let bounds = window.debug_bounds("tool-output").unwrap();
+        assert!(bounds.size.height <= px(320.));
+        let position = point(bounds.left() + px(10.), bounds.top() + px(10.));
+        let before = outer.offset().y;
+        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.run_until_parked();
+        assert!(inner.offset().y < px(0.));
+        assert_eq!(outer.offset().y, before, "one wheel event must move only the output");
+        preview.update(window, |_, cx| { inner.scroll_to_bottom(); cx.notify(); });
+        window.run_until_parked();
+        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.run_until_parked();
+        assert!(outer.offset().y < before, "at the output boundary the conversation can take over");
+    }
 
     #[gpui::test]
     fn long_questions_scroll_without_displacing_the_composer(cx: &mut gpui::TestAppContext) {
@@ -2182,6 +2317,7 @@ mod tests {
             "return value starts collapsed"
         );
         host.update(window, |host, cx| {
+            host.message_layout.pin = None;
             host.scroll.scroll_to_top_of_item(1);
             cx.notify();
         });
@@ -2204,6 +2340,14 @@ mod tests {
             waiting.top() >= live.bottom(),
             "waiting label overlaps expanded live response: {waiting:?}, {live:?}"
         );
+        // The newest thinking row now opens automatically. The older tool may
+        // be outside the virtualized viewport at the bottom; scroll back to it.
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_top_of_item(1);
+            cx.notify();
+        });
+        window.run_until_parked();
+        let live = window.debug_bounds("live-response").unwrap();
         let output = window.debug_bounds("code-mode-result").unwrap();
         let source = window.debug_bounds("code-mode-source").unwrap();
         assert!(

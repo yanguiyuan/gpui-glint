@@ -225,6 +225,12 @@ pub struct History {
     pub workspace_display: crate::workspace_tree::DisplayMode,
     #[serde(default = "crate::shortcuts::default_terminal_shortcut")]
     pub terminal_shortcut: String,
+    #[serde(default = "crate::shortcuts::default_diff_shortcut")]
+    pub diff_shortcut: String,
+    #[serde(default = "crate::shortcuts::default_preview_shortcut")]
+    pub preview_shortcut: String,
+    #[serde(default)]
+    pub terminal_default_position: crate::terminal_ui::Position,
     #[serde(default)]
     pub quick_replies_enabled: bool,
     #[serde(default)]
@@ -255,6 +261,9 @@ impl Default for History {
         let session = Session::new();
         Self {
             terminal_shortcut: crate::shortcuts::default_terminal_shortcut(),
+            diff_shortcut: crate::shortcuts::default_diff_shortcut(),
+            preview_shortcut: crate::shortcuts::default_preview_shortcut(),
+            terminal_default_position: Default::default(),
             workspace_display: Default::default(),
             removed_projects: Default::default(),
             partner_models: Default::default(),
@@ -286,6 +295,7 @@ impl History {
                 Err(error) => return Err(error),
             }
         };
+        crate::shortcuts::repair_project_shortcut_conflicts(&mut history);
         if history.sessions.is_empty() {
             let session = Session::new();
             history.active = session.id;

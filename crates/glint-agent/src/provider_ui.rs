@@ -85,6 +85,7 @@ pub enum Section {
     #[default]
     General,
     Appearance,
+    Layout,
     Storage,
     Shortcuts,
     Memory,
@@ -98,6 +99,7 @@ impl Section {
         match self {
             Self::General => "常规",
             Self::Appearance => "外观",
+            Self::Layout => "布局",
             Self::Storage => "存储",
             Self::Shortcuts => "键盘快捷键",
             Self::Memory => "记忆",
@@ -116,8 +118,8 @@ pub enum ProviderTab {
 }
 
 pub struct Settings {
-    pub terminal_shortcut_recording: bool,
-    pub terminal_shortcut_message: Option<String>,
+    pub shortcut_recording: Option<crate::shortcuts::ProjectAction>,
+    pub shortcut_message: Option<String>,
     pub compaction_threshold: Entity<TextEntry>,
     compaction_message: Option<String>,
     pub discovered: Vec<discovery::DiscoveredProvider>,
@@ -163,8 +165,8 @@ impl Settings {
             })
         };
         Self {
-            terminal_shortcut_recording: false,
-            terminal_shortcut_message: None,
+            shortcut_recording: None,
+            shortcut_message: None,
             compaction_threshold: entry("1–99，例如 75", "75"),
             compaction_message: None,
             selected,
@@ -1284,6 +1286,7 @@ impl AgentWorkspace {
         for (section, icon) in [
             (Section::General, Icon::Settings),
             (Section::Appearance, Icon::HalfCircle),
+            (Section::Layout, Icon::Sidebar),
             (Section::Storage, Icon::Folder),
             (Section::Memory, Icon::Database),
             (Section::Skills, Icon::Workflow),
@@ -1685,6 +1688,41 @@ impl AgentWorkspace {
                         }))
                     .child(self.code_font_settings(cx));
             }
+            Section::Layout => {
+                page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("终端面板"));
+                card = card.child(
+                    div().py_4().flex().items_center().gap_3()
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
+                            .child("默认位置")
+                            .child(div().text_size(px(12.)).text_color(rgb(p.text_muted))
+                                .child("启动时终端面板显示的位置。修改后立即生效，也可在面板中临时切换。")))
+                        .child({
+                            let weak = cx.entity().downgrade();
+                            SegmentedControl::new([
+                                SegmentOption::new("下方").debug_selector("terminal-position-bottom"),
+                                SegmentOption::new("右侧").debug_selector("terminal-position-right"),
+                            ])
+                            .id("terminal-default-position")
+                            .selected(usize::from(self.history.terminal_default_position == crate::terminal_ui::Position::Right))
+                            .theme(self.theme)
+                            .on_change(move |index, _, cx| {
+                                let position = if index == 1 {
+                                    crate::terminal_ui::Position::Right
+                                } else {
+                                    crate::terminal_ui::Position::Bottom
+                                };
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.history.terminal_default_position = position;
+                                    this.set_terminal_position(position);
+                                    this.save(cx);
+                                    cx.notify();
+                                });
+                            })
+                            .render()
+                        }),
+                );
+                page = page.child(card);
+            }
             Section::Storage => {
                 page = page.child(
                     div()
@@ -1808,13 +1846,16 @@ impl AgentWorkspace {
                             .child(keycaps(key)),
                     );
                 }
-                let recording = self.provider_settings.terminal_shortcut_recording;
-                let terminal_label =
-                    crate::shortcuts::terminal_shortcut_label(&self.history.terminal_shortcut);
-                let project = shortcut_card()
-                    .child(
+                let mut project = shortcut_card();
+                for action in crate::shortcuts::ProjectAction::ALL {
+                    let recording = self.provider_settings.shortcut_recording == Some(action);
+                    let shortcut_label = action.label(&self.history);
+                    let record_selector = format!("record-{}-shortcut", action.id());
+                    let reset_selector = format!("reset-{}-shortcut", action.id());
+                    project = project.child(
                         div()
                             .py_4()
+                            .when(action != crate::shortcuts::ProjectAction::Terminal, |row| row.border_t_1().border_color(rgb(p.border)))
                             .flex()
                             .flex_wrap()
                             .items_center()
@@ -1826,12 +1867,12 @@ impl AgentWorkspace {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(div().text_size(px(13.)).child("打开项目终端"))
+                                    .child(div().text_size(px(13.)).child(action.title()))
                                     .child(
                                         div()
                                             .text_size(px(11.))
                                             .text_color(rgb(p.text_muted))
-                                            .child("在当前项目目录打开并聚焦终端"),
+                                            .child(action.description()),
                                     ),
                             )
                             .child(
@@ -1841,8 +1882,8 @@ impl AgentWorkspace {
                                     .gap_3()
                                     .child(
                                         div()
-                                            .id("terminal-shortcut-trigger")
-                                            .debug_selector(|| "record-terminal-shortcut".into())
+                                            .id(SharedString::from(format!("{}-shortcut-trigger", action.id())))
+                                            .debug_selector(move || record_selector.clone())
                                             .cursor_pointer()
                                             .rounded(px(6.))
                                             .p_1()
@@ -1862,13 +1903,11 @@ impl AgentWorkspace {
                                                     .text_color(rgb(p.accent))
                                                     .child("请按组合键…")
                                             } else {
-                                                keycaps(terminal_label)
+                                                keycaps(shortcut_label)
                                             })
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.provider_settings
-                                                    .terminal_shortcut_recording = true;
-                                                this.provider_settings.terminal_shortcut_message =
-                                                    None;
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.provider_settings.shortcut_recording = Some(action);
+                                                this.provider_settings.shortcut_message = None;
                                                 window.focus(&this.focus, cx);
                                                 cx.notify();
                                             })),
@@ -1879,21 +1918,15 @@ impl AgentWorkspace {
                                             .size(ButtonSize::Small)
                                             .theme(self.theme)
                                             .render()
-                                            .debug_selector(|| "reset-terminal-shortcut".into())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.history.terminal_shortcut =
-                                                    crate::shortcuts::default_terminal_shortcut();
-                                                this.provider_settings
-                                                    .terminal_shortcut_recording = false;
-                                                this.provider_settings.terminal_shortcut_message =
-                                                    None;
-                                                this.save(cx);
-                                                cx.notify();
-                                            })),
+                                            .id(SharedString::from(format!("reset-{}-shortcut", action.id())))
+                                            .debug_selector(move || reset_selector.clone())
+                                            .on_click(cx.listener(move |this, _, _, cx| this.reset_project_shortcut(action, cx))),
                                     ),
                             ),
-                    )
-                    .child(
+                    );
+                }
+                let recording = self.provider_settings.shortcut_recording.is_some();
+                let project = project.child(
                         div()
                             .py_3()
                             .border_t_1()
@@ -1907,7 +1940,7 @@ impl AgentWorkspace {
                             }),
                     )
                     .when_some(
-                        self.provider_settings.terminal_shortcut_message.clone(),
+                        self.provider_settings.shortcut_message.clone(),
                         |card, message| {
                             card.child(
                                 div()

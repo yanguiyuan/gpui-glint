@@ -156,6 +156,8 @@ impl Remote {
     pub fn managed_run(&self, program: &str, args: &[String]) -> tokio::process::Command {
         const WORKER: &str = r#"import subprocess,sys,signal,threading,os,json
 argv=json.loads(sys.argv[1])
+os.environ.pop('NO_COLOR',None)
+os.environ.update(TERM='xterm-256color',FORCE_COLOR='1',CLICOLOR_FORCE='1',CARGO_TERM_COLOR='always')
 p=subprocess.Popen(argv,start_new_session=True,stdin=subprocess.DEVNULL)
 def stop(*_):
  try: os.killpg(p.pid,signal.SIGKILL)

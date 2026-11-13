@@ -110,11 +110,28 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Position {
+    Bottom,
+    #[default]
+    Right,
+}
+
 #[derive(Default)]
 pub struct State {
     pub open: bool,
     pub bottom: bool,
     terminals: HashMap<PathBuf, Entity<TerminalView>>,
+}
+
+impl State {
+    pub fn new(position: Position) -> Self {
+        Self {
+            bottom: position == Position::Bottom,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -437,6 +454,10 @@ fn color(value: Color, colors: TerminalColors) -> u32 {
         Color::Indexed(index) => ansi_color(index as usize, colors),
         Color::Named(name) => ansi_color(name as usize, colors),
     }
+}
+
+pub(super) fn output_color(value: Color, theme: ThemePreset) -> u32 {
+    color(value, TerminalColors::for_theme(theme))
 }
 
 pub(super) struct TerminalView {
@@ -1599,6 +1620,25 @@ impl EntityInputHandler for TerminalView {
 }
 
 impl AgentWorkspace {
+    pub(super) fn expanded_project_panel(&self, panel: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        div().size_full().min_h_0().flex().flex_col()
+            .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(panel))
+            .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| body.child(self.project_terminal_sidebar(cx)))
+    }
+
+    pub(super) fn set_terminal_position(&mut self, position: Position) {
+        self.terminal_ui.bottom = position == Position::Bottom;
+        if self.terminal_ui.open {
+            if self.terminal_ui.bottom {
+                self.project_actions.panel = false;
+            } else {
+                self.file_preview.open = false;
+                self.edits_ui.open = false;
+                self.git_ui.open = false;
+            }
+        }
+    }
+
     pub(super) fn sync_terminal_theme(&self, cx: &mut Context<Self>) {
         for terminal in self.terminal_ui.terminals.values() {
             terminal.update(cx, |terminal, cx| terminal.set_theme(self.theme, cx));
@@ -1627,8 +1667,17 @@ impl AgentWorkspace {
             self.terminal_ui.terminals.insert(root.clone(), terminal);
         }
         self.page = crate::Page::Chat;
-        self.file_preview.open = false;
-        self.edits_ui.open = false;
+        // Expanded project views keep their content above the terminal, even
+        // when the user's usual terminal position is the right sidebar.
+        if (self.file_preview.open && self.file_preview.expanded)
+            || (self.edits_ui.open && self.edits_ui.expanded)
+        {
+            self.terminal_ui.bottom = true;
+        }
+        if !self.terminal_ui.bottom {
+            self.file_preview.open = false;
+            self.edits_ui.open = false;
+        }
         self.git_ui.open = false;
         self.terminal_ui.open = true;
         if self.terminal_ui.bottom { self.project_actions.panel = false; }
@@ -1649,9 +1698,7 @@ impl AgentWorkspace {
                 if self.terminal_ui.bottom { "移到右侧" } else { "移到底部" }).theme(self.theme).render()
                 .debug_selector(|| "project-terminal-dock".into())
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.terminal_ui.bottom = !this.terminal_ui.bottom;
-                    if this.terminal_ui.bottom { this.project_actions.panel = false; }
-                    else { this.file_preview.open = false; this.edits_ui.open = false; this.git_ui.open = false; }
+                    this.set_terminal_position(if this.terminal_ui.bottom { Position::Right } else { Position::Bottom });
                     cx.notify();
                 })))
             .child(IconButton::new(Icon::Refresh, "重启项目终端").theme(self.theme).render()
@@ -1668,7 +1715,12 @@ impl AgentWorkspace {
                     cx.notify();
                 })))
             .child(IconButton::new(Icon::Close, "隐藏终端（继续运行）").theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| { this.terminal_ui.open = false; cx.notify(); })));
+                .debug_selector(|| "project-terminal-hide".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.terminal_ui.open = false;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                })));
         terminal_panel(terminal, title, controls, self.theme, self.terminal_ui.bottom, self.right_sidebar_width)
             .debug_selector(|| "project-terminal-sidebar".into())
     }

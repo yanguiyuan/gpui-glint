@@ -279,6 +279,12 @@ mod tests {
             assert!(panel.summary_scroll.offset().y < px(0.));
             assert!(!panel.is_expanded());
         });
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        panel.read_with(window, |panel, _| assert!(panel.is_expanded()));
+        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        panel.read_with(window, |panel, _| assert!(!panel.is_expanded()));
         panel.update(window, |panel, cx| {
             panel.set_expanded(true, cx);
             panel.set_summary("已思考 12.3 s", cx);

@@ -58,11 +58,13 @@ impl AgentWorkspace {
                 .disabled(session.project.is_none()),
             CommandItem::new("workspace-diff", "打开 Git 工作区 Diff 侧栏")
                 .icon(Icon::GitBranch)
+                .shortcut(crate::shortcuts::ProjectAction::Diff.label(&self.history))
                 .group("项目")
                 .keywords("diff 差异 变更 工作区 暂存 workspace changes")
                 .disabled(session.project.is_none()),
             CommandItem::new("project-files", "打开项目目录预览侧栏")
                 .icon(Icon::Folder)
+                .shortcut(crate::shortcuts::ProjectAction::Preview.label(&self.history))
                 .group("项目")
                 .keywords("文件 目录 预览 浏览 file preview explorer")
                 .disabled(session.project.is_none()),
