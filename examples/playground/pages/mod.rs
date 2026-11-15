@@ -28,3 +28,6 @@ pub use documents::DocumentsPage;
 
 mod commands;
 pub use commands::CommandsPage;
+
+mod masonry;
+pub use masonry::MasonryPage;

@@ -77,7 +77,7 @@ fn main() {
 | 基础表单 | `Checkbox`、`RadioOption`、`Switch`、`Slider`、`Stepper` |
 | 菜单与命令 | `GroupedDropdown`、`CommandPalette` |
 | 日期与时间 | `DatePicker`、`TimePicker`、`DateTimePicker`、`DateRangePicker`、`TimeRangePicker`、`DateTimeRangePicker` |
-| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel` |
+| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel`、`ImageMasonry` |
 | 文档与图表 | `DocumentEditor`、`MermaidDiagram`、`GitGraph` |
 | 对话输入 | `Composer`、`PromptEditor` |
 | 状态与身份 | `ToastHost`、`Avatar`、`AvatarGroup`、`ContentBadge`、`TagBadge`、`CountBadge`、`OverlayBadge`、`StatusBadge` |

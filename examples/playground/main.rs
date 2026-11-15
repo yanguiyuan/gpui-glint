@@ -14,7 +14,7 @@ use gpui_glint::components::{
 use gpui_glint::theme::ThemePreset;
 
 use pages::{
-    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, IconsPage, InputsPage,
+    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, IconsPage, InputsPage, MasonryPage,
     LayoutPage, OverviewPage, TablesPage, TabsPage, ThemeShowcase,
 };
 
@@ -31,11 +31,12 @@ enum Page {
     Tables,
     Documents,
     Tabs,
+    Masonry,
     Themes,
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 12] = [
+    const ALL: [(Self, &'static str); 13] = [
         (Self::Overview, "概览"),
         (Self::Buttons, "按钮"),
         (Self::Icons, "图标"),
@@ -47,6 +48,7 @@ impl Page {
         (Self::Tables, "表格"),
         (Self::Documents, "文档编辑器"),
         (Self::Tabs, "标签页"),
+        (Self::Masonry, "图片瀑布流"),
         (Self::Themes, "主题"),
     ];
 }
@@ -66,6 +68,7 @@ struct Playground {
     tables: Entity<TablesPage>,
     documents: Entity<DocumentsPage>,
     tabs: Entity<TabsPage>,
+    masonry: Entity<MasonryPage>,
     _theme_subscription: Subscription,
     _commands_subscription: Subscription,
 }
@@ -84,6 +87,7 @@ impl Playground {
             Page::Tables => self.tables.clone().into_any_element(),
             Page::Documents => self.documents.clone().into_any_element(),
             Page::Tabs => self.tabs.clone().into_any_element(),
+            Page::Masonry => self.masonry.clone().into_any_element(),
             Page::Themes => {
                 let playground = cx.entity();
                 ThemeShowcase::new(self.theme)
@@ -132,6 +136,7 @@ impl Playground {
         self.documents
             .update(cx, |page, cx| page.set_theme(theme, cx));
         self.tabs.update(cx, |page, cx| page.set_theme(theme, cx));
+        self.masonry.update(cx, |page, cx| page.set_theme(theme, cx));
         cx.notify();
     }
 
@@ -394,6 +399,7 @@ pub fn open(cx: &mut App) {
     let tables = cx.new(|cx| TablesPage::new(theme, cx));
     let documents = cx.new(|cx| DocumentsPage::new(theme, cx));
     let tabs = cx.new(|cx| TabsPage::new(theme, cx));
+    let masonry = cx.new(|cx| MasonryPage::new(theme, cx));
 
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     cx.open_window(
@@ -431,6 +437,7 @@ pub fn open(cx: &mut App) {
                     tables,
                     documents,
                     tabs,
+                    masonry,
                     _theme_subscription: theme_subscription,
                     _commands_subscription: commands_subscription,
                 }

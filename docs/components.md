@@ -822,3 +822,36 @@ calendar.update(cx, |calendar, cx| calendar.set_markers(markers, cx));
 开启 `context_on_at(true)` 后，面板会随光标处 `@关键词` 按候选名称和描述实时过滤，忽略大小写；未匹配时显示空状态。`register_context_tokens([(token, color)], cx)` 可为恢复的草稿注册 `$技能名` 高亮，不插入或改变文字。只有注册的 `$` 标记会高亮，普通 shell 变量保持原样。`PromptEditor::selection_range()` 和 `replace_range(range, text, cx)` 提供 UTF-8 边界校验的光标补全接口。
 
 `ComposerEvent::ContextQueryChanged(query)` 在面板打开与光标处查询变化时上报（`context_filter(cx)` 可读取当前值）。宿主可用它从缓存挑选有限的候选，再更新分组；不要在输入回调或 hover 中同步遍历文件系统。Glint Agent 的项目文件索引在后台建立，输入时仅过滤缓存。
+
+## 图片瀑布流
+
+`ImageMasonry` 按最短列排列图片，根据容器宽度自动调整列数，保持图片原始比例，不裁切内容。它自带垂直滚动视口，宿主需提供明确的可用高度。完整离线示例：`cargo run --example image_masonry`；也可在 Playground 的「图片瀑布流」页预览。
+
+```rust
+use gpui_glint::components::{ImageMasonry, ImageMasonryItem, ImageMasonryEvent};
+
+let gallery = cx.new(ImageMasonry::new);
+gallery.update(cx, |gallery, cx| {
+    gallery.set_theme(theme, cx);
+    // 最小列宽、最多列数、横纵间距（像素）
+    gallery.set_layout(200., 5, 12., cx);
+    gallery.set_items(vec![
+        ImageMasonryItem::new("cover", std::path::PathBuf::from("/images/cover.jpg"), 1200, 1600)
+            .title("封面"),
+        ImageMasonryItem::new("landscape", "https://example.com/landscape.jpg", 1600, 900),
+    ], cx);
+});
+// 在有界容器中使用，例如 div().h(px(600.)).child(gallery.clone())。
+cx.subscribe(&gallery, |_, _, event: &ImageMasonryEvent, _| {
+    let ImageMasonryEvent::Selected { id, index } = event;
+    // 宿主根据 id / 原始数据中的 index 打开预览或执行选择操作。
+}).detach();
+```
+
+图片源支持 GPUI `ImageSource`，包括 URL、本地 `PathBuf`、资源及已解码的 `RenderImage`。宿主应提供真实宽高，在图片加载前预留位置，避免加载成功或失败时重排；零宽高按正方形处理。每项必须使用唯一、稳定的 `id`，标题可省略，长标题单行截断。加载中及失败时在同一图片区域显示占位。
+
+`set_items` 替换内容并回到顶部；`append_items` 追加下一页并保留滚动位置，已有卡片在容器宽度不变时保持原位置。宿主负责分页、请求取消和图片尺寸获取。`set_loading(true, cx)` 在空列表显示加载状态，已有图片时显示「正在加载更多…」页尾；`set_selected` 可从外部同步选中状态。空列表显示「暂无图片」。组件不会自动打开预览，也不会请求下一页。
+
+组件默认开启虚拟化：仅为视口及上下各 400px 的预加载区域创建卡片、发起图片加载。`set_overscan(pixels, cx)` 可调整预加载范围；`scroll_to("id", cx)` 可直接定位图片。侧边滚动条支持拖动和跳转。滚动查询按各列二分查找，不逐项扫描全部数据；几何布局在宽度或布局参数变化时重算，分页追加仅计算新增项，缩放和密度切换保留当前阅读位置。
+
+URL / 路径图片使用组件独立缓存，离开预加载区域后移出缓存，避免浏览过的图片一直堆积；GPUI 已在途的读取仍可能完成。传入 `RenderImage` / `Image` 时，其原始图片数据由宿主和数据列表持有；大量数据建议传 URL / 路径及适合显示大小的缩略图，而不是提前解码所有原图。虚拟化减少活跃卡片和资源加载，数据记录及几何索引仍占 O(n) 内存。离线示例提供 24 张 / 10,000 张切换和两种显示密度。
