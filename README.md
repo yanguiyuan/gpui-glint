@@ -77,7 +77,7 @@ fn main() {
 | 基础表单 | `Checkbox`、`RadioOption`、`Switch`、`Slider`、`Stepper` |
 | 菜单与命令 | `GroupedDropdown`、`CommandPalette` |
 | 日期与时间 | `DatePicker`、`TimePicker`、`DateTimePicker`、`DateRangePicker`、`TimeRangePicker`、`DateTimeRangePicker` |
-| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel`、`ImageMasonry`、`VideoPlayer`（可选） |
+| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel`、`ImageMasonry`、`HtmlReader`、`VideoPlayer`（可选） |
 | 文档与图表 | `DocumentEditor`、`MermaidDiagram`、`GitGraph` |
 | 对话输入 | `Composer`、`PromptEditor` |
 | 状态与身份 | `ToastHost`、`Avatar`、`AvatarGroup`、`ContentBadge`、`TagBadge`、`CountBadge`、`OverlayBadge`、`StatusBadge` |
@@ -216,3 +216,17 @@ tests/               集成测试与性能基准
 ### Glint Vault
 
 `crates/glint-vault` 提供本地加密密码箱、可嵌入的原生页面和 Chrome / Edge 扩展。独立运行：`cargo run -p glint-vault`；Glint API / Agent 可从侧栏钥匙图标打开同一个密码箱。集成与共享存储说明见 [Glint Vault](crates/glint-vault/README.md)。
+
+### HTML 小说正文
+
+`HtmlReader` 是原生只读组件，不依赖 WebView，可在支持 GPUI 的平台使用。适合以 `<p>` 为主的 HTML 章节，支持 HTML 实体、`<br>` 和标题；内联标签保留文字，源 CSS 不影响主题，不执行脚本，也不请求外部资源。
+
+```rust,ignore
+let reader = cx.new(|cx| HtmlReader::new("<p>第一段正文。</p><p>第二段正文。</p>", cx));
+reader.update(cx, |reader, cx| reader.set_theme(theme, cx));
+// 换章并回到顶部：reader.set_html(html, cx)
+// 纯文本：reader.set_text(text, cx)
+// 字号：reader.set_font_size(18., cx)
+```
+
+`ImageMasonry` 的滚动续页由宿主调用 `set_has_more(true, cx)` 开启，然后监听 `ImageMasonryEvent::LoadMore` 取下一页。`set_loading(true, cx)` 显示加载态，`append_items` 追加后允许下一次触底请求；末页或失败时关闭 `has_more`，失败后的重试由宿主提供。

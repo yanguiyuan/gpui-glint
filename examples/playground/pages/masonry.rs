@@ -28,7 +28,9 @@ impl MasonryPage {
             gallery.set_items(samples.clone(), cx);
         });
         cx.subscribe(&gallery, |this, _, event: &ImageMasonryEvent, cx| {
-            let ImageMasonryEvent::Selected { index, .. } = event;
+            let ImageMasonryEvent::Selected { index, .. } = event else {
+                return;
+            };
             this.selected = format!("已选择 · {}", sample_title(*index));
             cx.notify();
         })

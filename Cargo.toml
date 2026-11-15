@@ -59,6 +59,7 @@ image = { version = "0.25", default-features = false }
 resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 chrono = "0.4"
 unicode-segmentation = "1.13"
+html5ever = "0.38"
 
 [dev-dependencies]
 rand = "0.9"

@@ -3580,6 +3580,7 @@ dependencies = [
  "glint-plugin-registry",
  "gpui-ce",
  "gpui_ce_platform",
+ "html5ever",
  "image",
  "irosashi",
  "mermaid-rs-renderer",

@@ -2,13 +2,64 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src http: https: glintvideo:; img-src data:">
 <style>
-:root{color-scheme:dark;--accent:#3a9cff;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#f5f6f8;background:#101318}
-*{box-sizing:border-box}body{margin:0;overflow:hidden}#player{height:100vh;display:flex;flex-direction:column;outline:none}#stage{position:relative;flex:1;min-height:0;background:#080a0e;display:flex;align-items:center;justify-content:center}video{width:100%;height:100%;object-fit:contain}#status{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;pointer-events:none;color:#a4aab5;text-align:center;padding:24px;background:#101318}#status:empty{display:none}#status svg{width:40px;height:40px;opacity:.6}#status strong{font-size:15px;font-weight:500;color:#dce0e6}#status span{font-size:12px;line-height:1.6;max-width:440px}#center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}#center button{pointer-events:auto;background:#101318b8;border:1px solid #ffffff35;backdrop-filter:blur(12px);width:58px;height:58px;border-radius:50%;padding:17px}#center[hidden]{display:none}#controls{flex-shrink:0;padding:12px 16px 14px;background:#171b22;border-top:1px solid #ffffff0d}#timeline{width:100%;margin:0 0 10px;height:4px;display:block}#bar{display:flex;align-items:center;gap:10px;min-width:0}button,select{font:inherit;color:inherit;border:0;background:transparent;border-radius:6px}button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}button:hover,select:hover{background:#ffffff13}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled,input:disabled{opacity:.35;cursor:default}svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}#clock{white-space:nowrap;font-size:11px;font-variant-numeric:tabular-nums;color:#b8bfca}#title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#a4acb8;font-size:11px;text-align:center;padding:0 8px}#volume{width:70px;margin:0}select{padding:5px 6px;font-size:11px;cursor:pointer}input[type=range]{accent-color:var(--accent);cursor:pointer}#timeline{appearance:none;border-radius:3px;background:linear-gradient(to right,var(--accent) var(--progress,0%),#ffffff26 var(--progress,0%))}#timeline::-webkit-slider-thumb{appearance:none;width:10px;height:10px;border-radius:50%;background:#fff}#timeline::-moz-range-thumb{width:10px;height:10px;border:0;border-radius:50%;background:#fff}#volume{height:4px}#bar .separator{width:1px;height:16px;background:#ffffff18;margin:0 2px}#player:fullscreen{background:#080a0e}#player:fullscreen #stage{flex:1}@media(max-width:520px){#title,#volume,#bar .separator{display:none}#bar{gap:5px}#clock{flex:1}#controls{padding:10px 12px}}
+:root {
+  color-scheme: dark;
+  --canvas:#141416; --panel:#212125; --surface:#212125; --subtle:#303036;
+  --border:#38383e; --text:#f2f2f7; --muted:#9e9ea4; --accent:#0a84ff; --tint:#1c3252;
+  font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  color:var(--text); background:var(--canvas);
+}
+* { box-sizing:border-box; }
+body { margin:0; overflow:hidden; }
+#player { height:100vh; display:flex; flex-direction:column; outline:none; overflow:hidden; border:1px solid var(--border); border-radius:10px; }
+#stage { position:relative; flex:1; min-height:0; background:#000; display:flex; align-items:center; justify-content:center; }
+video { width:100%; height:100%; object-fit:contain; }
+#status { position:absolute; inset:0; display:flex; flex-direction:column; gap:10px; align-items:center; justify-content:center; pointer-events:none; color:var(--muted); text-align:center; padding:24px; background:var(--canvas); }
+#status:empty { display:none; }
+#status svg { width:32px; height:32px; margin-bottom:4px; opacity:.65; }
+#status strong { font-size:14px; font-weight:500; color:var(--text); }
+#status span { font-size:12px; line-height:1.6; max-width:440px; }
+#center { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+#center button { pointer-events:auto; width:46px; height:46px; border-radius:50%; background:var(--panel); border:1px solid var(--border); box-shadow:0 4px 20px #0003; opacity:.92; }
+#center button:hover { opacity:1; transform:scale(1.04); }
+#center button svg { width:22px; height:22px; margin-left:2px; }
+#center[hidden] { display:none; }
+#controls { flex-shrink:0; padding:4px 14px 10px; background:var(--panel); border-top:1px solid var(--border); }
+#timeline { width:100%; margin:0 0 3px; display:block; }
+#bar { display:flex; align-items:center; gap:8px; min-width:0; }
+button,select { font:inherit; color:var(--text); border:0; background:transparent; border-radius:6px; }
+button { width:30px; height:30px; padding:6px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; flex-shrink:0; transition:background .12s,transform .12s; }
+button:hover,select:hover { background:var(--subtle); }
+#play { background:var(--tint); color:var(--accent); }
+#play:hover { background:var(--subtle); }
+button:focus-visible,select:focus-visible,input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+button:disabled,input:disabled { opacity:.35; cursor:default; }
+svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+#clock { white-space:nowrap; font-size:11px; font-variant-numeric:tabular-nums; color:var(--muted); margin-left:2px; }
+#title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:11px; padding:0 12px; }
+#volume { width:64px; margin:0 4px 0 -2px; }
+select { appearance:none; padding:5px 22px 5px 8px; font-size:11px; font-variant-numeric:tabular-nums; cursor:pointer; min-width:58px; height:30px; }
+#speed-wrap { position:relative; display:flex; align-items:center; }
+#speed-wrap>svg { position:absolute; pointer-events:none; right:5px; width:12px; height:12px; color:var(--muted); }
+option { background:var(--panel); color:var(--text); }
+input[type=range] { appearance:none; -webkit-appearance:none; height:16px; border:0; padding:0; background:transparent; cursor:pointer; accent-color:var(--accent); }
+input[type=range]::-webkit-slider-runnable-track { height:3px; border-radius:2px; background:linear-gradient(to right,var(--accent) var(--progress,0%),var(--subtle) var(--progress,0%)); }
+input[type=range]::-webkit-slider-thumb { appearance:none; -webkit-appearance:none; width:9px; height:9px; margin-top:-3px; border:0; border-radius:50%; background:var(--accent); }
+input[type=range]::-moz-range-track { height:3px; border-radius:2px; background:linear-gradient(to right,var(--accent) var(--progress,0%),var(--subtle) var(--progress,0%)); }
+input[type=range]::-moz-range-thumb { width:9px; height:9px; border:0; border-radius:50%; background:var(--accent); }
+#timeline:hover::-webkit-slider-runnable-track { height:4px; }
+#timeline:hover::-webkit-slider-thumb { width:10px; height:10px; }
+#bar .separator { width:1px; height:14px; background:var(--border); margin:0 2px; }
+#player:fullscreen { background:#000; border:0; border-radius:0; }
+#player:fullscreen #stage { flex:1; }
+@media(max-width:600px) { #title { display:none; } #clock { flex:1; } #bar { gap:5px; } #controls { padding:4px 10px 8px; } }
+@media(max-width:360px) { #volume,#bar .separator { display:none; } }
+@media(prefers-reduced-motion:reduce) { button { transition:none; } }
 </style></head><body>
 <div id="player" tabindex="0" role="region" aria-label="视频播放器">
 <div id="stage"><video id="video" playsinline preload="metadata" tabindex="-1"></video><div id="status" role="status"></div><div id="center" hidden><button id="centerPlay" aria-label="播放视频"></button></div></div>
 <div id="controls"><input id="timeline" type="range" min="0" max="1" step="0.05" value="0" aria-label="播放进度" disabled>
-<div id="bar"><button id="play" aria-label="播放" disabled></button><span id="clock">00:00 / 00:00</span><span id="title"></span><button id="mute" aria-label="静音"></button><input id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量"><span class="separator"></span><select id="speed" aria-label="播放速度"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select><button id="fullscreen" aria-label="全屏"></button></div></div></div>
+<div id="bar"><button id="play" aria-label="播放" disabled></button><span id="clock">00:00 / 00:00</span><span id="title"></span><button id="mute" aria-label="静音"></button><input id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量"><span class="separator"></span><span id="speed-wrap"><select id="speed" aria-label="播放速度"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg></span><button id="fullscreen" aria-label="全屏"></button></div></div></div>
 <script>
 'use strict';
 const $=id=>document.getElementById(id), player=$('player');let video=$('video');
@@ -20,7 +71,8 @@ const duration=()=>finite(video.duration), position=()=>finite(video.currentTime
 const emit=(kind,extra={})=>window.ipc.postMessage(JSON.stringify({kind,generation,position:position(),duration:duration(),playing:!video.paused&&!video.ended,ended:video.ended,volume:video.volume,muted:video.muted,rate:video.playbackRate,...extra}));
 function time(seconds){seconds=Math.floor(finite(seconds));const h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return(h?h+':':'')+(h?String(m).padStart(2,'0'):String(m).padStart(2,'0'))+':'+String(s).padStart(2,'0');}
 function status(title,detail){const el=$('status');el.replaceChildren();if(!title)return;el.innerHTML=icon('video');const heading=document.createElement('strong');heading.textContent=title;el.appendChild(heading);if(detail){const text=document.createElement('span');text.textContent=detail;el.appendChild(text);}}
-function update(){const active=!!source;$('play').disabled=!active;$('play').innerHTML=icon(video.paused?'play':'pause');$('play').ariaLabel=video.paused?'播放':'暂停';$('mute').innerHTML=icon(video.muted||video.volume===0?'mute':'volume');$('mute').ariaLabel=video.muted?'取消静音':'静音';$('volume').value=video.muted?0:video.volume;if(!Array.from($('speed').options).some(option=>option.value===String(video.playbackRate))){let option=$('customRate');if(!option){option=new Option();option.id='customRate';$('speed').add(option);}option.value=String(video.playbackRate);option.text=video.playbackRate+'×';}$('speed').value=String(video.playbackRate);const length=duration();$('timeline').disabled=!length;$('timeline').max=length||1;if(!scrubbing)$('timeline').value=position();const current=scrubbing?Number($('timeline').value):position();$('timeline').style.setProperty('--progress',(length?current/length*100:0)+'%');$('clock').textContent=time(current)+' / '+(Number.isFinite(video.duration)?time(length):(active&&video.readyState?'直播':'00:00'));$('center').hidden=!active||!video.paused||video.readyState<2||!!video.error;}
+function applyTheme(theme){if(!theme)return;const root=document.documentElement;root.style.colorScheme=theme.scheme==='light'?'light':'dark';for(const key of ['canvas','panel','surface','subtle','border','text','muted','accent','tint']){if(/^#[0-9a-f]{6}$/i.test(theme[key]))root.style.setProperty('--'+key,theme[key]);}}
+function update(){const active=!!source;$('play').disabled=!active;$('play').innerHTML=icon(video.paused?'play':'pause');$('play').ariaLabel=video.paused?'播放':'暂停';$('mute').innerHTML=icon(video.muted||video.volume===0?'mute':'volume');$('mute').ariaLabel=video.muted?'取消静音':'静音';$('volume').value=video.muted?0:video.volume;$('volume').style.setProperty('--progress',(video.muted?0:video.volume*100)+'%');if(!Array.from($('speed').options).some(option=>option.value===String(video.playbackRate))){let option=$('customRate');if(!option){option=new Option();option.id='customRate';$('speed').add(option);}option.value=String(video.playbackRate);option.text=video.playbackRate+'×';}$('speed').value=String(video.playbackRate);const length=duration();$('timeline').disabled=!length;$('timeline').max=length||1;if(!scrubbing)$('timeline').value=position();const current=scrubbing?Number($('timeline').value):position();$('timeline').style.setProperty('--progress',(length?current/length*100:0)+'%');$('clock').textContent=time(current)+' / '+(Number.isFinite(video.duration)?time(length):(active&&video.readyState?'直播':'00:00'));$('center').hidden=!active||!video.paused||video.readyState<2||!!video.error;}
 async function play(){desiredPlaying=true;if(!source||!visible)return;const current=video,token=generation;try{await current.play();}catch(error){if(current!==video||token!==generation)return;desiredPlaying=false;update();if(error.name!=='AbortError')emit('error',{message:error.name==='NotAllowedError'?'请点击播放按钮开始播放':error.message});}}
 function pause(){desiredPlaying=false;video.pause();update();}
 function seek(value){if(duration()){video.currentTime=Math.min(duration(),Math.max(0,value));pendingSeek=null;}else pendingSeek=value;update();}
@@ -32,8 +84,8 @@ $('timeline').oninput=()=>{scrubbing=true;update();};$('timeline').onchange=()=>
 $('fullscreen').innerHTML=icon('fullscreen');$('fullscreen').onclick=()=>emit('fullscreen');
 player.onkeydown=event=>{if(event.target.matches('input,select,button'))return;if([' ','k','ArrowLeft','ArrowRight','m','f'].includes(event.key)){event.preventDefault();if(event.key===' '||event.key==='k')toggle();if(event.key==='ArrowLeft')seek(position()-5);if(event.key==='ArrowRight')seek(position()+5);if(event.key==='m')video.muted=!video.muted;if(event.key==='f')emit('fullscreen');}};
 window.glintVideo={
-load(config){pause();video.removeAttribute('src');video.load();generation=config.generation;source=config.source;const next=document.createElement('video');next.id='video';next.playsInline=true;next.preload='metadata';next.tabIndex=-1;video.replaceWith(next);video=next;bindVideo(video,generation);pendingSeek=config.position||null;$('title').textContent=config.title||'';document.documentElement.style.setProperty('--accent',config.accent);video.volume=config.volume;video.muted=config.muted;video.defaultPlaybackRate=config.rate;video.playbackRate=config.rate;video.loop=config.looped;visible=config.visible;if(!source){status('选择一个视频','支持本地文件与网络视频');update();return;}status('正在载入视频…','');video.src=source;video.load();if(config.playing&&visible)play();update();},
-command(config){switch(config.action){case 'title':$('title').textContent=config.value;break;case 'play':play();break;case 'pause':pause();break;case 'seek':seek(config.value);break;case 'volume':video.volume=config.value;break;case 'mute':video.muted=config.value;break;case 'rate':video.playbackRate=config.value;break;case 'loop':video.loop=config.value;break;case 'visible':visible=config.value;if(!visible)pause();break;case 'accent':document.documentElement.style.setProperty('--accent',config.value);break;}update();}
+load(config){pause();video.removeAttribute('src');video.load();generation=config.generation;source=config.source;const next=document.createElement('video');next.id='video';next.playsInline=true;next.preload='metadata';next.tabIndex=-1;video.replaceWith(next);video=next;bindVideo(video,generation);pendingSeek=config.position||null;$('title').textContent=config.title||'';$('title').title=config.title||'';applyTheme(config.theme);video.volume=config.volume;video.muted=config.muted;video.defaultPlaybackRate=config.rate;video.playbackRate=config.rate;video.loop=config.looped;visible=config.visible;if(!source){status('选择一个视频','支持本地文件与网络视频');update();return;}status('正在载入视频…','');video.src=source;video.load();if(config.playing&&visible)play();update();},
+command(config){switch(config.action){case 'title':$('title').textContent=config.value;$('title').title=config.value;break;case 'play':play();break;case 'pause':pause();break;case 'seek':seek(config.value);break;case 'volume':video.volume=config.value;break;case 'mute':video.muted=config.value;break;case 'rate':video.playbackRate=config.value;break;case 'loop':video.loop=config.value;break;case 'visible':visible=config.value;if(!visible)pause();break;case 'theme':applyTheme(config.value);break;case 'accent':document.documentElement.style.setProperty('--accent',config.value);break;}update();}
 };
 function bindVideo(element,token){const on=(name,handler)=>element.addEventListener(name,event=>{if(element===video&&token===generation)handler(event);});
 on('loadedmetadata',()=>{status('','');if(pendingSeek!==null)seek(pendingSeek);update();emit('loaded',{width:video.videoWidth,height:video.videoHeight});});

@@ -110,6 +110,24 @@ struct Message {
 fn one() -> f64 {
     1.
 }
+/// Send the same semantic palette used by GPUI controls to the native surface.
+fn theme_config(theme: ThemePreset) -> Value {
+    let palette = theme.palette();
+    let hex = |color: u32| format!("#{color:06x}");
+    json!({
+        "scheme": if theme.is_dark() { "dark" } else { "light" },
+        "canvas": hex(palette.canvas),
+        "panel": hex(palette.panel),
+        "surface": hex(palette.surface),
+        "subtle": hex(palette.surface_subtle),
+        "border": hex(palette.border),
+        "text": hex(palette.text),
+        "muted": hex(palette.text_muted),
+        "accent": hex(palette.accent),
+        "tint": hex(palette.accent_tint),
+    })
+}
+
 fn nonnegative(value: f64) -> f64 {
     if value.is_finite() { value.max(0.) } else { 0. }
 }
@@ -307,11 +325,7 @@ impl VideoPlayer {
     }
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) -> Result<(), String> {
         self.theme = theme;
-        self.command(
-            "accent",
-            json!(format!("#{:06x}", theme.palette().accent)),
-            cx,
-        )
+        self.command("theme", theme_config(theme), cx)
     }
     /// Hiding pauses playback. Showing again does not automatically resume.
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) -> Result<(), String> {
@@ -343,7 +357,7 @@ impl VideoPlayer {
         if !self.ready {
             return Ok(());
         }
-        let config = json!({"generation":self.generation,"source":self.source,"position":self.pending_seek,"title":self.title,"volume":self.state.volume,"muted":self.state.muted,"rate":self.state.playback_rate,"looped":self.looped,"playing":self.state.playing,"visible":self.visible,"accent":format!("#{:06x}",self.theme.palette().accent)});
+        let config = json!({"generation":self.generation,"source":self.source,"position":self.pending_seek,"title":self.title,"volume":self.state.volume,"muted":self.state.muted,"rate":self.state.playback_rate,"looped":self.looped,"playing":self.state.playing,"visible":self.visible,"theme":theme_config(self.theme)});
         self.browser
             .read(cx)
             .raw()
@@ -598,6 +612,26 @@ fn read_file_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_controls_receive_every_theme_palette() {
+        for theme in ThemePreset::ALL {
+            let config = theme_config(theme);
+            assert_eq!(
+                config["scheme"],
+                if theme.is_dark() { "dark" } else { "light" }
+            );
+            assert_eq!(config["panel"], format!("#{:06x}", theme.palette().panel));
+            assert_eq!(config["text"], format!("#{:06x}", theme.palette().text));
+            for key in [
+                "canvas", "panel", "surface", "subtle", "border", "text", "muted", "accent", "tint",
+            ] {
+                assert_eq!(config[key].as_str().unwrap().len(), 7);
+                assert!(HTML.contains(&format!("--{key}")), "CSS must use {key}");
+            }
+        }
+        assert!(HTML.contains("case 'theme':applyTheme(config.value)"));
+    }
+
     #[test]
     fn ranges_are_bounded_and_reject_invalid_requests() {
         assert_eq!(byte_range(Some("bytes=0-1"), 100), Ok((0, 1)));

@@ -22,9 +22,11 @@ mod json_folding;
 mod layout;
 mod plugin_card;
 pub use calendar::{Calendar, CalendarEvent};
+mod html_reader;
 mod mermaid;
 mod popover;
 mod rich_text;
+pub use html_reader::HtmlReader;
 mod scrollbar;
 mod search_highlight;
 mod select;
@@ -72,8 +74,8 @@ pub use text_reference::TextReferenceResolver;
 pub use theme_selector::{ThemeSelector, ThemeSelectorEvent};
 pub use tooltip::Tooltip;
 pub use tree_list::{TreeList, TreeListNode, TreeListRow};
-pub use wallpaper::wallpaper;
 pub use tree_list_item::{TreeDrop, TreeDropPlacement, TreeListItem};
+pub use wallpaper::wallpaper;
 
 pub use code_card::{CodeCard, CodeCardEvent, CodeColors, CodeSelection, bind_code_card_keys};
 
