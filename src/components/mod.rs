@@ -72,6 +72,7 @@ pub use text_reference::TextReferenceResolver;
 pub use theme_selector::{ThemeSelector, ThemeSelectorEvent};
 pub use tooltip::Tooltip;
 pub use tree_list::{TreeList, TreeListNode, TreeListRow};
+pub use wallpaper::wallpaper;
 pub use tree_list_item::{TreeDrop, TreeDropPlacement, TreeListItem};
 
 pub use code_card::{CodeCard, CodeCardEvent, CodeColors, CodeSelection, bind_code_card_keys};

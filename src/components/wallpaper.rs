@@ -11,7 +11,10 @@ static CACHE: LazyLock<Mutex<HashMap<&'static str, Arc<RenderImage>>>> =
 
 /// Soft wallpaper behind the translucent dark materials. The artwork is rendered
 /// once per preset; controls remain sharp and opaque over the blurred color fields.
-pub(crate) fn wallpaper(theme: ThemePreset) -> Div {
+///
+/// Exposed so screens outside [`crate::components::AppLayout`] — a sign-in page,
+/// for instance — can sit on the same backdrop as the workspace.
+pub fn wallpaper(theme: ThemePreset) -> Div {
     let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
     let image = cache.entry(theme.id()).or_insert_with(|| render(theme));
     div()
