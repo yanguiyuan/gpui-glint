@@ -28,7 +28,10 @@ pub enum Status {
 
 impl Status {
     pub fn active(self) -> bool {
-        matches!(self, Self::Running | Self::WaitingApproval | Self::WaitingInput)
+        matches!(
+            self,
+            Self::Running | Self::WaitingApproval | Self::WaitingInput
+        )
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -517,7 +520,11 @@ mod tests {
                                 json!({"path":"denied.txt","content":"must not write"}),
                             ),
                             ("nested", "subagent", json!({"task":"must not run"})),
-                            ("ask", "ask_question", json!({"question":"Which approach?","options":["A","B"]})),
+                            (
+                                "ask",
+                                "ask_question",
+                                json!({"question":"Which approach?","options":["A","B"]}),
+                            ),
                         ],
                         _ => vec![],
                     };
@@ -564,7 +571,11 @@ mod tests {
                         "child checklist must not update the parent panel"
                     );
                     match event {
-                        ToolEvent::Approval { call, respond, agent_id } => {
+                        ToolEvent::Approval {
+                            call,
+                            respond,
+                            agent_id,
+                        } => {
                             assert_eq!(call.name, "write_file");
                             assert!(agent_id.is_some());
                             respond.send(false).unwrap();
@@ -585,7 +596,9 @@ mod tests {
             assert_eq!(trace.status, Status::Completed);
             assert_eq!(trace.task, "Inspect the project");
             assert_eq!(trace.tools.len(), 4);
-            assert!(trace.tools.iter().any(|t| t.call.name == "ask_question" && t.success && t.result.contains("B-user-answer")));
+            assert!(trace.tools.iter().any(|t| t.call.name == "ask_question"
+                && t.success
+                && t.result.contains("B-user-answer")));
             assert_eq!(trace.todos[0].content, "child-plan-sentinel");
             assert_eq!(
                 parent_todos.lock().unwrap()[0].content,

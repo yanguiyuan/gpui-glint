@@ -1159,7 +1159,8 @@ impl Composer {
     }
 
     pub fn discard_scoped_queue(&mut self, scope: &str, cx: &mut Context<Self>) {
-        self.queue.retain(|entry| entry.scope.as_deref() != Some(scope));
+        self.queue
+            .retain(|entry| entry.scope.as_deref() != Some(scope));
         if self.queue_scope.as_deref() == Some(scope) {
             self.queue_editor = None;
             self.queue_editor_references.clear();
@@ -1174,10 +1175,18 @@ impl Composer {
     }
 
     fn submit_next_in_scope(&mut self, scope: Option<&str>, cx: &mut Context<Self>) {
-        let Some(index) = self.queue.iter().position(|entry| entry.scope.as_deref() == scope) else {
+        let Some(index) = self
+            .queue
+            .iter()
+            .position(|entry| entry.scope.as_deref() == scope)
+        else {
             return;
         };
-        if self.queue_editor.as_ref().is_some_and(|(id, _)| *id == self.queue[index].id) {
+        if self
+            .queue_editor
+            .as_ref()
+            .is_some_and(|(id, _)| *id == self.queue[index].id)
+        {
             return;
         }
         let next = self.queue.remove(index);
@@ -1666,7 +1675,9 @@ impl Render for Composer {
             .gap(px(6.))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
                 if this.context_open {
-                    if !this.editor.read(cx).is_composing() { this.accept_context_selection(window, cx); }
+                    if !this.editor.read(cx).is_composing() {
+                        this.accept_context_selection(window, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -1681,12 +1692,18 @@ impl Render for Composer {
                 }
             }))
             .capture_action(cx.listener(|this, _: &super::prompt_editor::Up, _, cx| {
-                if this.context_open && !this.editor.read(cx).is_composing() { this.move_context_selection(true, cx); }
-                else { cx.propagate(); }
+                if this.context_open && !this.editor.read(cx).is_composing() {
+                    this.move_context_selection(true, cx);
+                } else {
+                    cx.propagate();
+                }
             }))
             .capture_action(cx.listener(|this, _: &super::prompt_editor::Down, _, cx| {
-                if this.context_open && !this.editor.read(cx).is_composing() { this.move_context_selection(false, cx); }
-                else { cx.propagate(); }
+                if this.context_open && !this.editor.read(cx).is_composing() {
+                    this.move_context_selection(false, cx);
+                } else {
+                    cx.propagate();
+                }
             }))
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
@@ -2126,40 +2143,80 @@ impl Composer {
         let mut rows = Vec::new();
         let mut child = 1; // Panel title.
         for section in &self.context_sections {
-            let entries: Vec<_> = section.entries.iter().filter(|entry| Self::context_entry_matches(entry, &query)).collect();
-            if entries.is_empty() { continue; }
+            let entries: Vec<_> = section
+                .entries
+                .iter()
+                .filter(|entry| Self::context_entry_matches(entry, &query))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
             child += usize::from(section.title.is_some());
-            for entry in entries { rows.push((entry.clone(), child)); child += 1; }
+            for entry in entries {
+                rows.push((entry.clone(), child));
+                child += 1;
+            }
         }
         rows
     }
 
     fn context_entry_matches(entry: &ComposerContextEntry, query: &str) -> bool {
-        query.is_empty() || entry.label.to_lowercase().replace('\\', "/").contains(query)
-            || entry.description.as_ref().is_some_and(|text| text.to_lowercase().replace('\\', "/").contains(query))
+        query.is_empty()
+            || entry
+                .label
+                .to_lowercase()
+                .replace('\\', "/")
+                .contains(query)
+            || entry
+                .description
+                .as_ref()
+                .is_some_and(|text| text.to_lowercase().replace('\\', "/").contains(query))
     }
 
     fn move_context_selection(&mut self, up: bool, cx: &mut Context<Self>) {
         let entries = self.matching_context_entries(cx);
-        if entries.is_empty() { return; }
+        if entries.is_empty() {
+            return;
+        }
         let current = self.context_selected.min(entries.len() - 1);
-        self.context_selected = if up { (current + entries.len() - 1) % entries.len() } else { (current + 1) % entries.len() };
-        self.context_scroll.scroll_to_item(entries[self.context_selected].1);
+        self.context_selected = if up {
+            (current + entries.len() - 1) % entries.len()
+        } else {
+            (current + 1) % entries.len()
+        };
+        self.context_scroll
+            .scroll_to_item(entries[self.context_selected].1);
         cx.notify();
     }
 
-    fn select_context_entry(&mut self, entry: ComposerContextEntry, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_context_entry(
+        &mut self,
+        entry: ComposerContextEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_context_panel(cx);
         window.focus(&self.editor.focus_handle(cx), cx);
-        if entry.insert_mention { self.add_mention(entry.label.clone(), entry.color.unwrap_or(self.theme.palette().accent), cx); }
-        cx.emit(ComposerEvent::ContextSelected { id: entry.id, label: entry.label });
+        if entry.insert_mention {
+            self.add_mention(
+                entry.label.clone(),
+                entry.color.unwrap_or(self.theme.palette().accent),
+                cx,
+            );
+        }
+        cx.emit(ComposerEvent::ContextSelected {
+            id: entry.id,
+            label: entry.label,
+        });
         cx.notify();
     }
 
     fn accept_context_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entries = self.matching_context_entries(cx);
         if !entries.is_empty() {
-            let entry = entries[self.context_selected.min(entries.len() - 1)].0.clone();
+            let entry = entries[self.context_selected.min(entries.len() - 1)]
+                .0
+                .clone();
             self.select_context_entry(entry, window, cx);
         }
     }
@@ -2224,7 +2281,9 @@ impl Composer {
             .unwrap_or_default();
         let match_query = query.replace('\\', "/");
         let mut matches = 0;
-        let selected_index = self.context_selected.min(self.matching_context_entries(cx).len().saturating_sub(1));
+        let selected_index = self
+            .context_selected
+            .min(self.matching_context_entries(cx).len().saturating_sub(1));
         for section in &self.context_sections {
             let entries: Vec<_> = section
                 .entries
@@ -3126,24 +3185,46 @@ mod tests {
     }
 
     #[gpui::test]
-    fn at_panel_closes_with_trigger_and_supports_keyboard_selection_without_submitting(cx: &mut gpui::TestAppContext) {
+    fn at_panel_closes_with_trigger_and_supports_keyboard_selection_without_submitting(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(bind_composer_keys);
         cx.update(super::super::bind_prompt_editor_keys);
         struct Preview(Entity<Composer>);
         impl Render for Preview {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().size_full().flex().flex_col().justify_end().child(self.0.clone()) }
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .child(self.0.clone())
+            }
         }
-        let (preview, window) = cx.add_window_view(|_, cx| Preview(cx.new(|cx| {
-            Composer::new("Message", cx).context_on_at(true).context_panel("attach", "Context", [ComposerContextSection::untitled([
-                ComposerContextEntry::new("first", "First"), ComposerContextEntry::new("second", "Second")
-            ])])
-        })));
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                Composer::new("Message", cx)
+                    .context_on_at(true)
+                    .context_panel(
+                        "attach",
+                        "Context",
+                        [ComposerContextSection::untitled([
+                            ComposerContextEntry::new("first", "First"),
+                            ComposerContextEntry::new("second", "Second"),
+                        ])],
+                    )
+            }))
+        });
         let composer = preview.read_with(window, |p, _| p.0.clone());
         let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = submitted.clone();
-        let _subscription = window.update(|_, cx| cx.subscribe(&composer, move |_, event, _| {
-            if matches!(event, ComposerEvent::Submitted(_)) { count.set(count.get() + 1); }
-        }));
+        let _subscription = window.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event, _| {
+                if matches!(event, ComposerEvent::Submitted(_)) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
         composer.update(window, |c, cx| c.set_value("@", cx));
         window.run_until_parked();
         window.update(|window, cx| window.focus(&composer.read(cx).editor.focus_handle(cx), cx));
@@ -3162,24 +3243,45 @@ mod tests {
         composer.update(window, |c, cx| c.set_value("@no-match", cx));
         window.run_until_parked();
         window.simulate_keystrokes("enter");
-        assert_eq!(submitted.get(), 0, "empty suggestions must not send a message");
+        assert_eq!(
+            submitted.get(),
+            0,
+            "empty suggestions must not send a message"
+        );
     }
 
     #[gpui::test]
-    fn access_menu_survives_toolbar_refresh_while_hovering_between_options(cx: &mut gpui::TestAppContext) {
+    fn access_menu_survives_toolbar_refresh_while_hovering_between_options(
+        cx: &mut gpui::TestAppContext,
+    ) {
         struct Preview(Entity<Composer>);
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().size_full().flex().flex_col().justify_end().child(self.0.clone())
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .child(self.0.clone())
             }
         }
-        let (preview, window) = cx.add_window_view(|_, cx| Preview(cx.new(|cx| {
-            Composer::new("Message", cx)
-                .chip(ComposerChip::new("access").option("ask", "请求批准").option("auto", "自动批准").option("full", "完全访问权限"))
-                .menu_chip(ComposerChip::new("model").option("a", "A"))
-        })));
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                Composer::new("Message", cx)
+                    .chip(
+                        ComposerChip::new("access")
+                            .option("ask", "请求批准")
+                            .option("auto", "自动批准")
+                            .option("full", "完全访问权限"),
+                    )
+                    .menu_chip(ComposerChip::new("model").option("a", "A"))
+            }))
+        });
         let composer = preview.read_with(window, |preview, _| preview.0.clone());
-        composer.update(window, |composer, cx| { composer.open_chip = Some("access".into()); cx.notify(); });
+        composer.update(window, |composer, cx| {
+            composer.open_chip = Some("access".into());
+            cx.notify();
+        });
         window.run_until_parked();
         for value in ["ask", "auto", "full", "auto", "ask"] {
             let selector = Box::leak(format!("composer-option:access:{value}").into_boxed_str());
@@ -3193,7 +3295,6 @@ mod tests {
             window.run_until_parked();
             assert!(window.debug_bounds("composer-chip-menu").is_some());
         }
-
     }
 
     #[gpui::test]

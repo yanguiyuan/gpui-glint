@@ -224,7 +224,12 @@ mod unix_tests {
         std::fs::write(&plain, b"#!/bin/sh\n").unwrap();
         std::fs::write(&found, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let directories = vec![temp.path().join("none"), missing, plain, temp.path().to_owned()];
+        let directories = vec![
+            temp.path().join("none"),
+            missing,
+            plain,
+            temp.path().to_owned(),
+        ];
         assert_eq!(resolve_in(&directories, "probe"), Some(found));
         assert_eq!(resolve_in(&directories, "absent"), None);
     }

@@ -27,8 +27,7 @@ impl AgentWorkspace {
                 }
             }
         }
-        if self.session_busy(self.history.active)
-        {
+        if self.session_busy(self.history.active) {
             if let Ok(live) = self.active_run().subagents.lock() {
                 for trace in live.iter() {
                     if !traces.iter().any(|other| other.id == trace.id) {
@@ -75,7 +74,8 @@ impl AgentWorkspace {
             if record.call.name != "subagent" || record.result != "执行中…" {
                 return None;
             }
-            self.active_run().subagents
+            self.active_run()
+                .subagents
                 .lock()
                 .ok()?
                 .iter()
@@ -98,7 +98,8 @@ impl AgentWorkspace {
             Vec::new()
         };
         for trace in traces {
-            if let Some(record) = run.tool_activity
+            if let Some(record) = run
+                .tool_activity
                 .iter_mut()
                 .find(|record| record.call.id == trace.call_id)
             {
@@ -130,7 +131,8 @@ impl AgentWorkspace {
                     change: None,
                 });
             }
-            let record = run.tool_activity
+            let record = run
+                .tool_activity
                 .iter()
                 .find(|record| record.call.id == trace.call_id)
                 .unwrap()
@@ -142,7 +144,12 @@ impl AgentWorkspace {
     }
 
     pub fn subagent_waiting_label(&self) -> &'static str {
-        if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+        if self
+            .active_run()
+            .questions
+            .iter()
+            .any(|question| !question.request.respond.is_closed())
+        {
             return "正在等待你的回答…";
         }
         let traces = self.all_subagents();
@@ -412,7 +419,12 @@ impl AgentWorkspace {
                 .theme(self.theme),
             );
         }
-        if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+        if self
+            .active_run()
+            .questions
+            .iter()
+            .any(|question| !question.request.respond.is_closed())
+        {
             body = body.child(self.question_panel(cx));
         }
         let footer = div()
@@ -427,18 +439,15 @@ impl AgentWorkspace {
             .when(self.active_run().approval.is_some(), |body| {
                 body.child(self.approval_panel(cx))
             })
-            .when(
-                self.session_busy(self.history.active),
-                |body| {
-                    body.child(
-                        Button::new("停止主任务及子代理")
-                            .kind(ButtonKind::Plain)
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                    )
-                },
-            );
+            .when(self.session_busy(self.history.active), |body| {
+                body.child(
+                    Button::new("停止主任务及子代理")
+                        .kind(ButtonKind::Plain)
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                )
+            });
         div()
             .size_full()
             .child(page_layout(header, body, footer, &scroll))

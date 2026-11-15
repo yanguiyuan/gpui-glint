@@ -15,14 +15,30 @@ pub struct Conflict {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConflictKind { BothModified, BothAdded, DeletedByUs, DeletedByThem, BothDeleted, AddedByUs, AddedByThem, Other }
+pub enum ConflictKind {
+    BothModified,
+    BothAdded,
+    DeletedByUs,
+    DeletedByThem,
+    BothDeleted,
+    AddedByUs,
+    AddedByThem,
+    Other,
+}
 
 impl Conflict {
     pub fn kind(&self) -> ConflictKind {
-        let stages = self.index.split(|b| *b == 0).filter_map(|record| {
-            let header = record.split(|b| *b == b'\t').next()?;
-            header.last().copied()
-        }).fold(0_u8, |mask, stage| match stage { b'1'..=b'3' => mask | (1 << (stage - b'1')), _ => mask });
+        let stages = self
+            .index
+            .split(|b| *b == 0)
+            .filter_map(|record| {
+                let header = record.split(|b| *b == b'\t').next()?;
+                header.last().copied()
+            })
+            .fold(0_u8, |mask, stage| match stage {
+                b'1'..=b'3' => mask | (1 << (stage - b'1')),
+                _ => mask,
+            });
         match stages {
             7 => ConflictKind::BothModified,
             6 => ConflictKind::BothAdded,
@@ -131,15 +147,18 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
     )
     .canonicalize()
     .map_err(|e| e.to_string())?;
-    let entries = git(
-        &root,
-        &["ls-files", "--unmerged", "-z"],
-    )?;
+    let entries = git(&root, &["ls-files", "--unmerged", "-z"])?;
     // One index snapshot covers every conflict. Keep each complete raw record
     // so save() can still compare it against a fresh path-scoped snapshot.
     let mut indexes = std::collections::BTreeMap::<String, Vec<u8>>::new();
-    for record in entries.split(|b| *b == 0).filter(|record| !record.is_empty()) {
-        let tab = record.iter().position(|b| *b == b'\t').ok_or("Git 冲突索引格式无效")?;
+    for record in entries
+        .split(|b| *b == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("Git 冲突索引格式无效")?;
         let label = std::str::from_utf8(&record[tab + 1..]).map_err(|_| "冲突路径不是 UTF-8")?;
         let snapshot = indexes.entry(label.to_owned()).or_default();
         snapshot.extend_from_slice(record);
@@ -368,7 +387,11 @@ pub(crate) mod tests {
         checked(root, &["config", "core.autocrlf", "false"]);
         std::fs::create_dir_all(root.join("vendor/tracked")).unwrap();
         for i in 0..tracked {
-            std::fs::write(root.join(format!("vendor/tracked/{i}.go")), "package before\n").unwrap();
+            std::fs::write(
+                root.join(format!("vendor/tracked/{i}.go")),
+                "package before\n",
+            )
+            .unwrap();
         }
         for (branch, content) in [
             ("main", "base\n"),
@@ -381,7 +404,11 @@ pub(crate) mod tests {
                 checked(root, &["checkout", branch]);
             }
             for i in 0..conflicts {
-                let label = if i == 0 { "冲突 [1].txt".to_owned() } else { format!("vendor/group_{}/conflict-{i}.go", i % 3) };
+                let label = if i == 0 {
+                    "冲突 [1].txt".to_owned()
+                } else {
+                    format!("vendor/group_{}/conflict-{i}.go", i % 3)
+                };
                 let path = root.join(label);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, content).unwrap();
@@ -391,7 +418,11 @@ pub(crate) mod tests {
         }
         assert!(!command(root, &["merge", "feature"]).status.success());
         for i in 0..tracked {
-            std::fs::write(root.join(format!("vendor/tracked/{i}.go")), "package after\n").unwrap();
+            std::fs::write(
+                root.join(format!("vendor/tracked/{i}.go")),
+                "package after\n",
+            )
+            .unwrap();
         }
         dir
     }
@@ -404,7 +435,12 @@ pub(crate) mod tests {
         let listing_time = started.elapsed();
         assert_eq!(inventory.files.len(), 6926);
         assert!(inventory.has_conflicts);
-        assert!(inventory.files.iter().all(|file| file.before.is_none() && file.after.is_empty()));
+        assert!(
+            inventory
+                .files
+                .iter()
+                .all(|file| file.before.is_none() && file.after.is_empty())
+        );
         let calls = GIT_CALLS.with(|count| count.get());
         let started = std::time::Instant::now();
         let (files, notes) = load(dir.path()).unwrap();
@@ -413,9 +449,15 @@ pub(crate) mod tests {
         assert_eq!(files.len(), 161);
         assert_eq!(GIT_CALLS.with(|count| count.get()) - calls, 2);
         for file in [files.first().unwrap(), files.last().unwrap()] {
-            assert_eq!(file.index, index(&file.root, &file.label).unwrap(), "batched snapshots preserve stale-index guards");
+            assert_eq!(
+                file.index,
+                index(&file.root, &file.label).unwrap(),
+                "batched snapshots preserve stale-index guards"
+            );
         }
-        eprintln!("7087 changes (6926 tracked + 161 conflicts): inventory={listing_time:?}, conflicts={conflict_time:?}, conflict Git processes=2 (previously 163)");
+        eprintln!(
+            "7087 changes (6926 tracked + 161 conflicts): inventory={listing_time:?}, conflicts={conflict_time:?}, conflict Git processes=2 (previously 163)"
+        );
     }
 
     #[test]

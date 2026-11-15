@@ -689,9 +689,9 @@ impl AgentWorkspace {
                                 })),
                         )
                         .when(state.show_path, |s| {
-                            s.child(caption(
-                                &gpui_glint::paths::display_path(self.path.with_file_name("mcp.json")),
-                            ))
+                            s.child(caption(&gpui_glint::paths::display_path(
+                                self.path.with_file_name("mcp.json"),
+                            )))
                         }),
                 ),
         )

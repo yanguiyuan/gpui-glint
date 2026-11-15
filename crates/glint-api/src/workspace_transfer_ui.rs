@@ -375,7 +375,8 @@ impl Workbench {
                 match result {
                     Ok(Some(path)) => {
                         this.workspace_transfer = None;
-                        this.notice = format!("工作区已导出至 {}", gpui_glint::paths::display_path(&path));
+                        this.notice =
+                            format!("工作区已导出至 {}", gpui_glint::paths::display_path(&path));
                         this.toasts.update(cx, |host, cx| {
                             host.push(Toast::new("工作区导出成功").kind(ToastKind::Success), cx)
                         });

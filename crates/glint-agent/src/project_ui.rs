@@ -5,33 +5,81 @@ impl AgentWorkspace {
     pub(super) fn remove_project_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let path = self.project_grouping.removing.as_ref().unwrap();
         let p = self.theme.palette();
-        let body = div().flex().flex_col().gap_4()
-            .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("移除项目？"))
-            .child(div().p_3().rounded(px(8.)).bg(rgb(p.surface_subtle)).flex().flex_col().gap_1()
-                .child(project_grouping::project_label(&self.history, path))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).truncate()
-                    .child(gpui_glint::paths::display_path(path))))
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("移除项目？"),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .rounded(px(8.))
+                    .bg(rgb(p.surface_subtle))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(project_grouping::project_label(&self.history, path))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .truncate()
+                            .child(gpui_glint::paths::display_path(path)),
+                    ),
+            )
             .child("仅从项目列表移除，磁盘文件和历史会话会保留。再次打开此项目即可恢复。")
-            .child(div().flex().justify_end().gap_2()
-                .child(Button::new("取消").kind(ButtonKind::Plain).theme(self.theme).render()
-                    .debug_selector(|| "cancel-remove-project".into())
-                    .on_click(cx.listener(|this, _, _, cx| { this.project_grouping.removing = None; cx.notify(); })))
-                .child(Button::new("移除项目").kind(ButtonKind::Danger).theme(self.theme).render()
-                    .debug_selector(|| "confirm-remove-project".into())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(path) = this.project_grouping.removing.take() { this.remove_project(path, cx); }
-                        cx.notify();
-                    }))));
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("取消")
+                            .kind(ButtonKind::Plain)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "cancel-remove-project".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.project_grouping.removing = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("移除项目")
+                            .kind(ButtonKind::Danger)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "confirm-remove-project".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(path) = this.project_grouping.removing.take() {
+                                    this.remove_project(path, cx);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
         let weak = cx.entity().downgrade();
-        gpui_glint::components::Dialog::new("remove-project-dialog", body).width(480.).theme(self.theme)
-            .on_close(move |_, _, cx| { let _ = weak.update(cx, |this, cx| {
-                this.project_grouping.removing = None;
-                cx.notify();
-            }); }).render()
+        gpui_glint::components::Dialog::new("remove-project-dialog", body)
+            .width(480.)
+            .theme(self.theme)
+            .on_close(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.project_grouping.removing = None;
+                    cx.notify();
+                });
+            })
+            .render()
     }
 
     pub(super) fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.history.projects.contains(&path) { return; }
+        if !self.history.projects.contains(&path) {
+            return;
+        }
         self.capture_draft(cx);
         self.history.projects.retain(|project| project != &path);
         self.history.removed_projects.insert(path.clone());
@@ -39,10 +87,22 @@ impl AgentWorkspace {
             self.history.agentspace = None;
         }
         if self.history.active().project.as_ref() == Some(&path) {
-            let next = self.history.sessions.iter().find(|session| session.project.as_ref().is_some_and(|project| self.history.projects.contains(project))).map(|session| session.id);
-            if let Some(next) = next { self.switch(next, cx); }
-            else {
-                self.history.new_session_for(self.history.projects.first().cloned());
+            let next = self
+                .history
+                .sessions
+                .iter()
+                .find(|session| {
+                    session
+                        .project
+                        .as_ref()
+                        .is_some_and(|project| self.history.projects.contains(project))
+                })
+                .map(|session| session.id);
+            if let Some(next) = next {
+                self.switch(next, cx);
+            } else {
+                self.history
+                    .new_session_for(self.history.projects.first().cloned());
                 self.restore_draft(cx);
                 self.open_conversation_at_latest();
             }
@@ -54,9 +114,13 @@ impl AgentWorkspace {
         }
         self.project_picker_open = false;
         self.project_grouping.editing = None;
-        self.git_ui.toasts.update(cx, |toasts, cx| toasts.push(
-            gpui_glint::components::Toast::new("已从列表移除项目")
-                .description("文件与历史会话已保留，再次打开项目即可恢复。"), cx));
+        self.git_ui.toasts.update(cx, |toasts, cx| {
+            toasts.push(
+                gpui_glint::components::Toast::new("已从列表移除项目")
+                    .description("文件与历史会话已保留，再次打开项目即可恢复。"),
+                cx,
+            )
+        });
         self.save(cx);
         cx.notify();
     }
@@ -114,25 +178,42 @@ impl AgentWorkspace {
             .rounded(px(8.))
             .text_color(rgb(p.text))
             .hover(|style| style.bg(rgb(p.border)))
-            .child(self.history.active().project.as_deref()
-                .map(|path| project_grouping::project_icon(&self.history, path))
-                .unwrap_or(Icon::Folder).render(16.))
+            .child(
+                self.history
+                    .active()
+                    .project
+                    .as_deref()
+                    .map(|path| project_grouping::project_icon(&self.history, path))
+                    .unwrap_or(Icon::Folder)
+                    .render(16.),
+            )
             .child(div().max_w(px(220.)).truncate().child(label))
             .child(Icon::ChevronDown.render(12.));
-        let section = |label: &str| div()
-            .px_2().pt_2().pb_1()
-            .text_size(px(10.)).font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(p.text_muted)).child(label.to_owned());
+        let section = |label: &str| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(p.text_muted))
+                .child(label.to_owned())
+        };
         let divider = || div().h(px(1.)).mx_2().my_1().bg(rgb(p.border));
-        let mut projects = div().id("project-picker-list")
-            .max_h(px(200.)).overflow_y_scroll()
-            .flex().flex_col().gap(px(2.));
+        let mut projects = div()
+            .id("project-picker-list")
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.));
         for path in &self.history.projects {
             let selected = self.history.active().project.as_ref() == Some(path);
             let is_space = self.history.agentspace.as_ref() == Some(path);
             let remote = ssh_project::is_remote(path);
             let label = if remote {
-                path.file_name().map(|name| name.to_string_lossy().into_owned())
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ssh_project::label(path))
             } else if is_space {
                 ssh_project::label(path)
@@ -141,82 +222,172 @@ impl AgentWorkspace {
             };
             let path = path.clone();
             projects = projects.child(
-                div().id(SharedString::from(format!("choose-project:{}", path.display())))
-                    .h(px(40.)).flex_shrink_0().px_2()
-                    .flex().items_center().gap_2().rounded(px(5.))
-                    .text_color(rgb(p.text)).cursor_pointer()
+                div()
+                    .id(SharedString::from(format!(
+                        "choose-project:{}",
+                        path.display()
+                    )))
+                    .h(px(40.))
+                    .flex_shrink_0()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .text_color(rgb(p.text))
+                    .cursor_pointer()
                     .when(selected, |row| row.bg(rgb(p.accent_tint)))
                     .hover(|style| style.bg(rgb(p.accent_tint)))
-                    .child(div().flex_shrink_0().text_color(rgb(p.text_muted))
-                        .child(if is_space { Icon::Box } else if remote { Icon::Globe } else { Icon::Folder }.render(15.)))
-                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.))
-                        .child(div().text_size(px(12.)).truncate().child(label))
-                        .child(div().text_size(px(10.)).text_color(rgb(p.text_muted))
-                            .truncate().child(gpui_glint::paths::display_path(&path))))
-                    .when(is_space, |row| row.child(div().flex_shrink_0()
-                        .text_size(px(9.)).text_color(rgb(p.text_muted)).child("默认空间")))
-                    .when(selected, |row| row.child(div().flex_shrink_0()
-                        .text_color(rgb(p.accent)).child(Icon::CheckCircle.render(14.))))
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_project(path.clone(), cx))),
+                    .child(
+                        div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
+                            if is_space {
+                                Icon::Box
+                            } else if remote {
+                                Icon::Globe
+                            } else {
+                                Icon::Folder
+                            }
+                            .render(15.),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(12.)).truncate().child(label))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(p.text_muted))
+                                    .truncate()
+                                    .child(gpui_glint::paths::display_path(&path)),
+                            ),
+                    )
+                    .when(is_space, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(9.))
+                                .text_color(rgb(p.text_muted))
+                                .child("默认空间"),
+                        )
+                    })
+                    .when(selected, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(rgb(p.accent))
+                                .child(Icon::CheckCircle.render(14.)),
+                        )
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_project(path.clone(), cx)),
+                    ),
             );
         }
-        let mut content = div().flex().flex_col()
-            .text_color(rgb(p.text)).child(section("切换项目"));
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .text_color(rgb(p.text))
+            .child(section("切换项目"));
         if self.history.projects.is_empty() {
-            content = content.child(div().px_2().py_2().text_size(px(12.))
-                .text_color(rgb(p.text_muted)).child("打开目录，或设置默认空间"));
+            content = content.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(p.text_muted))
+                    .child("打开目录，或设置默认空间"),
+            );
         } else {
             content = content.child(projects);
         }
-        content = content.child(divider())
-            .child(MenuItem::new("picker-open-project", "打开项目目录…")
-                .icon(Icon::FolderOpen).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.project_picker_open = false;
-                    this.open_project(cx);
-                    cx.notify();
-                })))
-            .child(MenuItem::new("picker-open-ssh", "连接 SSH 项目…")
-                .icon(Icon::Globe).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.project_picker_open = false;
-                    this.open_ssh_project(window, cx);
-                })));
+        content = content
+            .child(divider())
+            .child(
+                MenuItem::new("picker-open-project", "打开项目目录…")
+                    .icon(Icon::FolderOpen)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.project_picker_open = false;
+                        this.open_project(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                MenuItem::new("picker-open-ssh", "连接 SSH 项目…")
+                    .icon(Icon::Globe)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.project_picker_open = false;
+                        this.open_ssh_project(window, cx);
+                    })),
+            );
         if self.history.active().project.is_some() {
-            content = content.child(MenuItem::new("picker-project-group", "项目分组…")
-                .icon(Icon::Folders).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(path) = this.history.active().project.clone() {
-                        this.edit_project_group(path, cx);
-                    }
-                })));
+            content = content.child(
+                MenuItem::new("picker-project-group", "项目分组…")
+                    .icon(Icon::Folders)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(path) = this.history.active().project.clone() {
+                            this.edit_project_group(path, cx);
+                        }
+                    })),
+            );
         }
-        content = content.child(divider()).child(section("AgentSpace · 新会话默认目录"))
-            .child(MenuItem::new("picker-choose-agentspace", "选择默认目录…")
-                .icon(Icon::Box).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.project_picker_open = false;
-                    this.pick_agentspace(cx);
-                })));
-        if self.history.active().project.as_deref().is_some_and(|path|
-            !ssh_project::is_remote(path) && self.history.agentspace.as_deref() != Some(path)) {
-            content = content.child(MenuItem::new("picker-set-agentspace", "将当前目录设为默认空间")
-                .icon(Icon::Box).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(path) = this.history.active().project.clone() {
-                        this.set_agentspace(path, cx);
-                    }
-                })));
+        content = content
+            .child(divider())
+            .child(section("AgentSpace · 新会话默认目录"))
+            .child(
+                MenuItem::new("picker-choose-agentspace", "选择默认目录…")
+                    .icon(Icon::Box)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.project_picker_open = false;
+                        this.pick_agentspace(cx);
+                    })),
+            );
+        if self
+            .history
+            .active()
+            .project
+            .as_deref()
+            .is_some_and(|path| {
+                !ssh_project::is_remote(path) && self.history.agentspace.as_deref() != Some(path)
+            })
+        {
+            content = content.child(
+                MenuItem::new("picker-set-agentspace", "将当前目录设为默认空间")
+                    .icon(Icon::Box)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(path) = this.history.active().project.clone() {
+                            this.set_agentspace(path, cx);
+                        }
+                    })),
+            );
         }
         if self.history.agentspace.is_some() {
-            content = content.child(MenuItem::new("picker-clear-agentspace", "取消默认空间")
-                .icon(Icon::Close).theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.history.agentspace = None;
-                    this.project_picker_open = false;
-                    this.save(cx);
-                    cx.notify();
-                })));
+            content = content.child(
+                MenuItem::new("picker-clear-agentspace", "取消默认空间")
+                    .icon(Icon::Close)
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.history.agentspace = None;
+                        this.project_picker_open = false;
+                        this.save(cx);
+                        cx.notify();
+                    })),
+            );
         }
         let weak = cx.entity().downgrade();
         Popover::new("composer-project-selector", trigger, content)
@@ -319,7 +490,14 @@ impl AgentWorkspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some(if agentspace { "选择 AgentSpace 目录" } else { "打开项目" }.into()),
+            prompt: Some(
+                if agentspace {
+                    "选择 AgentSpace 目录"
+                } else {
+                    "打开项目"
+                }
+                .into(),
+            ),
         });
         cx.spawn(async move |weak, cx| {
             let result = picker.await;
@@ -335,8 +513,11 @@ impl AgentWorkspace {
                                 }
                             }) {
                                 Ok(path) => {
-                                    if agentspace { this.set_agentspace(path, cx); }
-                                    else { this.choose_project(path, cx); }
+                                    if agentspace {
+                                        this.set_agentspace(path, cx);
+                                    } else {
+                                        this.choose_project(path, cx);
+                                    }
                                 }
                                 Err(_) => this.provider_error = Some("无法打开项目目录".into()),
                             }
@@ -378,8 +559,11 @@ pub fn session_groups_with_partners(
             query.is_empty()
                 || session.title.to_lowercase().contains(&query)
                 || session.project.as_ref().is_some_and(|path| {
-                    project_grouping::project_label(history, path).to_lowercase().contains(&query)
-                        || project_grouping::group_name(history, path).is_some_and(|name| name.to_lowercase().contains(&query))
+                    project_grouping::project_label(history, path)
+                        .to_lowercase()
+                        .contains(&query)
+                        || project_grouping::group_name(history, path)
+                            .is_some_and(|name| name.to_lowercase().contains(&query))
                 })
                 || session
                     .messages
@@ -399,7 +583,10 @@ pub fn session_groups_with_partners(
                 GroupListHeader::new(id, project_grouping::project_label(history, path))
                     .icon(project_grouping::project_icon(history, path))
                     .actions([Icon::Plus, Icon::More])
-                    .menu([("设置分组".into(), Icon::Folders), ("移除项目".into(), Icon::Trash)]),
+                    .menu([
+                        ("设置分组".into(), Icon::Folders),
+                        ("移除项目".into(), Icon::Trash),
+                    ]),
             ));
         }
     }
@@ -452,17 +639,24 @@ fn nest_project_groups(history: &History, groups: Vec<GroupListGroup>) -> Vec<Gr
     let mut result: Vec<GroupListGroup> = Vec::new();
     for mut group in groups {
         let Some(path) = group.header.id.strip_prefix("project:").map(PathBuf::from) else {
-            result.push(group); continue;
+            result.push(group);
+            continue;
         };
         let Some(name) = project_grouping::group_name(history, &path) else {
-            result.push(group); continue;
+            result.push(group);
+            continue;
         };
         group.header.label = project_grouping::repository_label(history, &path).into();
         let id = format!("project-group:{name}");
-        let index = result.iter().position(|parent| parent.header.id.as_ref() == id).unwrap_or_else(|| {
-            result.push(GroupListGroup::new(GroupListHeader::new(id, name.to_owned()).icon(Icon::Folders)));
-            result.len() - 1
-        });
+        let index = result
+            .iter()
+            .position(|parent| parent.header.id.as_ref() == id)
+            .unwrap_or_else(|| {
+                result.push(GroupListGroup::new(
+                    GroupListHeader::new(id, name.to_owned()).icon(Icon::Folders),
+                ));
+                result.len() - 1
+            });
         result[index].children.push(group);
     }
     result
@@ -546,51 +740,90 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&project).unwrap();
         let path = dir.path().join("sessions.json");
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
         let home = home.canonicalize().unwrap();
         host.update_in(window, |host, window, cx| {
             host.choose_project(project.clone(), cx);
             let old = host.history.active;
-            host.history.active_mut().push(Role::User, "existing".into());
+            host.history
+                .active_mut()
+                .push(Role::User, "existing".into());
             host.set_agentspace(home.clone(), cx);
             assert_eq!(host.history.agentspace.as_ref(), Some(&home));
-            assert_eq!(host.history.sessions.iter().find(|s| s.id == old).unwrap().project.as_ref(), Some(&project));
+            assert_eq!(
+                host.history
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == old)
+                    .unwrap()
+                    .project
+                    .as_ref(),
+                Some(&project)
+            );
             host.choose_project(project.clone(), cx);
             host.new_session(window, cx);
             assert_eq!(host.history.active().project.as_ref(), Some(&home));
             host.history.save(&path).unwrap();
-            assert_eq!(History::load(&path).unwrap().agentspace.as_ref(), Some(&home));
+            assert_eq!(
+                History::load(&path).unwrap().agentspace.as_ref(),
+                Some(&home)
+            );
             host.remove_project(home.clone(), cx);
             assert!(host.history.agentspace.is_none());
             assert!(home.join(agentspace::CONFIG_FILE).exists());
         });
     }
 
-
     #[gpui::test]
-    fn project_more_menu_removes_persistently_and_reopening_restores_history(cx: &mut gpui::TestAppContext) {
+    fn project_more_menu_removes_persistently_and_reopening_restores_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir(&project).unwrap();
         std::fs::write(project.join("keep.txt"), "keep").unwrap();
         let path = dir.path().join("sessions.json");
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
         window.simulate_resize(size(px(1200.), px(900.)));
         let old_session = host.update(window, |host, cx| {
             host.history.projects.push(project.clone());
             host.history.active_mut().project = Some(project.clone());
-            host.history.active_mut().push(Role::User, "保留这条历史".into());
+            host.history
+                .active_mut()
+                .push(Role::User, "保留这条历史".into());
             cx.notify();
             host.history.active
         });
         let group = SharedString::from(format!("project:{}", project.display()));
         let list = host.read_with(window, |host, _| host.group_list.clone());
-        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group: group.clone(), index: 0 }));
-        host.read_with(window, |host, _| assert_eq!(host.project_grouping.editing.as_ref(), Some(&project)));
-        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group: group.clone(), index: 1 }));
+        list.update(window, |_, cx| {
+            cx.emit(GroupListEvent::HeaderMenuAction {
+                group: group.clone(),
+                index: 0,
+            })
+        });
+        host.read_with(window, |host, _| {
+            assert_eq!(host.project_grouping.editing.as_ref(), Some(&project))
+        });
+        list.update(window, |_, cx| {
+            cx.emit(GroupListEvent::HeaderMenuAction {
+                group: group.clone(),
+                index: 1,
+            })
+        });
         host.read_with(window, |host, _| {
             assert!(host.history.projects.contains(&project));
             assert_eq!(host.project_grouping.removing.as_ref(), Some(&project));
@@ -601,25 +834,41 @@ mod tests {
             assert!(host.project_grouping.removing.is_none());
             assert!(host.history.projects.contains(&project));
         });
-        list.update(window, |_, cx| cx.emit(GroupListEvent::HeaderMenuAction { group, index: 1 }));
+        list.update(window, |_, cx| {
+            cx.emit(GroupListEvent::HeaderMenuAction { group, index: 1 })
+        });
         let confirm = window.debug_bounds("confirm-remove-project").unwrap();
         window.simulate_click(confirm.center(), Default::default());
         host.update(window, |host, _| {
             assert!(!host.history.projects.contains(&project));
             assert_ne!(host.history.active, old_session);
-            assert!(host.history.sessions.iter().any(|session| session.id == old_session && session.messages[0].text == "保留这条历史"));
+            assert!(
+                host.history
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == old_session
+                        && session.messages[0].text == "保留这条历史")
+            );
             assert!(session_groups(&host.history, "", None).is_empty());
             host.history.save(&path).unwrap();
             let restored = History::load(&path).unwrap();
             assert!(!restored.projects.contains(&project));
             assert!(session_groups(&restored, "", None).is_empty());
         });
-        assert_eq!(std::fs::read_to_string(project.join("keep.txt")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(project.join("keep.txt")).unwrap(),
+            "keep"
+        );
         host.update(window, |host, cx| {
             host.choose_project(project.clone(), cx);
             assert!(!host.history.removed_projects.contains(&project));
             assert_eq!(session_groups(&host.history, "", None).len(), 1);
-            assert!(host.history.sessions.iter().any(|session| session.id == old_session));
+            assert!(
+                host.history
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == old_session)
+            );
         });
     }
 
@@ -630,23 +879,51 @@ mod tests {
         let kim = PathBuf::from("/worktree/kim/feat/chat-governance-openapi");
         for (path, name) in [(&idl, "idl"), (&kim, "kim")] {
             history.new_session_for(Some(path.clone()));
-            history.project_metadata.insert(path.clone(), project_grouping::Metadata {
-                repository_name: name.into(), branch: "feat/chat-governance-openapi".into(), linked_worktree: true,
-            });
+            history.project_metadata.insert(
+                path.clone(),
+                project_grouping::Metadata {
+                    repository_name: name.into(),
+                    branch: "feat/chat-governance-openapi".into(),
+                    linked_worktree: true,
+                },
+            );
         }
         let active = history.active;
         let groups = session_groups(&history, "", Some(active));
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].header.label.as_ref(), "feat/chat-governance-openapi");
+        assert_eq!(
+            groups[0].header.label.as_ref(),
+            "feat/chat-governance-openapi"
+        );
         assert_eq!(groups[0].children.len(), 2);
         assert_eq!(groups[0].children[0].header.label.as_ref(), "idl");
         assert_eq!(groups[0].children[1].header.label.as_ref(), "kim");
-        assert_ne!(groups[0].children[0].header.id, groups[0].children[1].header.id);
-        assert_eq!(groups[0].children[1].items[0].id.as_ref(), active.to_string());
+        assert_ne!(
+            groups[0].children[0].header.id,
+            groups[0].children[1].header.id
+        );
+        assert_eq!(
+            groups[0].children[1].items[0].id.as_ref(),
+            active.to_string()
+        );
         assert_eq!(groups[0].children[1].items[0].icon, Some(Icon::Spinner));
-        assert_eq!(session_groups(&history, "idl", None)[0].children[0].items.len(), 1);
-        assert_eq!(session_groups(&history, "chat-governance", None)[0].children.iter().map(|group| group.items.len()).sum::<usize>(), 2);
-        history.project_group_overrides.insert(idl.clone(), "custom".into());
+        assert_eq!(
+            session_groups(&history, "idl", None)[0].children[0]
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            session_groups(&history, "chat-governance", None)[0]
+                .children
+                .iter()
+                .map(|group| group.items.len())
+                .sum::<usize>(),
+            2
+        );
+        history
+            .project_group_overrides
+            .insert(idl.clone(), "custom".into());
         assert_eq!(session_groups(&history, "", None).len(), 2);
         history.project_group_overrides.insert(kim, String::new());
         let ungrouped = session_groups(&history, "", None);

@@ -267,7 +267,13 @@ impl AgentWorkspace {
         })
         .detach();
         let project = root.clone();
-        cx.subscribe(&terminal, move |this, _, _: &terminal_ui::WorkspaceActivity, cx| this.workspace_terminal_activity(&project, cx)).detach();
+        cx.subscribe(
+            &terminal,
+            move |this, _, _: &terminal_ui::WorkspaceActivity, cx| {
+                this.workspace_terminal_activity(&project, cx)
+            },
+        )
+        .detach();
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         self.project_actions
             .runs
@@ -367,7 +373,9 @@ impl AgentWorkspace {
             .child(
                 if busy { Icon::Pulse } else { Icon::Play }
                     .render(15.)
-                    .when(!busy, |icon| icon.text_color(rgb(self.theme.color(0x16833a)))),
+                    .when(!busy, |icon| {
+                        icon.text_color(rgb(self.theme.color(0x16833a)))
+                    }),
             )
             .child(if busy { "运行中" } else { "项目操作" })
             .child(Icon::ChevronDown.render(12.));

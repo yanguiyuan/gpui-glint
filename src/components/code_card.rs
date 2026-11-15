@@ -289,7 +289,10 @@ impl CodeCard {
         self.window_layouts.retain(|id, _| open.contains(id));
         let mut layout = self.window_layouts.remove(&id).unwrap_or_default();
         std::mem::swap(&mut self.scrollbar_drag, &mut layout.scrollbar_drag);
-        std::mem::swap(&mut self.vertical_scrollbar_drag, &mut layout.vertical_scrollbar_drag);
+        std::mem::swap(
+            &mut self.vertical_scrollbar_drag,
+            &mut layout.vertical_scrollbar_drag,
+        );
         std::mem::swap(&mut self.wrap_width, &mut layout.wrap_width);
         std::mem::swap(&mut self.line_cache, &mut layout.line_cache);
         std::mem::swap(&mut self.viewport_cache, &mut layout.viewport_cache);
@@ -633,7 +636,9 @@ impl CodeCard {
         self.content = rich.text.clone().into();
         let clamp = |offset: usize| {
             let mut offset = offset.min(self.content.len());
-            while !self.content.is_char_boundary(offset) { offset -= 1; }
+            while !self.content.is_char_boundary(offset) {
+                offset -= 1;
+            }
             offset
         };
         self.selected_range = clamp(self.selected_range.start)..clamp(self.selected_range.end);
@@ -869,9 +874,17 @@ impl CodeCard {
     }
 
     /// Present a read-only slice as part of a continuous, numbered source file.
-    pub fn set_inline_preview(&mut self, first_line: usize, background: Option<u32>, cx: &mut Context<Self>) {
+    pub fn set_inline_preview(
+        &mut self,
+        first_line: usize,
+        background: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
         let style = Some((first_line.max(1), background));
-        if self.inline_preview != style { self.inline_preview = style; cx.notify(); }
+        if self.inline_preview != style {
+            self.inline_preview = style;
+            cx.notify();
+        }
     }
 
     /// Show the language, JSON status and formatting bar. Defaults to true.
@@ -1714,11 +1727,19 @@ fn tokens(source: &str, language: &str) -> Vec<(Range<usize>, TokenKind)> {
     if let Some(tokens) = crate::syntax::global().tokens(source, language) {
         return tokens;
     }
-    if ["md", "markdown"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["md", "markdown"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::markdown(source);
     }
-    if language.eq_ignore_ascii_case("toml") { return source_syntax::toml(source); }
-    if ["yaml", "yml"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if language.eq_ignore_ascii_case("toml") {
+        return source_syntax::toml(source);
+    }
+    if ["yaml", "yml"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::yaml(source);
     }
     if ["html", "htm", "xml", "svg"]
@@ -1727,22 +1748,39 @@ fn tokens(source: &str, language: &str) -> Vec<(Range<usize>, TokenKind)> {
     {
         return markup_tokens(source);
     }
-    if ["make", "makefile", "mk", "gnumake"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["make", "makefile", "mk", "gnumake"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::makefile(source);
     }
-    if ["dockerfile", "docker", "containerfile"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["dockerfile", "docker", "containerfile"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::dockerfile(source);
     }
-    if ["python", "python3", "py"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["python", "python3", "py"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::python(source);
     }
-    if ["javascript", "js", "mjs", "cjs"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["javascript", "js", "mjs", "cjs"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::script(source, false);
     }
-    if ["typescript", "ts", "mts", "cts"].iter().any(|name| language.eq_ignore_ascii_case(name)) {
+    if ["typescript", "ts", "mts", "cts"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
         return source_syntax::script(source, true);
     }
-    if language.eq_ignore_ascii_case("css") { return web_tokens(source, true); }
+    if language.eq_ignore_ascii_case("css") {
+        return web_tokens(source, true);
+    }
     if language.eq_ignore_ascii_case("rust") || language.eq_ignore_ascii_case("rs") {
         return rust_tokens(source);
     }
@@ -2031,7 +2069,9 @@ fn markup_tokens(source: &str) -> Vec<(Range<usize>, TokenKind)> {
     result
 }
 fn web_tokens(source: &str, css: bool) -> Vec<(Range<usize>, TokenKind)> {
-    if !css { return source_syntax::script(source, false); }
+    if !css {
+        return source_syntax::script(source, false);
+    }
     let mut result = Vec::new();
     let mut i = 0;
     while i < source.len() {
@@ -2684,18 +2724,35 @@ impl CodeCard {
 
     fn viewport_scrollbar(&self, vertical: bool, cx: &mut Context<Self>) -> gpui::Div {
         let entity = cx.entity();
-        let scroll = if vertical { self.viewport_scroll.0.borrow().base_handle.clone() } else { self.scroll.clone() };
-        let drag = if vertical { self.vertical_scrollbar_drag.clone() } else { self.scrollbar_drag.clone() };
+        let scroll = if vertical {
+            self.viewport_scroll.0.borrow().base_handle.clone()
+        } else {
+            self.scroll.clone()
+        };
+        let drag = if vertical {
+            self.vertical_scrollbar_drag.clone()
+        } else {
+            self.scrollbar_drag.clone()
+        };
         let dark = self.dark;
         div()
             .when(vertical, |rail| rail.w(px(12.)).h_full())
             .when(!vertical, |rail| rail.h(px(12.)).w_full())
             .flex_shrink_0()
-            .debug_selector(move || if vertical { "code-card-vertical-scrollbar" } else { "code-card-horizontal-scrollbar" }.into())
+            .debug_selector(move || {
+                if vertical {
+                    "code-card-vertical-scrollbar"
+                } else {
+                    "code-card-horizontal-scrollbar"
+                }
+                .into()
+            })
             .child(
                 gpui::canvas(
                     move |bounds, window, cx| {
-                        let maximum = if vertical { scroll.max_offset().y } else {
+                        let maximum = if vertical {
+                            scroll.max_offset().y
+                        } else {
                             entity
                                 .read(cx)
                                 .viewport_cache
@@ -2712,23 +2769,40 @@ impl CodeCard {
                                     (cache.width + gutter + px(26.) - bounds.size.width).max(px(0.))
                                 })
                         };
-                        let extent = if vertical { bounds.size.height } else { bounds.size.width };
+                        let extent = if vertical {
+                            bounds.size.height
+                        } else {
+                            bounds.size.width
+                        };
                         if maximum <= px(0.) || extent <= px(4.) {
                             return None;
                         }
                         let track = bounds.inset(px(2.));
-                        let length = if vertical { track.size.height } else { track.size.width };
-                        let width = (length
-                            * (extent / (extent + maximum)))
+                        let length = if vertical {
+                            track.size.height
+                        } else {
+                            track.size.width
+                        };
+                        let width = (length * (extent / (extent + maximum)))
                             .max(px(24.))
                             .min(length);
                         let travel = length - width;
-                        let offset = if vertical { scroll.offset().y } else { scroll.offset().x };
+                        let offset = if vertical {
+                            scroll.offset().y
+                        } else {
+                            scroll.offset().x
+                        };
                         let position = travel * (-offset / maximum).clamp(0., 1.);
                         let thumb = if vertical {
-                            Bounds::new(point(bounds.left() + px(3.), track.top() + position), size(px(6.), width))
+                            Bounds::new(
+                                point(bounds.left() + px(3.), track.top() + position),
+                                size(px(6.), width),
+                            )
                         } else {
-                            Bounds::new(point(track.left() + position, bounds.top() + px(3.)), size(width, px(6.)))
+                            Bounds::new(
+                                point(track.left() + position, bounds.top() + px(3.)),
+                                size(width, px(6.)),
+                            )
                         };
                         let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
                         Some((hitbox, thumb, track, maximum, travel, scroll.clone()))
@@ -2758,14 +2832,26 @@ impl CodeCard {
                             cx.stop_propagation();
                             window.prevent_default();
                             let grab = if thumb.contains(&event.position) {
-                                if vertical { event.position.y - thumb.top() } else { event.position.x - thumb.left() }
+                                if vertical {
+                                    event.position.y - thumb.top()
+                                } else {
+                                    event.position.x - thumb.left()
+                                }
                             } else {
-                                if vertical { thumb.size.height / 2. } else { thumb.size.width / 2. }
+                                if vertical {
+                                    thumb.size.height / 2.
+                                } else {
+                                    thumb.size.width / 2.
+                                }
                             };
                             down_drag.set(Some(grab));
                             Self::set_scrollbar_position(
                                 &down_scroll,
-                                if vertical { event.position.y - grab - track.top() } else { event.position.x - grab - track.left() },
+                                if vertical {
+                                    event.position.y - grab - track.top()
+                                } else {
+                                    event.position.x - grab - track.left()
+                                },
                                 travel,
                                 maximum,
                                 vertical,
@@ -2784,7 +2870,11 @@ impl CodeCard {
                                 } else {
                                     Self::set_scrollbar_position(
                                         &move_scroll,
-                                        if vertical { event.position.y - grab - track.top() } else { event.position.x - grab - track.left() },
+                                        if vertical {
+                                            event.position.y - grab - track.top()
+                                        } else {
+                                            event.position.x - grab - track.left()
+                                        },
                                         travel,
                                         maximum,
                                         vertical,
@@ -2823,7 +2913,11 @@ impl CodeCard {
             0.
         };
         let offset = scroll.offset();
-        scroll.set_offset(if vertical { point(offset.x, -maximum * ratio) } else { point(-maximum * ratio, offset.y) });
+        scroll.set_offset(if vertical {
+            point(offset.x, -maximum * ratio)
+        } else {
+            point(-maximum * ratio, offset.y)
+        });
     }
 
     fn viewport_wheel(
@@ -2979,7 +3073,14 @@ impl CodeCard {
             cache.width = cache.width.max(line.width);
             let start = line.x_for_index(hit.start - range.start);
             let end = line.x_for_index(hit.end.min(range.end) - range.start);
-            let viewport_width = self.viewport_scroll.0.borrow().base_handle.bounds().size.width
+            let viewport_width = self
+                .viewport_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .width
                 - gutter_width;
             let offset = self.scroll.offset();
             let left = -offset.x - px(8.);
@@ -3208,16 +3309,26 @@ impl CodeCard {
                     .child(self.language.clone())
             }))
             .child(
-                div().flex().flex_1().min_h_0().child(
-                div().relative().flex_1().min_w_0().min_h_0().child(list).child(
-                    gpui::canvas(
-                        |bounds, window, _| {
-                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
-                        },
-                        {
-                            let entity = cx.entity().downgrade();
-                            move |_, hitbox: gpui::Hitbox, window, _cx| {
-                                window.on_mouse_event(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(list)
+                            .child(
+                                gpui::canvas(
+                                    |bounds, window, _| {
+                                        window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                                    },
+                                    {
+                                        let entity = cx.entity().downgrade();
+                                        move |_, hitbox: gpui::Hitbox, window, _cx| {
+                                            window.on_mouse_event(
                                     move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
                                         if phase == gpui::DispatchPhase::Capture
                                             && hitbox.should_handle_scroll(window)
@@ -3228,16 +3339,22 @@ impl CodeCard {
                                         }
                                     },
                                 );
-                            }
-                        },
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            ),
                     )
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-                )).child(self.viewport_scrollbar(true, cx)),
+                    .child(self.viewport_scrollbar(true, cx)),
             )
-            .child(div().pr(px(12.)).child(self.viewport_horizontal_scrollbar(cx)))
+            .child(
+                div()
+                    .pr(px(12.))
+                    .child(self.viewport_horizontal_scrollbar(cx)),
+            )
     }
 }
 
@@ -3507,7 +3624,11 @@ impl Render for CodeCard {
             self.reveal_cursor = false;
         }
         let mut gutter = div()
-            .w(px(if self.inline_preview.is_some() { 64. } else { 42. }))
+            .w(px(if self.inline_preview.is_some() {
+                64.
+            } else {
+                42.
+            }))
             .flex_shrink_0()
             .py(px(if rich_mode || self.inline_preview.is_some() {
                 0.
@@ -3849,7 +3970,9 @@ impl Render for CodeCard {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .when(self.inline_preview.is_none(), |card| card.rounded(px(9.)).border_1())
+            .when(self.inline_preview.is_none(), |card| {
+                card.rounded(px(9.)).border_1()
+            })
             .border_color(rgb(colors.border))
             .overflow_hidden()
             .bg(rgb(colors.surface))
@@ -4471,11 +4594,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn readonly_viewport_renders_tabs_without_changing_source_offsets(cx: &mut gpui::TestAppContext) {
+    fn readonly_viewport_renders_tabs_without_changing_source_offsets(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let source = "\t \t中文\n        中文";
-        let (editor, window) = cx.add_window_view(|_, cx| {
-            CodeCard::new(cx, "go", source).read_only(true).viewport()
-        });
+        let (editor, window) =
+            cx.add_window_view(|_, cx| CodeCard::new(cx, "go", source).read_only(true).viewport());
         editor.read_with(window, |editor, _| {
             let cache = editor.viewport_cache.as_ref().unwrap();
             let tabs = &cache.lines[&0];
@@ -4584,27 +4708,53 @@ mod tests {
         }
         impl Render for Nested {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().id("outer-scroll").h(px(300.)).w(px(400.)).overflow_y_scroll().track_scroll(&self.scroll)
-                    .child(div().flex().flex_col()
-                        .child(div().h(px(500.)).flex_shrink_0())
-                        .child(div().h(px(180.)).flex_shrink_0().child(self.editor.clone()))
-                        .child(div().h(px(500.)).flex_shrink_0()))
+                div()
+                    .id("outer-scroll")
+                    .h(px(300.))
+                    .w(px(400.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().h(px(500.)).flex_shrink_0())
+                            .child(div().h(px(180.)).flex_shrink_0().child(self.editor.clone()))
+                            .child(div().h(px(500.)).flex_shrink_0()),
+                    )
             }
         }
         let (host, window) = cx.add_window_view(|_, cx| Nested {
-            editor: cx.new(|cx| CodeCard::new(cx, "javascript", "const value = 1;\n".repeat(9)).show_header(false).read_only(true).viewport()),
+            editor: cx.new(|cx| {
+                CodeCard::new(cx, "javascript", "const value = 1;\n".repeat(9))
+                    .show_header(false)
+                    .read_only(true)
+                    .viewport()
+            }),
             scroll: ScrollHandle::new(),
         });
-        host.update(window, |host, cx| { host.scroll.set_offset(point(px(0.), px(-450.))); cx.notify(); });
+        host.update(window, |host, cx| {
+            host.scroll.set_offset(point(px(0.), px(-450.)));
+            cx.notify();
+        });
         window.run_until_parked();
         let editor = host.read_with(window, |host, _| host.editor.clone());
         let initial = host.read_with(window, |host, _| host.scroll.offset().y);
-        let viewport = editor.read_with(window, |editor, _| editor.viewport_scroll.0.borrow().base_handle.bounds());
+        let viewport = editor.read_with(window, |editor, _| {
+            editor.viewport_scroll.0.borrow().base_handle.bounds()
+        });
         for _ in 0..3 {
-            window.simulate_event(gpui::ScrollWheelEvent { position: viewport.center(), delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))), ..Default::default() });
+            window.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                ..Default::default()
+            });
             window.run_until_parked();
         }
-        assert!(host.read_with(window, |host, _| host.scroll.offset().y) < initial-px(10.), "an exhausted code viewport must not trap the parent scroll");
+        assert!(
+            host.read_with(window, |host, _| host.scroll.offset().y) < initial - px(10.),
+            "an exhausted code viewport must not trap the parent scroll"
+        );
     }
 
     #[gpui::test]
@@ -4687,17 +4837,29 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewport_vertical_scrollbar_drags_to_both_ends_without_selecting_text(cx: &mut gpui::TestAppContext) {
+    fn viewport_vertical_scrollbar_drags_to_both_ends_without_selecting_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
         struct Preview(Entity<CodeCard>);
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 div().w(px(480.)).h(px(240.)).child(self.0.clone())
             }
         }
-        let (preview, window) = cx.add_window_view(|_, cx| Preview(cx.new(|cx| {
-            CodeCard::new(cx, "rust", (0..1000).map(|i| format!("let value_{i} = {i};\n")).collect::<String>())
-                .read_only(true).show_header(false).viewport()
-        })));
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(cx.new(|cx| {
+                CodeCard::new(
+                    cx,
+                    "rust",
+                    (0..1000)
+                        .map(|i| format!("let value_{i} = {i};\n"))
+                        .collect::<String>(),
+                )
+                .read_only(true)
+                .show_header(false)
+                .viewport()
+            }))
+        });
         window.run_until_parked();
         let editor = preview.read_with(window, |preview, _| preview.0.clone());
         let rail = window.debug_bounds("code-card-vertical-scrollbar").unwrap();
@@ -4884,7 +5046,9 @@ mod tests {
     #[ignore = "Changes the application-wide code font; run in isolation"]
     fn changing_code_font_invalidates_viewport_layout_cache(cx: &mut gpui::TestAppContext) {
         let (card, window) = cx.add_window_view(|_, cx| {
-            CodeCard::new(cx, "rust", "fn main() {}\n").read_only(true).viewport()
+            CodeCard::new(cx, "rust", "fn main() {}\n")
+                .read_only(true)
+                .viewport()
         });
         window.run_until_parked();
         let original = crate::code_font::family();
@@ -4892,7 +5056,16 @@ mod tests {
         window.update(|_, cx| cx.refresh_windows());
         window.run_until_parked();
         card.read_with(window, |card, _| {
-            assert_eq!(card.viewport_cache.as_ref().unwrap().key.font.family.as_ref(), "Consolas");
+            assert_eq!(
+                card.viewport_cache
+                    .as_ref()
+                    .unwrap()
+                    .key
+                    .font
+                    .family
+                    .as_ref(),
+                "Consolas"
+            );
         });
         crate::code_font::set_family(Some(&original));
     }

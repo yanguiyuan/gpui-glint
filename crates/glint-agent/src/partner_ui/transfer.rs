@@ -122,8 +122,10 @@ impl AgentWorkspace {
                 this.partners_ui.transfer_task = None;
                 match result {
                     Ok(Some(path)) => {
-                        this.partners_ui.notice =
-                            Some(format!("伙伴与头像已导出至 {}", gpui_glint::paths::display_path(&path)))
+                        this.partners_ui.notice = Some(format!(
+                            "伙伴与头像已导出至 {}",
+                            gpui_glint::paths::display_path(&path)
+                        ))
                     }
                     Ok(None) => {}
                     Err(error) => this.partners_ui.notice = Some(format!("导出失败：{error}")),

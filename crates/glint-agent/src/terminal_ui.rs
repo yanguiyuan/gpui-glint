@@ -30,8 +30,13 @@ const CELL_H: f32 = 19.;
 const FONT_SIZE: f32 = 13.;
 
 fn fixed_pitch(widths: &[f32]) -> bool {
-    widths.first().is_some_and(|width| width.is_finite() && *width > 0.
-        && widths.iter().all(|other| other.is_finite() && (*other - *width).abs() < 0.02))
+    widths.first().is_some_and(|width| {
+        width.is_finite()
+            && *width > 0.
+            && widths
+                .iter()
+                .all(|other| other.is_finite() && (*other - *width).abs() < 0.02)
+    })
 }
 
 fn terminal_font(text: &gpui::TextSystem, configured: &str) -> (gpui::Font, f32) {
@@ -42,23 +47,41 @@ fn terminal_font(text: &gpui::TextSystem, configured: &str) -> (gpui::Font, f32)
     } else if cfg!(windows) {
         &["Consolas", "Cascadia Mono", "Lucida Console", "Courier New"]
     } else {
-        &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Monospace"]
+        &[
+            "DejaVu Sans Mono",
+            "Liberation Mono",
+            "Noto Sans Mono",
+            "Monospace",
+        ]
     };
     let installed = text.all_font_names();
     for family in std::iter::once(configured).chain(fallback.iter().copied()) {
-        if !installed.iter().any(|name| name.eq_ignore_ascii_case(family)) { continue; }
+        if !installed
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
         let font = gpui::font(family.to_owned());
         let id = text.resolve_font(&font);
-        let widths: Option<Vec<f32>> = ['0', 'i', 'W', 'm', '.', ' '].into_iter()
-            .map(|ch| text.advance(id, px(FONT_SIZE), ch).ok().map(|advance| f32::from(advance.width)))
+        let widths: Option<Vec<f32>> = ['0', 'i', 'W', 'm', '.', ' ']
+            .into_iter()
+            .map(|ch| {
+                text.advance(id, px(FONT_SIZE), ch)
+                    .ok()
+                    .map(|advance| f32::from(advance.width))
+            })
             .collect();
         if let Some(widths) = widths.filter(|widths| fixed_pitch(widths)) {
             return (font, widths[0]);
         }
     }
     let font = gpui::font(fallback[0]);
-    let width = text.advance(text.resolve_font(&font), px(FONT_SIZE), '0')
-        .map(|advance| f32::from(advance.width)).unwrap_or(CELL_W).max(1.);
+    let width = text
+        .advance(text.resolve_font(&font), px(FONT_SIZE), '0')
+        .map(|advance| f32::from(advance.width))
+        .unwrap_or(CELL_W)
+        .max(1.);
     (font, width)
 }
 
@@ -182,7 +205,10 @@ fn shell_options(root: &Path) -> Result<(tty::Options, String), String> {
     shell_options_with_command(root, None)
 }
 
-fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Result<(tty::Options, String), String> {
+fn shell_options_with_command(
+    root: &Path,
+    command: Option<(&str, &str)>,
+) -> Result<(tty::Options, String), String> {
     let mut options = tty::Options::default();
     options.drain_on_exit = true;
     options.env.insert("TERM".into(), "xterm-256color".into());
@@ -198,9 +224,16 @@ fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Res
         }
         let launch = if let Some((command, token)) = command {
             let command = task_script(command, token, false);
-            format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -lic {}", ssh_project::quote(&remote.directory), ssh_project::quote(&command))
+            format!(
+                "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -lic {}",
+                ssh_project::quote(&remote.directory),
+                ssh_project::quote(&command)
+            )
         } else {
-            format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l", ssh_project::quote(&remote.directory))
+            format!(
+                "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+                ssh_project::quote(&remote.directory)
+            )
         };
         args.extend([remote.target, launch]);
         options.shell = Some(tty::Shell::new("ssh".into(), args));
@@ -228,7 +261,9 @@ fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Res
         if let Some(bash) = candidates.into_iter().find(|path| path.is_file()) {
             let bash = crate::executable::resolve(&bash.to_string_lossy(), root);
             let (mut args, git_bin) = git_bash_startup(&bash)?;
-            if let Some((command, token)) = command { args.extend(["-c".into(), task_script(command, token, false)]); }
+            if let Some((command, token)) = command {
+                args.extend(["-c".into(), task_script(command, token, false)]);
+            }
             options.shell = Some(tty::Shell::new(bash.to_string_lossy().into_owned(), args));
             options.env.insert(
                 "GLINT_NATIVE_GIT_BIN".into(),
@@ -239,7 +274,9 @@ fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Res
             return Ok((options, "Git Bash".into()));
         }
         let mut args = vec!["-NoLogo".into()];
-        if let Some((command, token)) = command { args.extend(["-Command".into(), task_script(command, token, true)]); }
+        if let Some((command, token)) = command {
+            args.extend(["-Command".into(), task_script(command, token, true)]);
+        }
         options.shell = Some(tty::Shell::new("powershell.exe".into(), args));
         return Ok((options, "PowerShell".into()));
     }
@@ -253,7 +290,10 @@ fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Res
         );
         if let Some((command, token)) = command {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            options.shell = Some(tty::Shell::new(shell, vec!["-lic".into(), task_script(command, token, false)]));
+            options.shell = Some(tty::Shell::new(
+                shell,
+                vec!["-lic".into(), task_script(command, token, false)],
+            ));
         }
         Ok((options, "Shell".into()))
     }
@@ -263,9 +303,13 @@ fn shell_options_with_command(root: &Path, command: Option<(&str, &str)>) -> Res
 // exiting. ConPTY can otherwise close before the final output reaches the view.
 fn task_script(command: &str, token: &str, powershell: bool) -> String {
     if powershell {
-        format!("& {{ {command} }}; $glintExit = if ($?) {{ if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }} }} else {{ if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }} }}; [Console]::Write([char]27 + ']2;{token}:' + $glintExit + [char]7); $null = [Console]::ReadLine(); exit $glintExit")
+        format!(
+            "& {{ {command} }}; $glintExit = if ($?) {{ if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }} }} else {{ if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }} }}; [Console]::Write([char]27 + ']2;{token}:' + $glintExit + [char]7); $null = [Console]::ReadLine(); exit $glintExit"
+        )
     } else {
-        format!("(\n{command}\n); glint_exit=$?; printf '\\033]2;{token}:%s\\007' \"$glint_exit\"; IFS= read -r glint_ack; exit \"$glint_exit\"")
+        format!(
+            "(\n{command}\n); glint_exit=$?; printf '\\033]2;{token}:%s\\007' \"$glint_exit\"; IFS= read -r glint_ack; exit \"$glint_exit\""
+        )
     }
 }
 
@@ -283,9 +327,21 @@ impl EventListener for Listener {
     fn send_event(&self, event: Event) {
         let reply = match event {
             Event::PtyWrite(text) => Some(text),
-            Event::Title(title) if self.completion.as_ref().is_some_and(|token| title.starts_with(&format!("{token}:"))) => {
-                let code = title.rsplit_once(':').and_then(|(_, code)| code.parse::<i32>().ok());
-                if code.is_some() { *self.exit_code.lock().unwrap() = code; Some("\r".into()) } else { None }
+            Event::Title(title)
+                if self
+                    .completion
+                    .as_ref()
+                    .is_some_and(|token| title.starts_with(&format!("{token}:"))) =>
+            {
+                let code = title
+                    .rsplit_once(':')
+                    .and_then(|(_, code)| code.parse::<i32>().ok());
+                if code.is_some() {
+                    *self.exit_code.lock().unwrap() = code;
+                    Some("\r".into())
+                } else {
+                    None
+                }
             }
             Event::ColorRequest(index, format) => {
                 let color = ansi_color(index, *self.colors.lock().unwrap());
@@ -349,7 +405,11 @@ impl Session {
     ) -> Result<(Self, async_channel::Receiver<()>), String> {
         Self::start_command(root, theme, None)
     }
-    fn start_command(root: &Path, theme: ThemePreset, command: Option<&str>) -> Result<(Self, async_channel::Receiver<()>), String> {
+    fn start_command(
+        root: &Path,
+        theme: ThemePreset,
+        command: Option<&str>,
+    ) -> Result<(Self, async_channel::Receiver<()>), String> {
         let (wake, receiver) = async_channel::bounded(1);
         let size = WindowSize {
             num_lines: 28,
@@ -367,7 +427,8 @@ impl Session {
             size: Arc::new(Mutex::new(size)),
             colors: Arc::new(Mutex::new(TerminalColors::for_theme(theme))),
         };
-        let (mut options, label) = shell_options_with_command(root, command.zip(completion.as_deref()))?;
+        let (mut options, label) =
+            shell_options_with_command(root, command.zip(completion.as_deref()))?;
         if label != "SSH" {
             crate::vault_environment::with_variables(|name, value| {
                 options.env.insert(name.to_owned(), value.to_owned());
@@ -416,7 +477,10 @@ impl Session {
     fn resize(&self, columns: usize, rows: usize, cell_width: f32) {
         let mut size = self.listener.size.lock().unwrap();
         let width = cell_width.round().max(1.) as u16;
-        if usize::from(size.num_cols) == columns && usize::from(size.num_lines) == rows && size.cell_width == width {
+        if usize::from(size.num_cols) == columns
+            && usize::from(size.num_lines) == rows
+            && size.cell_width == width
+        {
             return;
         }
         size.cell_width = width;
@@ -482,10 +546,20 @@ impl TerminalView {
     fn new(root: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
         Self::new_with_command(root, theme, None, cx)
     }
-    pub(super) fn new_action(root: PathBuf, command: String, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new_action(
+        root: PathBuf,
+        command: String,
+        theme: ThemePreset,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::new_with_command(root, theme, Some(command), cx)
     }
-    fn new_with_command(root: PathBuf, theme: ThemePreset, command: Option<String>, cx: &mut Context<Self>) -> Self {
+    fn new_with_command(
+        root: PathBuf,
+        theme: ThemePreset,
+        command: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let configured_font = gpui_glint::code_font::family();
         let (font, cell_width) = terminal_font(cx.text_system(), &configured_font);
         let command_output = command.is_some();
@@ -499,7 +573,9 @@ impl TerminalView {
                         .update(cx, |this, cx| {
                             *session.listener.colors.lock().unwrap() =
                                 TerminalColors::for_theme(this.theme);
-                            if this.stop_requested { let _ = session.sender.send(Msg::Shutdown); }
+                            if this.stop_requested {
+                                let _ = session.sender.send(Msg::Shutdown);
+                            }
                             this.session = Some(session);
                             cx.emit(StatusChanged);
                             cx.notify();
@@ -522,7 +598,9 @@ impl TerminalView {
             while receiver.recv().await.is_ok() {
                 if weak
                     .update(cx, |this, cx| {
-                        if this.command_output { cx.emit(WorkspaceActivity); }
+                        if this.command_output {
+                            cx.emit(WorkspaceActivity);
+                        }
                         if !this.exit_notified
                             && this
                                 .session
@@ -558,7 +636,11 @@ impl TerminalView {
         }
     }
     pub(super) fn busy(&self) -> bool {
-        self.error.is_none() && !self.session.as_ref().is_some_and(|s| s.listener.exited.load(Ordering::Acquire))
+        self.error.is_none()
+            && !self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.listener.exited.load(Ordering::Acquire))
     }
     pub(super) fn completed_successfully(&self) -> bool {
         self.error.is_none()
@@ -569,26 +651,52 @@ impl TerminalView {
             })
     }
     pub(super) fn status(&self) -> String {
-        if self.error.is_some() { return "启动失败".into(); }
+        if self.error.is_some() {
+            return "启动失败".into();
+        }
         if let Some(session) = &self.session {
             if session.listener.exited.load(Ordering::Acquire) {
-                if self.stop_requested { return "已停止".into(); }
-                return session.listener.exit_code.lock().unwrap().map(|code|
-                    format!("{} · 退出码 {code}", if code == 0 { "已完成" } else { "运行失败" }))
+                if self.stop_requested {
+                    return "已停止".into();
+                }
+                return session
+                    .listener
+                    .exit_code
+                    .lock()
+                    .unwrap()
+                    .map(|code| {
+                        format!(
+                            "{} · 退出码 {code}",
+                            if code == 0 {
+                                "已完成"
+                            } else {
+                                "运行失败"
+                            }
+                        )
+                    })
                     .unwrap_or_else(|| "已退出".into());
             }
         }
-        if self.stop_requested { "正在停止…".into() } else { "运行中…".into() }
+        if self.stop_requested {
+            "正在停止…".into()
+        } else {
+            "运行中…".into()
+        }
     }
     pub(super) fn stop(&mut self, cx: &mut Context<Self>) {
         self.stop_requested = true;
-        if let Some(session) = &self.session { let _ = session.sender.send(Msg::Shutdown); }
+        if let Some(session) = &self.session {
+            let _ = session.sender.send(Msg::Shutdown);
+        }
         cx.notify();
     }
     pub(super) fn copy_output(&self, cx: &mut App) {
         if let Some(session) = &self.session {
             let term = session.term.lock();
-            let text = term.bounds_to_string(TermPoint::new(term.topmost_line(), Column(0)), TermPoint::new(term.bottommost_line(), Column(term.columns()-1)));
+            let text = term.bounds_to_string(
+                TermPoint::new(term.topmost_line(), Column(0)),
+                TermPoint::new(term.bottommost_line(), Column(term.columns() - 1)),
+            );
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
     }
@@ -613,7 +721,9 @@ impl TerminalView {
                 .mode()
                 .contains(TermMode::BRACKETED_PASTE);
             self.command_output = !bracketed && text.contains(['\r', '\n']);
-            if self.command_output { cx.emit(WorkspaceActivity); }
+            if self.command_output {
+                cx.emit(WorkspaceActivity);
+            }
             session.input(if bracketed {
                 format!("\x1b[200~{text}\x1b[201~").into_bytes()
             } else {
@@ -654,7 +764,9 @@ impl TerminalView {
         }
         let key = &event.keystroke;
         self.command_output = key.key == "enter";
-        if self.command_output { cx.emit(WorkspaceActivity); }
+        if self.command_output {
+            cx.emit(WorkspaceActivity);
+        }
         if (key.modifiers.platform || key.modifiers.control) && key.key == "v" {
             self.paste(&Paste, window, cx);
             cx.stop_propagation();
@@ -996,52 +1108,91 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project spaces");
         std::fs::create_dir_all(&root).unwrap();
-        if shell_options(&root).unwrap().1 != "Git Bash" { return; }
+        if shell_options(&root).unwrap().1 != "Git Bash" {
+            return;
+        }
         std::fs::write(root.join("Makefile"), include_str!("../../../Makefile")).unwrap();
-        let (session, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("make -- help")).unwrap();
+        let (session, _) =
+            Session::start_command(&root, ThemePreset::Moonstone, Some("make -- help")).unwrap();
         session.resize(180, 45, CELL_W);
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let text: String = session.term.lock().grid().display_iter().map(|cell| cell.c).collect();
-            if session.listener.exited.load(Ordering::Acquire) && text.contains("Windows overrides: VERSION=") {
-                assert_eq!(*session.listener.exit_code.lock().unwrap(), Some(0), "{text}");
+            let text: String = session
+                .term
+                .lock()
+                .grid()
+                .display_iter()
+                .map(|cell| cell.c)
+                .collect();
+            if session.listener.exited.load(Ordering::Acquire)
+                && text.contains("Windows overrides: VERSION=")
+            {
+                assert_eq!(
+                    *session.listener.exit_code.lock().unwrap(),
+                    Some(0),
+                    "{text}"
+                );
                 assert!(!text.contains("Shim:"), "{text}");
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "action did not complete (exited={}, code={:?}): {text}", session.listener.exited.load(Ordering::Acquire), session.listener.exit_code.lock().unwrap());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "action did not complete (exited={}, code={:?}): {text}",
+                session.listener.exited.load(Ordering::Acquire),
+                session.listener.exit_code.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(30));
         }
-        let (failed, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("exit 7")).unwrap();
+        let (failed, _) =
+            Session::start_command(&root, ThemePreset::Moonstone, Some("exit 7")).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while !failed.listener.exited.load(Ordering::Acquire) {
-            assert!(std::time::Instant::now() < deadline, "failed action did not exit");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed action did not exit"
+            );
             std::thread::sleep(Duration::from_millis(30));
         }
         assert_eq!(*failed.listener.exit_code.lock().unwrap(), Some(7));
-        let (stopped, _) = Session::start_command(&root, ThemePreset::Moonstone, Some("sleep 30")).unwrap();
+        let (stopped, _) =
+            Session::start_command(&root, ThemePreset::Moonstone, Some("sleep 30")).unwrap();
         stopped.sender.send(Msg::Shutdown).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !stopped.listener.exited.load(Ordering::Acquire) {
-            assert!(std::time::Instant::now() < deadline, "stopped action did not release PTY");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stopped action did not release PTY"
+            );
             std::thread::sleep(Duration::from_millis(30));
         }
-
     }
 
     #[gpui::test]
-    fn docking_terminal_keeps_the_same_session_and_only_renders_one_position(cx: &mut gpui::TestAppContext) {
+    fn docking_terminal_keeps_the_same_session_and_only_renders_one_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         cx.update(crate::initialize);
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
         window.simulate_resize(size(px(1440.), px(900.)));
-        window.update(|window, cx| host.update(cx, |host, cx| {
-            host.history.active_mut().project = Some(dir.path().into());
-            host.open_project_terminal(window, cx);
-        }));
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.history.active_mut().project = Some(dir.path().into());
+                host.open_project_terminal(window, cx);
+            })
+        });
         window.run_until_parked();
-        let original = host.read_with(window, |host, _| host.terminal_ui.terminals[dir.path()].entity_id());
+        let original = host.read_with(window, |host, _| {
+            host.terminal_ui.terminals[dir.path()].entity_id()
+        });
         let side = window.debug_bounds("project-terminal-sidebar").unwrap();
         let button = window.debug_bounds("project-terminal-dock").unwrap();
         window.simulate_click(button.center(), Default::default());
@@ -1134,33 +1285,61 @@ mod tests {
     fn git_bash_profiles_cannot_redirect_make_shell_through_scoop_shims() {
         let dir = tempfile::tempdir().unwrap();
         let git = crate::executable::resolve("git", dir.path());
-        let Some(base) = git.parent().and_then(Path::parent) else { return; };
+        let Some(base) = git.parent().and_then(Path::parent) else {
+            return;
+        };
         let bash = base.join("bin/bash.exe");
         let make = crate::executable::resolve("make", dir.path());
-        if !bash.is_file() || !make.is_file() { return; }
+        if !bash.is_file() || !make.is_file() {
+            return;
+        }
         let home = dir.path().join("home");
         let shims = home.join("scoop/shims");
         std::fs::create_dir_all(&shims).unwrap();
         std::fs::write(shims.join("sh.exe"), "broken shim must never execute").unwrap();
-        std::fs::write(home.join(".bash_profile"), format!(
-            "export PATH=\"$(/usr/bin/cygpath -u -- {}):$PATH\"\nexport SHELL=sh\n",
-            ssh_project::quote(&shims.to_string_lossy().replace('\\', "/"))
-        )).unwrap();
-        std::fs::write(dir.path().join("Makefile"), format!(
-            "{}\nprint-shell:\n\t@echo $(SHELL)\n", include_str!("../../../Makefile")
-        )).unwrap();
+        std::fs::write(
+            home.join(".bash_profile"),
+            format!(
+                "export PATH=\"$(/usr/bin/cygpath -u -- {}):$PATH\"\nexport SHELL=sh\n",
+                ssh_project::quote(&shims.to_string_lossy().replace('\\', "/"))
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            format!(
+                "{}\nprint-shell:\n\t@echo $(SHELL)\n",
+                include_str!("../../../Makefile")
+            ),
+        )
+        .unwrap();
         let (args, git_bin) = git_bash_startup(&bash).unwrap();
         let output = crate::child_process::command(&bash)
-            .current_dir(dir.path()).args(args)
-            .args(["-c", &format!("{} -- help print-shell", ssh_project::quote(&make.to_string_lossy().replace('\\', "/")))])
+            .current_dir(dir.path())
+            .args(args)
+            .args([
+                "-c",
+                &format!(
+                    "{} -- help print-shell",
+                    ssh_project::quote(&make.to_string_lossy().replace('\\', "/"))
+                ),
+            ])
             .env("HOME", home.to_string_lossy().replace('\\', "/"))
-            .env("CHERE_INVOKING", "1").env("MSYSTEM", "MINGW64")
-            .env("GLINT_NATIVE_GIT_BIN", &git_bin).output().unwrap();
+            .env("CHERE_INVOKING", "1")
+            .env("MSYSTEM", "MINGW64")
+            .env("GLINT_NATIVE_GIT_BIN", &git_bin)
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
         assert!(stdout.contains("Windows overrides: VERSION="), "{stdout}");
-        assert!(stdout.lines().any(|line| line.ends_with("/usr/bin/bash.exe") || line.ends_with("/usr/bin/sh.exe")), "{stdout}");
+        assert!(
+            stdout.lines().any(
+                |line| line.ends_with("/usr/bin/bash.exe") || line.ends_with("/usr/bin/sh.exe")
+            ),
+            "{stdout}"
+        );
         assert!(!stdout.contains("scoop/shims"), "{stdout}");
         assert!(!stderr.contains("Shim:"), "{stderr}");
     }
@@ -1300,11 +1479,22 @@ func main() {
             assert!(view.cell_width.is_finite() && view.cell_width > 0.);
             assert_ne!(view.font.family.as_ref(), "monospace");
             let session = view.session.as_ref().unwrap();
-            let expected = ((f32::from(view.bounds.size.width) / view.cell_width) as usize).clamp(2, 500);
+            let expected =
+                ((f32::from(view.bounds.size.width) / view.cell_width) as usize).clamp(2, 500);
             assert_eq!(session.term.lock().columns(), expected);
-            assert_eq!(session.listener.size.lock().unwrap().cell_width, view.cell_width.round() as u16);
-            let position = point(view.bounds.left() + px(view.cell_width * 4.5), view.bounds.top() + px(CELL_H * 2.5));
-            assert_eq!(view.grid_point(position).column.0, 4, "selection must follow the measured glyph width");
+            assert_eq!(
+                session.listener.size.lock().unwrap().cell_width,
+                view.cell_width.round() as u16
+            );
+            let position = point(
+                view.bounds.left() + px(view.cell_width * 4.5),
+                view.bounds.top() + px(CELL_H * 2.5),
+            );
+            assert_eq!(
+                view.grid_point(position).column.0,
+                4,
+                "selection must follow the measured glyph width"
+            );
         });
         window.update(|window, cx| {
             host.update(cx, |host, cx| {
@@ -1587,7 +1777,9 @@ impl EntityInputHandler for TerminalView {
         self.preedit.clear();
         if let Some(session) = &self.session {
             self.command_output = text.contains(['\r', '\n']);
-            if self.command_output { cx.emit(WorkspaceActivity); }
+            if self.command_output {
+                cx.emit(WorkspaceActivity);
+            }
             session.input(text.as_bytes().to_vec());
         }
         cx.notify();
@@ -1634,10 +1826,27 @@ impl EntityInputHandler for TerminalView {
 }
 
 impl AgentWorkspace {
-    pub(super) fn expanded_project_panel(&self, panel: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
-        div().size_full().min_h_0().flex().flex_col()
-            .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(panel))
-            .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| body.child(self.project_terminal_sidebar(cx)))
+    pub(super) fn expanded_project_panel(
+        &self,
+        panel: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(panel),
+            )
+            .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| {
+                body.child(self.project_terminal_sidebar(cx))
+            })
     }
 
     pub(super) fn set_terminal_position(&mut self, position: Position) {
@@ -1676,9 +1885,13 @@ impl AgentWorkspace {
                 return;
             }
             let terminal = cx.new(|cx| TerminalView::new(root.clone(), self.theme, cx));
-            cx.subscribe(&terminal, |_, _, _: &StatusChanged, cx| cx.notify()).detach();
+            cx.subscribe(&terminal, |_, _, _: &StatusChanged, cx| cx.notify())
+                .detach();
             let project = root.clone();
-            cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| this.workspace_terminal_activity(&project, cx)).detach();
+            cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| {
+                this.workspace_terminal_activity(&project, cx)
+            })
+            .detach();
             self.terminal_ui.terminals.insert(root.clone(), terminal);
         }
         self.page = crate::Page::Chat;
@@ -1695,7 +1908,9 @@ impl AgentWorkspace {
         }
         self.git_ui.open = false;
         self.terminal_ui.open = true;
-        if self.terminal_ui.bottom { self.project_actions.panel = false; }
+        if self.terminal_ui.bottom {
+            self.project_actions.panel = false;
+        }
         self.right_sidebar_width = self.right_sidebar_width.max(500.);
         let terminal = &self.terminal_ui.terminals[&root];
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
@@ -1703,57 +1918,138 @@ impl AgentWorkspace {
     }
     pub(super) fn project_terminal_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let root = self.history.active().project.clone();
-        let terminal = root.as_ref().and_then(|r| self.terminal_ui.terminals.get(r)).cloned();
-        let label = terminal.as_ref().and_then(|view| view.read(cx).session.as_ref().map(|s| {
-            format!("{}{}", s.label, if s.listener.exited.load(Ordering::Acquire) { " · 已退出" } else { "" })
-        })).unwrap_or_else(|| "项目终端".into());
-        let title = format!("{label} · {}", root.as_ref().map(|p| ssh_project::label(p)).unwrap_or_default());
-        let controls = div().flex().items_center().gap_2()
-            .child(IconButton::new(if self.terminal_ui.bottom { Icon::Sidebar } else { Icon::ChevronDown },
-                if self.terminal_ui.bottom { "移到右侧" } else { "移到底部" }).theme(self.theme).render()
+        let terminal = root
+            .as_ref()
+            .and_then(|r| self.terminal_ui.terminals.get(r))
+            .cloned();
+        let label = terminal
+            .as_ref()
+            .and_then(|view| {
+                view.read(cx).session.as_ref().map(|s| {
+                    format!(
+                        "{}{}",
+                        s.label,
+                        if s.listener.exited.load(Ordering::Acquire) {
+                            " · 已退出"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+            })
+            .unwrap_or_else(|| "项目终端".into());
+        let title = format!(
+            "{label} · {}",
+            root.as_ref()
+                .map(|p| ssh_project::label(p))
+                .unwrap_or_default()
+        );
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                IconButton::new(
+                    if self.terminal_ui.bottom {
+                        Icon::Sidebar
+                    } else {
+                        Icon::ChevronDown
+                    },
+                    if self.terminal_ui.bottom {
+                        "移到右侧"
+                    } else {
+                        "移到底部"
+                    },
+                )
+                .theme(self.theme)
+                .render()
                 .debug_selector(|| "project-terminal-dock".into())
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_terminal_position(if this.terminal_ui.bottom { Position::Right } else { Position::Bottom });
+                    this.set_terminal_position(if this.terminal_ui.bottom {
+                        Position::Right
+                    } else {
+                        Position::Bottom
+                    });
                     cx.notify();
-                })))
-            .child(IconButton::new(Icon::Refresh, "重启项目终端").theme(self.theme).render()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if let Some(root) = this.history.active().project.clone() {
-                        this.terminal_ui.terminals.remove(&root);
-                        this.open_project_terminal(window, cx);
-                    }
-                })))
-            .child(IconButton::new(Icon::Trash, "结束项目终端").theme(self.theme).render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(root) = this.history.active().project.clone() { this.terminal_ui.terminals.remove(&root); }
-                    this.terminal_ui.open = false;
-                    cx.notify();
-                })))
-            .child(IconButton::new(Icon::Close, "隐藏终端（继续运行）").theme(self.theme).render()
-                .debug_selector(|| "project-terminal-hide".into())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.terminal_ui.open = false;
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                })));
-        terminal_panel(terminal, title, controls, self.theme, self.terminal_ui.bottom, self.right_sidebar_width)
-            .debug_selector(|| "project-terminal-sidebar".into())
+                })),
+            )
+            .child(
+                IconButton::new(Icon::Refresh, "重启项目终端")
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(root) = this.history.active().project.clone() {
+                            this.terminal_ui.terminals.remove(&root);
+                            this.open_project_terminal(window, cx);
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new(Icon::Trash, "结束项目终端")
+                    .theme(self.theme)
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(root) = this.history.active().project.clone() {
+                            this.terminal_ui.terminals.remove(&root);
+                        }
+                        this.terminal_ui.open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new(Icon::Close, "隐藏终端（继续运行）")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "project-terminal-hide".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.terminal_ui.open = false;
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    })),
+            );
+        terminal_panel(
+            terminal,
+            title,
+            controls,
+            self.theme,
+            self.terminal_ui.bottom,
+            self.right_sidebar_width,
+        )
+        .debug_selector(|| "project-terminal-sidebar".into())
     }
 }
 
 /// Both dock positions and project actions use this same PTY view and frame.
 pub(super) fn terminal_panel(
-    terminal: Option<Entity<TerminalView>>, title: impl IntoElement, controls: gpui::Div,
-    theme: ThemePreset, bottom: bool, width: f32,
+    terminal: Option<Entity<TerminalView>>,
+    title: impl IntoElement,
+    controls: gpui::Div,
+    theme: ThemePreset,
+    bottom: bool,
+    width: f32,
 ) -> gpui::Div {
     let p = theme.palette();
-    div().min_h_0().flex_shrink_0().flex().flex_col().bg(rgb(p.panel)).border_color(rgb(p.border))
+    div()
+        .min_h_0()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .bg(rgb(p.panel))
+        .border_color(rgb(p.border))
         .when(bottom, |view| view.w_full().h(px(280.)).border_t_1())
         .when(!bottom, |view| view.w(px(width)).h_full().border_l_1())
-        .child(div().debug_selector(|| "project-terminal-header".into()).h(px(46.)).flex_shrink_0()
-            .px_3().flex().items_center().gap_2()
-            .child(Icon::Shell.render(16.).flex_shrink_0())
-            .child(div().flex_1().min_w_0().truncate().child(title))
-            .child(controls))
+        .child(
+            div()
+                .debug_selector(|| "project-terminal-header".into())
+                .h(px(46.))
+                .flex_shrink_0()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Icon::Shell.render(16.).flex_shrink_0())
+                .child(div().flex_1().min_w_0().truncate().child(title))
+                .child(controls),
+        )
         .child(div().flex_1().min_h_0().children(terminal))
 }

@@ -61,7 +61,8 @@ impl VaultPage {
     }
 
     fn sync_environment(&self) {
-        self.environment.replace(self.vault.as_ref().map(Vault::entries).unwrap_or(&[]));
+        self.environment
+            .replace(self.vault.as_ref().map(Vault::entries).unwrap_or(&[]));
     }
 
     pub fn new(path: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {

@@ -18,10 +18,29 @@ pub struct Change {
 }
 
 impl Change {
-    pub(super) fn preview(path: PathBuf, label: String, before: Option<Arc<str>>, after: Arc<str>, stats: Option<(usize, usize)>) -> Self {
-        let mut change = Self { id: uuid::Uuid::new_v4(), path, label, before, after, added: 0, removed: 0, lines: Default::default() };
-        if let Some((added, removed)) = stats { change.added = added; change.removed = removed; }
-        else { change.count(); }
+    pub(super) fn preview(
+        path: PathBuf,
+        label: String,
+        before: Option<Arc<str>>,
+        after: Arc<str>,
+        stats: Option<(usize, usize)>,
+    ) -> Self {
+        let mut change = Self {
+            id: uuid::Uuid::new_v4(),
+            path,
+            label,
+            before,
+            after,
+            added: 0,
+            removed: 0,
+            lines: Default::default(),
+        };
+        if let Some((added, removed)) = stats {
+            change.added = added;
+            change.removed = removed;
+        } else {
+            change.count();
+        }
         change
     }
     pub fn lines(&self) -> Vec<DiffLine> {
@@ -624,7 +643,10 @@ pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), Stri
         // Do not follow symlinks outside the repository during preview.
         let after = match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() && meta.len() > 2 * 1024 * 1024 => {
-                notes.push(format!("{name}：大文件（{:.1} MiB），为保持流畅已跳过全文 Diff。", meta.len() as f64 / (1024. * 1024.)));
+                notes.push(format!(
+                    "{name}：大文件（{:.1} MiB），为保持流畅已跳过全文 Diff。",
+                    meta.len() as f64 / (1024. * 1024.)
+                ));
                 continue;
             }
             Ok(meta) if meta.is_file() && meta.len() <= 2 * 1024 * 1024 => {
@@ -653,7 +675,9 @@ pub fn workspace_changes(root: &Path) -> Result<(Vec<Change>, Vec<String>), Stri
                     None
                 }
             } else {
-                notes.push(format!("{name}：HEAD 版本超过 2 MiB，为保持流畅已跳过全文 Diff。"));
+                notes.push(format!(
+                    "{name}：HEAD 版本超过 2 MiB，为保持流畅已跳过全文 Diff。"
+                ));
                 continue;
             }
         };

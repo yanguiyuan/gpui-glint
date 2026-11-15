@@ -279,14 +279,23 @@ pub fn apply_decorations(source: &str, replacements: &[(Range<usize>, String)]) 
 
 /// Keep verified links while new tokens arrive, but re-check Markdown context:
 /// a growing path or a newly opened code fence must not inherit an old link.
-pub fn retain_decorations(previous: &str, source: &str, replacements: &mut Vec<(Range<usize>, String)>) {
+pub fn retain_decorations(
+    previous: &str,
+    source: &str,
+    replacements: &mut Vec<(Range<usize>, String)>,
+) {
     let previous_candidates = candidates(previous);
     let candidates = candidates(source);
     replacements.retain(|(range, _)| {
         source.get(range.clone()) == previous.get(range.clone())
-            && candidates.iter().any(|candidate| candidate.range == *range
-                && previous_candidates.iter().any(|old| old.range == *range
-                    && old.value == candidate.value && old.explicit == candidate.explicit))
+            && candidates.iter().any(|candidate| {
+                candidate.range == *range
+                    && previous_candidates.iter().any(|old| {
+                        old.range == *range
+                            && old.value == candidate.value
+                            && old.explicit == candidate.explicit
+                    })
+            })
     });
 }
 #[cfg(test)]
@@ -419,17 +428,36 @@ enum Loaded {
 type PreviewData = (String, Option<String>, Loaded);
 type NavigationData = (String, Vec<FilePreviewEntry>, bool);
 
-async fn load_with_navigation(target: Target, known_directory: Option<String>) -> Result<(PreviewData, Option<NavigationData>), String> {
+async fn load_with_navigation(
+    target: Target,
+    known_directory: Option<String>,
+) -> Result<(PreviewData, Option<NavigationData>), String> {
     let root = target.root.clone();
     let result = load(target).await?;
     let navigation = if !matches!(result.2, Loaded::Directory(..)) {
-        if let Some(parent) = result.1.clone().filter(|parent| Some(parent) != known_directory.as_ref()) {
-            match load(Target { root, path: parent, line: None }).await {
-                Ok((path, _, Loaded::Directory(entries, truncated))) => Some((path, entries, truncated)),
+        if let Some(parent) = result
+            .1
+            .clone()
+            .filter(|parent| Some(parent) != known_directory.as_ref())
+        {
+            match load(Target {
+                root,
+                path: parent,
+                line: None,
+            })
+            .await
+            {
+                Ok((path, _, Loaded::Directory(entries, truncated))) => {
+                    Some((path, entries, truncated))
+                }
                 _ => None,
             }
-        } else { None }
-    } else { None };
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok((result, navigation))
 }
 
@@ -614,7 +642,9 @@ impl State {
                 this.file_preview.open = false;
                 this.file_preview.task = None;
                 this.file_preview.directory_tasks.clear();
-                this.file_preview.view.update(cx, |view, cx| view.cancel_directory_requests(cx));
+                this.file_preview
+                    .view
+                    .update(cx, |view, cx| view.cancel_directory_requests(cx));
                 cx.notify();
             }
             FilePreviewEvent::QuoteRequested { path, selection } => {
@@ -645,7 +675,9 @@ impl State {
                 this.quote_file_excerpt(&path, selection, cx);
             }
             FilePreviewEvent::DirectoryRequested { path, request } => {
-                let Some(mut target) = this.file_preview.target.clone() else { return; };
+                let Some(mut target) = this.file_preview.target.clone() else {
+                    return;
+                };
                 target.path = path.clone();
                 target.line = None;
                 let request = *request;
@@ -653,7 +685,9 @@ impl State {
                 let work = cx.background_executor().spawn(async move {
                     let result = if target.root.as_deref().is_some_and(ssh_project::is_remote) {
                         provider::Job::start(load(target))?.result().await
-                    } else { load(target).await };
+                    } else {
+                        load(target).await
+                    };
                     match result? {
                         (_, _, Loaded::Directory(entries, truncated)) => Ok((entries, truncated)),
                         _ => Err("路径不是目录".into()),
@@ -662,8 +696,12 @@ impl State {
                 let task = cx.spawn(async move |weak, cx| {
                     let result = work.await;
                     let _ = weak.update(cx, |this, cx| {
-                        if let Some(task) = this.file_preview.directory_tasks.remove(&request) { task.detach(); }
-                        this.file_preview.view.update(cx, |view, cx| view.set_directory_children(path, request, result, cx));
+                        if let Some(task) = this.file_preview.directory_tasks.remove(&request) {
+                            task.detach();
+                        }
+                        this.file_preview.view.update(cx, |view, cx| {
+                            view.set_directory_children(path, request, result, cx)
+                        });
                     });
                 });
                 this.file_preview.directory_tasks.insert(request, task);
@@ -695,9 +733,7 @@ impl AgentWorkspace {
         let Some(session) = self.history.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        let root = session
-            .project
-            .clone();
+        let root = session.project.clone();
         let path = match record.call.name.as_str() {
             "write_file" | "replace_in_file" => record
                 .call
@@ -923,7 +959,9 @@ impl AgentWorkspace {
         );
     }
     fn open_file_preview_mode(&mut self, target: Target, rendered: bool, cx: &mut Context<Self>) {
-        if !self.terminal_ui.bottom { self.terminal_ui.open = false; }
+        if !self.terminal_ui.bottom {
+            self.terminal_ui.open = false;
+        }
         self.file_preview.open = true;
         self.edits_ui.open = false;
         self.file_preview.revision += 1;
@@ -933,12 +971,19 @@ impl AgentWorkspace {
             view.set_theme(self.theme, cx);
             view.set_loading(target.path.clone(), cx);
         });
-        let known_directory = self.file_preview.view.read(cx).navigation_path().map(str::to_owned);
+        let known_directory = self
+            .file_preview
+            .view
+            .read(cx)
+            .navigation_path()
+            .map(str::to_owned);
         self.file_preview.task = Some(cx.spawn(async move |weak, cx| {
             let line = target.line;
             let work = cx.background_executor().spawn(async move {
                 if target.root.as_deref().is_some_and(ssh_project::is_remote) {
-                    provider::Job::start(load_with_navigation(target, known_directory))?.result().await
+                    provider::Job::start(load_with_navigation(target, known_directory))?
+                        .result()
+                        .await
                 } else {
                     load_with_navigation(target, known_directory).await
                 }
@@ -953,7 +998,9 @@ impl AgentWorkspace {
                 }
                 let result = result.map(|(result, navigation)| {
                     if let Some((path, entries, truncated)) = navigation {
-                        this.file_preview.view.update(cx, |view, cx| view.set_navigation(path, entries, truncated, cx));
+                        this.file_preview.view.update(cx, |view, cx| {
+                            view.set_navigation(path, entries, truncated, cx)
+                        });
                     }
                     result
                 });
@@ -1376,29 +1423,57 @@ mod tests {
     }
 
     #[gpui::test]
-    fn preview_tree_expands_nested_folders_and_keeps_the_selected_file_when_collapsed(cx: &mut gpui::TestAppContext) {
+    fn preview_tree_expands_nested_folders_and_keeps_the_selected_file_when_collapsed(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        std::fs::write(root.join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("src/nested")).unwrap();
         std::fs::write(root.join("src/nested/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(root.join("README.md"), "# Project").unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
+        let (host, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
         window.simulate_resize(size(px(1440.), px(900.)));
         host.update(window, |host, cx| {
             host.storage_readable = false;
             host.file_preview.expanded = true;
-            host.open_file_preview(Target { root: Some(root.clone()), path: root.to_string_lossy().into_owned(), line: None }, cx);
+            host.open_file_preview(
+                Target {
+                    root: Some(root.clone()),
+                    path: root.to_string_lossy().into_owned(),
+                    line: None,
+                },
+                cx,
+            );
         });
         window.run_until_parked();
-        let folder = Box::leak(format!("preview-entry:{}", root.join("src").display()).into_boxed_str());
-        let nested = Box::leak(format!("preview-entry:{}", root.join("src/nested").display()).into_boxed_str());
-        let file = Box::leak(format!("preview-entry:{}", root.join("src/nested/main.rs").display()).into_boxed_str());
+        let folder =
+            Box::leak(format!("preview-entry:{}", root.join("src").display()).into_boxed_str());
+        let nested = Box::leak(
+            format!("preview-entry:{}", root.join("src/nested").display()).into_boxed_str(),
+        );
+        let file = Box::leak(
+            format!(
+                "preview-entry:{}",
+                root.join("src/nested/main.rs").display()
+            )
+            .into_boxed_str(),
+        );
         assert!(window.debug_bounds(nested).is_none());
         let row = window.debug_bounds(folder).unwrap();
         window.simulate_click(row.center(), Default::default());
         window.run_until_parked();
-        host.read_with(window, |host, _| assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.to_string_lossy()));
+        host.read_with(window, |host, _| {
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.to_string_lossy()
+            )
+        });
         let child = window.debug_bounds(nested).expect("expanded child folder");
         assert!(child.left() >= row.left());
         window.simulate_click(child.center(), Default::default());
@@ -1408,51 +1483,94 @@ mod tests {
         window.run_until_parked();
         host.read_with(window, |host, _| {
             assert!(host.file_preview.expanded);
-            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("src/nested/main.rs").to_string_lossy());
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.join("src/nested/main.rs").to_string_lossy()
+            );
         });
         assert!(window.debug_bounds("file-preview-navigation").is_some());
         let row = window.debug_bounds(folder).unwrap();
         window.simulate_click(row.center(), Default::default());
         window.run_until_parked();
         assert!(window.debug_bounds(file).is_none());
-        host.read_with(window, |host, _| assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("src/nested/main.rs").to_string_lossy()));
+        host.read_with(window, |host, _| {
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.join("src/nested/main.rs").to_string_lossy()
+            )
+        });
         let row = window.debug_bounds(folder).unwrap();
         window.simulate_click(row.center(), Default::default());
         window.run_until_parked();
-        assert!(window.debug_bounds(file).is_some(), "nested expansion state must survive collapsing an ancestor");
-        host.read_with(window, |host, _| assert!(host.file_preview.directory_tasks.is_empty()));
+        assert!(
+            window.debug_bounds(file).is_some(),
+            "nested expansion state must survive collapsing an ancestor"
+        );
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.directory_tasks.is_empty())
+        });
     }
 
     #[gpui::test]
-    fn expanded_preview_keeps_directory_and_switches_files_without_collapsing(cx: &mut gpui::TestAppContext) {
+    fn expanded_preview_keeps_directory_and_switches_files_without_collapsing(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         cx.update(crate::initialize);
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        std::fs::write(root.join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        std::fs::write(root.join("a.rs"), "fn a() {}
-").unwrap();
-        std::fs::write(root.join("b.rs"), "fn b() {}
-").unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.rs"),
+            "fn a() {}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.rs"),
+            "fn b() {}
+",
+        )
+        .unwrap();
+        let (host, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(root.join("sessions.json"), cx));
         window.simulate_resize(size(px(1440.), px(900.)));
         host.update(window, |host, cx| {
             host.storage_readable = false;
             host.file_preview.expanded = true;
             host.history.active_mut().project = Some(root.clone());
-            host.open_file_preview(Target { root: Some(root.clone()), path: root.join("a.rs").to_string_lossy().into_owned(), line: None }, cx);
+            host.open_file_preview(
+                Target {
+                    root: Some(root.clone()),
+                    path: root.join("a.rs").to_string_lossy().into_owned(),
+                    line: None,
+                },
+                cx,
+            );
         });
         window.run_until_parked();
-        let navigation = window.debug_bounds("file-preview-navigation").expect("expanded preview keeps its folder");
+        let navigation = window
+            .debug_bounds("file-preview-navigation")
+            .expect("expanded preview keeps its folder");
         assert!(navigation.size.width > px(100.));
-        let selector = Box::leak(format!("preview-entry:{}", root.join("b.rs").display()).into_boxed_str());
-        let next = window.debug_bounds(selector).expect("sibling file in navigation");
+        let selector =
+            Box::leak(format!("preview-entry:{}", root.join("b.rs").display()).into_boxed_str());
+        let next = window
+            .debug_bounds(selector)
+            .expect("sibling file in navigation");
         assert!(next.right() <= navigation.right());
         window.simulate_click(next.center(), Default::default());
         window.run_until_parked();
         host.read_with(window, |host, _| {
             assert!(host.file_preview.expanded);
-            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("b.rs").to_string_lossy());
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.join("b.rs").to_string_lossy()
+            );
         });
         assert!(window.debug_bounds("file-preview-navigation").is_some());
         window.update(|window, cx| host.update(cx, |host, cx| window.focus(&host.focus, cx)));
@@ -1461,32 +1579,57 @@ mod tests {
         host.read_with(window, |host, _| {
             assert!(host.file_preview.open && host.file_preview.expanded);
             assert!(host.terminal_ui.open && host.terminal_ui.bottom);
-            assert_eq!(host.history.terminal_default_position, crate::terminal_ui::Position::Right);
-            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("b.rs").to_string_lossy());
+            assert_eq!(
+                host.history.terminal_default_position,
+                crate::terminal_ui::Position::Right
+            );
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.join("b.rs").to_string_lossy()
+            );
         });
         let terminal = window.debug_bounds("project-terminal-sidebar").unwrap();
         let navigation = window.debug_bounds("file-preview-navigation").unwrap();
-        assert!(navigation.bottom() <= terminal.top() + px(1.), "preview must fit above the bottom terminal");
-        let first_selector = Box::leak(format!("preview-entry:{}", root.join("a.rs").display()).into_boxed_str());
+        assert!(
+            navigation.bottom() <= terminal.top() + px(1.),
+            "preview must fit above the bottom terminal"
+        );
+        let first_selector =
+            Box::leak(format!("preview-entry:{}", root.join("a.rs").display()).into_boxed_str());
         let first = window.debug_bounds(first_selector).unwrap();
         window.simulate_click(first.center(), Default::default());
         window.run_until_parked();
         host.read_with(window, |host, _| {
             assert!(host.terminal_ui.open && host.file_preview.expanded);
-            assert_eq!(host.file_preview.target.as_ref().unwrap().path, root.join("a.rs").to_string_lossy());
+            assert_eq!(
+                host.file_preview.target.as_ref().unwrap().path,
+                root.join("a.rs").to_string_lossy()
+            );
         });
         let hide = window.debug_bounds("project-terminal-hide").unwrap();
         window.simulate_click(hide.center(), Default::default());
         window.run_until_parked();
-        host.read_with(window, |host, _| assert!(!host.terminal_ui.open && host.file_preview.open && host.file_preview.expanded));
-        assert!(window.debug_bounds("file-preview-navigation").unwrap().size.height > navigation.size.height);
+        host.read_with(window, |host, _| {
+            assert!(!host.terminal_ui.open && host.file_preview.open && host.file_preview.expanded)
+        });
+        assert!(
+            window
+                .debug_bounds("file-preview-navigation")
+                .unwrap()
+                .size
+                .height
+                > navigation.size.height
+        );
         let collapse = window.debug_bounds("file-preview-expand").unwrap();
         window.simulate_click(collapse.center(), Default::default());
         window.run_until_parked();
         assert!(window.debug_bounds("file-preview-navigation").is_none());
         assert!(window.debug_bounds("agent-right-sidebar-resize").is_some());
-        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "fn b() {}
-");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "fn b() {}
+"
+        );
     }
 
     #[gpui::test]
@@ -1544,17 +1687,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
         let source = "查看 `a.rs`，继续说明。";
-        let decorated = decorate_cached(source.into(), Some(dir.path().into()), Default::default()).await.unwrap();
+        let decorated = decorate_cached(source.into(), Some(dir.path().into()), Default::default())
+            .await
+            .unwrap();
         assert_eq!(decorated.replacements.len(), 1);
         let mut replacements = decorated.replacements.clone();
         let appended = format!("{source}\n\n新的总结 **结果**");
         retain_decorations(source, &appended, &mut replacements);
-        assert_eq!(apply_decorations(&appended, &replacements), format!("{}\n\n新的总结 **结果**", decorated.markdown));
+        assert_eq!(
+            apply_decorations(&appended, &replacements),
+            format!("{}\n\n新的总结 **结果**", decorated.markdown)
+        );
         let changed = "查看 `a.rsx`，继续说明。";
         retain_decorations(source, changed, &mut replacements);
         assert!(replacements.is_empty());
         let code = "a.rs";
-        let decorated = decorate_cached(code.into(), Some(dir.path().into()), Default::default()).await.unwrap();
+        let decorated = decorate_cached(code.into(), Some(dir.path().into()), Default::default())
+            .await
+            .unwrap();
         let mut replacements = decorated.replacements;
         // Same byte range, but the line now belongs to a setext heading.
         // It is still a path candidate and can keep its link.

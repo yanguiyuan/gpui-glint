@@ -66,14 +66,20 @@ impl State {
         }
     }
     fn set_project(&mut self, path: Option<PathBuf>, cx: &mut Context<AgentWorkspace>) {
-        let label = path.as_ref().map(gpui_glint::paths::display_path).unwrap_or_default();
+        let label = path
+            .as_ref()
+            .map(gpui_glint::paths::display_path)
+            .unwrap_or_default();
         self.project_source = path.map(|path| (label.clone(), path));
-        self.project.update(cx, |field, cx| field.set_value(label, cx));
+        self.project
+            .update(cx, |field, cx| field.set_value(label, cx));
     }
     fn project_path(&self, cx: &App) -> PathBuf {
         let value = self.project.read(cx).value();
         if let Some((label, source)) = &self.project_source {
-            if value == label { return source.clone(); }
+            if value == label {
+                return source.clone();
+            }
         }
         PathBuf::from(value.trim())
     }
@@ -340,8 +346,13 @@ impl AgentWorkspace {
     }
     fn set_channel_group_access(&mut self, id: Uuid, enabled: bool, cx: &mut Context<Self>) {
         let result = (|| {
-            let mut app = self.channels.apps.iter().find(|app| app.id == id)
-                .cloned().ok_or("应用不存在")?;
+            let mut app = self
+                .channels
+                .apps
+                .iter()
+                .find(|app| app.id == id)
+                .cloned()
+                .ok_or("应用不存在")?;
             app.allow_group_members = enabled;
             self.channels.repo.save(&app)?;
             self.channels.apps = self.channels.repo.applications()?;
@@ -725,8 +736,15 @@ mod tests {
         );
         host.read_with(window, |host, cx| {
             let original = dir.path().canonicalize().unwrap();
-            assert_eq!(host.channels.project.read(cx).value(), gpui_glint::paths::display_path(&original));
-            assert_eq!(host.channels.project_path(cx), original, "Unedited path labels must preserve their source path");
+            assert_eq!(
+                host.channels.project.read(cx).value(),
+                gpui_glint::paths::display_path(&original)
+            );
+            assert_eq!(
+                host.channels.project_path(cx),
+                original,
+                "Unedited path labels must preserve their source path"
+            );
             assert_eq!(host.channels.app_id.read(cx).value(), "test-ak");
             assert_eq!(host.channels.secret.read(cx).value(), "");
             assert!(host.channels.partner.is_some());

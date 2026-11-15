@@ -159,7 +159,8 @@ fn merge(groups: impl IntoIterator<Item = Vec<PathBuf>>) -> Vec<PathBuf> {
 fn same(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
     }
     #[cfg(not(windows))]
     {

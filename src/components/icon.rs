@@ -206,8 +206,16 @@ impl Icon {
 
     /// Resolve a file name to its language icon, retaining a text icon for unknown types.
     pub fn for_file_name(name: &str) -> Self {
-        let file = std::path::Path::new(name).file_name().and_then(|name| name.to_str()).unwrap_or(name).to_ascii_lowercase();
-        if file == "dockerfile" || file == "containerfile" || file.starts_with("dockerfile.") || file.ends_with(".dockerfile") {
+        let file = std::path::Path::new(name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        if file == "dockerfile"
+            || file == "containerfile"
+            || file.starts_with("dockerfile.")
+            || file.ends_with(".dockerfile")
+        {
             return Self::Docker;
         }
         if file == "makefile" || file == "gnumakefile" || file.starts_with("makefile.") {
@@ -429,7 +437,10 @@ impl AssetSource for GlintAssets {
 
 fn icon_svg(name: &str) -> Option<String> {
     let (body, _fill) = match name {
-        "sparkles" => ("<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z'/><path d='m20 2 .6 1.4L22 4l-1.4.6L20 6l-.6-1.4L18 4l1.4-.6L20 2Z'/>", "none"),
+        "sparkles" => (
+            "<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z'/><path d='m20 2 .6 1.4L22 4l-1.4.6L20 6l-.6-1.4L18 4l1.4-.6L20 2Z'/>",
+            "none",
+        ),
         "box" => (
             "<path d='m12 3 9 4.5v9L12 21l-9-4.5v-9L12 3Z'/><path d='m3 7.5 9 4.5 9-4.5M12 12v9M7.5 5.25l9 4.5'/>",
             "none",

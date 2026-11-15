@@ -14,8 +14,8 @@ use gpui_glint::components::{
 use gpui_glint::theme::ThemePreset;
 
 use pages::{
-    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, IconsPage, InputsPage, MasonryPage,
-    LayoutPage, OverviewPage, TablesPage, TabsPage, ThemeShowcase,
+    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, IconsPage, InputsPage,
+    LayoutPage, MasonryPage, OverviewPage, TablesPage, TabsPage, ThemeShowcase,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,7 +136,8 @@ impl Playground {
         self.documents
             .update(cx, |page, cx| page.set_theme(theme, cx));
         self.tabs.update(cx, |page, cx| page.set_theme(theme, cx));
-        self.masonry.update(cx, |page, cx| page.set_theme(theme, cx));
+        self.masonry
+            .update(cx, |page, cx| page.set_theme(theme, cx));
         cx.notify();
     }
 

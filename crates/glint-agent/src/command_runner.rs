@@ -34,8 +34,13 @@ fn spawn_error(program: &str, error: &std::io::Error) -> String {
 
 fn environment_error(stderr: &str) -> bool {
     let text = stderr.to_ascii_lowercase();
-    ["shim: could not create process", "untrusted mount point", "the path cannot be traversed"]
-        .iter().any(|message| text.contains(message))
+    [
+        "shim: could not create process",
+        "untrusted mount point",
+        "the path cannot be traversed",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Scope {
@@ -136,19 +141,29 @@ fn registry() -> &'static Mutex<HashMap<uuid::Uuid, Arc<Run>>> {
 /// UI cancellation is scoped to the conversation and the exact tool call.
 pub fn cancel_call(anchor: &Path, session: uuid::Uuid, call_id: &str) -> bool {
     let runs = registry().lock().unwrap();
-    let mut matching = runs.values().filter(|run| run.scope.anchor == anchor
-        && run.scope.session == Some(session) && run.call_id.as_deref() == Some(call_id)
-        && !run.finished.load(Ordering::Acquire));
-    let Some(run) = matching.next() else { return false; };
-    if matching.next().is_some() { return false; }
+    let mut matching = runs.values().filter(|run| {
+        run.scope.anchor == anchor
+            && run.scope.session == Some(session)
+            && run.call_id.as_deref() == Some(call_id)
+            && !run.finished.load(Ordering::Acquire)
+    });
+    let Some(run) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
     run.manual_cancel.store(true, Ordering::Release);
     run.cancel.send(true).is_ok()
 }
 
 pub fn call_cancelling(anchor: &Path, session: uuid::Uuid, call_id: &str) -> bool {
-    registry().lock().unwrap().values().any(|run| run.scope.anchor == anchor
-        && run.scope.session == Some(session) && run.call_id.as_deref() == Some(call_id)
-        && *run.cancel.borrow())
+    registry().lock().unwrap().values().any(|run| {
+        run.scope.anchor == anchor
+            && run.scope.session == Some(session)
+            && run.call_id.as_deref() == Some(call_id)
+            && *run.cancel.borrow()
+    })
 }
 fn store(scope: &Scope, result: &ResultData) -> Result<(), String> {
     database::save_command_run(
@@ -413,7 +428,8 @@ async fn worker(
         }
         // The native log view understands ANSI styling even though pipes are
         // used for capture. Ask common tools to retain their colored output.
-        command.env_remove("NO_COLOR")
+        command
+            .env_remove("NO_COLOR")
             .env("TERM", "xterm-256color")
             .env("FORCE_COLOR", "1")
             .env("CLICOLOR_FORCE", "1")
@@ -445,22 +461,30 @@ async fn worker(
                     return Err(spawn_error(&program, &first));
                 }
                 let mut fallback = crate::child_process::async_command(&retry);
-                fallback.args(&args).current_dir(&cwd)
+                fallback
+                    .args(&args)
+                    .current_dir(&cwd)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped()).kill_on_drop(true);
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
                 #[cfg(unix)]
                 fallback.process_group(0);
                 // Reuse the exact sanitized environment of the first attempt.
                 for (key, value) in command.as_std().get_envs() {
-                    if let Some(value) = value { fallback.env(key, value); }
-                    else { fallback.env_remove(key); }
+                    if let Some(value) = value {
+                        fallback.env(key, value);
+                    } else {
+                        fallback.env_remove(key);
+                    }
                 }
                 let mut state = run.state.lock().unwrap();
                 state.result.retry_count = 1;
                 state.result.resolved_program = Some(retry);
                 drop(state);
-                fallback.spawn().map_err(|e| format!("无法启动命令：{e}（首次错误：{first}）"))?
+                fallback
+                    .spawn()
+                    .map_err(|e| format!("无法启动命令：{e}（首次错误：{first}）"))?
             }
             Err(error) => return Err(format!("无法启动命令：{error}")),
         };
@@ -536,7 +560,9 @@ async fn worker(
         state.result.failure_kind = match state.result.status.as_str() {
             "timed_out" => Some("timeout".into()),
             "cancelled" => Some("cancelled".into()),
-            "failed" if state.result.exit_code.is_some_and(|code| code != 0) => Some("nonzero_exit".into()),
+            "failed" if state.result.exit_code.is_some_and(|code| code != 0) => {
+                Some("nonzero_exit".into())
+            }
             "failed" => Some("io_error".into()),
             _ => None,
         };
@@ -557,14 +583,19 @@ async fn worker(
             .into();
             state.result.error = Some(if run.manual_cancel.load(Ordering::Acquire) {
                 "用户手动终止了此命令；不要自动重试。".into()
-            } else { error });
-            state.result.failure_kind = Some(if *cancel.borrow() {
-                "cancelled"
-            } else if spawn_attempted && !spawned {
-                "spawn_failed"
             } else {
-                "io_error"
-            }.into());
+                error
+            });
+            state.result.failure_kind = Some(
+                if *cancel.borrow() {
+                    "cancelled"
+                } else if spawn_attempted && !spawned {
+                    "spawn_failed"
+                } else {
+                    "io_error"
+                }
+                .into(),
+            );
             state.result.environment_unavailable = spawn_attempted && !spawned;
         }
         state.result.stdout = state.buffers[0].text();
@@ -642,7 +673,8 @@ async fn start(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    _file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    _file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -967,16 +999,23 @@ pub async fn internal(
         events.map(|(id, sender)| (id.into(), sender.clone())),
     )
     .await?;
-    if (program == "rg" || program == "rg.exe") && result.exit_code == Some(1)
-        && result.stderr.trim().is_empty() && result.error.is_none() && !result.environment_unavailable
-        && result.failure_kind.as_deref() == Some("nonzero_exit") {
+    if (program == "rg" || program == "rg.exe")
+        && result.exit_code == Some(1)
+        && result.stderr.trim().is_empty()
+        && result.error.is_none()
+        && !result.environment_unavailable
+        && result.failure_kind.as_deref() == Some("nonzero_exit")
+    {
         return Ok(String::new());
     }
     if result.status != "completed" {
         return Err(format!(
             "exit: {:?}; failure_kind: {}\n{}\n{}\n{}",
-            result.exit_code, result.failure_kind.as_deref().unwrap_or("unknown"),
-            result.stdout, result.stderr, result.error.as_deref().unwrap_or("")
+            result.exit_code,
+            result.failure_kind.as_deref().unwrap_or("unknown"),
+            result.stdout,
+            result.stderr,
+            result.error.as_deref().unwrap_or("")
         ));
     }
     Ok(format!(
@@ -994,52 +1033,133 @@ mod windows_tests {
     #[tokio::test]
     async fn manual_stop_cancels_only_the_selected_call_and_preserves_output() {
         let temp = tempfile::tempdir().unwrap();
-        let scope = Scope { anchor: temp.path().join("sessions.json"), root: Some(temp.path().into()), partner: None, session: Some(uuid::Uuid::new_v4()) };
+        let scope = Scope {
+            anchor: temp.path().join("sessions.json"),
+            root: Some(temp.path().into()),
+            partner: None,
+            session: Some(uuid::Uuid::new_v4()),
+        };
         let (events, _) = async_channel::unbounded();
         let first = start(scope.clone(), temp.path().into(), "powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "[Console]::WriteLine('before stop'); [IO.File]::WriteAllText('ready.txt','ready'); Start-Sleep -Seconds 30".into()], 60, Some(("first-call".into(), events.clone()))).await.unwrap();
-        let other = start(scope.clone(), temp.path().into(), "powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "Start-Sleep -Seconds 30".into()], 60, Some(("other-call".into(), events))).await.unwrap();
-        let deadline = Instant::now()+Duration::from_secs(15);
+        let other = start(
+            scope.clone(),
+            temp.path().into(),
+            "powershell.exe".into(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 30".into(),
+            ],
+            60,
+            Some(("other-call".into(), events)),
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !temp.path().join("ready.txt").exists() {
-            assert!(Instant::now()<deadline, "test command did not start");
+            assert!(Instant::now() < deadline, "test command did not start");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        assert!(!cancel_call(&scope.anchor, uuid::Uuid::new_v4(), "first-call"));
-        assert!(cancel_call(&scope.anchor, scope.session.unwrap(), "first-call"));
-        tokio::time::timeout(Duration::from_secs(10), wait(&first)).await.unwrap();
+        assert!(!cancel_call(
+            &scope.anchor,
+            uuid::Uuid::new_v4(),
+            "first-call"
+        ));
+        assert!(cancel_call(
+            &scope.anchor,
+            scope.session.unwrap(),
+            "first-call"
+        ));
+        tokio::time::timeout(Duration::from_secs(10), wait(&first))
+            .await
+            .unwrap();
         let result = snapshot(&first);
         assert_eq!(result.status, "cancelled");
         assert_eq!(result.failure_kind.as_deref(), Some("cancelled"));
         assert!(result.error.as_deref().unwrap().contains("用户手动终止"));
         assert!(result.stdout.contains("before stop"));
-        assert!(!other.finished.load(Ordering::Acquire), "unrelated command must stay alive");
+        assert!(
+            !other.finished.load(Ordering::Acquire),
+            "unrelated command must stay alive"
+        );
         other.cancel.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), wait(&other)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait(&other))
+            .await
+            .unwrap();
     }
 
     async fn local(root: &Path, program: &str, args: &[&str], timeout: u64) -> ResultData {
         foreground_scope(
-            Scope { anchor: PathBuf::new(), root: Some(root.into()), partner: None, session: None },
-            root.into(), program.into(), args.iter().map(|arg| (*arg).into()).collect(),
-            timeout, false, None,
-        ).await.unwrap()
+            Scope {
+                anchor: PathBuf::new(),
+                root: Some(root.into()),
+                partner: None,
+                session: None,
+            },
+            root.into(),
+            program.into(),
+            args.iter().map(|arg| (*arg).into()).collect(),
+            timeout,
+            false,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
     async fn startup_exit_timeout_and_environment_failures_are_distinct() {
         let temp = tempfile::tempdir().unwrap();
-        let missing = local(temp.path(), "glint-nonexistent-executable-82793.exe", &[], 5).await;
+        let missing = local(
+            temp.path(),
+            "glint-nonexistent-executable-82793.exe",
+            &[],
+            5,
+        )
+        .await;
         assert_eq!(missing.failure_kind.as_deref(), Some("spawn_failed"));
         assert_eq!(missing.exit_code, None);
         assert!(missing.environment_unavailable);
-        let failed = local(temp.path(), "cmd.exe", &["/D", "/C", "echo failed 1>&2 & exit /b 7"], 5).await;
+        let failed = local(
+            temp.path(),
+            "cmd.exe",
+            &["/D", "/C", "echo failed 1>&2 & exit /b 7"],
+            5,
+        )
+        .await;
         assert_eq!(failed.failure_kind.as_deref(), Some("nonzero_exit"));
         assert_eq!(failed.exit_code, Some(7));
         assert!(!failed.environment_unavailable);
         assert_eq!(failed.retry_count, 0);
-        let environment = local(temp.path(), "cmd.exe", &["/D", "/C", "echo Shim: Could not create process 1>&2 & exit /b 1"], 5).await;
+        let environment = local(
+            temp.path(),
+            "cmd.exe",
+            &[
+                "/D",
+                "/C",
+                "echo Shim: Could not create process 1>&2 & exit /b 1",
+            ],
+            5,
+        )
+        .await;
         assert!(environment.environment_unavailable);
-        assert_eq!(environment.retry_count, 0, "never replay a command based on stderr text");
-        let timeout = local(temp.path(), "powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"], 1).await;
+        assert_eq!(
+            environment.retry_count, 0,
+            "never replay a command based on stderr text"
+        );
+        let timeout = local(
+            temp.path(),
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ],
+            1,
+        )
+        .await;
         assert_eq!(timeout.failure_kind.as_deref(), Some("timeout"));
         assert_eq!(timeout.status, "timed_out");
     }
@@ -1049,8 +1169,28 @@ mod windows_tests {
     async fn bundled_search_handles_matches_and_empty_results() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file.txt"), "hello").unwrap();
-        assert!(internal(temp.path(), "rg", &["hello".into(), "file.txt".into()], None).await.unwrap().contains("hello"));
-        assert_eq!(internal(temp.path(), "rg", &["absent".into(), "file.txt".into()], None).await.unwrap(), "");
+        assert!(
+            internal(
+                temp.path(),
+                "rg",
+                &["hello".into(), "file.txt".into()],
+                None
+            )
+            .await
+            .unwrap()
+            .contains("hello")
+        );
+        assert_eq!(
+            internal(
+                temp.path(),
+                "rg",
+                &["absent".into(), "file.txt".into()],
+                None
+            )
+            .await
+            .unwrap(),
+            ""
+        );
         let shell = local(temp.path(), "cmd.exe", &["/D", "/C", "rg --version"], 5).await;
         assert_eq!(shell.status, "completed");
         assert!(shell.stdout.starts_with("ripgrep 15.1.0"));
@@ -1060,11 +1200,26 @@ mod windows_tests {
         let root = tempfile::tempdir().unwrap();
         let script = r#"Add-Type -Name ConsoleProbe -Namespace GlintTest -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'; [Console]::Write([GlintTest.ConsoleProbe]::GetConsoleWindow().ToInt64()); [Console]::Error.Write('managed stderr'); exit 7"#;
         let result = foreground_scope(
-            Scope { anchor: PathBuf::new(), root: Some(root.path().to_owned()), partner: None, session: Some(uuid::Uuid::new_v4()) },
-            root.path().to_owned(), "powershell.exe".into(),
-            vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script.into()],
-            30, false, None,
-        ).await.unwrap();
+            Scope {
+                anchor: PathBuf::new(),
+                root: Some(root.path().to_owned()),
+                partner: None,
+                session: Some(uuid::Uuid::new_v4()),
+            },
+            root.path().to_owned(),
+            "powershell.exe".into(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+            30,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.status, "failed");
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.stdout, "0");

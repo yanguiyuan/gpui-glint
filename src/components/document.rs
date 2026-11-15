@@ -488,39 +488,68 @@ impl DocumentEditor {
         let previous = std::mem::take(&mut self.blocks);
         let references = self.render_references.clone();
         let mut changed = HashSet::new();
-        self.blocks = md::split(markdown.as_ref()).into_iter().enumerate().map(|(index, markdown)| {
-            let id = if let Some(old) = previous.get(index) { old.id } else {
-                let id = self.next_id;
-                self.next_id += 1;
-                id
-            };
-            if previous.get(index).is_none_or(|old| old.markdown != markdown) { changed.insert(id); }
-            DocumentBlock { id, markdown }
-        }).collect();
+        self.blocks = md::split(markdown.as_ref())
+            .into_iter()
+            .enumerate()
+            .map(|(index, markdown)| {
+                let id = if let Some(old) = previous.get(index) {
+                    old.id
+                } else {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                };
+                if previous
+                    .get(index)
+                    .is_none_or(|old| old.markdown != markdown)
+                {
+                    changed.insert(id);
+                }
+                DocumentBlock { id, markdown }
+            })
+            .collect();
         self.refresh_render_blocks();
         if references != self.render_references {
             changed.extend(self.blocks.iter().map(|block| block.id));
         }
-        if self.selection.is_some_and(|selection| changed.contains(&selection.anchor.block)
-            || changed.contains(&selection.head.block) || self.index(selection.anchor.block).is_none()
-            || self.index(selection.head.block).is_none()) {
+        if self.selection.is_some_and(|selection| {
+            changed.contains(&selection.anchor.block)
+                || changed.contains(&selection.head.block)
+                || self.index(selection.anchor.block).is_none()
+                || self.index(selection.head.block).is_none()
+        }) {
             self.clear_selection(cx);
         }
         for (index, block) in self.blocks.iter().enumerate() {
-            if !changed.contains(&block.id) { continue; }
-            let Some(view) = self.views.get_mut(&block.id) else { continue; };
+            if !changed.contains(&block.id) {
+                continue;
+            }
+            let Some(view) = self.views.get_mut(&block.id) else {
+                continue;
+            };
             let kind = block.kind();
             let same_kind = previous.get(index).is_some_and(|old| old.kind() == kind);
-            if same_kind && kind == DocumentBlockKind::Code
+            if same_kind
+                && kind == DocumentBlockKind::Code
                 && md::code(&previous[index].markdown).0 == md::code(&block.markdown).0
                 && view.mermaid.is_none()
             {
                 let (_, source) = md::code(&block.markdown);
-                view.source.update(cx, |editor, cx| editor.sync_content(source, cx));
-            } else if same_kind && matches!(kind, DocumentBlockKind::Paragraph | DocumentBlockKind::Heading(_) | DocumentBlockKind::List) {
+                view.source
+                    .update(cx, |editor, cx| editor.sync_content(source, cx));
+            } else if same_kind
+                && matches!(
+                    kind,
+                    DocumentBlockKind::Paragraph
+                        | DocumentBlockKind::Heading(_)
+                        | DocumentBlockKind::List
+                )
+            {
                 let leaves = block_leaves(&block.markdown);
                 if leaves.len() == view.inline.len() {
-                    view.source.update(cx, |editor, cx| editor.sync_content(block.markdown.clone(), cx));
+                    view.source.update(cx, |editor, cx| {
+                        editor.sync_content(block.markdown.clone(), cx)
+                    });
                     for (editor, leaf) in view.inline.iter().zip(leaves) {
                         let text = format!("{}\n\n{}", leaf.source, self.render_references);
                         editor.update(cx, |editor, cx| editor.sync_rich_text(&text, cx));
@@ -3346,17 +3375,29 @@ mod tests {
     }
 
     #[gpui::test]
-    fn streamed_preview_reuses_completed_blocks_and_the_growing_rich_text(cx: &mut gpui::TestAppContext) {
+    fn streamed_preview_reuses_completed_blocks_and_the_growing_rich_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
         use super::*;
         let (document, window) = cx.add_window_view(|_, cx| {
-            DocumentEditor::new(cx, "固定段落\n\n正在检查 [`src/main.rs`](glint-preview:test)").embedded_preview()
+            DocumentEditor::new(
+                cx,
+                "固定段落\n\n正在检查 [`src/main.rs`](glint-preview:test)",
+            )
+            .embedded_preview()
         });
         window.run_until_parked();
-        let (blocks, first, growing) = document.read_with(window, |editor, _| (
-            editor.blocks.iter().map(|block| block.id).collect::<Vec<_>>(),
-            editor.views[&editor.blocks[0].id].inline[0].entity_id(),
-            editor.views[&editor.blocks[1].id].inline[0].entity_id(),
-        ));
+        let (blocks, first, growing) = document.read_with(window, |editor, _| {
+            (
+                editor
+                    .blocks
+                    .iter()
+                    .map(|block| block.id)
+                    .collect::<Vec<_>>(),
+                editor.views[&editor.blocks[0].id].inline[0].entity_id(),
+                editor.views[&editor.blocks[1].id].inline[0].entity_id(),
+            )
+        });
         for text in [
             "固定段落\n\n正在检查 [`src/main.rs`](glint-preview:test)，继续输出中文",
             "固定段落\n\n正在检查 [`src/main.rs`](glint-preview:test)，继续输出中文 **结果**\n\n```rust\nfn main() {",
@@ -3369,7 +3410,12 @@ mod tests {
                 assert_eq!(editor.blocks[1].id, blocks[1]);
                 assert_eq!(editor.views[&blocks[0]].inline[0].entity_id(), first);
                 assert_eq!(editor.views[&blocks[1]].inline[0].entity_id(), growing);
-                assert!(editor.views[&blocks[1]].inline[0].read(cx).content().contains("继续输出中文"));
+                assert!(
+                    editor.views[&blocks[1]].inline[0]
+                        .read(cx)
+                        .content()
+                        .contains("继续输出中文")
+                );
             });
         }
     }

@@ -591,7 +591,8 @@ mod tests {
     fn tool_call_ids_survive_empty_argument_delta_ids() {
         for id in [None, Some(Value::Null), Some(serde_json::json!(""))] {
             let mut stream = StreamCompletion::default();
-            let mut delta = serde_json::json!({"index":0,"function":{"arguments":"{\"name\":\"kdev\"}"}});
+            let mut delta =
+                serde_json::json!({"index":0,"function":{"arguments":"{\"name\":\"kdev\"}"}});
             if let Some(id) = id {
                 delta["id"] = id;
             }

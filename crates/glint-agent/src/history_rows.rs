@@ -37,7 +37,11 @@ impl HistoryRows {
 
     pub fn set_rows(&mut self, rows: Vec<AnyView>, cx: &mut Context<Self>) {
         if self.rows.len() != rows.len()
-            || self.rows.iter().zip(&rows).any(|(a, b)| a.entity_id() != b.entity_id())
+            || self
+                .rows
+                .iter()
+                .zip(&rows)
+                .any(|(a, b)| a.entity_id() != b.entity_id())
         {
             self.measured.clear();
         }

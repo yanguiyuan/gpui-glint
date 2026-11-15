@@ -8,13 +8,13 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun,
-    Window, div, px, rgb,
+    SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun, Window, div, px,
+    rgb,
 };
 
-use super::{Icon, Scrollbar, ScrollbarState};
 use super::code_card::{CodeColors, EditorLine};
 use super::scroll_chain::ChainScroll;
+use super::{Icon, Scrollbar, ScrollbarState};
 use crate::theme::ThemePreset;
 
 /// One rendered line of a diff: context, added, or deleted.
@@ -346,10 +346,16 @@ impl DiffCard {
     }
 
     /// Use a host's bounded flex height; only the source rows scroll.
-    pub fn fill_height(mut self, enabled: bool) -> Self { self.fill_height = enabled; self }
+    pub fn fill_height(mut self, enabled: bool) -> Self {
+        self.fill_height = enabled;
+        self
+    }
 
     pub fn set_fill_height(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.fill_height != enabled { self.fill_height = enabled; cx.notify(); }
+        if self.fill_height != enabled {
+            self.fill_height = enabled;
+            cx.notify();
+        }
     }
 
     /// Number of replaced line pairs whose only difference is whitespace.
@@ -439,9 +445,23 @@ impl DiffCard {
     fn recompute_word_tints(&mut self) {
         self.measured_width.set(px(0.));
         // A cheap upper bound avoids shaping every line just to size a rail.
-        self.max_columns = self.lines.iter().map(|line| line.text.chars().fold(0, |column, ch| {
-            column + if ch == '\t' { 4 - column % 4 } else if ch.is_ascii() { 1 } else { 2 }
-        })).max().unwrap_or(0);
+        self.max_columns = self
+            .lines
+            .iter()
+            .map(|line| {
+                line.text.chars().fold(0, |column, ch| {
+                    column
+                        + if ch == '\t' {
+                            4 - column % 4
+                        } else if ch.is_ascii() {
+                            1
+                        } else {
+                            2
+                        }
+                })
+            })
+            .max()
+            .unwrap_or(0);
         self.rows = None;
         self.runs.clear();
         self.whitespace_pairs.clear();
@@ -1000,12 +1020,28 @@ impl Render for DiffCard {
                 }
                 root = root.child(headings);
             }
-            let font = window.text_system().resolve_font(&gpui::font(crate::code_font::family()));
-            let advance = window.text_system().advance(font, px(13.), '0').map_or(px(8.), |advance| advance.width);
-            let text_extent = ((self.viewport_width - px(12.)) / if self.side_by_side { 2. } else { 1. }
-                - px(if self.side_by_side { 50. } else { 94. })).max(px(1.));
-            let maximum = if self.viewport_width > px(0.) { ((advance * self.max_columns as f32).max(self.measured_width.get()) + px(16.) - text_extent).max(px(0.)) } else { px(0.) };
-            self.horizontal_scroll.set_offset(gpui::point(self.horizontal_scroll.offset().x.clamp(-maximum, px(0.)), px(0.)));
+            let font = window
+                .text_system()
+                .resolve_font(&gpui::font(crate::code_font::family()));
+            let advance = window
+                .text_system()
+                .advance(font, px(13.), '0')
+                .map_or(px(8.), |advance| advance.width);
+            let text_extent = ((self.viewport_width - px(12.))
+                / if self.side_by_side { 2. } else { 1. }
+                - px(if self.side_by_side { 50. } else { 94. }))
+            .max(px(1.));
+            let maximum = if self.viewport_width > px(0.) {
+                ((advance * self.max_columns as f32).max(self.measured_width.get()) + px(16.)
+                    - text_extent)
+                    .max(px(0.))
+            } else {
+                px(0.)
+            };
+            self.horizontal_scroll.set_offset(gpui::point(
+                self.horizontal_scroll.offset().x.clamp(-maximum, px(0.)),
+                px(0.),
+            ));
             let (rows, visible) = self.visible_rows();
             let paint_offset = self.scroll.offset();
             let card = cx.entity();
@@ -1025,11 +1061,13 @@ impl Render for DiffCard {
                 .w_full()
                 .pr(px(12.))
                 .when(self.fill_height, |body| body.flex_1().min_h_0())
-                .when(!self.fill_height, |body| body.max_h(px(if self.side_by_side {
-                    (f32::from(window.viewport_size().height) - 220.).max(240.)
-                } else {
-                    24. * LINE_HEIGHT
-                })))
+                .when(!self.fill_height, |body| {
+                    body.max_h(px(if self.side_by_side {
+                        (f32::from(window.viewport_size().height) - 220.).max(240.)
+                    } else {
+                        24. * LINE_HEIGHT
+                    }))
+                })
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
                 .chain_scroll_y(&self.scroll)
@@ -1037,16 +1075,30 @@ impl Render for DiffCard {
                 .flex_col();
             // Handle horizontal input inside the vertical scroll viewport, so
             // Shift+wheel is consumed before GPUI applies its vertical delta.
-            let mut content = div().w_full().flex_shrink_0().flex().flex_col()
-                .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
-                    let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-                    if event.modifiers.shift || delta.x != px(0.) {
-                        let horizontal = if event.modifiers.shift && delta.x == px(0.) { delta.y } else { delta.x };
-                        let offset = this.horizontal_scroll.offset();
-                        this.horizontal_scroll.set_offset(gpui::point((offset.x + horizontal).clamp(-maximum, px(0.)), px(0.)));
-                        cx.stop_propagation(); cx.notify();
-                    }
-                }));
+            let mut content = div()
+                .w_full()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .on_scroll_wheel(cx.listener(
+                    move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                        let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
+                        if event.modifiers.shift || delta.x != px(0.) {
+                            let horizontal = if event.modifiers.shift && delta.x == px(0.) {
+                                delta.y
+                            } else {
+                                delta.x
+                            };
+                            let offset = this.horizontal_scroll.offset();
+                            this.horizontal_scroll.set_offset(gpui::point(
+                                (offset.x + horizontal).clamp(-maximum, px(0.)),
+                                px(0.),
+                            ));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                ));
             let top = self.row_offsets.get(visible.start).copied().unwrap_or(0.);
             content = content.child(div().h(px(top)).flex_shrink_0());
             // Bound cached syntax runs as well as live UI elements.
@@ -1066,7 +1118,8 @@ impl Render for DiffCard {
                 match row {
                     Row::Pair(left, right) => {
                         let left = self.split_cell(left, true, colors, diff_colors, cx.entity_id());
-                        let right = self.split_cell(right, false, colors, diff_colors, cx.entity_id());
+                        let right =
+                            self.split_cell(right, false, colors, diff_colors, cx.entity_id());
                         content = content.child(
                             div()
                                 .w_full()
@@ -1190,7 +1243,10 @@ impl Render for DiffCard {
                                     runs,
                                     text: display_text,
                                     horizontal: Some(self.horizontal_scroll.clone()),
-                                    measurement: Some((self.measured_width.clone(), cx.entity_id())),
+                                    measurement: Some((
+                                        self.measured_width.clone(),
+                                        cx.entity_id(),
+                                    )),
                                 }),
                         );
                         content = content.child(row);
@@ -1239,16 +1295,32 @@ impl Render for DiffCard {
                 - self.row_offsets.get(visible.end).copied().unwrap_or(0.);
             content = content.child(div().h(px(bottom.max(0.))).flex_shrink_0());
             body = body.child(content);
-            root = root.child(
-                div().relative().w_full()
-                    .when(self.fill_height, |viewport| viewport.flex_1().min_h_0().flex().flex_col())
-                    .child(body)
-                    .child(Scrollbar::vertical(&self.scroll, &self.vertical_bar).theme(theme).render()
-                        .debug_selector(|| "diff-card-vertical-scrollbar".into()).absolute().right_0().top_0()),
-            ).child(
-                Scrollbar::horizontal(&self.horizontal_scroll, &self.horizontal_bar).theme(theme).range(maximum, text_extent).render()
-                    .debug_selector(|| "diff-card-horizontal-scrollbar".into()),
-            );
+            root = root
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .when(self.fill_height, |viewport| {
+                            viewport.flex_1().min_h_0().flex().flex_col()
+                        })
+                        .child(body)
+                        .child(
+                            Scrollbar::vertical(&self.scroll, &self.vertical_bar)
+                                .theme(theme)
+                                .render()
+                                .debug_selector(|| "diff-card-vertical-scrollbar".into())
+                                .absolute()
+                                .right_0()
+                                .top_0(),
+                        ),
+                )
+                .child(
+                    Scrollbar::horizontal(&self.horizontal_scroll, &self.horizontal_bar)
+                        .theme(theme)
+                        .range(maximum, text_extent)
+                        .render()
+                        .debug_selector(|| "diff-card-horizontal-scrollbar".into()),
+                );
         }
         root
     }
@@ -1451,19 +1523,16 @@ impl Element for DiffLineElement {
         cx: &mut App,
     ) {
         if let Some(line) = prepaint.line.take() {
-            let origin = gpui::point(bounds.origin.x + self.horizontal.as_ref().map_or(px(0.), |scroll| scroll.offset().x), bounds.origin.y);
-            line.paint_background(
-                origin,
-                px(LINE_HEIGHT),
-                window,
-                cx,
+            let origin = gpui::point(
+                bounds.origin.x
+                    + self
+                        .horizontal
+                        .as_ref()
+                        .map_or(px(0.), |scroll| scroll.offset().x),
+                bounds.origin.y,
             );
-            line.paint(
-                origin,
-                px(LINE_HEIGHT),
-                window,
-                cx,
-            );
+            line.paint_background(origin, px(LINE_HEIGHT), window, cx);
+            line.paint(origin, px(LINE_HEIGHT), window, cx);
         }
     }
 }
@@ -1475,88 +1544,181 @@ mod tests {
 
     #[gpui::test]
     fn fill_height_respects_host_height_instead_of_window_height(cx: &mut gpui::TestAppContext) {
-        struct Host { card: gpui::Entity<DiffCard>, height: Pixels }
+        struct Host {
+            card: gpui::Entity<DiffCard>,
+            height: Pixels,
+        }
         impl Render for Host {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().w(px(600.)).h(self.height).flex().flex_col()
+                div()
+                    .w(px(600.))
+                    .h(self.height)
+                    .flex()
+                    .flex_col()
                     .child(div().h(px(48.)).flex_shrink_0())
                     .child(self.card.clone())
-                    .child(div().debug_selector(|| "bounded-diff-footer".into()).h(px(24.)).flex_shrink_0())
+                    .child(
+                        div()
+                            .debug_selector(|| "bounded-diff-footer".into())
+                            .h(px(24.))
+                            .flex_shrink_0(),
+                    )
             }
         }
-        let card = cx.new(|cx| DiffCard::new(cx, "text", "", "changed\n".repeat(1000)).side_by_side(true).fill_height(true).header_visible(false));
-        let (host, window) = cx.add_window_view(|_, _| Host { card: card.clone(), height: px(260.) });
+        let card = cx.new(|cx| {
+            DiffCard::new(cx, "text", "", "changed\n".repeat(1000))
+                .side_by_side(true)
+                .fill_height(true)
+                .header_visible(false)
+        });
+        let (host, window) = cx.add_window_view(|_, _| Host {
+            card: card.clone(),
+            height: px(260.),
+        });
         for height in [260., 180., 420.] {
-            host.update(window, |host, cx| { host.height = px(height); cx.notify(); }); window.run_until_parked();
+            host.update(window, |host, cx| {
+                host.height = px(height);
+                cx.notify();
+            });
+            window.run_until_parked();
             let body = window.debug_bounds("glass-diff-card-body").unwrap();
-            let rail = window.debug_bounds("diff-card-horizontal-scrollbar").unwrap();
+            let rail = window
+                .debug_bounds("diff-card-horizontal-scrollbar")
+                .unwrap();
             let footer = window.debug_bounds("bounded-diff-footer").unwrap();
             assert!(body.size.height > px(20.));
             assert!(rail.bottom() <= footer.top() + px(1.));
             assert!(footer.bottom() <= px(height) + px(1.));
-            card.read_with(window, |card, _| assert!(card.scroll.max_offset().y > px(1000.)));
+            card.read_with(window, |card, _| {
+                assert!(card.scroll.max_offset().y > px(1000.))
+            });
         }
     }
 
     #[gpui::test]
-    fn diff_scrollbars_reveal_long_lines_and_drag_virtual_rows_to_both_ends(cx: &mut gpui::TestAppContext) {
-        let old = (0..300).map(|i| format!("old_{i} = \"{}\";\n", "a".repeat(400))).collect::<String>();
-        let new = (0..300).map(|i| format!("new_{i} = \"{}\";\n", "b".repeat(400))).collect::<String>();
-        let (card, window) = cx.add_window_view(|_, cx| DiffCard::new(cx, "rust", old, new).side_by_side(true));
-        window.simulate_resize(gpui::size(px(800.), px(500.))); window.run_until_parked();
+    fn diff_scrollbars_reveal_long_lines_and_drag_virtual_rows_to_both_ends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old = (0..300)
+            .map(|i| format!("old_{i} = \"{}\";\n", "a".repeat(400)))
+            .collect::<String>();
+        let new = (0..300)
+            .map(|i| format!("new_{i} = \"{}\";\n", "b".repeat(400)))
+            .collect::<String>();
+        let (card, window) =
+            cx.add_window_view(|_, cx| DiffCard::new(cx, "rust", old, new).side_by_side(true));
+        window.simulate_resize(gpui::size(px(800.), px(500.)));
+        window.run_until_parked();
         let body = window.debug_bounds("glass-diff-card-body").unwrap();
-        let horizontal = window.debug_bounds("diff-card-horizontal-scrollbar").unwrap();
+        let horizontal = window
+            .debug_bounds("diff-card-horizontal-scrollbar")
+            .unwrap();
         let vertical = window.debug_bounds("diff-card-vertical-scrollbar").unwrap();
-        assert_eq!(horizontal.size.height, px(12.)); assert_eq!(vertical.size.width, px(12.));
+        assert_eq!(horizontal.size.height, px(12.));
+        assert_eq!(vertical.size.width, px(12.));
         assert!(vertical.size.height > px(100.));
         window.simulate_event(gpui::ScrollWheelEvent {
             position: body.center(),
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-120.))),
-            modifiers: gpui::Modifiers { shift: true, ..Default::default() },
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
             ..Default::default()
-        }); window.run_until_parked();
+        });
+        window.run_until_parked();
         card.read_with(window, |card, _| {
             assert!(card.horizontal_scroll.offset().x < px(0.));
-            assert_eq!(card.scroll.offset().y, px(0.), "Shift+wheel only scrolls horizontally");
+            assert_eq!(
+                card.scroll.offset().y,
+                px(0.),
+                "Shift+wheel only scrolls horizontally"
+            );
         });
-        for (start, end, right) in [(horizontal.left() + px(3.), horizontal.right() + px(80.), true), (horizontal.right() - px(3.), horizontal.left() - px(80.), false)] {
+        for (start, end, right) in [
+            (
+                horizontal.left() + px(3.),
+                horizontal.right() + px(80.),
+                true,
+            ),
+            (
+                horizontal.right() - px(3.),
+                horizontal.left() - px(80.),
+                false,
+            ),
+        ] {
             let from = gpui::point(start, horizontal.center().y);
             let to = gpui::point(end, horizontal.center().y + px(35.));
             window.simulate_mouse_down(from, gpui::MouseButton::Left, Default::default());
             window.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
-            window.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default()); window.run_until_parked();
+            window.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+            window.run_until_parked();
             card.read_with(window, |card, _| {
-                if right { assert!(card.horizontal_scroll.offset().x < px(-1000.)); }
-                else { assert_eq!(card.horizontal_scroll.offset().x, px(0.)); }
+                if right {
+                    assert!(card.horizontal_scroll.offset().x < px(-1000.));
+                } else {
+                    assert_eq!(card.horizontal_scroll.offset().x, px(0.));
+                }
             });
         }
-        for (start, end, bottom) in [(vertical.top() + px(3.), vertical.bottom() + px(80.), true), (vertical.bottom() - px(3.), vertical.top() - px(80.), false)] {
+        for (start, end, bottom) in [
+            (vertical.top() + px(3.), vertical.bottom() + px(80.), true),
+            (vertical.bottom() - px(3.), vertical.top() - px(80.), false),
+        ] {
             let from = gpui::point(vertical.center().x, start);
             let to = gpui::point(vertical.center().x + px(35.), end);
             window.simulate_mouse_down(from, gpui::MouseButton::Left, Default::default());
             window.simulate_mouse_move(to, gpui::MouseButton::Left, Default::default());
-            window.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default()); window.run_until_parked();
+            window.simulate_mouse_up(to, gpui::MouseButton::Left, Default::default());
+            window.run_until_parked();
             card.read_with(window, |card, _| {
-                if bottom { assert_eq!(card.rendered_rows.end, 300); assert!(card.scroll.offset().y < px(-1000.)); }
-                else { assert_eq!(card.scroll.offset().y, px(0.)); }
-                assert!(card.rendered_rows.len() < 80, "dragging keeps row virtualization");
+                if bottom {
+                    assert_eq!(card.rendered_rows.end, 300);
+                    assert!(card.scroll.offset().y < px(-1000.));
+                } else {
+                    assert_eq!(card.scroll.offset().y, px(0.));
+                }
+                assert!(
+                    card.rendered_rows.len() < 80,
+                    "dragging keeps row virtualization"
+                );
             });
         }
     }
 
     #[gpui::test]
     fn tabs_keep_indentation_and_source_offsets_in_diff_lines(cx: &mut gpui::TestAppContext) {
-        let (_, window) = cx.add_window_view(|_, cx| DiffCard::new(cx, "go", "\treturn nil", "\t\treturn err"));
+        let (_, window) =
+            cx.add_window_view(|_, cx| DiffCard::new(cx, "go", "\treturn nil", "\t\treturn err"));
         window.update(|window, cx| {
             let text: SharedString = "\t \t中文 return".into();
-            let mut element = DiffLineElement { runs: dim_runs(&text, 0x555555), text: text.clone(), horizontal: None, measurement: None };
-            let mut spaces = DiffLineElement { runs: dim_runs("        中文 return", 0x555555), text: "        中文 return".into(), horizontal: None, measurement: None };
-            let tabbed = element.prepaint(None, None, Bounds::default(), &mut (), window, cx).line.unwrap();
-            let spaced = spaces.prepaint(None, None, Bounds::default(), &mut (), window, cx).line.unwrap();
+            let mut element = DiffLineElement {
+                runs: dim_runs(&text, 0x555555),
+                text: text.clone(),
+                horizontal: None,
+                measurement: None,
+            };
+            let mut spaces = DiffLineElement {
+                runs: dim_runs("        中文 return", 0x555555),
+                text: "        中文 return".into(),
+                horizontal: None,
+                measurement: None,
+            };
+            let tabbed = element
+                .prepaint(None, None, Bounds::default(), &mut (), window, cx)
+                .line
+                .unwrap();
+            let spaced = spaces
+                .prepaint(None, None, Bounds::default(), &mut (), window, cx)
+                .line
+                .unwrap();
             assert!(tabbed.x_for_index(1) > tabbed.x_for_index(0));
             assert_eq!(tabbed.x_for_index(3), spaced.x_for_index(8));
             assert_eq!(tabbed.len(), text.len());
-            assert_eq!(element.text, text, "display expansion must not alter copy/source data");
+            assert_eq!(
+                element.text, text,
+                "display expansion must not alter copy/source data"
+            );
         });
     }
 

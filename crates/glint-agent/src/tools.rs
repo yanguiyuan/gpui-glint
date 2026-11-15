@@ -962,7 +962,9 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             }
             args_list.extend(["--".into(), text(args, "pattern")?.into(), ".".into()]);
             let directory = resolve(args["path"].as_str().unwrap_or("."), false)?;
-            if !directory.is_dir() { return Err("搜索路径必须为目录".into()); }
+            if !directory.is_dir() {
+                return Err("搜索路径必须为目录".into());
+            }
             let result = command(&directory, "rg", &args_list, None).await?;
             Ok(result
                 .lines()

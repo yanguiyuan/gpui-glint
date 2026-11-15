@@ -15,12 +15,20 @@ mod tests {
     #[gpui::test]
     fn project_group_editor_modes_only_persist_on_save(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let project = PathBuf::from("/repo/feature");
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
         window.simulate_resize(size(px(1200.), px(900.)));
         host.update(window, |host, cx| {
-            host.history.project_group_overrides.insert(project.clone(), "custom".into());
+            host.history
+                .project_group_overrides
+                .insert(project.clone(), "custom".into());
             host.edit_project_group(project.clone(), cx);
         });
         let auto = window.debug_bounds("project-group-auto").unwrap();
@@ -31,14 +39,24 @@ mod tests {
         });
         let save = window.debug_bounds("save-project-group").unwrap();
         window.simulate_click(save.center(), Default::default());
-        host.read_with(window, |host, _| assert!(!host.history.project_group_overrides.contains_key(&project)));
-        host.update(window, |host, cx| host.edit_project_group(project.clone(), cx));
+        host.read_with(window, |host, _| {
+            assert!(!host.history.project_group_overrides.contains_key(&project))
+        });
+        host.update(window, |host, cx| {
+            host.edit_project_group(project.clone(), cx)
+        });
         let manual = window.debug_bounds("project-group-manual").unwrap();
         window.simulate_click(manual.center(), Default::default());
-        host.update(window, |host, cx| { host.project_grouping.name.update(cx, |input, cx| input.set_value("", cx)); });
+        host.update(window, |host, cx| {
+            host.project_grouping
+                .name
+                .update(cx, |input, cx| input.set_value("", cx));
+        });
         let save = window.debug_bounds("save-project-group").unwrap();
         window.simulate_click(save.center(), Default::default());
-        host.read_with(window, |host, _| assert_eq!(host.history.project_group_overrides[&project], ""));
+        host.read_with(window, |host, _| {
+            assert_eq!(host.history.project_group_overrides[&project], "")
+        });
     }
 
     fn git(root: &std::path::Path, args: &[&str]) {
@@ -217,7 +235,11 @@ pub fn group_name<'a>(history: &'a History, path: &std::path::Path) -> Option<&'
 }
 
 pub fn project_icon(history: &History, path: &std::path::Path) -> Icon {
-    if history.agentspace.as_deref() == Some(path) { Icon::Box } else { Icon::Folder }
+    if history.agentspace.as_deref() == Some(path) {
+        Icon::Box
+    } else {
+        Icon::Folder
+    }
 }
 
 pub fn repository_label(history: &History, path: &std::path::Path) -> String {
@@ -361,7 +383,11 @@ impl AgentWorkspace {
         for name in names {
             choices = choices.child(
                 Button::new(name.clone())
-                    .kind(if self.project_grouping.name.read(cx).value() == name { ButtonKind::Tinted } else { ButtonKind::Plain })
+                    .kind(if self.project_grouping.name.read(cx).value() == name {
+                        ButtonKind::Tinted
+                    } else {
+                        ButtonKind::Plain
+                    })
                     .size(ButtonSize::Small)
                     .theme(self.theme)
                     .render()
@@ -432,7 +458,11 @@ impl AgentWorkspace {
         Dialog::new("project-group-dialog", body)
             .width(520.)
             .theme(self.theme)
-            .focus_handles(if automatic { vec![] } else { vec![self.project_grouping.name.focus_handle(cx)] })
+            .focus_handles(if automatic {
+                vec![]
+            } else {
+                vec![self.project_grouping.name.focus_handle(cx)]
+            })
             .on_close(move |_, _, cx| {
                 let _ = weak.update(cx, |this, cx| {
                     this.project_grouping.editing = None;

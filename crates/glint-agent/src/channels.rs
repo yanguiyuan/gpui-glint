@@ -162,9 +162,11 @@ impl Repository {
             }
         }
         tx.execute("INSERT INTO applications VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![app.id.to_string(),serde_json::to_string(app).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
-        if !app.allow_group_members || apps.iter().any(|old| {
-            old.id == app.id && (old.partner != app.partner || old.project != app.project)
-        }) {
+        if !app.allow_group_members
+            || apps.iter().any(|old| {
+                old.id == app.id && (old.partner != app.partner || old.project != app.project)
+            })
+        {
             let id = app.id.to_string();
             tx.execute("UPDATE inbox SET state='failed',error='群聊使用已关闭' WHERE app=?1 AND state IN ('queued','running') AND id IN (SELECT id FROM group_inbox)", [&id]).map_err(|e|e.to_string())?;
             tx.execute("UPDATE outbox SET state='cancelled',error='群聊使用已关闭' WHERE app=?1 AND state IN ('queued','failed') AND inbox IN (SELECT id FROM group_inbox)", [&id]).map_err(|e|e.to_string())?;
@@ -211,7 +213,9 @@ impl Repository {
                 .map_err(|e| e.to_string())?;
             }
             Some((company, sender)) if company == m.company && sender == m.sender => {}
-            Some((company, _)) if company == m.company && m.group && current.allow_group_members => {
+            Some((company, _))
+                if company == m.company && m.group && current.allow_group_members =>
+            {
                 group_member = true;
             }
             _ => return Ok(()),
@@ -219,7 +223,8 @@ impl Repository {
         let inserted=tx.execute("INSERT OR IGNORE INTO inbox(app,company,chat,message,sender,text) VALUES(?1,?2,?3,?4,?5,?6)",params![m.app.to_string(),m.company,m.chat,m.message,m.sender,m.text]).map_err(|e|e.to_string())?;
         if inserted > 0 {
             if group_member {
-                tx.execute("INSERT INTO group_inbox VALUES(last_insert_rowid())", []).map_err(|e|e.to_string())?;
+                tx.execute("INSERT INTO group_inbox VALUES(last_insert_rowid())", [])
+                    .map_err(|e| e.to_string())?;
             }
             tx.execute(
                 "INSERT INTO reactions(inbox,stage) VALUES(last_insert_rowid(),'received')",
@@ -270,7 +275,14 @@ impl Repository {
         )
         .map_err(|e| e.to_string())?;
         config.allow_group_members = false;
-        tx.execute("UPDATE applications SET payload=?2 WHERE id=?1",params![app.to_string(),serde_json::to_string(&config).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        tx.execute(
+            "UPDATE applications SET payload=?2 WHERE id=?1",
+            params![
+                app.to_string(),
+                serde_json::to_string(&config).map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute("UPDATE outbox SET state='cancelled',error='主人绑定已解除' WHERE app=?1 AND state IN ('queued','failed') AND inbox IN (SELECT id FROM group_inbox)",[app.to_string()]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM reactions WHERE state='queued' AND inbox IN (SELECT inbox.id FROM inbox JOIN group_inbox USING(id) WHERE inbox.app=?1)",[app.to_string()]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM owners WHERE app=?1", [app.to_string()])
@@ -292,7 +304,11 @@ impl Repository {
         for app in apps.into_iter().filter(|a| a.enabled) {
             let row:Option<(i64,String,String,String,String,bool)>=tx.query_row("SELECT id,company,chat,text,sender,id IN (SELECT id FROM group_inbox) FROM inbox WHERE app=?1 AND state='queued' AND id IN (SELECT id FROM authorized_inbox) ORDER BY id LIMIT 1",[app.id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|e|e.to_string())?;
             if let Some((row, company, chat, text, sender, group_member)) = row {
-                let owner = if group_member { format!("group:{}", app.partner) } else { app.partner.to_string() };
+                let owner = if group_member {
+                    format!("group:{}", app.partner)
+                } else {
+                    app.partner.to_string()
+                };
                 let project = app.project.to_string_lossy();
                 let app_id = app.id.to_string();
                 let session:Option<String>=tx.query_row("SELECT session FROM conversations WHERE app=?1 AND partner=?2 AND project=?3 AND company=?4 AND chat=?5 AND sender=?6",params![app_id,owner,project,company,chat,sender],|r|r.get(0)).optional().map_err(|e|e.to_string())?;

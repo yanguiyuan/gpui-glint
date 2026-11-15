@@ -220,15 +220,26 @@ impl AgentWorkspace {
             );
             let mut actions = div().flex().flex_wrap().items_center().gap_2();
             actions = actions.child(
-                Button::new(if group_shared { "取消群聊共享" } else { "标为群聊可用" })
-                    .kind(if group_shared { ButtonKind::Tinted } else { ButtonKind::Plain })
-                    .size(ButtonSize::Small)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.partners_ui.notice = this.partner_repo().set_group_shared(partner, mid, !group_shared).err();
-                        cx.notify();
-                    })),
+                Button::new(if group_shared {
+                    "取消群聊共享"
+                } else {
+                    "标为群聊可用"
+                })
+                .kind(if group_shared {
+                    ButtonKind::Tinted
+                } else {
+                    ButtonKind::Plain
+                })
+                .size(ButtonSize::Small)
+                .theme(self.theme)
+                .render()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.partners_ui.notice = this
+                        .partner_repo()
+                        .set_group_shared(partner, mid, !group_shared)
+                        .err();
+                    cx.notify();
+                })),
             );
             if entry.kind == "identity" {
                 let name = entry.content.clone();

@@ -89,10 +89,22 @@ impl ProjectAction {
 pub(super) fn repair_project_shortcut_conflicts(history: &mut History) {
     let mut used = std::collections::HashSet::new();
     for action in ProjectAction::ALL {
-        if used.insert(action.binding(history).unparse()) { continue; }
-        let letter = match action { ProjectAction::Terminal => "t", ProjectAction::Diff => "d", ProjectAction::Preview => "e" };
-        let fallback = [action.default_binding(), format!("ctrl-alt-shift-{letter}"), format!("alt-shift-{letter}")]
-            .into_iter().find(|candidate| !used.contains(candidate)).unwrap();
+        if used.insert(action.binding(history).unparse()) {
+            continue;
+        }
+        let letter = match action {
+            ProjectAction::Terminal => "t",
+            ProjectAction::Diff => "d",
+            ProjectAction::Preview => "e",
+        };
+        let fallback = [
+            action.default_binding(),
+            format!("ctrl-alt-shift-{letter}"),
+            format!("alt-shift-{letter}"),
+        ]
+        .into_iter()
+        .find(|candidate| !used.contains(candidate))
+        .unwrap();
         used.insert(fallback.clone());
         action.store(history, fallback);
     }
@@ -293,13 +305,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn diff_and_preview_shortcuts_record_reject_duplicates_and_open_panels(cx: &mut gpui::TestAppContext) {
+    fn diff_and_preview_shortcuts_record_reject_duplicates_and_open_panels(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.executor().allow_parking();
         cx.update(crate::initialize);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
         window.simulate_resize(size(px(1440.), px(1200.)));
         host.update(window, |host, cx| {
             host.history.active_mut().project = Some(dir.path().into());
@@ -308,8 +327,15 @@ mod tests {
             cx.notify();
         });
         window.run_until_parked();
-        for (action, custom) in [(ProjectAction::Diff, "ctrl-alt-d"), (ProjectAction::Preview, "ctrl-alt-e")] {
-            let selector = if action == ProjectAction::Diff { "record-diff-shortcut" } else { "record-preview-shortcut" };
+        for (action, custom) in [
+            (ProjectAction::Diff, "ctrl-alt-d"),
+            (ProjectAction::Preview, "ctrl-alt-e"),
+        ] {
+            let selector = if action == ProjectAction::Diff {
+                "record-diff-shortcut"
+            } else {
+                "record-preview-shortcut"
+            };
             let record = window.debug_bounds(selector).unwrap();
             window.simulate_click(record.center(), Default::default());
             window.simulate_keystrokes("ctrl-`");
@@ -329,21 +355,31 @@ mod tests {
         }
         window.simulate_keystrokes("ctrl-alt-d");
         window.run_until_parked();
-        host.read_with(window, |host, _| assert!(host.edits_ui.open && !host.file_preview.open));
+        host.read_with(window, |host, _| {
+            assert!(host.edits_ui.open && !host.file_preview.open)
+        });
         window.simulate_keystrokes("ctrl-alt-e");
         window.run_until_parked();
-        host.read_with(window, |host, _| assert!(host.file_preview.open && !host.edits_ui.open));
+        host.read_with(window, |host, _| {
+            assert!(host.file_preview.open && !host.edits_ui.open)
+        });
         host.update(window, |host, cx| {
             host.page = crate::Page::Settings;
             cx.notify();
         });
         window.run_until_parked();
         for action in [ProjectAction::Diff, ProjectAction::Preview] {
-            let selector = if action == ProjectAction::Diff { "reset-diff-shortcut" } else { "reset-preview-shortcut" };
+            let selector = if action == ProjectAction::Diff {
+                "reset-diff-shortcut"
+            } else {
+                "reset-preview-shortcut"
+            };
             let reset = window.debug_bounds(selector).unwrap();
             window.simulate_click(reset.center(), Default::default());
             window.run_until_parked();
-            host.read_with(window, |host, _| assert_eq!(action.stored(&host.history), action.default_binding()));
+            host.read_with(window, |host, _| {
+                assert_eq!(action.stored(&host.history), action.default_binding())
+            });
         }
     }
 

@@ -1,8 +1,8 @@
 mod ask_question;
-mod shortcuts;
 mod history_rows;
 pub mod host_tools;
 mod hosting;
+mod shortcuts;
 pub use hosting::{Page, WpsCredentialSource};
 
 mod agentspace;
@@ -12,13 +12,13 @@ mod atomic_file;
 mod channels;
 mod chatgpt;
 mod child_process;
-mod vault_environment;
 mod code_fonts;
 mod code_fonts_ui;
 mod code_mode;
-mod command_runner;
 mod command_output;
+mod command_runner;
 mod executable;
+mod vault_environment;
 pub use code_mode::worker_main as run_code_mode_worker;
 mod commands;
 mod compaction;
@@ -32,7 +32,6 @@ mod file_preview;
 mod generation;
 mod git_project;
 mod git_ui;
-mod project_grouping;
 mod images;
 mod mcp;
 mod mcp_ui;
@@ -48,7 +47,9 @@ mod partner_model;
 mod partner_transfer;
 mod partner_ui;
 mod partners;
+mod project_actions;
 mod project_context;
+mod project_grouping;
 mod project_ui;
 mod provider;
 mod provider_catalog;
@@ -67,7 +68,6 @@ mod steering_ui;
 mod storage;
 mod subagent;
 mod subagent_ui;
-mod project_actions;
 mod terminal_ui;
 mod titles;
 mod todo;
@@ -414,7 +414,13 @@ impl AgentWorkspace {
                 }
                 if let GroupListEvent::HeaderAction { group, index } = event {
                     if *index == 1 {
-                        if let Some(path) = this.history.projects.iter().find(|path| format!("project:{}", path.display()) == group.as_ref()).cloned() {
+                        if let Some(path) = this
+                            .history
+                            .projects
+                            .iter()
+                            .find(|path| format!("project:{}", path.display()) == group.as_ref())
+                            .cloned()
+                        {
                             this.edit_project_group(path, cx);
                         }
                     }
@@ -423,7 +429,13 @@ impl AgentWorkspace {
                     }
                 }
                 if let GroupListEvent::HeaderMenuAction { group, index } = event {
-                    if let Some(path) = this.history.projects.iter().find(|path| format!("project:{}", path.display()) == group.as_ref()).cloned() {
+                    if let Some(path) = this
+                        .history
+                        .projects
+                        .iter()
+                        .find(|path| format!("project:{}", path.display()) == group.as_ref())
+                        .cloned()
+                    {
                         match index {
                             0 => this.edit_project_group(path, cx),
                             1 => {
@@ -736,13 +748,15 @@ impl AgentWorkspace {
             memory_last_probe: None,
         };
         let weak = cx.entity().downgrade();
-        workspace._subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
-            let _ = weak.update(cx, |this, cx| {
-                if this.focus.contains_focused(window, cx) {
-                    this.project_shortcut(event, window, cx);
-                }
-            });
-        }));
+        workspace
+            ._subscriptions
+            .push(cx.intercept_keystrokes(move |event, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if this.focus.contains_focused(window, cx) {
+                        this.project_shortcut(event, window, cx);
+                    }
+                });
+            }));
         workspace._subscriptions.push(cx.observe_self(|this, cx| {
             if !this.host_owns_vault {
                 this.vault.update(cx, |vault, cx| {
@@ -1242,7 +1256,11 @@ impl AgentWorkspace {
                 .unwrap_or(false);
         let todos = std::sync::Arc::new(std::sync::Mutex::new(request_session.todos.clone()));
         let subagents = subagent::Registry::default();
-        if !group_member && self.history.agentspace.as_deref() == project && agentspace.is_none() && project.is_some() {
+        if !group_member
+            && self.history.agentspace.as_deref() == project
+            && agentspace.is_none()
+            && project.is_some()
+        {
             return Err("AgentSpace 配置文件已丢失，请重新设置 AgentSpace".into());
         }
         let tool_context = tools::ToolContext {
@@ -1285,7 +1303,10 @@ impl AgentWorkspace {
             }
             if !group_member {
                 if let Some(space) = &agentspace {
-                    messages.insert(1, serde_json::json!({"role":"system","content":space.instructions()}));
+                    messages.insert(
+                        1,
+                        serde_json::json!({"role":"system","content":space.instructions()}),
+                    );
                 }
             }
             if !group_member
@@ -1321,9 +1342,15 @@ impl AgentWorkspace {
             self.history.sessions[index] = replacement;
             images::release_previews(self.image_views.borrow_mut().remove_session(id), cx);
             let prefix = format!("{id}:");
-            self.markdown_views.borrow_mut().retain(|key, _| !key.starts_with(&prefix));
-            self.tool_panels.borrow_mut().retain(|key, _| !key.starts_with(&prefix));
-            self.process_panels.borrow_mut().retain(|key, _| !key.starts_with(&prefix));
+            self.markdown_views
+                .borrow_mut()
+                .retain(|key, _| !key.starts_with(&prefix));
+            self.tool_panels
+                .borrow_mut()
+                .retain(|key, _| !key.starts_with(&prefix));
+            self.process_panels
+                .borrow_mut()
+                .retain(|key, _| !key.starts_with(&prefix));
             self.recall_runner.update(cx, |runner, _| runner.cancel(id));
             if self
                 .message_edit
@@ -2292,7 +2319,12 @@ impl AgentWorkspace {
                 // space for its expanded height so the final message stays visible.
                 .pb(px(if !session.todos.is_empty() {
                     300.
-                } else if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+                } else if self
+                    .active_run()
+                    .questions
+                    .iter()
+                    .any(|question| !question.request.respond.is_closed())
+                {
                     16.
                 } else {
                     96.
@@ -2569,7 +2601,12 @@ impl AgentWorkspace {
             }
             // Questions belong to the scrollable conversation so their intrinsic
             // height cannot push the fixed composer outside the viewport.
-            if self.active_run().questions.iter().any(|question| !question.request.respond.is_closed()) {
+            if self
+                .active_run()
+                .questions
+                .iter()
+                .any(|question| !question.request.respond.is_closed())
+            {
                 messages = messages.child(self.question_panel(cx));
             }
             div()
@@ -2756,8 +2793,10 @@ impl Render for AgentWorkspace {
                 cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
                     if let Some((start, width)) = this.edits_ui.navigation_resize {
                         if event.dragging() {
-                            this.edits_ui.navigation_width = Some((width + f32::from(event.position.x - start))
-                                .clamp(180., this.edits_ui.navigation_maximum.get().max(180.)));
+                            this.edits_ui.navigation_width = Some(
+                                (width + f32::from(event.position.x - start))
+                                    .clamp(180., this.edits_ui.navigation_maximum.get().max(180.)),
+                            );
                         } else {
                             this.edits_ui.navigation_resize = None;
                         }
@@ -2779,7 +2818,9 @@ impl Render for AgentWorkspace {
             .on_mouse_up(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.edits_ui.navigation_resize.take().is_some() { cx.notify(); }
+                    if this.edits_ui.navigation_resize.take().is_some() {
+                        cx.notify();
+                    }
                     if this.right_sidebar_resize.take().is_some() {
                         cx.notify();
                     }
@@ -2788,7 +2829,9 @@ impl Render for AgentWorkspace {
             .on_mouse_up_out(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.edits_ui.navigation_resize.take().is_some() { cx.notify(); }
+                    if this.edits_ui.navigation_resize.take().is_some() {
+                        cx.notify();
+                    }
                     if this.right_sidebar_resize.take().is_some() {
                         cx.notify();
                     }
@@ -2813,10 +2856,16 @@ impl Render for AgentWorkspace {
                         self.sidebar(cx)
                     })
                     .into_any_element(),
-                    content: (if self.page == crate::Page::Chat && self.file_preview.open && self.file_preview.expanded {
+                    content: (if self.page == crate::Page::Chat
+                        && self.file_preview.open
+                        && self.file_preview.expanded
+                    {
                         let panel = self.file_preview_sidebar(cx);
                         self.expanded_project_panel(panel, cx)
-                    } else if self.page == crate::Page::Chat && self.edits_ui.open && self.edits_ui.expanded {
+                    } else if self.page == crate::Page::Chat
+                        && self.edits_ui.open
+                        && self.edits_ui.expanded
+                    {
                         let panel = self.edits_sidebar(cx);
                         self.expanded_project_panel(panel, cx)
                     } else if self.page == crate::Page::Channels {
@@ -2841,13 +2890,16 @@ impl Render for AgentWorkspace {
                                     .h_full()
                                     .flex()
                                     .flex_col()
-                                    .child(div().flex_1().min_h_0().w_full().child(self.content(cx)))
+                                    .child(
+                                        div().flex_1().min_h_0().w_full().child(self.content(cx)),
+                                    )
                                     .when(self.project_actions.panel, |body| {
                                         body.child(self.project_action_panel(cx))
                                     })
-                                    .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| {
-                                        body.child(self.project_terminal_sidebar(cx))
-                                    }),
+                                    .when(
+                                        self.terminal_ui.open && self.terminal_ui.bottom,
+                                        |body| body.child(self.project_terminal_sidebar(cx)),
+                                    ),
                             )
                             .when(
                                 self.file_preview.open

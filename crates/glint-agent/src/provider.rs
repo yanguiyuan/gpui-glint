@@ -551,8 +551,15 @@ async fn complete(
             let steering = context.take_steering();
             if !steering.is_empty() {
                 steering_boundary = Some(blocks.len());
-                let _ = context.events.send(crate::tools::ToolEvent::SteeringApplied(blocks.clone())).await;
-                messages.extend(steering.into_iter().map(|steering| steering.turn(config.protocol)));
+                let _ = context
+                    .events
+                    .send(crate::tools::ToolEvent::SteeringApplied(blocks.clone()))
+                    .await;
+                messages.extend(
+                    steering
+                        .into_iter()
+                        .map(|steering| steering.turn(config.protocol)),
+                );
             }
         }
         if let Some(recalled) = context
@@ -612,7 +619,10 @@ async fn complete(
             if !steering.is_empty() {
                 steering_boundary = Some(blocks.len());
                 if let Some(context) = &context {
-                    let _ = context.events.send(crate::tools::ToolEvent::SteeringApplied(blocks.clone())).await;
+                    let _ = context
+                        .events
+                        .send(crate::tools::ToolEvent::SteeringApplied(blocks.clone()))
+                        .await;
                 }
                 if config.kind == Kind::ChatGpt {
                     messages.push(json!({"responses_output":reply.raw_content}));
@@ -1160,7 +1170,7 @@ mod tests {
                 };
                 let (events, receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
-            agentspace: None,
+                    agentspace: None,
                     delegation: Default::default(),
                     subagents: Default::default(),
                     todos: Default::default(),
@@ -1549,7 +1559,7 @@ mod tests {
                 };
                 let (events, _receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
-            agentspace: None,
+                    agentspace: None,
                     delegation: Default::default(),
                     subagents: Default::default(),
                     todos: Default::default(),

@@ -71,7 +71,12 @@ impl crate::AgentWorkspace {
     }
 
     pub fn finish_todos(&mut self, session_id: uuid::Uuid, cx: &mut gpui::Context<Self>) {
-        let todos = self.run(session_id).todo_live.lock().ok().map(|todos| todos.clone());
+        let todos = self
+            .run(session_id)
+            .todo_live
+            .lock()
+            .ok()
+            .map(|todos| todos.clone());
         if let Some(todos) = todos {
             if let Some(session) = self
                 .history

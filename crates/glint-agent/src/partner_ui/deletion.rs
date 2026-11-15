@@ -28,10 +28,20 @@ impl AgentWorkspace {
         }
         let busy = self.runs.iter().any(|(sid, run)| {
             (run.busy()
-                && self.history.sessions.iter().any(|s| s.id == *sid && s.partner_id == Some(id)))
-                || run.subagents.lock().map(|traces| {
-                    traces.iter().any(|trace| trace.partner_id == Some(id) && trace.status.active())
-                }).unwrap_or(true)
+                && self
+                    .history
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == *sid && s.partner_id == Some(id)))
+                || run
+                    .subagents
+                    .lock()
+                    .map(|traces| {
+                        traces
+                            .iter()
+                            .any(|trace| trace.partner_id == Some(id) && trace.status.active())
+                    })
+                    .unwrap_or(true)
         });
         let result = if busy {
             Err("伙伴正在执行任务，请先停止再删除".into())

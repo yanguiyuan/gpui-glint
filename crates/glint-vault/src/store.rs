@@ -344,7 +344,9 @@ impl Vault {
         if !entry.env_identifier.is_empty()
             && self.entries.iter().any(|other| {
                 other.id != entry.id
-                    && other.env_identifier.eq_ignore_ascii_case(&entry.env_identifier)
+                    && other
+                        .env_identifier
+                        .eq_ignore_ascii_case(&entry.env_identifier)
             })
         {
             return Err("环境变量标识已被其他密码使用".into());
@@ -458,7 +460,12 @@ mod tests {
         let legacy = entry("Legacy", "secret");
         let mut json = serde_json::to_value(&legacy).unwrap();
         json.as_object_mut().unwrap().remove("env_identifier");
-        assert!(serde_json::from_value::<Entry>(json).unwrap().env_identifier.is_empty());
+        assert!(
+            serde_json::from_value::<Entry>(json)
+                .unwrap()
+                .env_identifier
+                .is_empty()
+        );
 
         let directory = tempfile::tempdir().unwrap();
         let store = VaultStore::new(directory.path().join("vault.sqlite3"));
@@ -483,7 +490,15 @@ mod tests {
         vault.upsert(renamed).unwrap();
         vault.upsert(legacy).unwrap();
         let restored = store.unlock(MASTER).unwrap();
-        assert_eq!(restored.entries().iter().find(|e| e.id == id).unwrap().env_identifier, "NEW_NAME");
+        assert_eq!(
+            restored
+                .entries()
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .env_identifier,
+            "NEW_NAME"
+        );
     }
 
     #[test]

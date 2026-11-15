@@ -260,8 +260,10 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
                 "已启动后台命令"
             } else if success {
                 "已运行"
-            } else if serde_json::from_str::<serde_json::Value>(&record.result).ok()
-                .is_some_and(|value| value["status"] == "cancelled") {
+            } else if serde_json::from_str::<serde_json::Value>(&record.result)
+                .ok()
+                .is_some_and(|value| value["status"] == "cancelled")
+            {
                 "命令已终止"
             } else {
                 "命令失败"
@@ -584,7 +586,8 @@ impl AgentWorkspace {
                                 }
                                 tools::ToolEvent::SubagentUpdated => {
                                     let run = this.run_mut(id);
-                                    if run.approval
+                                    if run
+                                        .approval
                                         .as_ref()
                                         .and_then(|approval| approval.agent_id)
                                         .is_some_and(|agent_id| {
@@ -597,9 +600,10 @@ impl AgentWorkspace {
                                     {
                                         run.approval = None;
                                     }
-                                    if id == this.history.active && this
-                                        .selected_subagent()
-                                        .is_some_and(|trace| trace.status.active())
+                                    if id == this.history.active
+                                        && this
+                                            .selected_subagent()
+                                            .is_some_and(|trace| trace.status.active())
                                     {
                                         if let Some(scroll) = this.selected_subagent_scroll() {
                                             scroll_follow::follow_if_at_bottom(&scroll);
@@ -607,15 +611,20 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::BatchProgress { call_id, tools } => {
-                                    let previous = this.run(id).tool_activity
+                                    let previous = this
+                                        .run(id)
+                                        .tool_activity
                                         .iter()
                                         .find(|r| r.call.id == call_id)
                                         .map_or(0, |r| r.nested_tools.len());
                                     for child in tools.iter().skip(previous) {
                                         this.invalidate_preview_paths(id, child);
                                     }
-                                    if let Some(record) =
-                                        this.run_mut(id).tool_activity.iter_mut().find(|r| r.call.id == call_id)
+                                    if let Some(record) = this
+                                        .run_mut(id)
+                                        .tool_activity
+                                        .iter_mut()
+                                        .find(|r| r.call.id == call_id)
                                     {
                                         record.nested_tools = tools.into();
                                     }
@@ -623,15 +632,23 @@ impl AgentWorkspace {
                                 tools::ToolEvent::Question(request) => {
                                     if !request.respond.is_closed() {
                                         let theme = this.theme;
-                                        let input = cx.new(|cx| TextEntry::new(cx, "输入回答…", "").theme(theme));
-                                        this.run_mut(id).questions.push(Question { request, input });
+                                        let input = cx.new(|cx| {
+                                            TextEntry::new(cx, "输入回答…", "").theme(theme)
+                                        });
+                                        this.run_mut(id)
+                                            .questions
+                                            .push(Question { request, input });
                                     }
                                 }
                                 tools::ToolEvent::QuestionResolved(question_id) => {
-                                    this.run_mut(id).questions.retain(|q| q.request.id != question_id);
+                                    this.run_mut(id)
+                                        .questions
+                                        .retain(|q| q.request.id != question_id);
                                 }
                                 tools::ToolEvent::ApprovalResolved => {
-                                    if this.run_mut(id).approval
+                                    if this
+                                        .run_mut(id)
+                                        .approval
                                         .as_ref()
                                         .is_some_and(|a| a.respond.is_closed())
                                     {
@@ -650,13 +667,12 @@ impl AgentWorkspace {
                                         .iter_mut()
                                         .find(|session| session.id == id)
                                     {
-                                        session.context =
-                                            Some(context_usage::ContextSnapshot {
-                                                provider_id,
-                                                model,
-                                                used_tokens,
-                                                capacity_tokens,
-                                            });
+                                        session.context = Some(context_usage::ContextSnapshot {
+                                            provider_id,
+                                            model,
+                                            used_tokens,
+                                            capacity_tokens,
+                                        });
                                     }
                                     this.sync_context_usage(cx);
                                 }
@@ -718,7 +734,9 @@ impl AgentWorkspace {
                                         this.refresh_calendar(cx);
                                     }
 
-                                    if let Some(existing) = this.run_mut(id).tool_activity
+                                    if let Some(existing) = this
+                                        .run_mut(id)
+                                        .tool_activity
                                         .iter_mut()
                                         .find(|item| item.call.id == record.call.id)
                                     {
@@ -789,8 +807,11 @@ impl AgentWorkspace {
         if entry.signature != signature || entry.theme != theme {
             let presentation = tool_presentation(record);
             let result: SharedString = presentation.body.into();
-            let command_output = matches!(record.call.name.as_str(), "run_command" | "command_poll" | "command_stop")
-                .then(|| crate::command_output::Output::parse(&result, theme));
+            let command_output = matches!(
+                record.call.name.as_str(),
+                "run_command" | "command_poll" | "command_stop"
+            )
+            .then(|| crate::command_output::Output::parse(&result, theme));
             let result_scroll = entry.output_scroll.clone();
             if record.result == "执行中…" {
                 scroll_follow::follow_if_at_bottom(&result_scroll);
@@ -838,7 +859,9 @@ impl AgentWorkspace {
                 output.update(cx, |panel, cx| {
                     panel.set_theme(theme, cx);
                     panel.set_content(
-                        move |_, _| code_mode_result_view(&cards, theme, &output_scroll).into_any_element(),
+                        move |_, _| {
+                            code_mode_result_view(&cards, theme, &output_scroll).into_any_element()
+                        },
                         cx,
                     );
                 });
@@ -861,31 +884,63 @@ impl AgentWorkspace {
                     let call_id = record.call.id.clone();
                     let summary = presentation.summary.clone();
                     let host = weak.clone();
-                    panel.set_summary_content(move |_, _| {
-                        let cancelling = crate::command_runner::call_cancelling(&anchor, session, &call_id);
-                        let anchor = anchor.clone();
-                        let call_id = call_id.clone();
-                        let host = host.clone();
-                        div().w_full().min_w_0().flex().items_center().gap_2()
-                            .child(div().flex_1().min_w_0().truncate().child(summary.clone()))
-                            .child(div().id("stop-running-command").debug_selector(|| "stop-running-command".into())
-                                .flex_shrink_0().px_2().py_1().rounded(px(5.)).cursor_pointer().text_size(px(11.)).text_color(rgb(p.text_muted))
-                                .child(if cancelling { "正在终止…" } else { "终止" })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    let accepted = crate::command_runner::cancel_call(&anchor, session, &call_id);
-                                    let _ = host.update(cx, |this, cx| {
-                                        if !accepted {
-                                            this.git_ui.toasts.update(cx, |toasts, cx| {
-                                                toasts.push(gpui_glint::components::Toast::new("命令尚未启动或已经结束")
-                                                    .description("若命令刚开始，请稍后重试。"), cx);
+                    panel.set_summary_content(
+                        move |_, _| {
+                            let cancelling =
+                                crate::command_runner::call_cancelling(&anchor, session, &call_id);
+                            let anchor = anchor.clone();
+                            let call_id = call_id.clone();
+                            let host = host.clone();
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().flex_1().min_w_0().truncate().child(summary.clone()))
+                                .child(
+                                    div()
+                                        .id("stop-running-command")
+                                        .debug_selector(|| "stop-running-command".into())
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(5.))
+                                        .cursor_pointer()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(if cancelling {
+                                            "正在终止…"
+                                        } else {
+                                            "终止"
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            let accepted = crate::command_runner::cancel_call(
+                                                &anchor, session, &call_id,
+                                            );
+                                            let _ = host.update(cx, |this, cx| {
+                                                if !accepted {
+                                                    this.git_ui.toasts.update(cx, |toasts, cx| {
+                                                        toasts.push(
+                                                            gpui_glint::components::Toast::new(
+                                                                "命令尚未启动或已经结束",
+                                                            )
+                                                            .description(
+                                                                "若命令刚开始，请稍后重试。",
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                                cx.notify();
                                             });
-                                        }
-                                        cx.notify();
-                                    });
-                                }))
-                            .into_any_element()
-                    }, cx);
+                                        }),
+                                )
+                                .into_any_element()
+                        },
+                        cx,
+                    );
                 }
                 if let Some(change) = &record.change {
                     let path = change.path.clone();
@@ -1016,8 +1071,11 @@ impl AgentWorkspace {
                             .font_family("monospace")
                             .text_color(rgb(p.text_muted))
                             .child(div().w_full().min_w_0().child(
-                                if let Some(output) = &command_output { output.render().into_any_element() }
-                                else { div().child(result.clone()).into_any_element() }
+                                if let Some(output) = &command_output {
+                                    output.render().into_any_element()
+                                } else {
+                                    div().child(result.clone()).into_any_element()
+                                },
                             ))
                             .child(crate::command_output::scroll_guard(&result_scroll, 20.))
                             .into_any_element()
@@ -1105,7 +1163,8 @@ impl AgentWorkspace {
             let changed = view.source.as_ref() != text;
             if changed {
                 file_preview::retain_decorations(&view.source, text, &mut view.link_replacements);
-                view.render_source = file_preview::apply_decorations(text, &view.link_replacements).into();
+                view.render_source =
+                    file_preview::apply_decorations(text, &view.link_replacements).into();
             }
             view.editor.update(cx, |editor, cx| {
                 editor.set_theme(theme, cx);
@@ -1162,8 +1221,9 @@ impl AgentWorkspace {
                             view.link_replacements = result.replacements;
                             let markdown = result.markdown;
                             if view.render_source.as_ref() != markdown {
-                                view.editor
-                                    .update(cx, |editor, cx| editor.sync_preview_markdown(&markdown, cx));
+                                view.editor.update(cx, |editor, cx| {
+                                    editor.sync_preview_markdown(&markdown, cx)
+                                });
                                 view.render_source = markdown.into();
                             }
                         }
@@ -1213,7 +1273,11 @@ impl AgentWorkspace {
                 blocks,
                 thinking_ms,
                 complete,
-                if complete { &[] } else { self.active_run().visible_tools() },
+                if complete {
+                    &[]
+                } else {
+                    self.active_run().visible_tools()
+                },
                 cx,
             ))
     }
@@ -1328,7 +1392,9 @@ impl AgentWorkspace {
             }
             let panel_key = match block {
                 ContentBlock::Thinking(_) => Some(format!("{key}:{index}:thinking")),
-                ContentBlock::ToolCall(call) if !completed.contains(call.id.as_str()) => Some(format!("{key}:tool:{}", call.id)),
+                ContentBlock::ToolCall(call) if !completed.contains(call.id.as_str()) => {
+                    Some(format!("{key}:tool:{}", call.id))
+                }
                 ContentBlock::ToolResult(record) => Some(format!("{key}:tool:{}", record.call.id)),
                 _ => None,
             };
@@ -1340,7 +1406,9 @@ impl AgentWorkspace {
                 // must never override a user's manual expansion/collapse.
                 if entry.active != active {
                     entry.active = active;
-                    entry.panel.update(cx, |panel, cx| panel.set_expanded(active, cx));
+                    entry
+                        .panel
+                        .update(cx, |panel, cx| panel.set_expanded(active, cx));
                 }
             }
         }
@@ -1393,7 +1461,11 @@ impl AgentWorkspace {
                     &blocks[..split],
                     thinking_ms,
                     &summary,
-                    if complete { &[] } else { self.active_run().visible_tools() },
+                    if complete {
+                        &[]
+                    } else {
+                        self.active_run().visible_tools()
+                    },
                 )
             });
         let signature = source_signature ^ self.subagent_revision();
@@ -1436,28 +1508,38 @@ impl AgentWorkspace {
                 }
                 panel.set_content(
                     move |_, cx| {
-                        let scroll = weak.update(cx, |this, _| this.scroll.clone()).unwrap_or_default();
+                        let scroll = weak
+                            .update(cx, |this, _| this.scroll.clone())
+                            .unwrap_or_default();
                         let mut rows = rows.borrow_mut();
                         if !refreshed.replace(true) {
-                            let children = weak.update(cx, |this, cx| {
-                                this.transcript_rows(
-                                    &content_key,
-                                    &process,
-                                    &thinking_ms,
-                                    complete,
-                                    &activity,
-                                    cx,
-                                )
-                            }).unwrap_or_default();
+                            let children = weak
+                                .update(cx, |this, cx| {
+                                    this.transcript_rows(
+                                        &content_key,
+                                        &process,
+                                        &thinking_ms,
+                                        complete,
+                                        &activity,
+                                        cx,
+                                    )
+                                })
+                                .unwrap_or_default();
                             if let Some(rows) = rows.as_ref() {
                                 rows.update(cx, |rows, cx| rows.set_rows(children, cx));
                             } else {
-                                *rows = Some(cx.new(|_| crate::history_rows::HistoryRows::new(children, scroll.clone())));
+                                *rows = Some(cx.new(|_| {
+                                    crate::history_rows::HistoryRows::new(children, scroll.clone())
+                                }));
                             }
                         }
                         let rows = rows.as_ref().unwrap();
                         rows.update(cx, |rows, _| rows.set_scroll(scroll));
-                        div().w_full().min_w_0().child(rows.clone()).into_any_element()
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .child(rows.clone())
+                            .into_any_element()
                     },
                     cx,
                 );
@@ -1487,7 +1569,13 @@ impl AgentWorkspace {
         body
     }
 
-    fn answer_question(&mut self, session: Uuid, id: Uuid, answer: Option<String>, cx: &mut Context<Self>) {
+    fn answer_question(
+        &mut self,
+        session: Uuid,
+        id: Uuid,
+        answer: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let questions = &mut self.run_mut(session).questions;
         if let Some(index) = questions.iter().position(|q| q.request.id == id) {
             let question = questions.remove(index);
@@ -1503,49 +1591,155 @@ impl AgentWorkspace {
         const CONTENT_WIDTH: f32 = MAX_WIDTH - 26.;
         let p = self.theme.palette();
         let session = self.history.active;
-        let mut panel = div().debug_selector(|| "agent-question-panel".into()).w_full().max_w(px(MAX_WIDTH)).min_w_0().flex_shrink_0().flex().flex_col().gap_3();
-        for question in self.active_run().questions.iter().filter(|q| !q.request.respond.is_closed()) {
+        let mut panel = div()
+            .debug_selector(|| "agent-question-panel".into())
+            .w_full()
+            .max_w(px(MAX_WIDTH))
+            .min_w_0()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_3();
+        for question in self
+            .active_run()
+            .questions
+            .iter()
+            .filter(|q| !q.request.respond.is_closed())
+        {
             let id = question.request.id;
             let input = question.input.clone();
-            let source = question.request.agent_id.and_then(|id| {
-                self.active_run().subagents.lock().ok()?.iter().find(|trace| trace.id == id).map(|trace| format!("子 Agent「{}」提问", trace.title))
-            }).unwrap_or_else(|| "Agent 提问".into());
-            let mut choices = div().max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().flex().flex_col().gap_2();
+            let source = question
+                .request
+                .agent_id
+                .and_then(|id| {
+                    self.active_run()
+                        .subagents
+                        .lock()
+                        .ok()?
+                        .iter()
+                        .find(|trace| trace.id == id)
+                        .map(|trace| format!("子 Agent「{}」提问", trace.title))
+                })
+                .unwrap_or_else(|| "Agent 提问".into());
+            let mut choices = div()
+                .max_w(px(CONTENT_WIDTH))
+                .min_w_0()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_2();
             for (index, option) in question.request.options.iter().enumerate() {
                 let answer = option.clone();
-                choices = choices.child(div()
-                    .id(("question-option", index))
-                    .debug_selector(move || format!("question-option-{id}-{index}"))
-                    .max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().whitespace_normal()
-                    .px_3().py_2().rounded(px(7.)).border_1().border_color(rgb(p.border))
-                    .bg(rgb(p.surface)).text_size(px(12.)).cursor_pointer()
-                    .hover(|style| style.bg(rgb(p.accent_tint)).border_color(rgb(p.accent)))
-                    .child(format!("{}. {option}", index + 1))
-                    .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, Some(answer.clone()), cx))));
-            }
-            panel = panel.child(div().id(SharedString::from(format!("agent-question-{id}")))
-                .debug_selector(move || format!("agent-question-{id}"))
-                .max_w(px(MAX_WIDTH)).min_w_0().flex_shrink_0().p_3().rounded_lg()
-                .border_1().border_color(rgb(p.border)).bg(rgb(p.panel))
-                .flex().flex_col().gap_3()
-                .child(div().flex_shrink_0().flex().items_center().gap_2().text_size(px(11.)).text_color(rgb(p.text_muted))
-                    .child(Icon::Text.render(14.).text_color(rgb(p.accent)))
-                    .child(source).child("· 等待你的回答"))
-                .child(div().max_w(px(CONTENT_WIDTH)).min_w_0().flex_shrink_0().whitespace_normal().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(question.request.question.clone()))
-                .when(!question.request.options.is_empty(), |card| card
-                    .child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(p.text_muted)).child("点击一项直接回答，也可以在下方自行填写"))
-                    .child(choices))
-                .child(div().flex_shrink_0().h(px(38.)).px_3().rounded(px(7.))
-                    .border_1().border_color(rgb(p.border)).bg(rgb(p.surface)).child(input.clone()))
-                .child(div().flex_shrink_0().flex().items_center().gap_2()
-                    .child(Button::new("提交回答").theme(self.theme).render()
-                        .debug_selector(move || format!("question-submit-{id}"))
+                choices = choices.child(
+                    div()
+                        .id(("question-option", index))
+                        .debug_selector(move || format!("question-option-{id}-{index}"))
+                        .max_w(px(CONTENT_WIDTH))
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .whitespace_normal()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.surface))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(p.accent_tint)).border_color(rgb(p.accent)))
+                        .child(format!("{}. {option}", index + 1))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                        let answer = input.read(cx).value().trim().to_owned();
-                        if !answer.is_empty() { this.answer_question(session, id, Some(answer), cx); }
-                    })))
-                    .child(Button::new("跳过").kind(ButtonKind::Plain).theme(self.theme).render()
-                        .on_click(cx.listener(move |this, _, _, cx| this.answer_question(session, id, None, cx))))));
+                            this.answer_question(session, id, Some(answer.clone()), cx)
+                        })),
+                );
+            }
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("agent-question-{id}")))
+                    .debug_selector(move || format!("agent-question-{id}"))
+                    .max_w(px(MAX_WIDTH))
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .bg(rgb(p.panel))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(Icon::Text.render(14.).text_color(rgb(p.accent)))
+                            .child(source)
+                            .child("· 等待你的回答"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(CONTENT_WIDTH))
+                            .min_w_0()
+                            .flex_shrink_0()
+                            .whitespace_normal()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(question.request.question.clone()),
+                    )
+                    .when(!question.request.options.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child("点击一项直接回答，也可以在下方自行填写"),
+                        )
+                        .child(choices)
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(38.))
+                            .px_3()
+                            .rounded(px(7.))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .bg(rgb(p.surface))
+                            .child(input.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("提交回答")
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(move || format!("question-submit-{id}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let answer = input.read(cx).value().trim().to_owned();
+                                        if !answer.is_empty() {
+                                            this.answer_question(session, id, Some(answer), cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("跳过")
+                                    .kind(ButtonKind::Plain)
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.answer_question(session, id, None, cx)
+                                    })),
+                            ),
+                    ),
+            );
         }
         panel
     }
@@ -1558,7 +1752,8 @@ impl AgentWorkspace {
             let source = approval
                 .agent_id
                 .and_then(|id| {
-                    self.active_run().subagents
+                    self.active_run()
+                        .subagents
                         .lock()
                         .ok()?
                         .iter()
@@ -1585,7 +1780,11 @@ type OutputCard = (
     f32,
 );
 
-fn code_mode_result_view(cards: &[OutputCard], theme: ThemePreset, scroll: &ScrollHandle) -> gpui::Stateful<gpui::Div> {
+fn code_mode_result_view(
+    cards: &[OutputCard],
+    theme: ThemePreset,
+    scroll: &ScrollHandle,
+) -> gpui::Stateful<gpui::Div> {
     let p = theme.palette();
     let scroll = scroll.clone();
     div()
@@ -1711,24 +1910,42 @@ mod tests {
     use generation::ContentBlock::{Text, Thinking};
 
     #[gpui::test]
-    fn streamed_answer_and_thinking_keep_path_decorations_between_lookups(cx: &mut gpui::TestAppContext) {
+    fn streamed_answer_and_thinking_keep_path_decorations_between_lookups(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)
+        });
         host.update(window, |host, cx| {
             let source = "查看 `src/main.rs`。";
-            for (key, scrollable) in [("stream-answer", false), ("stream-thinking:thinking", true)] {
+            for (key, scrollable) in [("stream-answer", false), ("stream-thinking:thinking", true)]
+            {
                 let editor = host.markdown_preview(key.into(), source, scrollable, cx);
                 let range = source.find('`').unwrap()..source.rfind('`').unwrap() + 1;
                 {
                     let mut cache = host.markdown_views.borrow_mut();
                     let view = cache.get_mut(key).unwrap();
-                    view.link_replacements = vec![(range, "[`src/main.rs`](glint-preview:verified)".into())];
-                    view.render_source = file_preview::apply_decorations(source, &view.link_replacements).into();
-                    editor.update(cx, |editor, cx| editor.sync_preview_markdown(&view.render_source, cx));
+                    view.link_replacements =
+                        vec![(range, "[`src/main.rs`](glint-preview:verified)".into())];
+                    view.render_source =
+                        file_preview::apply_decorations(source, &view.link_replacements).into();
+                    editor.update(cx, |editor, cx| {
+                        editor.sync_preview_markdown(&view.render_source, cx)
+                    });
                 }
                 for suffix in ["继续", "继续补充总结", "继续补充总结\n\n下一段"] {
-                    let updated = host.markdown_preview(key.into(), &format!("{source}{suffix}"), scrollable, cx);
+                    let updated = host.markdown_preview(
+                        key.into(),
+                        &format!("{source}{suffix}"),
+                        scrollable,
+                        cx,
+                    );
                     assert_eq!(updated.entity_id(), editor.entity_id());
                     let cache = host.markdown_views.borrow();
                     let view = &cache[key];
@@ -1748,20 +1965,38 @@ mod tests {
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div().w(px(800.)).child(self.host.update(cx, |host, cx| {
-                    host.response_view("stream-click", &self.blocks, None, &Default::default(), false, cx)
+                    host.response_view(
+                        "stream-click",
+                        &self.blocks,
+                        None,
+                        &Default::default(),
+                        false,
+                        cx,
+                    )
                 }))
             }
         }
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let (preview, window) = cx.add_window_view(|_, cx| Preview {
-            host: cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)),
+            host: cx
+                .new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)),
             blocks: vec![Thinking("检查文件".into())],
         });
         window.run_until_parked();
         let host = preview.read_with(window, |view, _| view.host.clone());
-        let panel = host.read_with(window, |host, _| host.tool_panels.borrow()["stream-click:0:thinking"].panel.clone());
-        panel.read_with(window, |panel, _| assert!(panel.is_expanded(), "the latest action starts expanded"));
+        let panel = host.read_with(window, |host, _| {
+            host.tool_panels.borrow()["stream-click:0:thinking"]
+                .panel
+                .clone()
+        });
+        panel.read_with(window, |panel, _| {
+            assert!(panel.is_expanded(), "the latest action starts expanded")
+        });
         panel.update(window, |panel, cx| panel.set_expanded(true, cx));
         window.run_until_parked();
         let position = window.debug_bounds("streaming-summary").unwrap().center();
@@ -1773,34 +2008,64 @@ mod tests {
         window.run_until_parked();
         window.simulate_mouse_up(position, gpui::MouseButton::Left, Default::default());
         window.run_until_parked();
-        panel.read_with(window, |panel, _| assert!(!panel.is_expanded(), "streaming must preserve the pending click"));
+        panel.read_with(window, |panel, _| {
+            assert!(
+                !panel.is_expanded(),
+                "streaming must preserve the pending click"
+            )
+        });
         preview.update(window, |view, cx| {
             view.blocks[0] = Thinking("继续检查文件，保留手动折叠".into());
             cx.notify();
         });
         window.run_until_parked();
         panel.read_with(window, |panel, _| assert!(!panel.is_expanded()));
-        let call = tools::ToolCall { id: "next-command".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"cargo","args":["check"]}) };
+        let call = tools::ToolCall {
+            id: "next-command".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"program":"cargo","args":["check"]}),
+        };
         preview.update(window, |view, cx| {
-            view.blocks.push(generation::ContentBlock::ToolCall(call.clone()));
+            view.blocks
+                .push(generation::ContentBlock::ToolCall(call.clone()));
             cx.notify();
         });
         window.run_until_parked();
-        let command = host.read_with(window, |host, _| host.tool_panels.borrow()["stream-click:tool:next-command"].panel.clone());
+        let command = host.read_with(window, |host, _| {
+            host.tool_panels.borrow()["stream-click:tool:next-command"]
+                .panel
+                .clone()
+        });
         command.read_with(window, |panel, _| assert!(panel.is_expanded()));
         preview.update(window, |view, cx| {
-            view.blocks.push(generation::ContentBlock::ToolResult(tools::rejected(call, "finished".into())));
+            view.blocks
+                .push(generation::ContentBlock::ToolResult(tools::rejected(
+                    call,
+                    "finished".into(),
+                )));
             cx.notify();
         });
         window.run_until_parked();
-        command.read_with(window, |panel, _| assert!(panel.is_expanded(), "keep the result visible until the next action"));
+        command.read_with(window, |panel, _| {
+            assert!(
+                panel.is_expanded(),
+                "keep the result visible until the next action"
+            )
+        });
         preview.update(window, |view, cx| {
             view.blocks.push(Thinking("检查结果".into()));
             cx.notify();
         });
         window.run_until_parked();
         command.read_with(window, |panel, _| assert!(!panel.is_expanded()));
-        host.read_with(window, |host, cx| assert!(host.tool_panels.borrow()["stream-click:3:thinking"].panel.read(cx).is_expanded()));
+        host.read_with(window, |host, cx| {
+            assert!(
+                host.tool_panels.borrow()["stream-click:3:thinking"]
+                    .panel
+                    .read(cx)
+                    .is_expanded()
+            )
+        });
     }
 
     #[gpui::test]
@@ -1812,45 +2077,99 @@ mod tests {
         }
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().id("command-scroll-outer").h(px(400.)).w(px(600.)).overflow_y_scroll().track_scroll(&self.outer)
-                    .child(div().flex().flex_col()
-                        .child(div().h(px(300.)).flex_shrink_0())
-                        .child(self.panel.clone())
-                        .child(div().h(px(500.)).flex_shrink_0()))
+                div()
+                    .id("command-scroll-outer")
+                    .h(px(400.))
+                    .w(px(600.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.outer)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().h(px(300.)).flex_shrink_0())
+                            .child(self.panel.clone())
+                            .child(div().h(px(500.)).flex_shrink_0()),
+                    )
             }
         }
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let (preview, window) = cx.add_window_view(|_, cx| {
-            let host = cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
-            let record = tools::rejected(tools::ToolCall { id: "scroll".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"cargo"}) }, "\x1b[32mChecking crate\x1b[0m\n".repeat(100));
+            let host =
+                cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+            let record = tools::rejected(
+                tools::ToolCall {
+                    id: "scroll".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"program":"cargo"}),
+                },
+                "\x1b[32mChecking crate\x1b[0m\n".repeat(100),
+            );
             let panel = host.update(cx, |host, cx| host.tool_panel("scroll", &record, cx));
             panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
-            Preview { host, panel, outer: ScrollHandle::new() }
+            Preview {
+                host,
+                panel,
+                outer: ScrollHandle::new(),
+            }
         });
-        preview.update(window, |view, cx| { view.outer.set_offset(point(px(0.), px(-250.))); cx.notify(); });
+        preview.update(window, |view, cx| {
+            view.outer.set_offset(point(px(0.), px(-250.)));
+            cx.notify();
+        });
         window.run_until_parked();
         let (outer, inner) = preview.read_with(window, |view, cx| {
-            (view.outer.clone(), view.host.read(cx).tool_panels.borrow()["scroll:tool:scroll"].output_scroll.clone())
+            (
+                view.outer.clone(),
+                view.host.read(cx).tool_panels.borrow()["scroll:tool:scroll"]
+                    .output_scroll
+                    .clone(),
+            )
         });
         let bounds = window.debug_bounds("tool-output").unwrap();
         assert!(bounds.size.height <= px(320.));
         let position = point(bounds.left() + px(10.), bounds.top() + px(10.));
         let before = outer.offset().y;
-        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))),
+            ..Default::default()
+        });
         window.run_until_parked();
         assert!(inner.offset().y < px(0.));
-        assert_eq!(outer.offset().y, before, "one wheel event must move only the output");
-        preview.update(window, |_, cx| { inner.scroll_to_bottom(); cx.notify(); });
+        assert_eq!(
+            outer.offset().y,
+            before,
+            "one wheel event must move only the output"
+        );
+        preview.update(window, |_, cx| {
+            inner.scroll_to_bottom();
+            cx.notify();
+        });
         window.run_until_parked();
-        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))),
+            ..Default::default()
+        });
         window.run_until_parked();
-        assert!(outer.offset().y < before, "at the output boundary the conversation can take over");
+        assert!(
+            outer.offset().y < before,
+            "at the output boundary the conversation can take over"
+        );
     }
 
     #[gpui::test]
     fn long_questions_scroll_without_displacing_the_composer(cx: &mut gpui::TestAppContext) {
-        struct Preview { host: Entity<AgentWorkspace>, _subscription: Subscription }
+        struct Preview {
+            host: Entity<AgentWorkspace>,
+            _subscription: Subscription,
+        }
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 self.host.update(cx, |host, cx| host.content(cx))
@@ -1859,33 +2178,56 @@ mod tests {
         cx.executor().allow_parking();
         cx.update(crate::initialize);
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let (respond, mut response) = tokio::sync::oneshot::channel();
         let id = Uuid::new_v4();
-        let submit_selector: &'static str = Box::leak(format!("question-submit-{id}").into_boxed_str());
+        let submit_selector: &'static str =
+            Box::leak(format!("question-submit-{id}").into_boxed_str());
         let (preview, window) = cx.add_window_view(|_, cx| {
             let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
             host.update(cx, |host, cx| {
-                host.history.active_mut().push(Role::User, "请选择目标文件".into());
+                host.history
+                    .active_mut()
+                    .push(Role::User, "请选择目标文件".into());
                 let session = host.history.active;
                 let input = cx.new(|cx| TextEntry::new(cx, "输入回答…", "自定义目标"));
                 host.run_mut(session).questions.push(Question {
                     request: crate::ask_question::Request {
-                        id, agent_id: None, question: "具体要覆盖哪个文件？".repeat(20),
-                        options: (0..6).map(|index| format!("{index}：覆盖 xidl/apis/spec/open/im/api_chat_control.xidl {}", "请确认目标文件及写入范围。".repeat(12))).collect(),
+                        id,
+                        agent_id: None,
+                        question: "具体要覆盖哪个文件？".repeat(20),
+                        options: (0..6)
+                            .map(|index| {
+                                format!(
+                                    "{index}：覆盖 xidl/apis/spec/open/im/api_chat_control.xidl {}",
+                                    "请确认目标文件及写入范围。".repeat(12)
+                                )
+                            })
+                            .collect(),
                         respond,
-                    }, input,
+                    },
+                    input,
                 });
             });
             let subscription = cx.observe(&host, |_, _, cx| cx.notify());
-            Preview { host, _subscription: subscription }
+            Preview {
+                host,
+                _subscription: subscription,
+            }
         });
         let host = preview.read_with(window, |preview, _| preview.host.clone());
         for (width, height) in [(520., 420.), (1440., 900.), (900., 480.)] {
             window.simulate_resize(size(px(width), px(height)));
             preview.update(window, |_, cx| cx.notify());
             window.run_until_parked();
-            host.update(window, |host, cx| { host.scroll.scroll_to_bottom(); cx.notify(); });
+            host.update(window, |host, cx| {
+                host.scroll.scroll_to_bottom();
+                cx.notify();
+            });
             preview.update(window, |_, cx| cx.notify());
             window.run_until_parked();
             let composer = window.debug_bounds("agent-composer-panel").unwrap();
@@ -1894,8 +2236,10 @@ mod tests {
             assert!(composer.top() >= px(0.) && composer.bottom() <= px(height));
             assert!(composer.size.height > px(60.));
             assert!(conversation.size.height > px(0.) && conversation.bottom() <= composer.top());
-            assert!(submit.top() >= conversation.top() && submit.bottom() <= conversation.bottom(),
-                "{width}x{height}: submit={submit:?}, conversation={conversation:?}, composer={composer:?}");
+            assert!(
+                submit.top() >= conversation.top() && submit.bottom() <= conversation.bottom(),
+                "{width}x{height}: submit={submit:?}, conversation={conversation:?}, composer={composer:?}"
+            );
         }
         let submit = window.debug_bounds(submit_selector).unwrap();
         window.simulate_click(submit.center(), Default::default());
@@ -1903,9 +2247,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn question_answers_are_scoped_and_preserve_other_pending_questions(cx: &mut gpui::TestAppContext) {
+    fn question_answers_are_scoped_and_preserve_other_pending_questions(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
         let (respond, mut response) = tokio::sync::oneshot::channel();
         let (other, mut other_response) = tokio::sync::oneshot::channel();
@@ -1915,7 +2265,14 @@ mod tests {
             for (question_id, sender) in [(id, respond), (Uuid::new_v4(), other)] {
                 let input = cx.new(|cx| TextEntry::new(cx, "回答", ""));
                 host.run_mut(session).questions.push(Question {
-                    request: crate::ask_question::Request { id: question_id, agent_id: None, question: "问题".into(), options: vec![], respond: sender }, input,
+                    request: crate::ask_question::Request {
+                        id: question_id,
+                        agent_id: None,
+                        question: "问题".into(),
+                        options: vec![],
+                        respond: sender,
+                    },
+                    input,
                 });
             }
             host.answer_question(Uuid::new_v4(), id, Some("错误会话".into()), cx);
@@ -1932,49 +2289,111 @@ mod tests {
 
     #[gpui::test]
     fn running_command_stop_button_does_not_toggle_tool_details(cx: &mut gpui::TestAppContext) {
-        struct Preview { _host: Entity<AgentWorkspace>, panel: Entity<gpui_glint::components::CollapsePanel> }
+        struct Preview {
+            _host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+        }
         impl Render for Preview {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().w(px(600.)).child(self.panel.clone()) }
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(600.)).child(self.panel.clone())
+            }
         }
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let (preview, window) = cx.add_window_view(|_, cx| {
             let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
-            let record = tools::rejected(tools::ToolCall { id: "stop-test".into(), name: "run_command".into(), arguments: serde_json::json!({"program":"rg","args":["search"]}) }, "执行中…".into());
+            let record = tools::rejected(
+                tools::ToolCall {
+                    id: "stop-test".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"program":"rg","args":["search"]}),
+                },
+                "执行中…".into(),
+            );
             let panel = host.update(cx, |host, cx| host.tool_panel("stop-test", &record, cx));
             Preview { _host: host, panel }
         });
-        let button = window.debug_bounds("stop-running-command").expect("active command stop button");
+        let button = window
+            .debug_bounds("stop-running-command")
+            .expect("active command stop button");
         window.simulate_click(button.center(), Default::default());
-        preview.read_with(window, |preview, cx| assert!(!preview.panel.read(cx).is_expanded()));
+        preview.read_with(window, |preview, cx| {
+            assert!(!preview.panel.read(cx).is_expanded())
+        });
     }
 
     #[gpui::test]
     fn orchestration_output_scroll_chains_at_its_boundary(cx: &mut gpui::TestAppContext) {
-        struct Nested { outer: ScrollHandle, inner: ScrollHandle }
+        struct Nested {
+            outer: ScrollHandle,
+            inner: ScrollHandle,
+        }
         impl Render for Nested {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let cards = (0..12).map(|i| (Some(format!("section {i}")), None, 50.)).collect::<Vec<_>>();
-                div().id("outer-output").h(px(400.)).w(px(400.)).track_scroll(&self.outer).overflow_y_scroll()
-                    .child(div().flex().flex_col().child(div().h(px(300.)).flex_shrink_0())
-                        .child(code_mode_result_view(&cards, ThemePreset::default(), &self.inner))
-                        .child(div().h(px(500.)).flex_shrink_0()))
+                let cards = (0..12)
+                    .map(|i| (Some(format!("section {i}")), None, 50.))
+                    .collect::<Vec<_>>();
+                div()
+                    .id("outer-output")
+                    .h(px(400.))
+                    .w(px(400.))
+                    .track_scroll(&self.outer)
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().h(px(300.)).flex_shrink_0())
+                            .child(code_mode_result_view(
+                                &cards,
+                                ThemePreset::default(),
+                                &self.inner,
+                            ))
+                            .child(div().h(px(500.)).flex_shrink_0()),
+                    )
             }
         }
-        let (host, window) = cx.add_window_view(|_, _| Nested { outer: ScrollHandle::new(), inner: ScrollHandle::new() });
-        host.update(window, |host, cx| { host.outer.set_offset(point(px(0.), px(-250.))); cx.notify(); });
+        let (host, window) = cx.add_window_view(|_, _| Nested {
+            outer: ScrollHandle::new(),
+            inner: ScrollHandle::new(),
+        });
+        host.update(window, |host, cx| {
+            host.outer.set_offset(point(px(0.), px(-250.)));
+            cx.notify();
+        });
         window.run_until_parked();
         let bounds = window.debug_bounds("code-mode-result").unwrap();
-        let position = point(bounds.left()+px(8.), bounds.top()+px(8.));
+        let position = point(bounds.left() + px(8.), bounds.top() + px(8.));
         let initial = host.read_with(window, |host, _| host.outer.offset().y);
-        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))),
+            ..Default::default()
+        });
         window.run_until_parked();
-        host.read_with(window, |host, _| { assert!(host.inner.offset().y < px(0.)); assert_eq!(host.outer.offset().y, initial); });
-        host.update(window, |host, cx| { host.inner.scroll_to_bottom(); cx.notify(); });
+        host.read_with(window, |host, _| {
+            assert!(host.inner.offset().y < px(0.));
+            assert_eq!(host.outer.offset().y, initial);
+        });
+        host.update(window, |host, cx| {
+            host.inner.scroll_to_bottom();
+            cx.notify();
+        });
         window.run_until_parked();
-        window.simulate_event(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))), ..Default::default() });
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-80.))),
+            ..Default::default()
+        });
         window.run_until_parked();
-        assert!(host.read_with(window, |host, _| host.outer.offset().y) < initial, "exhausted output must release the outer conversation");
+        assert!(
+            host.read_with(window, |host, _| host.outer.offset().y) < initial,
+            "exhausted output must release the outer conversation"
+        );
     }
 
     #[gpui::test]
@@ -2078,7 +2497,9 @@ mod tests {
         .unwrap();
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
-            host.history.active_mut().push(Role::User, "查询记录".into());
+            host.history
+                .active_mut()
+                .push(Role::User, "查询记录".into());
             let mut memory = tools::rejected(
                 tools::ToolCall {
                     id: "memory-overlap".into(),
@@ -2088,22 +2509,38 @@ mod tests {
                 serde_json::json!({"matches": vec!["很长的记忆结果。".repeat(30); 20]}).to_string(),
             );
             memory.success = true;
-            host.run_mut(host.history.active).transcript = vec![generation::ContentBlock::ToolResult(memory)];
-            host.run_mut(host.history.active).transcript.extend((0..6).map(|_| Thinking("继续查询".into())));
-            host.run_mut(host.history.active).pending = Some((host.history.active, cx.spawn(async move |_, _| std::future::pending::<()>().await)));
+            host.run_mut(host.history.active).transcript =
+                vec![generation::ContentBlock::ToolResult(memory)];
+            host.run_mut(host.history.active)
+                .transcript
+                .extend((0..6).map(|_| Thinking("继续查询".into())));
+            host.run_mut(host.history.active).pending = Some((
+                host.history.active,
+                cx.spawn(async move |_, _| std::future::pending::<()>().await),
+            ));
             host
         });
         window.simulate_resize(size(px(1200.), px(700.)));
         window.run_until_parked();
         let panel = host.read_with(window, |host, _| {
-            host.tool_panels.borrow().iter().find(|(key, _)| key.ends_with(":tool:memory-overlap")).unwrap().1.panel.clone()
+            host.tool_panels
+                .borrow()
+                .iter()
+                .find(|(key, _)| key.ends_with(":tool:memory-overlap"))
+                .unwrap()
+                .1
+                .panel
+                .clone()
         });
         let before = window.debug_bounds("waiting-for-model").unwrap();
         panel.update(window, |panel, cx| panel.set_expanded(true, cx));
         window.run_until_parked();
         let live = window.debug_bounds("live-response").unwrap();
         let waiting = window.debug_bounds("waiting-for-model").unwrap();
-        assert!(waiting.top() >= live.bottom(), "{waiting:?} overlaps {live:?}");
+        assert!(
+            waiting.top() >= live.bottom(),
+            "{waiting:?} overlaps {live:?}"
+        );
         // A conversation resting at its newest message follows the growth by
         // scrolling, so the waiting row may stay put instead of moving down;
         // an overlap would pull it up over the response above.
@@ -2240,17 +2677,20 @@ mod tests {
         image::RgbaImage::from_pixel(300, 200, image::Rgba([40, 90, 160, 255]))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let data: std::sync::Arc<str> =
-            base64::engine::general_purpose::STANDARD.encode(&png).into();
+        let data: std::sync::Arc<str> = base64::engine::general_purpose::STANDARD
+            .encode(&png)
+            .into();
         let (host, window) = cx.add_window_view(|_, cx| {
             let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
-            host.history
-                .active_mut()
-                .push_message(Role::User, "看看这张图".into(), vec![crate::model::MessageImage {
+            host.history.active_mut().push_message(
+                Role::User,
+                "看看这张图".into(),
+                vec![crate::model::MessageImage {
                     media_type: "image/png".into(),
                     data,
                     file: None,
-                }]);
+                }],
+            );
             host
         });
         window.simulate_resize(size(px(1000.), px(760.)));
@@ -2370,8 +2810,14 @@ mod tests {
         let waiting = window.debug_bounds("waiting-for-model").unwrap();
         let viewport = host.read_with(window, |host, _| host.scroll.bounds());
         let composer = window.debug_bounds("agent-composer-panel").unwrap();
-        assert!(waiting.bottom() <= viewport.bottom()+px(1.), "the last row must be reachable at the true scroll bottom: {waiting:?}, {viewport:?}");
-        assert!(viewport.bottom() <= composer.top()+px(1.), "the composer must not cover the chat viewport");
+        assert!(
+            waiting.bottom() <= viewport.bottom() + px(1.),
+            "the last row must be reachable at the true scroll bottom: {waiting:?}, {viewport:?}"
+        );
+        assert!(
+            viewport.bottom() <= composer.top() + px(1.),
+            "the composer must not cover the chat viewport"
+        );
         assert!(
             waiting.top() >= live.bottom(),
             "waiting label overlaps expanded live response: {waiting:?}, {live:?}"
@@ -2491,12 +2937,16 @@ mod tests {
             (first, second)
         });
 
-        first_sender.try_send(tools::ToolEvent::Transcript(vec![
-            generation::ContentBlock::Text("first".into()),
-        ])).unwrap();
-        second_sender.try_send(tools::ToolEvent::Transcript(vec![
-            generation::ContentBlock::Text("second".into()),
-        ])).unwrap();
+        first_sender
+            .try_send(tools::ToolEvent::Transcript(vec![
+                generation::ContentBlock::Text("first".into()),
+            ]))
+            .unwrap();
+        second_sender
+            .try_send(tools::ToolEvent::Transcript(vec![
+                generation::ContentBlock::Text("second".into()),
+            ]))
+            .unwrap();
         window.run_until_parked();
         workspace.update(window, |workspace, cx| {
             assert!(matches!(
@@ -2623,7 +3073,8 @@ mod tests {
         window.run_until_parked();
         let reading_offset = scroll.offset();
         workspace.update(window, |workspace, cx| {
-            let blocks = std::mem::take(&mut workspace.run_mut(workspace.history.active).transcript);
+            let blocks =
+                std::mem::take(&mut workspace.run_mut(workspace.history.active).transcript);
             workspace
                 .history
                 .active_mut()
@@ -2648,16 +3099,35 @@ mod tests {
     }
 
     #[gpui::test]
-    fn expanded_history_process_culls_rows_after_scroll_and_session_switch(cx: &mut gpui::TestAppContext) {
+    fn expanded_history_process_culls_rows_after_scroll_and_session_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
         let (workspace, window) = cx.add_window_view(|_, cx| {
-            let mut workspace = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
-            workspace.history.active_mut().push(Role::Agent, "done".into());
-            workspace.history.active_mut().messages[0].blocks = (0..300).map(|i| {
-                let record = tools::rejected(tools::ToolCall { id: format!("row-{i}"), name: "read_file".into(), arguments: serde_json::json!({"path":format!("file-{i}.rs")}) }, "example output".into());
-                generation::ContentBlock::ToolResult(record)
-            }).collect();
+            let mut workspace =
+                AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            workspace
+                .history
+                .active_mut()
+                .push(Role::Agent, "done".into());
+            workspace.history.active_mut().messages[0].blocks = (0..300)
+                .map(|i| {
+                    let record = tools::rejected(
+                        tools::ToolCall {
+                            id: format!("row-{i}"),
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({"path":format!("file-{i}.rs")}),
+                        },
+                        "example output".into(),
+                    );
+                    generation::ContentBlock::ToolResult(record)
+                })
+                .collect();
             workspace
         });
         window.simulate_resize(size(px(1440.), px(900.)));
@@ -2665,7 +3135,9 @@ mod tests {
         let original = workspace.read_with(window, |workspace, _| workspace.history.active);
         let key = format!("{original}:0");
         workspace.update(window, |workspace, cx| {
-            workspace.process_panels.borrow()[&key].panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
+            workspace.process_panels.borrow()[&key]
+                .panel
+                .update(cx, |panel, cx| panel.set_expanded(true, cx));
             // Explicitly read the top; opening a process otherwise follows the end.
             workspace.message_layout.pin = None;
             workspace.scroll.scroll_to_top_of_item(0);
@@ -2675,7 +3147,10 @@ mod tests {
         assert!(window.debug_bounds("history-row-0").is_some());
         assert!(window.debug_bounds("history-spacer-299").is_some());
         let height = workspace.read_with(window, |w, _| w.scroll.max_offset().y);
-        workspace.update(window, |w, cx| { w.scroll.scroll_to_bottom(); cx.notify(); });
+        workspace.update(window, |w, cx| {
+            w.scroll.scroll_to_bottom();
+            cx.notify();
+        });
         window.run_until_parked();
         assert!(window.debug_bounds("history-spacer-0").is_some());
         assert!(window.debug_bounds("history-row-299").is_some());
@@ -2751,7 +3226,11 @@ mod tests {
         });
         workspace.update(window, |this, cx| {
             this.switch(original, cx);
-            assert_eq!(this.message_layout.context.unwrap().0, original, "warm switch must reuse measured geometry before its first frame");
+            assert_eq!(
+                this.message_layout.context.unwrap().0,
+                original,
+                "warm switch must reuse measured geometry before its first frame"
+            );
             assert_eq!(this.message_layout.measure_passes, 0);
             assert!(this.scroll.bounds_for_item(0).is_some());
             assert!(this.scroll.max_offset().y > px(400.));
@@ -2763,9 +3242,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn switching_to_a_conversation_opens_it_at_the_latest_message(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn switching_to_a_conversation_opens_it_at_the_latest_message(cx: &mut gpui::TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("providers.json"),
@@ -2835,7 +3312,10 @@ mod tests {
         });
         window.run_until_parked();
         workspace.read_with(window, |this, _| {
-            assert!(this.message_layout.pin.is_none(), "scrolling cancels the pin");
+            assert!(
+                this.message_layout.pin.is_none(),
+                "scrolling cancels the pin"
+            );
             assert!(
                 this.scroll.max_offset().y + this.scroll.offset().y > px(2.),
                 "the reader must keep the position they scrolled to"

@@ -291,7 +291,10 @@ impl AgentWorkspace {
         let chip = model_chip(&self.catalog);
         self.composer.update(cx, |composer, cx| {
             composer.set_menu_chip(chip, cx);
-            composer.set_disabled(!self.active_model_enabled() || self.active_run().preparing.is_some(), cx);
+            composer.set_disabled(
+                !self.active_model_enabled() || self.active_run().preparing.is_some(),
+                cx,
+            );
         });
         self.sync_context_usage(cx);
         self.context_models = None;
@@ -1689,7 +1692,12 @@ impl AgentWorkspace {
                     .child(self.code_font_settings(cx));
             }
             Section::Layout => {
-                page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("终端面板"));
+                page = page.child(
+                    div()
+                        .mt_4()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("终端面板"),
+                );
                 card = card.child(
                     div().py_4().flex().items_center().gap_3()
                         .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
@@ -1744,7 +1752,9 @@ impl AgentWorkspace {
                     ))
                     .child(row(
                         "数据目录",
-                        gpui_glint::paths::display_path(self.path.parent().unwrap_or(std::path::Path::new("."))),
+                        gpui_glint::paths::display_path(
+                            self.path.parent().unwrap_or(std::path::Path::new(".")),
+                        ),
                         "".into(),
                     ))
                     .child(div().border_t_1().border_color(rgb(p.border)))
@@ -1855,7 +1865,9 @@ impl AgentWorkspace {
                     project = project.child(
                         div()
                             .py_4()
-                            .when(action != crate::shortcuts::ProjectAction::Terminal, |row| row.border_t_1().border_color(rgb(p.border)))
+                            .when(action != crate::shortcuts::ProjectAction::Terminal, |row| {
+                                row.border_t_1().border_color(rgb(p.border))
+                            })
                             .flex()
                             .flex_wrap()
                             .items_center()
@@ -1882,7 +1894,10 @@ impl AgentWorkspace {
                                     .gap_3()
                                     .child(
                                         div()
-                                            .id(SharedString::from(format!("{}-shortcut-trigger", action.id())))
+                                            .id(SharedString::from(format!(
+                                                "{}-shortcut-trigger",
+                                                action.id()
+                                            )))
                                             .debug_selector(move || record_selector.clone())
                                             .cursor_pointer()
                                             .rounded(px(6.))
@@ -1906,7 +1921,8 @@ impl AgentWorkspace {
                                                 keycaps(shortcut_label)
                                             })
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.provider_settings.shortcut_recording = Some(action);
+                                                this.provider_settings.shortcut_recording =
+                                                    Some(action);
                                                 this.provider_settings.shortcut_message = None;
                                                 window.focus(&this.focus, cx);
                                                 cx.notify();
@@ -1918,15 +1934,21 @@ impl AgentWorkspace {
                                             .size(ButtonSize::Small)
                                             .theme(self.theme)
                                             .render()
-                                            .id(SharedString::from(format!("reset-{}-shortcut", action.id())))
+                                            .id(SharedString::from(format!(
+                                                "reset-{}-shortcut",
+                                                action.id()
+                                            )))
                                             .debug_selector(move || reset_selector.clone())
-                                            .on_click(cx.listener(move |this, _, _, cx| this.reset_project_shortcut(action, cx))),
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.reset_project_shortcut(action, cx)
+                                            })),
                                     ),
                             ),
                     );
                 }
                 let recording = self.provider_settings.shortcut_recording.is_some();
-                let project = project.child(
+                let project = project
+                    .child(
                         div()
                             .py_3()
                             .border_t_1()

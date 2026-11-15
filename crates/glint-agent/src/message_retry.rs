@@ -173,25 +173,29 @@ impl AgentWorkspace {
             composer.set_theme(self.theme, cx);
             composer.set_disabled(busy, cx);
         });
-        Some(div().child(
-            div()
-                .id(("message-retry-editor", index))
-                .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    if event.button == gpui::MouseButton::Left && !this.session_busy(this.history.active) {
-                        this.message_edit = None;
-                        this.sync_composer_run(cx);
-                        cx.notify();
-                    }
-                }))
-                .debug_selector(move || format!("message-retry-editor-{index}"))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(rgb(p.border))
-                .overflow_hidden()
-                .child(edit.composer.clone())
-                .when_some(edit.error.clone(), |panel, error| {
-                    panel.child(div().px_3().py_2().text_size(px(12.)).child(error))
-                }),
-        ))
+        Some(
+            div().child(
+                div()
+                    .id(("message-retry-editor", index))
+                    .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                        if event.button == gpui::MouseButton::Left
+                            && !this.session_busy(this.history.active)
+                        {
+                            this.message_edit = None;
+                            this.sync_composer_run(cx);
+                            cx.notify();
+                        }
+                    }))
+                    .debug_selector(move || format!("message-retry-editor-{index}"))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .overflow_hidden()
+                    .child(edit.composer.clone())
+                    .when_some(edit.error.clone(), |panel, error| {
+                        panel.child(div().px_3().py_2().text_size(px(12.)).child(error))
+                    }),
+            ),
+        )
     }
 }

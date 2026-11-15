@@ -229,7 +229,17 @@ pub fn save_ui_state(
         let mut state = meta(&transaction, "history")?.ok_or("会话尚未保存，需要重试完整保存")?;
         state["active"] = json!(active);
         let partner = match partner {
-            Some(id) if transaction.query_row("SELECT EXISTS(SELECT 1 FROM partners WHERE id=?1)", [id.to_string()], |row| row.get::<_, bool>(0)).map_err(|e| e.to_string())? => Some(id),
+            Some(id)
+                if transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM partners WHERE id=?1)",
+                        [id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|e| e.to_string())? =>
+            {
+                Some(id)
+            }
             _ => None,
         };
         state["preferred_partner"] = json!(partner);

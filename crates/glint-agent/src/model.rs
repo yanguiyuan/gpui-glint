@@ -246,7 +246,8 @@ pub struct History {
     #[serde(default)]
     pub projects: Vec<std::path::PathBuf>,
     #[serde(default)]
-    pub project_metadata: std::collections::HashMap<std::path::PathBuf, crate::project_grouping::Metadata>,
+    pub project_metadata:
+        std::collections::HashMap<std::path::PathBuf, crate::project_grouping::Metadata>,
     /// An empty override explicitly disables automatic worktree grouping.
     #[serde(default)]
     pub project_group_overrides: std::collections::HashMap<std::path::PathBuf, String>,
@@ -307,10 +308,14 @@ impl History {
         if !history.sessions.iter().any(|s| s.id == history.active) {
             history.active = history.sessions[0].id;
         }
-        history.projects.retain(|path| !history.removed_projects.contains(path));
+        history
+            .projects
+            .retain(|path| !history.removed_projects.contains(path));
         for session in &history.sessions {
             if let Some(project) = &session.project {
-                if !history.projects.contains(project) && !history.removed_projects.contains(project) {
+                if !history.projects.contains(project)
+                    && !history.removed_projects.contains(project)
+                {
                     history.projects.push(project.clone());
                 }
             }
@@ -404,7 +409,10 @@ impl History {
     }
 
     pub fn new_default_session(&mut self) {
-        let project = self.agentspace.clone().or_else(|| self.active().project.clone());
+        let project = self
+            .agentspace
+            .clone()
+            .or_else(|| self.active().project.clone());
         self.new_session_for(project);
     }
 
