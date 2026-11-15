@@ -32,6 +32,7 @@ pub enum Icon {
     GitConflict,
     Pulse,
     Key,
+    Box,
     Folders,
     Folder,
     FolderOpen,
@@ -116,6 +117,7 @@ impl Icon {
             Self::GitConflict => "git-conflict",
             Self::Pulse => "pulse",
             Self::Key => "key",
+            Self::Box => "box",
             Self::Folders => "folders",
             Self::Folder => "folder",
             Self::FolderOpen => "folder-open",
@@ -428,6 +430,10 @@ impl AssetSource for GlintAssets {
 fn icon_svg(name: &str) -> Option<String> {
     let (body, _fill) = match name {
         "sparkles" => ("<path d='m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z'/><path d='m20 2 .6 1.4L22 4l-1.4.6L20 6l-.6-1.4L18 4l1.4-.6L20 2Z'/>", "none"),
+        "box" => (
+            "<path d='m12 3 9 4.5v9L12 21l-9-4.5v-9L12 3Z'/><path d='m3 7.5 9 4.5 9-4.5M12 12v9M7.5 5.25l9 4.5'/>",
+            "none",
+        ),
         "folder" => (
             "<path d='M3 7V5.5A1.5 1.5 0 0 1 4.5 4H9l2.5 3H19.5A1.5 1.5 0 0 1 21 8.5v10A1.5 1.5 0 0 1 19.5 20h-15A1.5 1.5 0 0 1 3 18.5V7Z'/><path d='M3 9h18'/>",
             "none",

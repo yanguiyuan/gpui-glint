@@ -95,6 +95,7 @@ impl AccessMode {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub agentspace: Option<crate::agentspace::Space>,
     pub steering: Option<async_channel::Receiver<crate::provider::Steering>>,
     pub todos: crate::todo::Store,
     pub subagents: crate::subagent::Registry,
@@ -199,8 +200,8 @@ pub fn definitions(anthropic: bool) -> Value {
         ),
         definition(
             "search_files",
-            "Search project text with regex (ripgrep locally, Python regex over SSH); returns at most 200 matches.",
-            json!({"pattern":string(),"glob":string()}),
+            "Search text with regex (ripgrep locally, Python regex over SSH); returns at most 200 matches. Optional path selects a directory, including an absolute AgentSpace repository path; defaults to the home project.",
+            json!({"pattern":string(),"glob":string(),"path":string()}),
             &["pattern"],
         ),
         definition(
@@ -673,6 +674,15 @@ pub(crate) fn resolve_file(
     }
     if access == AccessMode::FullAccess {
         Ok(root.join(relative))
+    } else if let Some(space) = &context.agentspace {
+        // Resolve relative paths against home only; absolute paths can target any declared repo.
+        let requested = root.join(relative);
+        for allowed in space.roots() {
+            if let Ok(path) = safe_path(allowed, &requested.to_string_lossy(), writing) {
+                return Ok(path);
+            }
+        }
+        Err("路径必须位于 AgentSpace 或配置的关联仓库内".into())
     } else {
         safe_path(&root, relative, writing)
     }
@@ -869,13 +879,7 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
             .map(str::to_owned)
             .ok_or("远程文件响应无效".into());
     }
-    let resolve = |path: &str, writing| {
-        if access == AccessMode::FullAccess {
-            Ok(root.join(path))
-        } else {
-            safe_path(root, path, writing)
-        }
-    };
+    let resolve = |path: &str, writing| resolve_file(context, path, writing);
     match call.name.as_str() {
         "read_file" => {
             let path = resolve(text(args, "path")?, false)?;
@@ -957,7 +961,9 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
                 args_list.extend(["--glob".into(), glob.into()]);
             }
             args_list.extend(["--".into(), text(args, "pattern")?.into(), ".".into()]);
-            let result = command(root, "rg", &args_list, None).await?;
+            let directory = resolve(args["path"].as_str().unwrap_or("."), false)?;
+            if !directory.is_dir() { return Err("搜索路径必须为目录".into()); }
+            let result = command(&directory, "rg", &args_list, None).await?;
             Ok(result
                 .lines()
                 .skip(1)
@@ -1324,6 +1330,7 @@ mod tests {
         let outside = directory.path().join("outside.txt");
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
+            agentspace: None,
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
@@ -1401,6 +1408,7 @@ mod tests {
         crate::database::save_history(&anchor, &history).unwrap();
         let (events, receiver) = async_channel::unbounded();
         let context = ToolContext {
+            agentspace: None,
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
@@ -1470,6 +1478,7 @@ mod tests {
         std::fs::write(package.join("SKILL.md"),"---\nname: review\ndescription: Review changes\nallowed-tools: Bash(*)\n---\nRead the diff.\n").unwrap();
         let (events, _) = async_channel::unbounded();
         let context = ToolContext {
+            agentspace: None,
             delegation: Default::default(),
             subagents: Default::default(),
             todos: Default::default(),
@@ -1630,6 +1639,7 @@ mod companion_wake_tests {
             crate::memory::Repository::new(dir.join("sessions.json")).for_partner(Some(partner));
         memory.automatic_goal = true;
         ToolContext {
+            agentspace: None,
             steering: None,
             todos: Default::default(),
             subagents: Default::default(),

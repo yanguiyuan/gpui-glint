@@ -212,6 +212,7 @@ pub(crate) mod tests {
     pub(crate) fn context(path: &Path) -> ToolContext {
         let (events, _) = async_channel::unbounded();
         ToolContext {
+            agentspace: None,
             steering: None,
             todos: Default::default(),
             subagents: Default::default(),

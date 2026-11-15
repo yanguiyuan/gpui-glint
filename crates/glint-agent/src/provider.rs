@@ -1160,6 +1160,7 @@ mod tests {
                 };
                 let (events, receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
+            agentspace: None,
                     delegation: Default::default(),
                     subagents: Default::default(),
                     todos: Default::default(),
@@ -1548,6 +1549,7 @@ mod tests {
                 };
                 let (events, _receiver) = async_channel::unbounded();
                 let context = crate::tools::ToolContext {
+            agentspace: None,
                     delegation: Default::default(),
                     subagents: Default::default(),
                     todos: Default::default(),

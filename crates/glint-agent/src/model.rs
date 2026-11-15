@@ -220,6 +220,8 @@ impl Session {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct History {
     #[serde(default)]
+    pub agentspace: Option<std::path::PathBuf>,
+    #[serde(default)]
     pub removed_projects: std::collections::HashSet<std::path::PathBuf>,
     #[serde(default)]
     pub workspace_display: crate::workspace_tree::DisplayMode,
@@ -271,6 +273,7 @@ impl Default for History {
             compaction_settings: Default::default(),
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
+            agentspace: None,
             projects: vec![],
             project_metadata: Default::default(),
             project_group_overrides: Default::default(),
@@ -398,6 +401,11 @@ impl History {
     #[cfg(test)]
     pub fn new_session(&mut self) {
         self.new_session_for(None);
+    }
+
+    pub fn new_default_session(&mut self) {
+        let project = self.agentspace.clone().or_else(|| self.active().project.clone());
+        self.new_session_for(project);
     }
 
     pub fn new_session_for(&mut self, project: Option<std::path::PathBuf>) {

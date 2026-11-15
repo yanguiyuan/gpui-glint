@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{GroupListGroup, GroupListHeader, GroupListItem};
+use gpui_glint::components::{GroupListGroup, GroupListHeader, GroupListItem, MenuItem};
 
 impl AgentWorkspace {
     pub(super) fn remove_project_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -35,6 +35,9 @@ impl AgentWorkspace {
         self.capture_draft(cx);
         self.history.projects.retain(|project| project != &path);
         self.history.removed_projects.insert(path.clone());
+        if self.history.agentspace.as_ref() == Some(&path) {
+            self.history.agentspace = None;
+        }
         if self.history.active().project.as_ref() == Some(&path) {
             let next = self.history.sessions.iter().find(|session| session.project.as_ref().is_some_and(|project| self.history.projects.contains(project))).map(|session| session.id);
             if let Some(next) = next { self.switch(next, cx); }
@@ -111,71 +114,116 @@ impl AgentWorkspace {
             .rounded(px(8.))
             .text_color(rgb(p.text))
             .hover(|style| style.bg(rgb(p.border)))
-            .child(Icon::Folder.render(16.))
-            .child(label)
+            .child(self.history.active().project.as_deref()
+                .map(|path| project_grouping::project_icon(&self.history, path))
+                .unwrap_or(Icon::Folder).render(16.))
+            .child(div().max_w(px(220.)).truncate().child(label))
             .child(Icon::ChevronDown.render(12.));
-        let mut content = div().flex().flex_col().gap_1();
+        let section = |label: &str| div()
+            .px_2().pt_2().pb_1()
+            .text_size(px(10.)).font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(p.text_muted)).child(label.to_owned());
+        let divider = || div().h(px(1.)).mx_2().my_1().bg(rgb(p.border));
+        let mut projects = div().id("project-picker-list")
+            .max_h(px(200.)).overflow_y_scroll()
+            .flex().flex_col().gap(px(2.));
         for path in &self.history.projects {
+            let selected = self.history.active().project.as_ref() == Some(path);
+            let is_space = self.history.agentspace.as_ref() == Some(path);
+            let remote = ssh_project::is_remote(path);
+            let label = if remote {
+                path.file_name().map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ssh_project::label(path))
+            } else if is_space {
+                ssh_project::label(path)
+            } else {
+                project_grouping::project_label(&self.history, path)
+            };
             let path = path.clone();
-            let label = project_grouping::project_label(&self.history, &path);
-            content = content.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "choose-project:{}",
-                        path.display()
-                    )))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_2()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(Icon::Folder.render(15.))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.choose_project(path.clone(), cx)),
-                    ),
+            projects = projects.child(
+                div().id(SharedString::from(format!("choose-project:{}", path.display())))
+                    .h(px(40.)).flex_shrink_0().px_2()
+                    .flex().items_center().gap_2().rounded(px(5.))
+                    .text_color(rgb(p.text)).cursor_pointer()
+                    .when(selected, |row| row.bg(rgb(p.accent_tint)))
+                    .hover(|style| style.bg(rgb(p.accent_tint)))
+                    .child(div().flex_shrink_0().text_color(rgb(p.text_muted))
+                        .child(if is_space { Icon::Box } else if remote { Icon::Globe } else { Icon::Folder }.render(15.)))
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.))
+                        .child(div().text_size(px(12.)).truncate().child(label))
+                        .child(div().text_size(px(10.)).text_color(rgb(p.text_muted))
+                            .truncate().child(gpui_glint::paths::display_path(&path))))
+                    .when(is_space, |row| row.child(div().flex_shrink_0()
+                        .text_size(px(9.)).text_color(rgb(p.text_muted)).child("默认空间")))
+                    .when(selected, |row| row.child(div().flex_shrink_0()
+                        .text_color(rgb(p.accent)).child(Icon::CheckCircle.render(14.))))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_project(path.clone(), cx))),
             );
         }
-        content = content.child(
-            Button::new("设置当前项目分组…")
-                .icon(Icon::Folders)
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(path) = this.history.active().project.clone() {
-                        this.edit_project_group(path, cx);
-                    }
-                })),
-        );
-        content = content.child(
-            Button::new("打开项目目录…")
-                .icon(Icon::Plus)
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .render()
+        let mut content = div().flex().flex_col()
+            .text_color(rgb(p.text)).child(section("切换项目"));
+        if self.history.projects.is_empty() {
+            content = content.child(div().px_2().py_2().text_size(px(12.))
+                .text_color(rgb(p.text_muted)).child("打开目录，或设置默认空间"));
+        } else {
+            content = content.child(projects);
+        }
+        content = content.child(divider())
+            .child(MenuItem::new("picker-open-project", "打开项目目录…")
+                .icon(Icon::FolderOpen).theme(self.theme).render()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.project_picker_open = false;
                     this.open_project(cx);
                     cx.notify();
-                })),
-        );
-        content = content.child(
-            Button::new("打开 SSH 项目…")
-                .icon(Icon::Globe)
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .render()
-                .on_click(cx.listener(|this, _, window, cx| this.open_ssh_project(window, cx))),
-        );
+                })))
+            .child(MenuItem::new("picker-open-ssh", "连接 SSH 项目…")
+                .icon(Icon::Globe).theme(self.theme).render()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.project_picker_open = false;
+                    this.open_ssh_project(window, cx);
+                })));
+        if self.history.active().project.is_some() {
+            content = content.child(MenuItem::new("picker-project-group", "项目分组…")
+                .icon(Icon::Folders).theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(path) = this.history.active().project.clone() {
+                        this.edit_project_group(path, cx);
+                    }
+                })));
+        }
+        content = content.child(divider()).child(section("AgentSpace · 新会话默认目录"))
+            .child(MenuItem::new("picker-choose-agentspace", "选择默认目录…")
+                .icon(Icon::Box).theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.project_picker_open = false;
+                    this.pick_agentspace(cx);
+                })));
+        if self.history.active().project.as_deref().is_some_and(|path|
+            !ssh_project::is_remote(path) && self.history.agentspace.as_deref() != Some(path)) {
+            content = content.child(MenuItem::new("picker-set-agentspace", "将当前目录设为默认空间")
+                .icon(Icon::Box).theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(path) = this.history.active().project.clone() {
+                        this.set_agentspace(path, cx);
+                    }
+                })));
+        }
+        if self.history.agentspace.is_some() {
+            content = content.child(MenuItem::new("picker-clear-agentspace", "取消默认空间")
+                .icon(Icon::Close).theme(self.theme).render()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.history.agentspace = None;
+                    this.project_picker_open = false;
+                    this.save(cx);
+                    cx.notify();
+                })));
+        }
         let weak = cx.entity().downgrade();
         Popover::new("composer-project-selector", trigger, content)
             .open(self.project_picker_open)
             .above_trigger()
             .trigger_height(28.)
-            .width(280.)
+            .width(304.)
             .padding(6.)
             .theme(self.theme)
             .on_open_change(move |open, _, cx| {
@@ -244,12 +292,34 @@ impl AgentWorkspace {
         .detach();
     }
 
+    fn set_agentspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match agentspace::configure(&path) {
+            Ok(path) => {
+                self.history.agentspace = Some(path.clone());
+                self.choose_project(path, cx);
+                self.git_ui.toasts.update(cx, |toasts, cx| toasts.push(
+                    gpui_glint::components::Toast::new("已设置默认 AgentSpace")
+                        .description("加号将默认使用此目录。在 agentspace.toml 中配置关联仓库，下次发送消息时生效。"), cx));
+            }
+            Err(error) => self.provider_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn pick_agentspace(&mut self, cx: &mut Context<Self>) {
+        self.pick_project_directory(true, cx);
+    }
+
     pub fn open_project(&mut self, cx: &mut Context<Self>) {
+        self.pick_project_directory(false, cx);
+    }
+
+    fn pick_project_directory(&mut self, agentspace: bool, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("打开项目".into()),
+            prompt: Some(if agentspace { "选择 AgentSpace 目录" } else { "打开项目" }.into()),
         });
         cx.spawn(async move |weak, cx| {
             let result = picker.await;
@@ -265,7 +335,8 @@ impl AgentWorkspace {
                                 }
                             }) {
                                 Ok(path) => {
-                                    this.choose_project(path, cx);
+                                    if agentspace { this.set_agentspace(path, cx); }
+                                    else { this.choose_project(path, cx); }
                                 }
                                 Err(_) => this.provider_error = Some("无法打开项目目录".into()),
                             }
@@ -326,7 +397,7 @@ pub fn session_groups_with_partners(
             }
             groups.push(GroupListGroup::new(
                 GroupListHeader::new(id, project_grouping::project_label(history, path))
-                    .icon(Icon::Folder)
+                    .icon(project_grouping::project_icon(history, path))
                     .actions([Icon::Plus, Icon::More])
                     .menu([("设置分组".into(), Icon::Folders), ("移除项目".into(), Icon::Trash)]),
             ));
@@ -338,7 +409,7 @@ pub fn session_groups_with_partners(
                 Some(path) if !history.removed_projects.contains(path) => (
                     format!("project:{}", path.display()),
                     project_grouping::project_label(history, path),
-                    Icon::Folder,
+                    project_grouping::project_icon(history, path),
                 ),
                 _ => continue,
             }
@@ -465,6 +536,37 @@ fn partner_session_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn agentspace_default_switches_without_moving_existing_sessions(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(dir.path().join("providers.json"), r#"{"providers":[],"active":null,"active_model":""}"#).unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path.clone(), cx));
+        let home = home.canonicalize().unwrap();
+        host.update_in(window, |host, window, cx| {
+            host.choose_project(project.clone(), cx);
+            let old = host.history.active;
+            host.history.active_mut().push(Role::User, "existing".into());
+            host.set_agentspace(home.clone(), cx);
+            assert_eq!(host.history.agentspace.as_ref(), Some(&home));
+            assert_eq!(host.history.sessions.iter().find(|s| s.id == old).unwrap().project.as_ref(), Some(&project));
+            host.choose_project(project.clone(), cx);
+            host.new_session(window, cx);
+            assert_eq!(host.history.active().project.as_ref(), Some(&home));
+            host.history.save(&path).unwrap();
+            assert_eq!(History::load(&path).unwrap().agentspace.as_ref(), Some(&home));
+            host.remove_project(home.clone(), cx);
+            assert!(host.history.agentspace.is_none());
+            assert!(home.join(agentspace::CONFIG_FILE).exists());
+        });
+    }
+
 
     #[gpui::test]
     fn project_more_menu_removes_persistently_and_reopening_restores_history(cx: &mut gpui::TestAppContext) {

@@ -216,6 +216,10 @@ pub fn group_name<'a>(history: &'a History, path: &std::path::Path) -> Option<&'
         .map(|meta| meta.branch.as_str())
 }
 
+pub fn project_icon(history: &History, path: &std::path::Path) -> Icon {
+    if history.agentspace.as_deref() == Some(path) { Icon::Box } else { Icon::Folder }
+}
+
 pub fn repository_label(history: &History, path: &std::path::Path) -> String {
     history
         .project_metadata
@@ -377,7 +381,7 @@ impl AgentWorkspace {
                 .gap_4()
                 .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("设置项目分组"))
                 .child(div().p_3().rounded(px(8.)).bg(rgb(self.theme.palette().surface_subtle)).flex().flex_col().gap_1()
-                    .child(div().flex().items_center().gap_2().child(Icon::Folder.render(16.)).child(project_label(&self.history, path)))
+                    .child(div().flex().items_center().gap_2().child(project_icon(&self.history, path).render(16.)).child(project_label(&self.history, path)))
                     .child(div().text_size(px(11.)).text_color(rgb(self.theme.palette().text_muted)).truncate()
                         .child(gpui_glint::paths::display_path(path))))
                 .child(div().flex().gap_2().children([

@@ -392,6 +392,7 @@ mod tests {
 
     fn context(path: &std::path::Path, events: async_channel::Sender<ToolEvent>) -> ToolContext {
         ToolContext {
+            agentspace: None,
             delegation: Delegation::default(),
             subagents: Default::default(),
             todos: Default::default(),

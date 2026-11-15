@@ -52,6 +52,7 @@ mod tests {
         assert!(mcp.instructions().contains("内置 Glint API"));
         let (events, receiver) = async_channel::unbounded();
         let mut context = ToolContext {
+            agentspace: None,
             steering: None,
             todos: Default::default(),
             subagents: Default::default(),

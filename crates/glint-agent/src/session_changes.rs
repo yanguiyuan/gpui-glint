@@ -508,6 +508,7 @@ mod tests {
     fn context(root: &Path, anchor: &Path) -> ToolContext {
         let (events, _) = async_channel::unbounded();
         ToolContext {
+            agentspace: None,
             steering: None,
             todos: Default::default(),
             subagents: Default::default(),
