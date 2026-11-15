@@ -1086,8 +1086,10 @@ impl AgentWorkspace {
                 return Ok((
                     images,
                     std::sync::Arc::new(skills::Catalog::empty(skills_anchor)),
+                    None,
                 ));
             }
+            let agentspace = agentspace::Space::load_request(&project)?;
             let skills =
                 std::sync::Arc::new(skills_manager.catalog(Some(&project)).unwrap_or_else(
                     |error| {
@@ -1096,13 +1098,13 @@ impl AgentWorkspace {
                         catalog
                     },
                 ));
-            Ok::<_, String>((images, skills))
+            Ok::<_, String>((images, skills, agentspace))
         });
         self.run_mut(id).preparing = Some((
             id,
             cx.spawn(async move |weak, cx| {
                 let result = async {
-                    let (images, skills) = prepare.await?;
+                    let (images, skills, agentspace) = prepare.await?;
                     let summary = if let Some(plan) = compact_plan {
                         let previous = plan.previous();
                         Some((
@@ -1114,7 +1116,7 @@ impl AgentWorkspace {
                     } else {
                         None
                     };
-                    Ok::<_, String>((images, skills, summary))
+                    Ok::<_, String>((images, skills, agentspace, summary))
                 }
                 .await;
                 let _ = weak.update(cx, |this, cx| {
@@ -1122,7 +1124,7 @@ impl AgentWorkspace {
                         task.detach();
                     }
                     match result {
-                        Ok((images, skills, summary)) => {
+                        Ok((images, skills, agentspace, summary)) => {
                             if let Some((summary, previous)) = summary {
                                 if let Some(session) =
                                     this.history.sessions.iter_mut().find(|s| s.id == id)
@@ -1143,6 +1145,7 @@ impl AgentWorkspace {
                                 display,
                                 images,
                                 skills,
+                                agentspace,
                                 config,
                                 clear_composer,
                                 retry,
@@ -1184,6 +1187,7 @@ impl AgentWorkspace {
         display: Option<model::MessageDisplay>,
         images: Vec<model::MessageImage>,
         skills: std::sync::Arc<skills::Catalog>,
+        agentspace: Option<agentspace::Space>,
         config: provider::Config,
         clear_composer: bool,
         retry: Option<usize>,
@@ -1238,8 +1242,7 @@ impl AgentWorkspace {
                 .unwrap_or(false);
         let todos = std::sync::Arc::new(std::sync::Mutex::new(request_session.todos.clone()));
         let subagents = subagent::Registry::default();
-        let agentspace = project.map(agentspace::Space::load).transpose()?.flatten();
-        if self.history.agentspace.as_deref() == project && agentspace.is_none() && project.is_some() {
+        if !group_member && self.history.agentspace.as_deref() == project && agentspace.is_none() && project.is_some() {
             return Err("AgentSpace 配置文件已丢失，请重新设置 AgentSpace".into());
         }
         let tool_context = tools::ToolContext {
