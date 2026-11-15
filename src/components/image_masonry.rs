@@ -17,6 +17,9 @@ pub struct ImageMasonryItem {
     pub width: u32,
     pub height: u32,
     pub title: Option<SharedString>,
+    /// Optional second caption line, e.g. "第 12 话 · 2 小时前". Only shown when
+    /// `title` is present; the card footer grows to fit it.
+    pub subtitle: Option<SharedString>,
 }
 
 impl ImageMasonryItem {
@@ -32,17 +35,35 @@ impl ImageMasonryItem {
             width,
             height,
             title: None,
+            subtitle: None,
         }
     }
     pub fn title(mut self, title: impl Into<SharedString>) -> Self {
         self.title = Some(title.into());
         self
     }
+    pub fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
+    }
+    /// Footer strip below the image: nothing, one caption line, or two.
+    fn footer_height(&self) -> f32 {
+        match (self.title.is_some(), self.subtitle.is_some()) {
+            (false, _) => 0.,
+            (true, false) => 34.,
+            (true, true) => 50.,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageMasonryEvent {
-    Selected { id: SharedString, index: usize },
+    Selected {
+        id: SharedString,
+        index: usize,
+    },
+    /// Emitted once near the bottom when the host has enabled pagination.
+    LoadMore,
 }
 
 /// Owns a vertical scroll viewport. Place the entity in a container with a bounded
@@ -56,6 +77,8 @@ pub struct ImageMasonry {
     viewport_width: f32,
     selected: Option<SharedString>,
     loading: bool,
+    has_more: bool,
+    load_more_requested: bool,
     scroll: ScrollHandle,
     viewport_height: f32,
     overscan: f32,
@@ -78,6 +101,8 @@ impl ImageMasonry {
             viewport_width: 0.,
             selected: None,
             loading: false,
+            has_more: false,
+            load_more_requested: false,
             scroll: ScrollHandle::new(),
             viewport_height: 0.,
             overscan: 400.,
@@ -91,6 +116,7 @@ impl ImageMasonry {
     }
     pub fn set_items(&mut self, items: Vec<ImageMasonryItem>, cx: &mut Context<Self>) {
         self.items = items;
+        self.load_more_requested = false;
         self.geometry = None;
         self.pending_anchor = None;
         self.pending_scroll = None;
@@ -109,6 +135,7 @@ impl ImageMasonry {
         items: impl IntoIterator<Item = ImageMasonryItem>,
         cx: &mut Context<Self>,
     ) {
+        self.load_more_requested = false;
         let start = self.items.len();
         self.items.extend(items);
         if let Some(geometry) = &mut self.geometry {
@@ -210,6 +237,14 @@ impl ImageMasonry {
         self.loading = loading;
         cx.notify();
     }
+    /// Opt into near-bottom pagination. Disable after a failure; enable again on retry.
+    pub fn set_has_more(&mut self, has_more: bool, cx: &mut Context<Self>) {
+        if self.has_more != has_more {
+            self.has_more = has_more;
+            self.load_more_requested = false;
+            cx.notify();
+        }
+    }
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(item) = self.items.get(index) {
             let id = item.id.clone();
@@ -270,7 +305,7 @@ impl Geometry {
                 item.height as f32 / item.width as f32
             };
             let image_height = self.column_width * ratio;
-            let height = image_height + if item.title.is_some() { 34. } else { 0. };
+            let height = image_height + item.footer_height();
             self.places.push(Placement {
                 x: column as f32 * (self.column_width + gap),
                 y: self.bottoms[column],
@@ -420,16 +455,34 @@ impl Render for ImageMasonry {
                             ),
                     );
                 if let Some(title) = &item.title {
-                    card = card.child(
-                        div()
-                            .h(px(34.))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .text_size(px(12.))
-                            .text_color(rgb(p.text))
-                            .child(div().flex_1().min_w_0().truncate().child(title.clone())),
-                    );
+                    let mut footer = div()
+                        .h(px(item.footer_height()))
+                        .px_3()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(1.))
+                        .text_color(rgb(p.text))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(px(12.))
+                                .truncate()
+                                .child(title.clone()),
+                        );
+                    if let Some(subtitle) = &item.subtitle {
+                        footer = footer.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .truncate()
+                                .child(subtitle.clone()),
+                        );
+                    }
+                    card = card.child(footer);
                 }
                 // Overlay selection avoids changing image dimensions or card positions.
                 if selected {
@@ -469,6 +522,23 @@ impl Render for ImageMasonry {
                     let width = (f32::from(bounds.size.width) - 12.).max(0.).round();
                     let height = f32::from(bounds.size.height);
                     let width_changed = (this.viewport_width - width).abs() >= 1.;
+                    let remaining = this.scroll.max_offset().y + this.scroll.offset().y;
+                    if this.has_more
+                        && !this.loading
+                        && !this.load_more_requested
+                        && !width_changed
+                        && this.viewport_height > 0.
+                        && width > 0.
+                        && height > 0.
+                        && remaining <= px(400.)
+                    {
+                        this.load_more_requested = true;
+                        let entity = cx.entity().downgrade();
+                        cx.defer(move |cx| {
+                            let _ = entity.update(cx, |_, cx| cx.emit(ImageMasonryEvent::LoadMore));
+                        });
+                    }
+
                     if width_changed
                         || this.viewport_height != height
                         || this.scroll.offset() != paint_offset
@@ -641,6 +711,46 @@ mod tests {
             (first.x, first.y)
         );
         assert!(geometry.height() >= old_height);
+    }
+
+    #[gpui::test]
+    fn near_bottom_requests_once_until_the_host_appends_a_page(cx: &mut gpui::TestAppContext) {
+        let (gallery, window) = cx.add_window_view(|_, cx| {
+            let mut gallery = ImageMasonry::new(cx);
+            gallery.set_items(
+                (0..100)
+                    .map(|i| ImageMasonryItem::new(format!("image-{i}"), "missing.png", 350, 500))
+                    .collect(),
+                cx,
+            );
+            gallery
+        });
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let received = count.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&gallery, move |_, _, event: &ImageMasonryEvent, _| {
+                if matches!(event, ImageMasonryEvent::LoadMore) {
+                    received.set(received.get() + 1);
+                }
+            })
+            .detach();
+        });
+        window.run_until_parked();
+        gallery.update(window, |gallery, cx| gallery.set_has_more(true, cx));
+        window.run_until_parked();
+        assert_eq!(count.get(), 0, "at the top, no page is requested");
+        gallery.update(window, |gallery, cx| gallery.scroll_to("image-99", cx));
+        window.run_until_parked();
+        assert_eq!(count.get(), 1);
+        gallery.update(window, |_, cx| cx.notify());
+        window.run_until_parked();
+        assert_eq!(count.get(), 1, "repainting cannot duplicate the request");
+        gallery.update(window, |gallery, cx| {
+            gallery.set_has_more(false, cx);
+            gallery.set_loading(false, cx);
+        });
+        window.run_until_parked();
+        assert_eq!(count.get(), 1, "a failed or finished page does not loop");
     }
 
     #[gpui::test]
