@@ -36,3 +36,9 @@ pub use masonry::MasonryPage;
 mod video;
 #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
 pub use video::VideoPage;
+
+mod media;
+pub use media::MediaPage;
+
+mod forms;
+pub use forms::FormsPage;

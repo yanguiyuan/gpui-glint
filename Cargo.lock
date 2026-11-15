@@ -3573,9 +3573,11 @@ dependencies = [
 name = "gpui-glint"
 version = "0.1.3"
 dependencies = [
+ "anyhow",
  "async-channel",
  "chrono",
  "encoding_rs",
+ "futures",
  "glint-plugin",
  "glint-plugin-registry",
  "gpui-ce",

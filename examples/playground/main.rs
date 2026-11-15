@@ -16,8 +16,9 @@ use gpui_glint::components::{
 use gpui_glint::theme::ThemePreset;
 
 use pages::{
-    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, IconsPage, InputsPage,
-    LayoutPage, MasonryPage, OverviewPage, TablesPage, TabsPage, ThemeShowcase,
+    BadgesPage, ButtonsPage, CodeCardsPage, CommandsPage, DocumentsPage, FormsPage, IconsPage,
+    InputsPage, LayoutPage, MasonryPage, MediaPage, OverviewPage, TablesPage, TabsPage,
+    ThemeShowcase,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ enum Page {
     Icons,
     Layout,
     Inputs,
+    Forms,
     Badges,
     CodeCards,
     Commands,
@@ -34,6 +36,7 @@ enum Page {
     Documents,
     Tabs,
     Masonry,
+    Media,
     #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
     Video,
     Themes,
@@ -46,6 +49,7 @@ impl Page {
         (Self::Icons, "图标"),
         (Self::Layout, "布局容器"),
         (Self::Inputs, "输入与选择"),
+        (Self::Forms, "表单"),
         (Self::Badges, "徽标与标签"),
         (Self::CodeCards, "文档代码卡"),
         (Self::Commands, "命令面板"),
@@ -53,6 +57,7 @@ impl Page {
         (Self::Documents, "文档编辑器"),
         (Self::Tabs, "标签页"),
         (Self::Masonry, "图片瀑布流"),
+        (Self::Media, "图片阅读与缩略图"),
         #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
         (Self::Video, "视频播放"),
         (Self::Themes, "主题"),
@@ -68,6 +73,7 @@ struct Playground {
     icons: Entity<IconsPage>,
     layout: Entity<LayoutPage>,
     inputs: Entity<InputsPage>,
+    forms: Entity<FormsPage>,
     badges: Entity<BadgesPage>,
     code_cards: Entity<CodeCardsPage>,
     commands: Entity<CommandsPage>,
@@ -75,6 +81,7 @@ struct Playground {
     documents: Entity<DocumentsPage>,
     tabs: Entity<TabsPage>,
     masonry: Entity<MasonryPage>,
+    media: Entity<MediaPage>,
     #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
     video: Entity<VideoPage>,
     _theme_subscription: Subscription,
@@ -89,6 +96,7 @@ impl Playground {
             Page::Icons => self.icons.clone().into_any_element(),
             Page::Layout => self.layout.clone().into_any_element(),
             Page::Inputs => self.inputs.clone().into_any_element(),
+            Page::Forms => self.forms.clone().into_any_element(),
             Page::Badges => self.badges.clone().into_any_element(),
             Page::CodeCards => self.code_cards.clone().into_any_element(),
             Page::Commands => self.commands.clone().into_any_element(),
@@ -96,6 +104,7 @@ impl Playground {
             Page::Documents => self.documents.clone().into_any_element(),
             Page::Tabs => self.tabs.clone().into_any_element(),
             Page::Masonry => self.masonry.clone().into_any_element(),
+            Page::Media => self.media.clone().into_any_element(),
             #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
             Page::Video => self.video.clone().into_any_element(),
             Page::Themes => {
@@ -134,6 +143,7 @@ impl Playground {
             cx.notify();
         });
         self.inputs.update(cx, |page, cx| page.set_theme(theme, cx));
+        self.forms.update(cx, |page, cx| page.set_theme(theme, cx));
         self.badges.update(cx, |page, cx| {
             page.theme = theme;
             cx.notify();
@@ -150,6 +160,7 @@ impl Playground {
         self.tabs.update(cx, |page, cx| page.set_theme(theme, cx));
         self.masonry
             .update(cx, |page, cx| page.set_theme(theme, cx));
+        self.media.update(cx, |page, cx| page.set_theme(theme, cx));
         cx.notify();
     }
 
@@ -194,7 +205,8 @@ impl Playground {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
-                this.video.update(cx, |video, cx| video.set_visible(page == Page::Video, cx));
+                this.video
+                    .update(cx, |video, cx| video.set_visible(page == Page::Video, cx));
                 this.selected = page;
                 this.inputs.update(cx, |inputs, cx| {
                     inputs.close_menu(cx);
@@ -213,7 +225,8 @@ impl Render for Playground {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sidebar_items = Page::ALL
-            .iter().copied()
+            .iter()
+            .copied()
             .fold(div().flex().flex_col().gap_1(), |items, (page, label)| {
                 items.child(self.nav_item(page, label, cx))
             });
@@ -408,6 +421,7 @@ pub fn open(cx: &mut App) {
             cx,
         )
     });
+    let forms = cx.new(|cx| FormsPage::new(theme, cx));
     let badges = cx.new(|_| BadgesPage { theme });
     let code_cards = cx.new(|cx| CodeCardsPage::new(theme, cx));
     let commands = cx.new(|cx| CommandsPage::new(theme, cx));
@@ -415,6 +429,7 @@ pub fn open(cx: &mut App) {
     let documents = cx.new(|cx| DocumentsPage::new(theme, cx));
     let tabs = cx.new(|cx| TabsPage::new(theme, cx));
     let masonry = cx.new(|cx| MasonryPage::new(theme, cx));
+    let media = cx.new(|cx| MediaPage::new(theme, cx));
 
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     cx.open_window(
@@ -438,7 +453,11 @@ pub fn open(cx: &mut App) {
                 );
                 let commands_subscription = cx.observe(&commands, |_, _, cx| cx.notify());
                 #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
-                let video = cx.new(|cx| {let mut page = VideoPage::new(_window, theme, cx);page.set_visible(false, cx);page});
+                let video = cx.new(|cx| {
+                    let mut page = VideoPage::new(_window, theme, cx);
+                    page.set_visible(false, cx);
+                    page
+                });
                 Playground {
                     selected: Page::Documents,
                     theme,
@@ -448,6 +467,7 @@ pub fn open(cx: &mut App) {
                     icons,
                     layout,
                     inputs,
+                    forms,
                     badges,
                     code_cards,
                     commands,
@@ -455,7 +475,11 @@ pub fn open(cx: &mut App) {
                     documents,
                     tabs,
                     masonry,
-                    #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+                    media,
+                    #[cfg(all(
+                        feature = "video",
+                        any(target_os = "macos", target_os = "windows")
+                    ))]
                     video,
                     _theme_subscription: theme_subscription,
                     _commands_subscription: commands_subscription,

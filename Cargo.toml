@@ -44,6 +44,7 @@ plugin-registry = ["dep:glint-plugin-registry"]
 wry = { version = "0.55", optional = true }
 
 [dependencies]
+futures = "0.3"
 async-channel = { version = "2", optional = true }
 irosashi = { version = "=0.3.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +63,7 @@ unicode-segmentation = "1.13"
 html5ever = "0.38"
 
 [dev-dependencies]
+anyhow = "1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.39", features = ["bundled"] }

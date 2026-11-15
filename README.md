@@ -77,7 +77,7 @@ fn main() {
 | 基础表单 | `Checkbox`、`RadioOption`、`Switch`、`Slider`、`Stepper` |
 | 菜单与命令 | `GroupedDropdown`、`CommandPalette` |
 | 日期与时间 | `DatePicker`、`TimePicker`、`DateTimePicker`、`DateRangePicker`、`TimeRangePicker`、`DateTimeRangePicker` |
-| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel`、`ImageMasonry`、`HtmlReader`、`VideoPlayer`（可选） |
+| 内容展示 | `DataTable`、`CodeCard`、`DiffCard`、`CollapsePanel`、`ImageMasonry`、`ImageStream`、`ImageViewer`、`ThumbnailList`、`HtmlReader`、`VideoPlayer`（可选） |
 | 文档与图表 | `DocumentEditor`、`MermaidDiagram`、`GitGraph` |
 | 对话输入 | `Composer`、`PromptEditor` |
 | 状态与身份 | `ToastHost`、`Avatar`、`AvatarGroup`、`ContentBadge`、`TagBadge`、`CountBadge`、`OverlayBadge`、`StatusBadge` |
@@ -230,3 +230,7 @@ reader.update(cx, |reader, cx| reader.set_theme(theme, cx));
 ```
 
 `ImageMasonry` 的滚动续页由宿主调用 `set_has_more(true, cx)` 开启，然后监听 `ImageMasonryEvent::LoadMore` 取下一页。`set_loading(true, cx)` 显示加载态，`append_items` 追加后允许下一次触底请求；末页或失败时关闭 `has_more`，失败后的重试由宿主提供。
+
+媒体组件：[`ImageStream`、`ImageViewer`、`ThumbnailList`、分组 `NavigationRail` 与图片字节缓存](docs/media-components.md)。
+
+通用表单：[`Form`、`FormSection`、`FormField` 与 `FormActions`](docs/forms.md)，支持主题、字段提示、提交状态和可选回车提交。

@@ -25,3 +25,6 @@ pub use glint_plugin as plugins;
 /// Optional signed-source and installation SDK; does not require the JavaScript runtime.
 #[cfg(feature = "plugin-registry")]
 pub use glint_plugin_registry as plugin_registry;
+
+/// Shared infrastructure for image download and transform caches.
+pub mod image_cache;

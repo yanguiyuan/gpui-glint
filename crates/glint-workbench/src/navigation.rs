@@ -1,8 +1,5 @@
-use gpui::{Context, EventEmitter, Window, div, prelude::*, px, rgb};
-use gpui_glint::{
-    components::{Icon, IconButton, Tooltip},
-    theme::ThemePreset,
-};
+use gpui::{Context, EventEmitter, Window, prelude::*};
+use gpui_glint::{components::Icon, theme::ThemePreset};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -20,7 +17,7 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext, Entity, Subscription};
+    use gpui::{AppContext, Entity, Subscription, div, px};
 
     struct Harness {
         navigation: Entity<Navigation>,
@@ -143,157 +140,124 @@ impl Navigation {
             cx.notify();
         }
     }
-
-    fn route_button(
-        &self,
-        id: &'static str,
-        icon: Icon,
-        title: &'static str,
-        route: Route,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let button = IconButton::new(icon, title)
-            .theme(self.theme)
-            .render()
-            .id(id)
-            .debug_selector(move || id.into())
-            .when(self.route == route, |button| {
-                button
-                    .bg(rgb(self.theme.palette().accent_tint))
-                    .text_color(rgb(self.theme.palette().accent))
-            })
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(Action::Navigate(route))));
-        Tooltip::new(button, title).theme(self.theme).render(cx)
-    }
 }
 
 impl Render for Navigation {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use glint_agent::Page as Agent;
         use glint_api::Page as Api;
-        let separator = |id: &'static str| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .w(px(24.))
-                .my_1()
-                .h(px(1.))
-                .flex_shrink_0()
-                .bg(rgb(self.theme.palette().border))
-        };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_2()
-            .py_3()
-            .child(self.route_button(
+        use gpui_glint::components::{NavigationGroup, NavigationItem, NavigationRail};
+        let routes = [
+            (
                 "nav-agent",
                 Icon::MessageCircle,
                 "Agent 会话",
                 Route::Agent(Agent::Chat),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-partners",
                 Icon::Users,
                 "伙伴",
                 Route::Agent(Agent::Partners),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-channels",
                 Icon::Radio,
                 "频道",
                 Route::Agent(Agent::Channels),
-                cx,
-            ))
-            .child(
-                Tooltip::new(
-                    IconButton::new(Icon::Plus, "新建 Agent 会话")
-                        .theme(self.theme)
-                        .render()
-                        .id("nav-new-session")
-                        .debug_selector(|| "nav-new-session".into())
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(Action::NewSession))),
-                    "新建 Agent 会话",
-                )
-                .theme(self.theme)
-                .render(cx),
-            )
-            .child(self.route_button(
+            ),
+            (
                 "nav-calendar",
                 Icon::Calendar,
                 "日程与定时任务",
                 Route::Agent(Agent::Calendar),
-                cx,
-            ))
-            .child(separator("nav-api-agent-divider"))
-            .child(self.route_button(
+            ),
+            (
                 "nav-api",
                 Icon::Folders,
                 "API 请求",
                 Route::Api(Api::Requests),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-environments",
                 Icon::Globe,
                 "环境变量",
                 Route::Api(Api::Environments),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-proxies",
                 Icon::Shuffle,
                 "代理管理",
                 Route::Api(Api::Proxies),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-history",
                 Icon::Clock,
                 "请求历史",
                 Route::Api(Api::History),
-                cx,
-            ))
-            .child(div().flex_1().min_h_0())
-            .child(separator("nav-common-divider"))
-            .child(self.route_button(
+            ),
+            (
                 "nav-plugins",
                 Icon::Puzzle,
                 "插件管理",
                 Route::Api(Api::Plugins),
-                cx,
-            ))
-            .child(self.route_button(
+            ),
+            (
                 "nav-mcp",
                 Icon::Workflow,
                 "MCP 调用历史",
                 Route::Api(Api::Mcp),
-                cx,
-            ))
-            .child(self.route_button("nav-vault", Icon::Key, "密码箱", Route::Api(Api::Vault), cx))
-            .child(self.route_button(
+            ),
+            ("nav-vault", Icon::Key, "密码箱", Route::Api(Api::Vault)),
+            (
                 "nav-settings",
                 Icon::Settings,
                 "Agent 设置",
                 Route::Agent(Agent::Settings),
-                cx,
-            ))
-            .child(
-                Tooltip::new(
-                    IconButton::new(Icon::HalfCircle, "切换明暗主题")
-                        .theme(self.theme)
-                        .render()
-                        .id("nav-theme")
-                        .debug_selector(|| "nav-theme".into())
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(Action::ToggleTheme))),
-                    "切换明暗主题",
-                )
-                .theme(self.theme)
-                .render(cx),
+            ),
+        ];
+        let item = |(id, icon, title, _): &(&'static str, Icon, &'static str, Route)| {
+            NavigationItem::new(*id, *title, *icon)
+        };
+        let mut agent: Vec<_> = routes[..3].iter().map(item).collect();
+        agent.push(NavigationItem::new(
+            "nav-new-session",
+            "新建 Agent 会话",
+            Icon::Plus,
+        ));
+        agent.push(item(&routes[3]));
+        let mut footer: Vec<_> = routes[8..].iter().map(item).collect();
+        footer.push(NavigationItem::new(
+            "nav-theme",
+            "切换明暗主题",
+            Icon::HalfCircle,
+        ));
+        let selected = routes
+            .iter()
+            .find(|(_, _, _, route)| *route == self.route)
+            .map(|entry| entry.0)
+            .unwrap_or("nav-agent");
+        NavigationRail::new([])
+            .groups([
+                NavigationGroup::new("nav-agent", agent),
+                NavigationGroup::new("nav-api-agent", routes[4..8].iter().map(item)),
+            ])
+            .footer_group(NavigationGroup::new("nav-common", footer))
+            .selected(selected)
+            .theme(self.theme)
+            .on_select(
+                cx.listener(move |_, id: &gpui::SharedString, _, cx| match id.as_ref() {
+                    "nav-new-session" => cx.emit(Action::NewSession),
+                    "nav-theme" => cx.emit(Action::ToggleTheme),
+                    _ => {
+                        if let Some((_, _, _, route)) =
+                            routes.iter().find(|(entry, _, _, _)| *entry == id.as_ref())
+                        {
+                            cx.emit(Action::Navigate(*route));
+                        }
+                    }
+                }),
             )
+            .render(cx)
     }
 }
