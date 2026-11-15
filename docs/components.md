@@ -855,3 +855,42 @@ cx.subscribe(&gallery, |_, _, event: &ImageMasonryEvent, _| {
 组件默认开启虚拟化：仅为视口及上下各 400px 的预加载区域创建卡片、发起图片加载。`set_overscan(pixels, cx)` 可调整预加载范围；`scroll_to("id", cx)` 可直接定位图片。侧边滚动条支持拖动和跳转。滚动查询按各列二分查找，不逐项扫描全部数据；几何布局在宽度或布局参数变化时重算，分页追加仅计算新增项，缩放和密度切换保留当前阅读位置。
 
 URL / 路径图片使用组件独立缓存，离开预加载区域后移出缓存，避免浏览过的图片一直堆积；GPUI 已在途的读取仍可能完成。传入 `RenderImage` / `Image` 时，其原始图片数据由宿主和数据列表持有；大量数据建议传 URL / 路径及适合显示大小的缩略图，而不是提前解码所有原图。虚拟化减少活跃卡片和资源加载，数据记录及几何索引仍占 O(n) 内存。离线示例提供 24 张 / 10,000 张切换和两种显示密度。
+
+## 视频播放（可选）
+
+启用 `video` feature 使用 `VideoPlayer`。播放器通过系统 WebView 的 HTML5 视频引擎解码、播放音轨，控制栏在同一原生视图中渲染；无需安装 ffmpeg。当前接入 macOS（WKWebView）和 Windows（WebView2，需系统安装运行时）；Linux 暂未接入。实际格式、编码及网络流支持取决于系统引擎，文件扩展名不保证可解码。macOS 已实测本地 MP4；Windows 路径尚未实机验证。
+
+```toml
+[dependencies]
+gpui-glint = { version = "0.1", features = ["video"] }
+```
+
+在真实窗口创建后初始化，宿主应显示 `Result` 中的初始化错误：
+
+```rust
+use gpui_glint::components::{VideoPlayer, VideoSource, VideoPlayerEvent};
+
+let player = VideoPlayer::new_entity(window, cx)?;
+player.update(cx, |player, cx| -> Result<(), String> {
+    player.set_title("演示视频", cx)?;
+    player.set_source(VideoSource::file("/videos/demo.mp4"), cx)?;
+    // 网络视频使用 VideoSource::url("https://example.com/demo.mp4")。
+    player.set_volume(0.8, cx)?;
+    player.set_loop(false, cx)?;
+    Ok(())
+})?;
+// 使用有界容器，例如 div().h(px(480.)).child(player.clone())。
+cx.subscribe(&player, |_, _, event: &VideoPlayerEvent, _| {
+    // Loaded、StateChanged、Progress、Ended、Error、FullscreenChanged。
+}).detach();
+```
+
+默认不自动播放。内置控制包括播放 / 暂停、时间与总时长、拖动进度、静音、音量、播放速度和全屏。播放器背景按原始比例完整显示视频；窄窗口收起标题与音量滑块。焦点位于视频区域时，空格 / K 切换播放、左右方向键跳转 5 秒、M 切换静音、F 切换窗口全屏；输入控件保留自己的键盘操作。全屏按钮切换宿主窗口全屏，不会自动替换宿主的其他布局。
+
+宿主 API：`play(cx)`、`pause(cx)`、`seek(seconds, cx)`、`set_volume(0..1, cx)`、`set_muted(bool, cx)`、`set_playback_rate(0.25..4, cx)`、`set_loop(bool, cx)`、`set_theme(theme, cx)`、`clear(cx)`。`state()` 返回当前播放状态、时间、音量、倍速、结束标记与错误；状态通过异步媒体事件更新，命令提交成功不代表媒体已经完成播放或加载。切换源重置进度并暂停，旧源的事件会被忽略；首次加载完成前的播放与定位请求会在媒体就绪后执行。文件不可读、格式不支持、解码失败或网络失败会显示提示并发出错误事件。用户需要时可重新设置视频源重试。
+
+本地文件通过播放器私有协议按字节范围读取，支持拖动定位，单次响应最多 2MiB，后台读取队列有界；协议仅暴露本次指定文件，不按请求路径任意读取磁盘。HTTP(S) 视频由系统引擎直接请求，认证、CORS、TLS 和播放限制沿用系统引擎行为。
+
+与 `WebView` 一样，原生区域覆盖同一位置的 GPUI 绘制元素，不能直接放在图片瀑布流的卡片内或叠加 GPUI 弹窗。宿主移除布局节点、切换页面或展示重叠弹窗前，必须先调用 `set_visible(false, cx)`；隐藏会暂停，重新显示不会自动恢复。释放播放器实体后释放原生视图。Playground 页面切换已接入隐藏与暂停。
+
+运行独立示例 `cargo run --example video_player --features video -- /path/to/demo.mp4`，也可传 HTTP(S) 视频地址；不传参数时使用「打开视频…」选择文件。`cargo run --example playground --features video` 可打开「视频播放」页面。示例不内置远程演示视频或联网字体。

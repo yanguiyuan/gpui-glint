@@ -31,3 +31,8 @@ pub use commands::CommandsPage;
 
 mod masonry;
 pub use masonry::MasonryPage;
+
+#[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+mod video;
+#[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+pub use video::VideoPage;

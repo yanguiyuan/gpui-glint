@@ -1,4 +1,6 @@
 mod pages;
+#[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+use pages::VideoPage;
 
 use std::path::PathBuf;
 
@@ -32,11 +34,13 @@ enum Page {
     Documents,
     Tabs,
     Masonry,
+    #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+    Video,
     Themes,
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 13] = [
+    const ALL: &'static [(Self, &'static str)] = &[
         (Self::Overview, "概览"),
         (Self::Buttons, "按钮"),
         (Self::Icons, "图标"),
@@ -49,6 +53,8 @@ impl Page {
         (Self::Documents, "文档编辑器"),
         (Self::Tabs, "标签页"),
         (Self::Masonry, "图片瀑布流"),
+        #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+        (Self::Video, "视频播放"),
         (Self::Themes, "主题"),
     ];
 }
@@ -69,6 +75,8 @@ struct Playground {
     documents: Entity<DocumentsPage>,
     tabs: Entity<TabsPage>,
     masonry: Entity<MasonryPage>,
+    #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+    video: Entity<VideoPage>,
     _theme_subscription: Subscription,
     _commands_subscription: Subscription,
 }
@@ -88,6 +96,8 @@ impl Playground {
             Page::Documents => self.documents.clone().into_any_element(),
             Page::Tabs => self.tabs.clone().into_any_element(),
             Page::Masonry => self.masonry.clone().into_any_element(),
+            #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+            Page::Video => self.video.clone().into_any_element(),
             Page::Themes => {
                 let playground = cx.entity();
                 ThemeShowcase::new(self.theme)
@@ -102,6 +112,8 @@ impl Playground {
 
     fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         self.theme = theme;
+        #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+        self.video.update(cx, |page, cx| page.set_theme(theme, cx));
         self.resource_dropdown
             .update(cx, |menu, cx| menu.set_theme(theme, cx));
         persist_theme(theme);
@@ -181,6 +193,8 @@ impl Playground {
                 }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
+                #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+                this.video.update(cx, |video, cx| video.set_visible(page == Page::Video, cx));
                 this.selected = page;
                 this.inputs.update(cx, |inputs, cx| {
                     inputs.close_menu(cx);
@@ -199,7 +213,7 @@ impl Render for Playground {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sidebar_items = Page::ALL
-            .into_iter()
+            .iter().copied()
             .fold(div().flex().flex_col().gap_1(), |items, (page, label)| {
                 items.child(self.nav_item(page, label, cx))
             });
@@ -413,7 +427,7 @@ pub fn open(cx: &mut App) {
             }),
             ..Default::default()
         },
-        move |_, cx| {
+        move |_window, cx| {
             cx.new(|cx| {
                 let theme_subscription = cx.subscribe(
                     &inputs,
@@ -423,6 +437,8 @@ pub fn open(cx: &mut App) {
                     },
                 );
                 let commands_subscription = cx.observe(&commands, |_, _, cx| cx.notify());
+                #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+                let video = cx.new(|cx| {let mut page = VideoPage::new(_window, theme, cx);page.set_visible(false, cx);page});
                 Playground {
                     selected: Page::Documents,
                     theme,
@@ -439,6 +455,8 @@ pub fn open(cx: &mut App) {
                     documents,
                     tabs,
                     masonry,
+                    #[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+                    video,
                     _theme_subscription: theme_subscription,
                     _commands_subscription: commands_subscription,
                 }

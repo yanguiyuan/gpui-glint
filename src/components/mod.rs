@@ -151,3 +151,8 @@ pub use menu::{DropdownMenu, MenuItem};
 
 mod image_masonry;
 pub use image_masonry::{ImageMasonry, ImageMasonryEvent, ImageMasonryItem};
+
+#[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+mod video_player;
+#[cfg(all(feature = "video", any(target_os = "macos", target_os = "windows")))]
+pub use video_player::{VideoPlayer, VideoPlayerEvent, VideoSource, VideoState};
