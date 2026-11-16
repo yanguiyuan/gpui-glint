@@ -202,6 +202,8 @@ pub struct DocumentEditor {
     embedded_preview: bool,
     preview_links: bool,
     scrollable_preview: bool,
+    follow_tail: bool,
+    tail_follow_pending: bool,
     render_blocks: HashMap<u64, Rc<RenderBlock>>,
     render_references: String,
     character_count: usize,
@@ -259,6 +261,8 @@ impl DocumentEditor {
             embedded_preview: false,
             preview_links: false,
             scrollable_preview: false,
+            follow_tail: false,
+            tail_follow_pending: false,
             render_blocks: HashMap::new(),
             render_references: String::new(),
             character_count: 0,
@@ -330,6 +334,30 @@ impl DocumentEditor {
         self.toc_collapsed = true;
         self.rounded_corners = false;
         self
+    }
+
+    /// Keep a scrolling preview pinned to its newest line while content streams
+    /// in. Readers who scroll away stay detached until they return to the end.
+    pub fn follow_preview_tail(mut self) -> Self {
+        self.follow_tail = true;
+        self
+    }
+
+    /// The scroll handle of the preview viewport. Hosts use it to inspect or
+    /// restore the reader's position without owning the document layout.
+    pub fn preview_scroll(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    /// Enable or disable tail following on a mounted preview. Enabling from the
+    /// end pins to the newest line on the next layout; disabling keeps the
+    /// current scroll position.
+    pub fn set_follow_preview_tail(&mut self, follow: bool, cx: &mut Context<Self>) {
+        if self.follow_tail != follow {
+            self.follow_tail = follow;
+            self.tail_follow_pending = follow && self.scroll_at_end();
+            cx.notify();
+        }
     }
 
     pub fn theme(mut self, theme: ThemePreset) -> Self {
@@ -485,6 +513,11 @@ impl DocumentEditor {
             self.set_markdown(markdown, cx);
             return;
         }
+        // Follow only from the previous layout's end: scrolling up detaches
+        // until the reader returns to the newest line.
+        if self.follow_tail && self.scroll_at_end() {
+            self.tail_follow_pending = true;
+        }
         let previous = std::mem::take(&mut self.blocks);
         let references = self.render_references.clone();
         let mut changed = HashSet::new();
@@ -564,6 +597,13 @@ impl DocumentEditor {
         self.ensure_views(cx);
         cx.notify();
     }
+
+    /// True while the preview shows its last line; an unlaid-out preview counts
+    /// as the end so a freshly opened stream starts pinned to the newest text.
+    fn scroll_at_end(&self) -> bool {
+        self.scroll.max_offset().y + self.scroll.offset().y <= px(2.)
+    }
+
     fn load(&mut self, source: &str) {
         self.blocks = md::split(source)
             .into_iter()
@@ -2804,6 +2844,12 @@ impl DocumentEditor {
                         this.layout_width = width;
                         this.layout_measure_passes = 2;
                     }
+                    // Content height is only known after layout, so the tail
+                    // follow lands here rather than in the sync call.
+                    if this.tail_follow_pending {
+                        this.tail_follow_pending = false;
+                        this.scroll.scroll_to_bottom();
+                    }
                     if this.layout_measure_passes > 0 {
                         this.layout_measure_passes -= 1;
                         let id = cx.entity_id();
@@ -3334,6 +3380,72 @@ mod tests {
             assert_eq!(editor.blocks.len(), 150);
         });
     }
+    #[gpui::test]
+    fn streaming_preview_follows_the_newest_paragraph_until_the_reader_scrolls_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        struct Bounded(Entity<DocumentEditor>);
+        impl Render for Bounded {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(600.)).h(px(240.)).child(self.0.clone())
+            }
+        }
+        let paragraphs = |count: usize| {
+            (0..count)
+                .map(|index| format!("Paragraph {index} with **reasoning** and details."))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Bounded(cx.new(|cx| {
+                DocumentEditor::new(cx, &paragraphs(4))
+                    .scrollable_preview()
+                    .follow_preview_tail()
+            }))
+        });
+        window.simulate_resize(gpui::size(px(700.), px(400.)));
+        window.run_until_parked();
+        let document = preview.read_with(window, |preview, _| preview.0.clone());
+        for count in [12, 24, 36] {
+            document.update(window, |editor, cx| {
+                editor.sync_preview_markdown(paragraphs(count), cx);
+            });
+            window.run_until_parked();
+            document.read_with(window, |editor, _| {
+                assert!(
+                    editor.scroll.max_offset().y > px(0.),
+                    "content must overflow"
+                );
+                assert!(
+                    editor.scroll.max_offset().y + editor.scroll.offset().y <= px(2.),
+                    "streaming must keep the newest paragraph visible"
+                );
+            });
+        }
+        // Scrolling up detaches the tail follow instead of yanking the reader back.
+        document.update(window, |editor, cx| {
+            editor.scroll.set_offset(gpui::point(px(0.), px(-40.)));
+            editor.sync_preview_markdown(paragraphs(48), cx);
+        });
+        window.run_until_parked();
+        document.read_with(window, |editor, _| {
+            assert!(
+                editor.scroll.max_offset().y + editor.scroll.offset().y > px(2.),
+                "a reader who scrolled up must stay put"
+            );
+        });
+        // Returning to the end resumes following the newest line.
+        document.update(window, |editor, cx| {
+            editor.scroll.scroll_to_bottom();
+            editor.sync_preview_markdown(paragraphs(60), cx);
+        });
+        window.run_until_parked();
+        document.read_with(window, |editor, _| {
+            assert!(editor.scroll.max_offset().y + editor.scroll.offset().y <= px(2.));
+        });
+    }
+
     #[gpui::test]
     fn read_only_preview_does_not_track_editing_hover(cx: &mut gpui::TestAppContext) {
         use super::*;

@@ -485,6 +485,10 @@ mod tests {
             assert_ne!(service.address.port(), 0);
             assert_eq!(host.profile_draft(0, cx).unwrap().listener.port, 0);
             assert!(service.address.ip().is_loopback());
+            let tasks = host.background_tasks(cx);
+            assert!(tasks.iter().any(|task| task.id
+                == format!("proxy:{}", host.workspace.proxies[0].id)
+                && task.detail == service.endpoint()));
             (service.endpoint(), service.address.port())
         });
         let result = reqwest::blocking::Client::builder()

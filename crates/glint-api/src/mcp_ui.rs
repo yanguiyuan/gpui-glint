@@ -387,9 +387,19 @@ impl Workbench {
                             })
                             .collect::<Result<Vec<_>, String>>()?;
                     }
-                    self.workspace.collections[c]
+                    let auth_profiles = self.workspace.collections[c]
                         .defaults
-                        .insert(path.into(), model::DirectoryDefaults { sections, draft });
+                        .get(path)
+                        .map(|d| d.auth_profiles.clone())
+                        .unwrap_or_default();
+                    self.workspace.collections[c].defaults.insert(
+                        path.into(),
+                        model::DirectoryDefaults {
+                            sections,
+                            draft,
+                            auth_profiles,
+                        },
+                    );
                     self.directory_settings = None;
                 }
                 json!({"explicit":self.workspace.collections[c].defaults.get(path),"resolved":self.workspace.collections[c].request_defaults(path)})
@@ -537,16 +547,26 @@ impl Workbench {
             }
             "request_preview" => {
                 let i = self.mcp_request_index(&args)?;
+                let source = &self.workspace.requests[i];
+                let mut draft = source.draft.clone();
+                if draft.auth_profile.is_some() {
+                    self.workspace
+                        .collections
+                        .iter()
+                        .find(|g| g.collection == source.collection)
+                        .ok_or("授权所属集合不存在")?
+                        .resolve_auth(&source.group, &mut draft)?;
+                }
                 let proxy = self.effective_proxy(self.selected_environment(cx));
                 let mut request = PreparedRequest::new(
-                    &self.workspace.requests[i].draft,
+                    &draft,
                     &self.environment_values(
                         self.selected_environment(cx),
                         Some(&self.workspace.requests[i].collection),
                     ),
                 )?
                 .with_proxy(&proxy)?;
-                if self.workspace.requests[i].draft.oauth.is_some() {
+                if draft.oauth.is_some() {
                     request = request.with_oauth_token("[已隐藏]")?;
                 }
                 json!({"preview":request.preview,"curl":if self.workspace.requests[i].draft.method!="WS" {request.to_curl().ok()} else {None},"plugins_applied":false})

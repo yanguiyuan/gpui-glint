@@ -92,6 +92,7 @@ pub enum TagBadgeKind {
     Tag,
     Synced,
     RealData,
+    Metadata,
 }
 
 /// A content tag or a softly tinted state label.
@@ -99,6 +100,7 @@ pub struct TagBadge {
     theme: ThemePreset,
     label: SharedString,
     kind: TagBadgeKind,
+    compact: bool,
 }
 
 impl TagBadge {
@@ -112,6 +114,7 @@ impl TagBadge {
             theme: ThemePreset::default(),
             label: label.into(),
             kind: TagBadgeKind::Tag,
+            compact: false,
         }
     }
 
@@ -119,9 +122,15 @@ impl TagBadge {
         self.kind = kind;
         self
     }
+    /// A small inline label for dense lists and metadata.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
+    }
 
     pub fn render(self) -> gpui::Div {
         let theme = self.theme;
+        let compact = self.compact || matches!(self.kind, TagBadgeKind::Metadata);
         let (background, foreground, border, prefix) = match self.kind {
             TagBadgeKind::Tag => (
                 theme.color(0xf0f2ee),
@@ -141,18 +150,24 @@ impl TagBadge {
                 theme.color(0xe0f2e2),
                 "",
             ),
+            TagBadgeKind::Metadata => (
+                theme.palette().panel,
+                theme.palette().text_muted,
+                theme.palette().border,
+                "",
+            ),
         };
         div()
-            .h(px(30.))
-            .px(px(12.))
+            .h(px(if compact { 18. } else { 30. }))
+            .px(px(if compact { 6. } else { 12. }))
             .flex()
             .items_center()
-            .rounded(px(999.))
+            .rounded(px(if compact { 4. } else { 999. }))
             .border_1()
             .border_color(rgb(border))
             .bg(rgb(background))
             .text_color(rgb(foreground))
-            .text_size(px(13.))
+            .text_size(px(if compact { 10. } else { 13. }))
             .child(format!("{prefix}{}", self.label))
     }
 }

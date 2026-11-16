@@ -262,6 +262,8 @@ pub struct Draft {
     pub auth: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<super::oauth::Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
     #[serde(default)]
     pub skip_tls_verification: bool,
 }
@@ -384,6 +386,7 @@ impl DefaultSection {
                 to.method = from.method.clone();
             }
             Self::Auth => {
+                to.auth_profile = from.auth_profile.clone();
                 to.oauth = from.oauth.clone();
                 to.auth = from.auth;
                 to.token = from.token.clone();
@@ -409,8 +412,101 @@ impl DefaultSection {
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryDefaults {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_profiles: Vec<AuthProfile>,
     pub sections: std::collections::BTreeSet<DefaultSection>,
     pub draft: Draft,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthProfile {
+    pub id: String,
+    pub name: String,
+    pub token: String,
+    pub oauth: Option<super::oauth::Config>,
+}
+impl AuthProfile {
+    pub fn apply(&self, draft: &mut Draft) {
+        draft.oauth = self.oauth.clone();
+        draft.auth = self.oauth.is_none();
+        draft.token = self.token.clone();
+    }
+}
+
+#[cfg(test)]
+mod auth_profile_tests {
+    use super::*;
+
+    #[test]
+    fn auth_profiles_follow_updates_and_fail_when_removed_or_moved_out_of_scope() {
+        let mut groups = RequestGroups::create_collection("API", &[]).unwrap();
+        groups.add_child("", "Users").unwrap();
+        groups.add_child("Users", "Details").unwrap();
+        groups.add_child("", "Other").unwrap();
+        let id = new_id();
+        groups.defaults.insert(
+            "Users".into(),
+            DirectoryDefaults {
+                auth_profiles: vec![AuthProfile {
+                    id: id.clone(),
+                    name: "应用授权".into(),
+                    token: "first".into(),
+                    oauth: None,
+                }],
+                sections: [DefaultSection::Auth].into(),
+                draft: Draft {
+                    auth_profile: Some(id.clone()),
+                    ..Draft::default()
+                },
+            },
+        );
+        let draft = groups.request_defaults("Users/Details");
+        assert_eq!(draft.auth_profile.as_deref(), Some(id.as_str()));
+        let mut resolved = draft.clone();
+        groups.resolve_auth("Users/Details", &mut resolved).unwrap();
+        assert_eq!(resolved.token, "first");
+        groups.defaults.get_mut("Users").unwrap().auth_profiles[0].token = "updated".into();
+        groups.resolve_auth("Users/Details", &mut resolved).unwrap();
+        assert_eq!(resolved.token, "updated");
+        assert!(groups.resolve_auth("Other", &mut resolved).is_err());
+        groups
+            .defaults
+            .get_mut("Users")
+            .unwrap()
+            .auth_profiles
+            .clear();
+        assert!(groups.resolve_auth("Users/Details", &mut resolved).is_err());
+        // Independent requests keep their original behavior.
+        groups
+            .resolve_auth(
+                "Other",
+                &mut Draft {
+                    auth: true,
+                    token: "own".into(),
+                    ..Draft::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn auth_profile_serialization_keeps_references_and_plain_client_secret() {
+        let profile = AuthProfile {
+            id: new_id(),
+            name: "用户授权".into(),
+            token: String::new(),
+            oauth: Some(super::super::oauth::Config {
+                client_secret: "saved-secret".into(),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let restored: AuthProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, profile);
+        let mut config = profile.oauth.unwrap();
+        let key = config.key("env");
+        config.client_secret = "changed-secret".into();
+        assert_eq!(config.key("env"), key);
+    }
 }
 impl DirectoryDefaults {
     pub fn apply(&self, draft: &mut Draft) {
@@ -523,6 +619,36 @@ impl RequestGroups {
             }
         }
         draft
+    }
+    /// Nearest directory first. IDs remain stable across renames and edits.
+    pub fn auth_profiles<'a>(&'a self, path: &'a str) -> Vec<(&'a str, &'a AuthProfile)> {
+        let mut profiles = Vec::new();
+        let mut ancestor = path;
+        loop {
+            if let Some(defaults) = self.defaults.get(ancestor) {
+                profiles.extend(defaults.auth_profiles.iter().map(|p| (ancestor, p)));
+            }
+            if ancestor.is_empty() {
+                break;
+            }
+            ancestor = Self::parent(ancestor);
+        }
+        profiles
+    }
+    pub fn resolve_auth(&self, path: &str, draft: &mut Draft) -> Result<(), String> {
+        if let Some(id) = &draft.auth_profile {
+            if id.is_empty() {
+                return Err("请选择目录授权方案；可在集合或目录的身份验证中添加方案".into());
+            }
+            let profile = self
+                .auth_profiles(path)
+                .into_iter()
+                .find(|(_, p)| &p.id == id)
+                .ok_or("继承的授权方案已删除或不在当前目录，请重新选择授权方式")?
+                .1;
+            profile.apply(draft);
+        }
+        Ok(())
     }
     pub fn parent(path: &str) -> &str {
         path.rsplit_once('/').map_or("", |(parent, _)| parent)
@@ -980,6 +1106,7 @@ impl Default for Draft {
             token: String::new(),
             auth: false,
             oauth: None,
+            auth_profile: None,
             skip_tls_verification: false,
         }
     }

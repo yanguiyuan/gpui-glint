@@ -165,6 +165,7 @@ mod tests {
             h.workspace.collections[0].defaults.insert(
                 "Folder".into(),
                 model::DirectoryDefaults {
+                    auth_profiles: vec![],
                     sections: [model::DefaultSection::Auth].into_iter().collect(),
                     draft: Draft {
                         auth: true,

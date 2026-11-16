@@ -56,11 +56,24 @@ pub fn rows(files: &[Change], collapsed: &HashSet<String>) -> Vec<Row> {
         rows: &mut Vec<Row>,
     ) {
         for (label, child) in &directory.directories {
-            let path = if prefix.is_empty() {
+            let mut path = if prefix.is_empty() {
                 label.clone()
             } else {
                 format!("{prefix}/{label}")
             };
+            let mut label = label.clone();
+            let mut child = child;
+            while child.files.is_empty()
+                && child.directories.len() == 1
+                && !collapsed.contains(&path)
+            {
+                let (next_label, next) = child.directories.first_key_value().unwrap();
+                path.push('/');
+                path.push_str(next_label);
+                label.push('/');
+                label.push_str(next_label);
+                child = next;
+            }
             let is_collapsed = collapsed.contains(&path);
             rows.push(Row::Directory {
                 path: path.clone(),
@@ -144,6 +157,51 @@ mod tests {
         let reopened = rows(&files, &HashSet::from(["src/nested".into()]));
         assert!(!reopened.contains(&Row::File { index: 2, depth: 2 }));
         assert!(reopened.contains(&Row::File { index: 3, depth: 1 }));
+    }
+
+    #[test]
+    fn compact_paths_stop_at_files_and_branches_and_keep_collapse_identity() {
+        let files = [
+            file("vendor/org/chat/api/model/a.rs"),
+            file("vendor/org/chat/api/model/b.rs"),
+        ];
+        let all = rows(&files, &HashSet::new());
+        assert!(
+            matches!(&all[0], Row::Directory { path, label, depth: 0, count: 2, .. }
+            if path == "vendor/org/chat/api/model" && label == path)
+        );
+        assert_eq!(
+            &all[1..],
+            &[
+                Row::File { index: 0, depth: 1 },
+                Row::File { index: 1, depth: 1 }
+            ]
+        );
+        let closed = rows(&files, &HashSet::from(["vendor/org/chat/api/model".into()]));
+        assert_eq!(closed.len(), 1);
+        assert!(matches!(
+            closed[0],
+            Row::Directory {
+                collapsed: true,
+                ..
+            }
+        ));
+        // Previously saved ancestor collapses still work after compact paths are enabled.
+        let closed = rows(&files, &HashSet::from(["vendor/org".into()]));
+        assert!(
+            matches!(&closed[0], Row::Directory { path, collapsed: true, .. } if path == "vendor/org")
+        );
+        let branched = rows(
+            &[file("vendor/org/a/a.rs"), file("vendor/org/b/b.rs")],
+            &HashSet::new(),
+        );
+        assert!(matches!(&branched[0], Row::Directory { label, .. } if label == "vendor/org"));
+        assert!(matches!(&branched[1], Row::Directory { label, depth: 1, .. } if label == "a"));
+        let mixed = rows(
+            &[file("vendor/root.rs"), file("vendor/org/a.rs")],
+            &HashSet::new(),
+        );
+        assert!(matches!(&mixed[0], Row::Directory { label, .. } if label == "vendor"));
     }
 
     #[test]

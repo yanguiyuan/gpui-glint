@@ -287,14 +287,22 @@ impl Repository {
             .map_err(|e| e.to_string())
     }
     pub fn read(&self, id: Uuid, project: Option<&Path>) -> Result<Record, String> {
+        self.read_with_scope(id, project, false)
+    }
+    pub(crate) fn read_with_scope(
+        &self,
+        id: Uuid,
+        project: Option<&Path>,
+        cross_project: bool,
+    ) -> Result<Record, String> {
         if let Some(partner) = self.partner {
             let repo = crate::partners::Repository::new(self.anchor.clone());
-            if let Ok(record) = repo.read(partner, project, id) {
+            if let Ok(record) = repo.read_with_scope(partner, project, id, cross_project) {
                 return Ok(record);
             }
         }
         let connection = database::open(&self.anchor)?;
-        connection.query_row("SELECT id,title,summary,project,updated_at,source,content,keywords FROM memories WHERE id=?1 AND (project IS NULL OR project='' OR project=?2)",params![id.to_string(),scope(project)],|row|{
+        connection.query_row("SELECT id,title,summary,project,updated_at,source,content,keywords FROM memories WHERE id=?1 AND (?3 OR project IS NULL OR project='' OR project=?2)",params![id.to_string(),scope(project),cross_project],|row|{
             let source:String=row.get(5)?;let keywords:String=row.get(7)?;
             Ok(Record{card:decode_card(row)?,content:row.get(6)?,keywords:serde_json::from_str(&keywords).unwrap_or_default(),source:serde_json::from_str(&source).unwrap_or_default()})
         }).optional().map_err(|e|e.to_string())?.ok_or_else(||"记忆不存在，或不属于当前项目".into())
@@ -342,6 +350,16 @@ impl Repository {
         project: Option<&Path>,
         limit: usize,
     ) -> Result<Vec<Card>, String> {
+        self.candidates_with_scope(query, categories, project, limit, false)
+    }
+    pub(crate) fn candidates_with_scope(
+        &self,
+        query: &str,
+        categories: &[String],
+        project: Option<&Path>,
+        limit: usize,
+        cross_project: bool,
+    ) -> Result<Vec<Card>, String> {
         let words = terms(query);
         if words.is_empty() && categories.is_empty() {
             return Ok(vec![]);
@@ -351,7 +369,7 @@ impl Repository {
         let mut collect = |sql: &str, query: &str| -> Result<(), String> {
             let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
             let rows = statement
-                .query_map(params![query, scope(project)], |row| {
+                .query_map(params![query, scope(project), cross_project], |row| {
                     Ok((decode_card(row)?, row.get::<_, String>(6)?))
                 })
                 .map_err(|e| e.to_string())?;
@@ -363,20 +381,20 @@ impl Repository {
         };
         if !words.is_empty() {
             collect(
-                "SELECT m.id,m.title,m.summary,m.project,m.updated_at,m.source,m.terms FROM memory_fts JOIN memories m ON m.id=memory_fts.id WHERE memory_fts MATCH ?1 AND (m.project IS NULL OR m.project='' OR m.project=?2) ORDER BY rank LIMIT 100",
+                "SELECT m.id,m.title,m.summary,m.project,m.updated_at,m.source,m.terms FROM memory_fts JOIN memories m ON m.id=memory_fts.id WHERE memory_fts MATCH ?1 AND (?3 OR m.project IS NULL OR m.project='' OR m.project=?2) ORDER BY rank LIMIT 100",
                 &fts_query(&words, true),
             )?;
             let fuzzy = grams(&words);
             if !fuzzy.is_empty() {
                 collect(
-                    "SELECT m.id,m.title,m.summary,m.project,m.updated_at,m.source,m.terms FROM memory_grams JOIN memories m ON m.id=memory_grams.id WHERE memory_grams MATCH ?1 AND (m.project IS NULL OR m.project='' OR m.project=?2) ORDER BY rank LIMIT 100",
+                    "SELECT m.id,m.title,m.summary,m.project,m.updated_at,m.source,m.terms FROM memory_grams JOIN memories m ON m.id=memory_grams.id WHERE memory_grams MATCH ?1 AND (?3 OR m.project IS NULL OR m.project='' OR m.project=?2) ORDER BY rank LIMIT 100",
                     &fts_query(&fuzzy, false),
                 )?;
             }
         }
         for category in categories.iter().take(8) {
             collect(
-                "SELECT id,title,summary,project,updated_at,source,terms FROM memories WHERE json_extract(source,'$.category')=?1 AND (project IS NULL OR project='' OR project=?2) ORDER BY updated_at DESC LIMIT 80",
+                "SELECT id,title,summary,project,updated_at,source,terms FROM memories WHERE json_extract(source,'$.category')=?1 AND (?3 OR project IS NULL OR project='' OR project=?2) ORDER BY updated_at DESC LIMIT 80",
                 category,
             )?;
         }
@@ -426,7 +444,7 @@ impl Repository {
             .collect();
         if let Some(partner) = self.partner {
             let mut personal: Vec<_> = crate::partners::Repository::new(self.anchor.clone())
-                .search(partner, project, query, true, limit)?
+                .search_with_scope(partner, project, query, true, limit, cross_project)?
                 .into_iter()
                 .map(|entry| entry.card())
                 .collect();
@@ -1035,6 +1053,15 @@ mod tests {
         );
         assert_eq!(repo.list(Some(a), 20).unwrap().len(), 2);
         assert!(repo.read(project, Some(b)).is_err());
+        let cross = repo.read_with_scope(project, Some(b), true).unwrap();
+        assert_eq!(cross.card.project.as_deref(), Some(a));
+        assert!(
+            repo.candidates_with_scope("postgresql", &[], Some(b), 10, true)
+                .unwrap()
+                .iter()
+                .any(|card| card.id == project)
+        );
+        assert!(repo.delete(project, Some(b)).is_err());
         assert_eq!(
             repo.save(draft("饮食偏好", "喜欢清淡口味，花生过敏"), None, json!({}))
                 .unwrap(),

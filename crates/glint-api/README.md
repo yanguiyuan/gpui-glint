@@ -275,6 +275,8 @@ Cookie 提取区分名称大小写，读取已启用的 Cookie 请求头并应�
 
 ## OAuth 2.0 用户授权
 
+集合／目录的“身份验证”支持新增多个具名 Bearer、OAuth 授权方案，“添加方案”下拉框可搜索空白方案和启用插件提供的授权预设（如 WPS、飞书），目录页不内置服务商配置。选择“设为新请求默认”后，新建请求直接引用方案。请求面板统一使用 No Auth / Bearer / OAuth 2.0 分段控件，右侧“继承”开关用于选择对应类型的目录授权；Bearer 的 Token 输入框独立显示在下方。修改方案后，所有引用它的请求立即使用最新配置；删除方案或移动请求导致引用不可见时会阻止发送，提示重新选择。原有请求保留独立配置。
+
 在请求的“身份验证”中选择 **OAuth 2.0**，填写授权地址、Token 地址、Client ID、回调地址和 Scope。从 **授权预设 → WPS 用户授权** 中选择内置插件的预设，可填入 WPS 的接口地址与 `kso.user_base.read`，默认关闭该文档尚未声明支持的 PKCE。WPS 多个 Scope 使用英文逗号分隔；其他服务商按其文档配置。Client ID 与 Secret 并排填写，接口地址使用紧凑对齐表单，底部固定授权状态与主操作。客户端认证默认将 Client ID / Secret 放在表单中；“高级设置”默认收起，其中可选用 Basic 认证、PKCE S256 和手动回调。
 
 先在服务商后台登记完全一致的回调地址；自动回调默认 `http://127.0.0.1:17943/oauth/callback`，只监听本机 IPv4 回环地址。点击 **浏览器授权** 后在系统浏览器中登录并同意权限，工作台校验本次随机 state、回调地址、参数唯一性和会话有效期，再用授权码换取 Token。会话 10 分钟超时，支持取消；端口被占用时可换端口。服务商是否接受 HTTP 本机回调以其后台规则为准，WPS 文档没有保证支持本机回调。
@@ -283,13 +285,13 @@ Cookie 提取区分名称大小写，读取已启用的 Cookie 请求头并应�
 
 **飞书用户授权**：选择 **授权预设 → 飞书用户授权**，填入飞书应用的 App ID（Client ID）与 App Secret（Client Secret），并在开发者后台“安全设置”登记相同回调地址。预设使用 `https://accounts.feishu.cn/oauth/v3/token`，默认通过表单传递应用凭据、关闭 PKCE。Scope 使用空格分隔，按需添加应用已开通的用户权限；默认的 `offline_access` 用于获取刷新令牌，需在“权限管理”开通。如后台显示“刷新 user_access_token”开关，还需启用并发布。仅保留 `offline_access` 不代表已获取业务权限。参考飞书官方的[授权码](https://open.feishu.cn/document/authentication-management/access-token/obtain-oauth-code)、[Token 交换](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token-v3)与[刷新](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/refresh-user-access-token-v3)文档。
 
-OAuth 的授权地址、Token 地址、Client ID、回调地址、Scope 和本次输入的 Client Secret 均支持当前环境中的 `{{变量名}}`，例如 `{{wps_app_id}}` 与 `{{wps_app_secret}}`，并提供变量补全。授权、刷新和发送前解析，编辑器与请求草稿保留模板原文；未定义、空值或循环引用会提示错误。凭据按解析后的配置隔离，同一环境的 Client ID 等配置值变更后需重新授权，不会复用旧应用的 Token。Secret 引用解析后仅用于本次授权并保存在系统凭据库，环境变量本身仍按已有工作区存储规则保存。
+OAuth 的授权地址、Token 地址、Client ID、回调地址、Scope 和本次输入的 Client Secret 均支持当前环境中的 `{{变量名}}`，例如 `{{wps_app_id}}` 与 `{{wps_app_secret}}`，并提供变量补全。授权、刷新和发送前解析，编辑器与请求草稿保留模板原文；未定义、空值或循环引用会提示错误。凭据按解析后的配置隔离，同一环境的 Client ID 等配置值变更后需重新授权，不会复用旧应用的 Token。Secret 的模板原文随协议配置存入 SQLite，运行时按当前环境解析。
 
-首次授权或更换密钥时填写 Client Secret（输入内容可见，提交时清空）；留空时沿用此连接已有的系统凭据。Client Secret、access_token 和 refresh_token 成对保存在 macOS Keychain、Windows Credential Store 或 Linux Secret Service 中，不能访问凭据库时会报错，不回退到明文文件。SQLite、版本、工作区导出和 MCP 中仅保存协议配置与连接 ID，不保存这些新凭据。请求快照与 cURL 始终隐藏注入的 OAuth Authorization，包括 MCP 的 `include_secrets: true`；原有手工 Bearer / 环境变量的存储方式不变。
+Client Secret 使用普通输入框直接显示，随请求或目录授权配置保存到 SQLite，重新打开自动回填，提交授权时保留输入内容。access_token 和 refresh_token 仍成对保存在 macOS Keychain、Windows Credential Store 或 Linux Secret Service 中。旧连接未填写 Secret 时仍可沿用其系统凭据。请求快照与 cURL 始终隐藏注入的 OAuth Authorization，包括 MCP 的 `include_secrets: true`；原有手工 Bearer / 环境变量的存储方式不变。
 
 HTTP、SSE 和 WebSocket 握手发送前检查授权，Token 临近到期（30 秒内）时刷新；同一进程的刷新操作串行化，避免重复使用已轮换的 refresh_token。刷新成功后在系统凭据库一次替换整组凭据，默认保留首次授权的 refresh_token 截止时间；飞书预设按每次响应的 `refresh_token_expires_in` 更新轮换令牌的截止时间，响应缺失时保留旧值；过期或刷新失败会提示重新授权。OAuth Token 接口使用当前环境的代理，始终验证 TLS 证书，不跟随重定向。WPS 的授权和 Token 接口不执行 KSO-1 插件；业务请求仍可自行启用已有签名插件。
 
-凭据按工作区路径、环境名、连接 ID 和协议配置隔离；修改应用、Scope 或回调配置后需要重新授权。切换请求或环境会取消等待中的授权。目录设置的“身份验证”可选择 **使用当前请求的 OAuth 配置**，保存后新建请求继承同一连接；现有请求不受目录默认配置的后续变更影响。**清除本地授权** 删除当前连接的本机凭据，服务商端撤销需到其账号设置中操作。
+凭据按工作区路径、环境名、连接 ID 和协议配置隔离；修改应用、Scope 或回调配置后需要重新授权。切换请求或环境会取消等待中的授权。目录设置的“身份验证”可新增授权方案，也可将当前请求的 OAuth 配置添加为方案；请求引用该方案后会跟随其更新。**清除本地授权** 删除当前连接的本机凭据，服务商端撤销需到其账号设置中操作。
 
 WPS 与飞书的预设配置分别来自独立插件 `plugins/wps-oauth/glint-plugin.json` 和 `plugins/feishu-oauth/glint-plugin.json`，贡献点为 `oauth.preset`；选择时不执行 JavaScript，也不向预设插件提供密钥或 Token。自定义授权服务同样可以通过本地或远程插件提供，清单格式见根目录 [插件说明](../../docs/plugins.md#oauth-presets)。预设复制后由请求自行保存，插件更新或移除不会修改已有配置。
 
@@ -328,5 +330,43 @@ Version 0.1.4 adds **软件更新 → 更新源设置**. Save a distribution bas
 The release workflow builds Windows x64 Setup plus macOS Apple Silicon and Intel DMGs. Run `bash crates/glint-api/packaging/macos/build-macos.sh` on a Mac for a native-architecture `.app` and DMG. Mac installation is drag-to-Applications; Mac updates currently require manually replacing the app. Default Mac builds have ad-hoc signing only, without Developer ID signing or Apple notarization. Set `GLINT_API_CODESIGN_IDENTITY` to use an available signing certificate (notarization remains separate). Release artifacts include SHA-256 sidecars.
 
 事件解密扩展声明贡献 `websocket.message.decode`、权限 `event.read` 和按名授权的 `environment.read.<name>`。钩子接收原始 JSON 事件，返回 `{data: <JSON>, title?: "列表摘要"}` 或 `{error: "说明"}`；通过同一个受监督插件子进程执行，事件解密的 IPC 输出上限为 2 MiB。可选 `title` 会替换左侧事件列表的密文预览，去除空白换行并限制为 160 字符；缺省、空标题或失败时保留原始预览。接收事件串行在后台处理，原文不被改写。跟随最新和显示格式与解密插件一起在“请求设置”配置并随请求保存。应用通用密码学由共享运行时提供，WPS 的字段拼接和协议规则位于独立插件脚本。
+
+响应头右键菜单扩展声明贡献 `response.header.action`、权限 `response.read` 和按名授权的 `environment.read.<name>`。`data` 是静态匹配条件：`header` 为小写响应头名、名称数组（最多 32 个、不可重复）或 `*`，可选 `value` 用 `prefix`、`suffix`、`contains`、`equals` 组合过滤（显式匹配，不使用正则，打开菜单不执行脚本）；`title` 即菜单项文案。右键“响应头”中的任意一行会显示“复制值 / 复制名称”和所有匹配的插件项。点击菜单项后才在同一个受监督子进程执行该贡献的同步 hook，输入 `{header: {name, value}, response: {status}}`，返回 `{action: "copy", text}` 或 `{action: "open-url", url}`（仅 http/https 且需带主机名），也可返回 `{error: "说明"}` 显示在状态提示中。复制文本上限 64 KiB，地址上限 2048 字节，插件输出上限 1 MiB；不匹配、未授权、超限或未知动作一律拒绝。发送请求、收到新响应或按 Esc 会关闭菜单，动作执行前会按当前响应头重新校验匹配条件，避免菜单停留在旧响应上产生误操作。
+
+`data` 也可以声明宿主直接执行的动作，此时贡献项不得声明 `hook`，点击不会启动插件子进程：
+
+```json
+{ "id": "open-url", "kind": "response.header.action", "title": "在浏览器打开",
+  "data": { "header": "*", "action": "open-url", "url": "https://example.com?query={{header.value}}&time=111111" } }
+```
+
+- `action` 为 `copy` 或 `open-url`；`copy` 用 `text`、`open-url` 用 `url`，缺省都是 `{{header.value}}`。
+- 模板只能引用 `{{header.name}}`、`{{header.value}}`、`{{response.status}}`，长度上限 2048 字符；未知占位符、未闭合占位符或展开后超过上限一律拒绝。
+- `open-url` 的模板需以 `http://`/`https://` 开头（或整段就是 `{{header.value}}`），展开后仍只接受带主机名的 http/https，且不超过 2048 字节；不满足时该菜单项不会出现，也不会执行。
+- 内置插件 **响应头动作**（`com.glint.response-headers`）声明了“复制响应头值”和“在浏览器打开”两个声明式动作，无需编写 JavaScript。
+
+非声明式动作用脚本实现：`data` 只保留静态匹配条件，`hook` 指向 `response.header.action` 并在清单的 `hooks` 中声明。菜单是否出现仍只由 `data` 决定（打开菜单不执行脚本），点击后才启动受监督子进程执行该 hook：
+
+```json
+{
+  "id": "com.example.header-actions", "name": "回跳地址", "version": "1.0.0", "api_version": 1,
+  "entry": "main.js", "capabilities": ["response.read"], "hooks": ["response.header.action"],
+  "contributions": [{
+    "id": "open-callback", "kind": "response.header.action", "title": "在浏览器打开回跳地址",
+    "hook": "response.header.action",
+    "data": { "header": ["location", "content-location"], "value": { "prefix": "https://" } }
+  }]
+}
+```
+
+```js
+// main.js：把响应头值当作地址交给宿主；需要读取环境变量时再声明 environment.read.<name>
+glint.on('response.header.action', (input) => ({ action: 'open-url', url: input.header.value }));
+```
+
+- 一个贡献要么声明 `action`（宿主执行），要么声明 `hook`（脚本执行），两者同时出现或都不写都会在加载时被拒绝；脚本动作不出现“动作配置”，匹配条件与返回地址都在清单和脚本里，需要可配置时改用声明式动作，或通过 `environment.read.<name>` 读取环境变量。
+- `header` 写成数组即可只针对若干响应头，比较不区分大小写，命中任意一个即显示；值谓词对当前这一行生效。
+
+插件详情页把只读元信息（插件 ID、扩展点、权限）和可编辑配置分开：详情卡片下半部的“动作配置”为每个声明式动作（`copy` 和 `open-url` 各一张卡）渲染“匹配响应头”和内容模板两个字段。匹配响应头按 `identity::action::headers` 保存，填 `*` 或逗号分隔的头名（如 `location, content-location`），输入时统一转小写并合并重复项，因此一个已安装的动作可以只针对某几个响应头，无需重新发布；模板按 `identity::action` 保存（`copy` 为复制内容模板，`open-url` 为打开 URL 模板），并提供可点击插入的占位符提示（`{{header.name}}`、`{{header.value}}`、`{{response.status}}`）。两者都写入应用数据库的 `plugin_settings` 表，对所有工作区生效；点击“恢复默认”或清空输入即删除覆盖、回到清单值。不可用的值仍会保存，但状态行会标红说明原因、输入框边框变为警告色，且该菜单项不显示。匹配条件在点击时按同一份有效配置重新校验。
 
 插件管理的每个已安装版本均提供标准 Switch，内置插件同样可禁用。开关按来源与插件 ID 保存到应用数据库，在所有工作区共享，同来源的全部版本共用状态；更新或刷新列表不会自动重新启用。禁用后，后续请求不执行已绑定的前置动作，不再提供对应 OAuth 预设和事件解密能力；原有绑定及已复制的 OAuth 配置保留，重新启用后恢复。已经发出的网络请求不受影响。`plugins_list` 同时返回 `enabled` 状态。

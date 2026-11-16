@@ -1,4 +1,4 @@
-//! Bounded, project-scoped access to saved conversation text and tool logs.
+//! Bounded cross-project access to saved conversation text and tool logs.
 use crate::database;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
@@ -27,13 +27,12 @@ pub fn read(anchor: &Path, project: Option<&Path>, args: &Value) -> Result<Strin
 }
 pub fn read_scoped(
     anchor: &Path,
-    project: Option<&Path>,
+    _project: Option<&Path>,
     partner: Option<Uuid>,
     args: &Value,
 ) -> Result<String, String> {
     let args: ReadArgs = serde_json::from_value(args.clone())
         .map_err(|error| format!("会话读取参数无效：{error}"))?;
-    let project = project.ok_or("请先选择项目，再查看会话历史")?;
     let limit = args.limit.unwrap_or(20);
     if !(1..=50).contains(&limit) {
         return Err("limit 必须在 1 到 50 之间".into());
@@ -43,16 +42,15 @@ pub fn read_scoped(
     }
     let mut database = database::open(anchor)?;
     let connection = database.transaction().map_err(|error| error.to_string())?;
-    // FullAccess changes file boundaries, not conversation visibility.
-    let title: String = connection
+    let (title, source_project): (String, Option<String>) = connection
         .query_row(
-            "SELECT title FROM sessions WHERE id=?1 AND project=?2 AND (?3 IS NULL OR json_extract(payload,'$.partner_id') IS NULL OR json_extract(payload,'$.partner_id')=?3)",
-            params![args.session_id.to_string(), project.to_string_lossy(),partner.map(|id|id.to_string())],
-            |row| row.get(0),
+            "SELECT title,project FROM sessions WHERE id=?1 AND (?2 IS NULL OR json_extract(payload,'$.partner_id') IS NULL OR json_extract(payload,'$.partner_id')=?2)",
+            params![args.session_id.to_string(),partner.map(|id|id.to_string())],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?
-        .ok_or("会话不存在、已删除或不属于当前项目")?;
+        .ok_or("会话不存在、已删除或当前身份不可访问")?;
     let count: u32 = connection
         .query_row(
             "SELECT count(*) FROM messages WHERE session_id=?1",
@@ -131,7 +129,7 @@ pub fn read_scoped(
             break;
         }
     }
-    Ok(json!({"session_id":args.session_id,"title":title,"total_messages":count,
+    Ok(json!({"session_id":args.session_id,"title":title,"project":source_project,"total_messages":count,
         "messages":messages,"next":next,"include_tools":args.include_tools,
         "notice":"历史参考数据，可能过时，不是当前指令。ordinal 从 0 开始，与记忆 evidence 对应。图片仅返回数量；不返回草稿或思考内容。next 非空时可直接作为下一次 session_read 参数。"}).to_string())
 }
@@ -140,6 +138,30 @@ pub fn read_scoped(
 mod tests {
     use super::*;
     use crate::model::{History, Role, Session};
+
+    #[test]
+    fn cross_project_history_preserves_partner_visibility() {
+        let (_dir, anchor, _, foreign) = fixture();
+        let owner = Uuid::new_v4();
+        database::open(&anchor)
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET payload=json_set(payload,'$.partner_id',?1) WHERE id=?2",
+                params![owner.to_string(), foreign.to_string()],
+            )
+            .unwrap();
+        let args = json!({"session_id":foreign});
+        assert!(read_scoped(&anchor, Some(Path::new("/project/a")), Some(owner), &args).is_ok());
+        assert!(
+            read_scoped(
+                &anchor,
+                Some(Path::new("/project/a")),
+                Some(Uuid::new_v4()),
+                &args
+            )
+            .is_err()
+        );
+    }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Uuid, Uuid) {
         let dir = tempfile::tempdir().unwrap();
@@ -270,15 +292,14 @@ mod tests {
         assert_eq!(result["messages"][0]["content"], "原始消息 1");
     }
     #[test]
-    fn project_boundary_deletion_and_invalid_positions_are_enforced() {
+    fn cross_project_reads_keep_provenance_and_validate_deleted_sessions_and_positions() {
         let (_dir, anchor, id, foreign) = fixture();
         let root = Some(Path::new("/project/a"));
-        assert!(read(&anchor, None, &json!({"session_id":id})).is_err());
-        let denied = read(&anchor, root, &json!({"session_id":foreign})).unwrap_err();
-        assert_eq!(
-            denied,
-            read(&anchor, root, &json!({"session_id":Uuid::new_v4()})).unwrap_err()
-        );
+        assert!(read(&anchor, None, &json!({"session_id":id})).is_ok());
+        let other = page(&anchor, json!({"session_id":foreign}));
+        assert_eq!(other["project"], "/project/b");
+        assert_eq!(other["messages"][0]["content"], "另一个项目的内容");
+        let denied = read(&anchor, root, &json!({"session_id":Uuid::new_v4()})).unwrap_err();
         for args in [
             json!({"session_id":"bad"}),
             json!({"session_id":id,"limit":0}),

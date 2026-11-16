@@ -29,6 +29,7 @@ fn collection_rename_menu_validates_preserves_requests_defaults_and_reopens(
         host.workspace.collections[0].defaults.insert(
             String::new(),
             model::DirectoryDefaults {
+                auth_profiles: vec![],
                 sections: [model::DefaultSection::Endpoint].into(),
                 draft: Draft {
                     url: "https://example.test/api".into(),

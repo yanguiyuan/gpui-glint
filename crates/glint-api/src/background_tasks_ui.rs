@@ -215,76 +215,68 @@ impl Workbench {
             })
             .collect()
     }
+    pub fn background_tasks(&self, _cx: &App) -> Vec<gpui_glint::components::BackgroundTask> {
+        use gpui_glint::components::BackgroundTask;
+        let mut tasks: Vec<_> = self
+            .running_request_tasks()
+            .into_iter()
+            .map(|(id, label)| BackgroundTask {
+                id,
+                label,
+                detail: String::new(),
+                group: "API 请求".into(),
+                icon: Icon::Workflow,
+            })
+            .collect();
+        tasks.extend(self.workspace.proxies.iter().filter_map(|profile| {
+            let service = self.proxy_services.get(&profile.id)?;
+            Some(BackgroundTask {
+                id: format!("proxy:{}", profile.id),
+                label: profile.name.clone(),
+                detail: service.endpoint(),
+                group: "代理服务".into(),
+                icon: Icon::Globe,
+            })
+        }));
+        tasks
+    }
+    pub fn focus_background_task(
+        &mut self,
+        id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_background_tasks = false;
+        if let Some(id) = id.strip_prefix("proxy:") {
+            if let Some(index) = self.workspace.proxies.iter().position(|p| p.id == id) {
+                self.editing_proxy = index;
+                self.page = crate::Page::Proxies;
+            }
+        } else if let Some(index) = self.workspace.requests.iter().position(|r| r.id == id) {
+            self.choose(index, cx);
+            self.page = crate::Page::Requests;
+        }
+        cx.notify();
+    }
+    pub fn set_host_background_tasks(&mut self, hosted: bool) {
+        self.host_background_tasks = hosted;
+    }
     pub(super) fn background_tasks_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tasks = self.running_request_tasks();
-        let count = tasks.len();
-        let p = self.theme.palette();
-        let mut rows = div()
-            .id("background-task-list")
-            .flex()
-            .flex_col()
-            .max_h(px(320.))
-            .overflow_y_scroll()
-            .occlude();
-        if tasks.is_empty() {
-            rows = rows.child(
-                div()
-                    .p_3()
-                    .text_color(rgb(p.text_muted))
-                    .child("暂无运行中的任务"),
-            );
-        }
-        for (id, label) in tasks {
-            let selector = id.clone();
-            rows = rows.child(
-                MenuItem::new(format!("background-task-{id}"), label)
-                    .icon(Icon::Workflow)
-                    .theme(self.theme)
-                    .render()
-                    .debug_selector(move || format!("background-task-{selector}"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.show_background_tasks = false;
-                        if let Some(index) = this.workspace.requests.iter().position(|r| r.id == id)
-                        {
-                            if index != this.active {
-                                this.choose(index, cx);
-                            } else {
-                                if matches!(
-                                    this.page,
-                                    crate::Page::Proxies
-                                        | crate::Page::Plugins
-                                        | crate::Page::Environments
-                                        | crate::Page::Mcp
-                                ) {
-                                    this.page = crate::Page::Requests;
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
         let owner = cx.entity().downgrade();
-        DropdownMenu::new(
-            "background-tasks-menu",
-            Button::new(format!("后台任务 · {count}"))
-                .kind(ButtonKind::Plain)
-                .size(ButtonSize::Mini)
-                .theme(self.theme)
-                .render()
-                .debug_selector(|| "background-tasks-trigger".into()),
-            rows,
-        )
-        .width(320.)
-        .open(self.show_background_tasks)
-        .theme(self.theme)
-        .on_open_change(move |open, _, cx| {
-            let _ = owner.update(cx, |this, cx| {
-                this.show_background_tasks = open;
-                cx.notify();
-            });
-        })
-        .render()
+        let toggle = owner.clone();
+        gpui_glint::components::BackgroundTasksMenu::new(self.background_tasks(cx))
+            .theme(self.theme)
+            .open(self.show_background_tasks)
+            .on_select(move |id, window, cx| {
+                let _ = owner.update(cx, |this, cx| this.focus_background_task(id, window, cx));
+            })
+            .on_open_change(move |open, _, cx| {
+                let _ = toggle.update(cx, |this, cx| {
+                    this.show_background_tasks = open;
+                    cx.notify();
+                });
+            })
+            .render()
     }
 }
 

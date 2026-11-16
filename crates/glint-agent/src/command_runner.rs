@@ -125,6 +125,7 @@ struct State {
 }
 struct Run {
     scope: Scope,
+    program: String,
     call_id: Option<String>,
     state: Mutex<State>,
     cancel: watch::Sender<bool>,
@@ -136,6 +137,27 @@ struct Run {
 fn registry() -> &'static Mutex<HashMap<uuid::Uuid, Arc<Run>>> {
     static RUNS: OnceLock<Mutex<HashMap<uuid::Uuid, Arc<Run>>>> = OnceLock::new();
     RUNS.get_or_init(Default::default)
+}
+pub(super) struct ActiveCommand {
+    pub id: uuid::Uuid,
+    pub session: Option<uuid::Uuid>,
+    pub root: Option<PathBuf>,
+    pub label: String,
+}
+pub(super) fn active_commands(anchor: &Path) -> Vec<ActiveCommand> {
+    let runs = registry().lock().unwrap();
+    let mut active: Vec<_> = runs
+        .iter()
+        .filter(|(_, run)| run.scope.anchor == anchor && !run.finished.load(Ordering::Acquire))
+        .map(|(id, run)| ActiveCommand {
+            id: *id,
+            session: run.scope.session,
+            root: run.scope.root.clone(),
+            label: format!("{} · {}", run.program, &id.to_string()[..8]),
+        })
+        .collect();
+    active.sort_by_key(|r| r.id);
+    active
 }
 
 /// UI cancellation is scoped to the conversation and the exact tool call.
@@ -686,6 +708,7 @@ async fn start(
     let (cancel, receiver) = watch::channel(false);
     let run = Arc::new(Run {
         scope,
+        program: program.clone(),
         call_id: events.as_ref().map(|(call_id, _)| call_id.clone()),
         state: Mutex::new(State {
             result: ResultData {
@@ -1079,6 +1102,11 @@ mod windows_tests {
         assert_eq!(result.failure_kind.as_deref(), Some("cancelled"));
         assert!(result.error.as_deref().unwrap().contains("用户手动终止"));
         assert!(result.stdout.contains("before stop"));
+        let active = active_commands(&scope.anchor);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session, scope.session);
+        assert!(active[0].label.contains("powershell.exe"));
+        assert!(active_commands(&temp.path().join("other-app.json")).is_empty());
         assert!(
             !other.finished.load(Ordering::Acquire),
             "unrelated command must stay alive"
@@ -1087,6 +1115,7 @@ mod windows_tests {
         tokio::time::timeout(Duration::from_secs(10), wait(&other))
             .await
             .unwrap();
+        assert!(active_commands(&scope.anchor).is_empty());
     }
 
     async fn local(root: &Path, program: &str, args: &[&str], timeout: u64) -> ResultData {

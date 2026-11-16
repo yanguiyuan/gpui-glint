@@ -933,8 +933,16 @@ impl AgentWorkspace {
     fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {
         self.open_file_preview_mode(target, false, cx);
     }
+    pub(super) fn switch_preview_repository(&mut self, cx: &mut Context<Self>) {
+        let expanded = self.file_preview.expanded;
+        self.file_preview.directory_tasks.clear();
+        self.open_project_directory(cx);
+        self.file_preview.expanded = expanded;
+    }
+
     pub(super) fn open_project_directory(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.history.active().project.clone() else {
+        let Some(root) = self.panel_repository_root(crate::panel_repositories::Panel::Preview)
+        else {
             return;
         };
         let path = if ssh_project::is_remote(&root) {
@@ -1004,6 +1012,17 @@ impl AgentWorkspace {
                     }
                     result
                 });
+                if let Ok((path, _, _)) = &result {
+                    if let Some(root) = this.adopt_panel_repository(
+                        crate::panel_repositories::Panel::Preview,
+                        path,
+                        cx,
+                    ) {
+                        if let Some(target) = &mut this.file_preview.target {
+                            target.root = Some(root);
+                        }
+                    }
+                }
                 this.file_preview.view.update(cx, |view, cx| match result {
                     Ok((path, parent, Loaded::Image(bytes))) => {
                         view.set_image(
@@ -1047,7 +1066,11 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub fn file_preview_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let accessory = self
+            .repository_select(crate::panel_repositories::Panel::Preview, cx)
+            .map(gpui::AnyView::from);
         self.file_preview.view.update(cx, |view, cx| {
+            view.set_header_accessory(accessory, cx);
             view.set_theme(self.theme, cx);
             view.set_expanded(self.file_preview.expanded, cx);
         });

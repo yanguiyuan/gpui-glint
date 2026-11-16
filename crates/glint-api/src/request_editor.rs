@@ -300,6 +300,14 @@ impl Workbench {
                 .collect(),
             oauth: (self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"))
                 .then(|| self.oauth.snapshot(cx)),
+            auth_profile: self
+                .authentication
+                .read(cx)
+                .value()
+                .selected
+                .as_deref()
+                .and_then(|s| s.strip_prefix("profile:"))
+                .map(str::to_owned),
             token: self.authentication.read(cx).value().text.to_string(),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
             skip_tls_verification: self.skip_tls_verification,
@@ -329,17 +337,25 @@ impl Workbench {
             request.draft.event_decoder = draft.event_decoder.clone();
         }
         self.ws_refresh_decoder_select(cx);
-        self.oauth.load(draft.oauth.clone().unwrap_or_default(), cx);
+        let mut resolved = draft.clone();
+        let _ = self.resolve_request_auth(&mut resolved);
+        self.oauth
+            .load(resolved.oauth.clone().unwrap_or_default(), cx);
+        self.oauth.inherited_mode = if resolved.oauth.is_some() { 2 } else { 1 };
         self.skip_tls_verification = draft.skip_tls_verification;
+        let options = self.request_auth_options();
         self.authentication.update(cx, |field, cx| {
+            field.set_options(options, cx);
             field.set_selected(
                 Some(
-                    if draft.oauth.is_some() {
-                        "oauth2"
+                    if let Some(id) = &draft.auth_profile {
+                        format!("profile:{id}")
+                    } else if draft.oauth.is_some() {
+                        "oauth2".into()
                     } else if draft.auth {
-                        "bearer"
+                        "bearer".into()
                     } else {
-                        "none"
+                        "none".into()
                     }
                     .into(),
                 ),
@@ -348,6 +364,7 @@ impl Workbench {
             field.set_text(draft.token.clone(), cx);
             field.set_input_disabled(!draft.auth, cx);
         });
+        self.refresh_auth_profiles(cx);
         self.endpoint.update(cx, |field, cx| {
             field.set_selected(Some(draft.method.clone().into()), cx);
             field.set_text(draft.url.clone(), cx);

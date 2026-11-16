@@ -97,6 +97,10 @@ impl SelectField {
     pub fn value(&self) -> &SelectFieldValue {
         &self.value
     }
+    /// Render the same text value independently of the combined dropdown layout.
+    pub fn text_input(&self) -> Entity<TextEntry> {
+        self.input.clone()
+    }
     /// Set the dropdown width (92px by default), preserving space for longer labels.
     pub fn select_width(self, width: f32, cx: &mut Context<Self>) -> Self {
         self.select.update(cx, |select, cx| {

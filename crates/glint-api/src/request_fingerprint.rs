@@ -17,6 +17,11 @@ pub(super) struct Fingerprint {
 impl Fingerprint {
     pub fn new(draft: &Draft) -> Self {
         let mut draft = draft.clone();
+        if draft.auth_profile.is_some() {
+            draft.oauth = None;
+            draft.auth = false;
+            draft.token.clear();
+        }
         for rows in [
             &mut draft.params,
             &mut draft.headers,

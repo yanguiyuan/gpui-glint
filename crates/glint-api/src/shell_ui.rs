@@ -106,7 +106,7 @@ impl Workbench {
                         .child(self.environment.clone()),
                 )
             })
-            .when(request_controls, |bar| {
+            .when(!self.host_background_tasks, |bar| {
                 bar.child(self.background_tasks_menu(cx))
             })
             .when(request_controls, |bar| {
@@ -667,6 +667,8 @@ impl Render for Workbench {
             } else if self.page == crate::Page::Environments {
                 self.environment_workspace(cx)
             } else if let Some(editor) = &self.directory_settings {
+                let presets = plugins::oauth_presets(&self.enabled_plugin_catalog());
+                editor.update(cx, |editor, cx| editor.set_auth_presets(presets, cx));
                 div().size_full().child(editor.clone())
             } else {
                 self.workspace(cx)
@@ -989,10 +991,13 @@ impl Render for Workbench {
                     return;
                 }
                 if event.keystroke.key == "escape"
-                    && (this.json_pick.is_some() || this.json_menu.is_some())
+                    && (this.json_pick.is_some()
+                        || this.json_menu.is_some()
+                        || this.response_header_menu.is_some())
                 {
                     this.cancel_json_pick(cx);
                     this.json_menu = None;
+                    this.response_header_menu = None;
                     cx.stop_propagation();
                     cx.notify();
                     return;

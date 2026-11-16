@@ -1,6 +1,8 @@
 //! Response display, search, HTML preview, traces, and sent-request snapshots.
 
 use super::*;
+use gpui::{MouseButton, MouseDownEvent};
+use std::rc::Rc;
 
 impl Workbench {
     pub(super) fn trace_view(&self) -> gpui::Stateful<gpui::Div> {
@@ -124,6 +126,7 @@ impl Workbench {
     pub(super) fn update_response(&mut self, cx: &mut Context<Self>) {
         self.cancel_json_pick(cx);
         self.json_menu = None;
+        self.response_header_menu = None;
         let headers = self
             .response_data
             .as_ref()
@@ -148,11 +151,18 @@ impl Workbench {
             .iter()
             .enumerate()
             .map(|(index, entries)| {
+                // One listener per header row; the cell factory rebuilds the element each render.
+                let open_menu: Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> =
+                    Rc::new(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.open_response_header_menu(index, event.position, cx);
+                    }));
                 TableRow::new(
                     format!("response-header-{index}"),
                     entries.iter().enumerate().map(|(column, entry)| {
                         let entry = entry.clone();
+                        let open_menu = open_menu.clone();
                         TableCell::custom(move || {
+                            let open_menu = open_menu.clone();
                             div()
                                 .id(("response-header-cell", index * 2 + column))
                                 .debug_selector(move || {
@@ -164,6 +174,9 @@ impl Workbench {
                                 .overflow_x_scroll()
                                 .font_family("Menlo")
                                 .text_size(px(11.))
+                                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    open_menu(event, window, cx)
+                                })
                                 .child(entry.clone())
                         })
                     }),
@@ -193,6 +206,165 @@ impl Workbench {
             editor.set_content(content, cx);
         });
         self.sync_response_search(true, cx);
+    }
+
+    /// Right-click on a response header row opens its context menu at the pointer.
+    pub(super) fn open_response_header_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .response_data
+            .as_ref()
+            .is_none_or(|response| index >= response.headers.len())
+        {
+            return;
+        }
+        self.response_header_menu = Some((index, position));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Built-in copy rows plus the declarative plugin entries; no plugin code runs to open it.
+    fn response_header_menu_view(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (index, position) = self.response_header_menu?;
+        let (name, value) = self.response_data.as_ref()?.headers.get(index)?.clone();
+        let p = self.theme.palette();
+        let mut menu = div()
+            .id("response-header-context-menu")
+            .debug_selector(|| "response-header-context-menu".into())
+            .w(px(300.))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.response_header_menu = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .truncate()
+                    .child(format!("{name}: {value}")),
+            );
+        for (row, (label, text)) in [("复制值", value.clone()), ("复制名称", name.clone())]
+            .into_iter()
+            .enumerate()
+        {
+            menu = menu.child(
+                MenuItem::new(("response-header-copy", row), label)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(move || format!("response-header-copy-{row}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.notice = format!("已复制响应头{label}");
+                        this.response_header_menu = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        for (row, entry) in plugins::header_menu(
+            &self.enabled_plugin_catalog(),
+            &self.plugin_action_settings,
+            &name,
+            &value,
+            self.status,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            let title = entry.title.clone();
+            menu = menu.child(
+                MenuItem::new(("response-header-action", row), title)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(move || format!("response-header-action-{row}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_response_header_action(index, entry.clone(), cx);
+                    })),
+            );
+        }
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .with_priority(40)
+            .into_any_element(),
+        )
+    }
+
+    fn run_response_header_action(
+        &mut self,
+        index: usize,
+        entry: plugins::HeaderEntry,
+        cx: &mut Context<Self>,
+    ) {
+        self.response_header_menu = None;
+        let Some((name, value)) = self
+            .response_data
+            .as_ref()
+            .and_then(|response| response.headers.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let status = self.status;
+        let catalog = self.enabled_plugin_catalog();
+        let settings = self.plugin_action_settings.clone();
+        let variables = self.active_environment_values(cx);
+        let header = name.clone();
+        self.notice = "正在执行响应头插件动作…".into();
+        // Same supervised worker, timeout and output limits as every other plugin hook.
+        self.response_header_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    plugins::run_header_action(
+                        &catalog, &settings, &entry, &header, &value, status, &variables,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.response_header_action_finished(name, result, cx)
+            });
+        }));
+        cx.notify();
+    }
+
+    fn response_header_action_finished(
+        &mut self,
+        name: String,
+        result: Result<plugins::HeaderAction, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.response_header_task = None;
+        match result {
+            Ok(plugins::HeaderAction::Copy(text)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.notice = format!("已复制插件返回的 {name}");
+            }
+            Ok(plugins::HeaderAction::OpenUrl(url)) => {
+                cx.open_url(&url);
+                self.notice = format!("已在浏览器打开 {name}");
+            }
+            Err(error) => self.notice = format!("响应头插件动作失败：{error}"),
+        }
+        cx.notify();
     }
 
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -454,6 +626,7 @@ impl Workbench {
                 tab_button(label, i == self.response_tab, self.theme).on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.response_tab = i;
+                        this.response_header_menu = None;
                         cx.notify();
                     },
                 )),
@@ -560,7 +733,7 @@ impl Workbench {
                         })),
                 )
         } else if self.response_tab == 1 {
-            div()
+            let mut headers = div()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
@@ -578,7 +751,11 @@ impl Workbench {
                         .px_5()
                         .py_3()
                         .child(self.response_headers_table.clone()),
-                )
+                );
+            if let Some(menu) = self.response_header_menu_view(cx) {
+                headers = headers.child(menu);
+            }
+            headers
         } else if self.response_tab == 2 {
             let success = self.status.is_some_and(|s| s < 400);
             div()
@@ -758,5 +935,109 @@ impl Workbench {
             }
         }
         self.json_response_view(cx).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_plugin() -> gpui_glint::plugins::Plugin {
+        let manifest = serde_json::json!({
+            "id": "com.example.header-actions",
+            "name": "响应头动作",
+            "version": "1.0.0",
+            "api_version": 1,
+            "entry": "main.js",
+            "capabilities": ["response.read"],
+            "hooks": ["response.header.action"],
+            "contributions": [{
+                "id": "open-callback",
+                "kind": "response.header.action",
+                "title": "在浏览器打开回跳地址",
+                "hook": "response.header.action",
+                "data": { "header": "location", "value": { "prefix": "https://" } }
+            }]
+        });
+        gpui_glint::plugins::Plugin::from_source(
+            &manifest.to_string(),
+            "glint.on('response.header.action', (input) => ({ action: 'open-url', url: input.header.value }));",
+        )
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn response_header_right_click_offers_copy_rows_and_matching_plugin_actions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.group_edit = Some(GroupEdit::CreateCollection);
+            host.group_name
+                .update(cx, |entry, cx| entry.set_value("API", cx));
+            host.save_group(cx);
+            host.add_request(cx);
+            host.show_activity = false;
+            host
+        });
+        host.update(window, |host, cx| {
+            host.plugin_catalog = vec![header_plugin()];
+            host.response_data = Some(HttpResponse {
+                status: 302,
+                headers: vec![
+                    ("location".into(), "https://example.test/cb".into()),
+                    ("x-trace".into(), "trace-1".into()),
+                ],
+                text: String::new(),
+                bytes: 0,
+                json: None,
+            });
+            host.status = Some(302);
+            host.update_response(cx);
+            host.response_tab = 1;
+            cx.notify();
+        });
+        window.update(|window, _| window.refresh());
+
+        let location = window.debug_bounds("response-header-0-0").unwrap();
+        window.simulate_event(MouseDownEvent {
+            position: location.center(),
+            button: MouseButton::Right,
+            ..Default::default()
+        });
+        host.update(window, |host, _| {
+            assert_eq!(host.response_header_menu.map(|(index, _)| index), Some(0));
+        });
+        assert!(
+            window
+                .debug_bounds("response-header-context-menu")
+                .is_some()
+        );
+        assert!(window.debug_bounds("response-header-copy-0").is_some());
+        assert!(window.debug_bounds("response-header-copy-1").is_some());
+        assert!(window.debug_bounds("response-header-action-0").is_some());
+        assert!(window.debug_bounds("response-header-action-1").is_none());
+
+        // A header the matcher rejects keeps only the built-in rows.
+        let trace = window.debug_bounds("response-header-1-0").unwrap();
+        window.simulate_event(MouseDownEvent {
+            position: trace.center(),
+            button: MouseButton::Right,
+            ..Default::default()
+        });
+        host.update(window, |host, _| {
+            assert_eq!(host.response_header_menu.map(|(index, _)| index), Some(1));
+        });
+        assert!(window.debug_bounds("response-header-copy-0").is_some());
+        assert!(window.debug_bounds("response-header-action-0").is_none());
+
+        // A new response closes the menu instead of acting on stale headers.
+        host.update(window, |host, cx| {
+            host.update_response(cx);
+            assert!(host.response_header_menu.is_none());
+        });
     }
 }

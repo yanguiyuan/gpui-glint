@@ -5,6 +5,7 @@
 
 mod api_tools;
 mod app_icon;
+mod background_tasks;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod desktop_adapter;
 mod navigation;
@@ -34,6 +35,10 @@ impl Workbench {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let navigation = cx.new(|_| Navigation::default());
         let rail = navigation.clone();
+        let task_menu = std::rc::Rc::new(std::cell::RefCell::new(
+            None::<Entity<background_tasks::Tasks>>,
+        ));
+        let shell_tasks = task_menu.clone();
         let shell: ShellRenderer = std::rc::Rc::new(move |mut slots| {
             slots.topbar = div()
                 .size_full()
@@ -49,6 +54,9 @@ impl Workbench {
                         .child("Glint Workbench"),
                 )
                 .child(div().flex_1().min_w_0().h_full().child(slots.topbar))
+                .when_some(shell_tasks.borrow().clone(), |bar, tasks| {
+                    bar.child(div().flex_shrink_0().pr_3().child(tasks))
+                })
                 .into_any_element();
             AppLayout::from_slots(slots)
                 .navigation_rail(rail.clone())
@@ -76,6 +84,13 @@ impl Workbench {
             }));
             agent
         });
+        api.update(cx, |api, _| api.set_host_background_tasks(true));
+        agent.update(cx, |agent, _| agent.set_host_background_tasks(true));
+        let task_owner = cx.entity().downgrade();
+        *task_menu.borrow_mut() =
+            Some(cx.new(|cx| {
+                background_tasks::Tasks::new(api.clone(), agent.clone(), task_owner, cx)
+            }));
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         {
             let api_owner = api.downgrade();

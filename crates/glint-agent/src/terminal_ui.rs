@@ -1213,6 +1213,101 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn agentspace_terminal_switch_keeps_each_repository_shell(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let home = tempfile::tempdir().unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        let linked_root = linked.path().canonicalize().unwrap();
+        std::fs::write(
+            home.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(crate::agentspace::CONFIG_FILE),
+            format!(
+                "[[repositories]]\nname='backend'\npath='{}'\n",
+                linked.path().to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(home.path().join("sessions.json"), cx)
+        });
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.history.active_mut().project = Some(home.path().into());
+                host.open_project_terminal(window, cx);
+            })
+        });
+        window.run_until_parked();
+        let original = host.read_with(window, |host, _| {
+            host.terminal_ui.terminals[home.path()].entity_id()
+        });
+        let select = host.update(window, |host, cx| {
+            host.repository_select(crate::panel_repositories::Panel::Terminal, cx)
+                .unwrap()
+        });
+        select.update(window, |_, cx| {
+            cx.emit(gpui_glint::components::SelectEvent::Changed(
+                linked_root.to_string_lossy().into_owned().into(),
+            ))
+        });
+        window.run_until_parked();
+        let backend = host.read_with(window, |host, _| {
+            assert_eq!(host.history.active().project.as_deref(), Some(home.path()));
+            assert_eq!(host.terminal_ui.terminals.len(), 2);
+            assert_eq!(
+                host.terminal_ui.terminals[home.path()].entity_id(),
+                original
+            );
+            host.terminal_ui.terminals[&linked_root].entity_id()
+        });
+        for value in [
+            home.path().to_string_lossy().into_owned(),
+            linked_root.to_string_lossy().into_owned(),
+        ] {
+            select.update(window, |_, cx| {
+                cx.emit(gpui_glint::components::SelectEvent::Changed(value.into()))
+            });
+            window.run_until_parked();
+        }
+        for root in [home.path(), linked_root.as_path()] {
+            window.update(|window, cx| {
+                host.update(cx, |host, cx| {
+                    host.focus_background_task(
+                        &format!("terminal:{}", root.to_string_lossy()),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        host.panel_repository_root(crate::panel_repositories::Panel::Terminal)
+                            .as_deref(),
+                        Some(root)
+                    );
+                    assert_eq!(host.history.active().project.as_deref(), Some(home.path()));
+                })
+            });
+        }
+        host.read_with(window, |host, _| {
+            assert_eq!(
+                host.terminal_ui.terminals[home.path()].entity_id(),
+                original
+            );
+            assert_eq!(
+                host.terminal_ui.terminals[&linked_root].entity_id(),
+                backend
+            );
+        });
+    }
+
     #[test]
     fn terminal_font_requires_a_finite_fixed_pitch() {
         assert!(fixed_pitch(&[7.826, 7.826, 7.826, 7.826, 7.826, 7.826]));
@@ -1826,6 +1921,17 @@ impl EntityInputHandler for TerminalView {
 }
 
 impl AgentWorkspace {
+    pub(super) fn running_terminal_tasks(&self, cx: &App) -> Vec<(PathBuf, String)> {
+        let mut tasks: Vec<_> = self
+            .terminal_ui
+            .terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.read(cx).busy())
+            .map(|(root, terminal)| (root.clone(), terminal.read(cx).status()))
+            .collect();
+        tasks.sort_by(|a, b| a.0.cmp(&b.0));
+        tasks
+    }
     pub(super) fn expanded_project_panel(
         &self,
         panel: gpui::Div,
@@ -1868,7 +1974,8 @@ impl AgentWorkspace {
         }
     }
     pub(super) fn open_project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.history.active().project.clone() else {
+        let Some(root) = self.panel_repository_root(crate::panel_repositories::Panel::Terminal)
+        else {
             return;
         };
         if !self.terminal_ui.terminals.contains_key(&root) {
@@ -1917,7 +2024,7 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub(super) fn project_terminal_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let root = self.history.active().project.clone();
+        let root = self.panel_repository_root(crate::panel_repositories::Panel::Terminal);
         let terminal = root
             .as_ref()
             .and_then(|r| self.terminal_ui.terminals.get(r))
@@ -1945,6 +2052,7 @@ impl AgentWorkspace {
                 .unwrap_or_default()
         );
         let controls = div()
+            .children(self.repository_select(crate::panel_repositories::Panel::Terminal, cx))
             .flex()
             .items_center()
             .gap_2()
@@ -1978,7 +2086,9 @@ impl AgentWorkspace {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(root) = this.history.active().project.clone() {
+                        if let Some(root) =
+                            this.panel_repository_root(crate::panel_repositories::Panel::Terminal)
+                        {
                             this.terminal_ui.terminals.remove(&root);
                             this.open_project_terminal(window, cx);
                         }
@@ -1989,7 +2099,9 @@ impl AgentWorkspace {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(root) = this.history.active().project.clone() {
+                        if let Some(root) =
+                            this.panel_repository_root(crate::panel_repositories::Panel::Terminal)
+                        {
                             this.terminal_ui.terminals.remove(&root);
                         }
                         this.terminal_ui.open = false;

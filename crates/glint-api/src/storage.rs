@@ -236,6 +236,36 @@ impl Store {
         .map(|_| ())
         .map_err(|e| format!("无法保存插件启用状态：{e}"))
     }
+    /// Installation-level plugin settings, such as a response header URL template.
+    pub fn plugin_settings(&self) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM plugin_settings")
+            .map_err(|e| e.to_string())?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    }
+    /// An empty value deletes the override so the plugin default applies again.
+    pub fn set_plugin_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        if key.is_empty() || key.len() > 300 || value.len() > 4096 {
+            return Err("插件配置无效".into());
+        }
+        if value.trim().is_empty() {
+            self.connection
+                .execute("DELETE FROM plugin_settings WHERE key=?1", [key])
+        } else {
+            self.connection.execute(
+                "INSERT INTO plugin_settings(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [key, value],
+            )
+        }
+        .map(|_| ())
+        .map_err(|e| format!("无法保存插件配置：{e}"))
+    }
     pub fn default_path() -> Result<PathBuf, String> {
         if let Some(path) = std::env::var_os("GLINT_API_DB_PATH") {
             return Ok(path.into());
@@ -316,7 +346,8 @@ impl Store {
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS disabled_plugins (family TEXT PRIMARY KEY NOT NULL);
-                 CREATE TABLE IF NOT EXISTS agent_plugin_approvals (fingerprint TEXT PRIMARY KEY NOT NULL);",
+                 CREATE TABLE IF NOT EXISTS agent_plugin_approvals (fingerprint TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE IF NOT EXISTS plugin_settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
             )
             .map_err(|e| e.to_string())?;
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL); COMMIT;").map_err(|e| e.to_string())?;

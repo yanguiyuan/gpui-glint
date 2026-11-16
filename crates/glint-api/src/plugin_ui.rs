@@ -1,11 +1,135 @@
 use super::*;
 use gpui_glint::components::{
-    CountBadge, CountBadgeKind, TagBadge, TagBadgeKind, plugin_card_details, plugin_details_back,
-    plugin_group, plugin_row, plugin_summary,
+    TagBadge, TagBadgeKind, plugin_card_details, plugin_details_back, plugin_group,
+    plugin_meta_item, plugin_row, plugin_section_title, plugin_setting_card, plugin_summary,
 };
 
 pub(super) type EnvironmentSettingsCache =
     std::cell::RefCell<HashMap<(String, String, String), EnvironmentSettings>>;
+
+pub(super) struct PluginSettingEntry {
+    entry: Entity<TextEntry>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Detail-page editors for installation-level plugin settings, keyed by setting key.
+pub(super) type PluginSettingCache = std::cell::RefCell<HashMap<String, PluginSettingEntry>>;
+
+/// Which validator and result wording one installation-level setting uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeaderSettingKind {
+    CopyTemplate,
+    UrlTemplate,
+    Headers,
+}
+
+impl HeaderSettingKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CopyTemplate => "复制模板",
+            Self::UrlTemplate => "打开 URL 模板",
+            Self::Headers => "匹配响应头",
+        }
+    }
+
+    fn validate(self, text: &str) -> Result<(), String> {
+        match self {
+            Self::CopyTemplate => plugins::validate_header_copy_template(text),
+            Self::UrlTemplate => plugins::validate_header_url_template(text),
+            Self::Headers => plugins::validate_header_names_setting(text),
+        }
+    }
+}
+
+/// One labelled setting below an action card: editor, hint, and why it is unusable.
+struct SettingField<'a> {
+    /// Selector suffix, so the two fields of one action stay distinguishable in tests.
+    field: &'a str,
+    label: &'static str,
+    entry: Entity<TextEntry>,
+    customized: bool,
+    error: Option<String>,
+    /// Placeholder chips or a hint line, already built by the caller.
+    extra: Option<gpui::AnyElement>,
+    theme: ThemePreset,
+}
+
+impl SettingField<'_> {
+    fn render(self, action_id: &str) -> gpui::Div {
+        let p = self.theme.palette();
+        let status = if self.error.is_some() {
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(self.theme.color(0xd9342b)))
+                .child("配置无效")
+        } else if self.customized {
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(self.theme.color(0x258545)))
+                .child("已自动保存")
+        } else {
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(p.text_muted))
+                .child("使用默认值")
+        };
+        let input_selector = format!("header-{}-{action_id}", self.field);
+        let status_selector = format!("header-{}-status-{action_id}", self.field);
+        let border = if self.error.is_some() {
+            self.theme.color(0xd9342b)
+        } else {
+            p.border
+        };
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(p.text))
+                            .child(self.label),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || status_selector.clone())
+                            .child(status),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(rgb(border))
+                    .bg(rgb(p.surface))
+                    .hover(|style| style.border_color(rgb(p.accent)))
+                    .debug_selector(move || input_selector.clone())
+                    .child(self.entry),
+            )
+            .when_some(self.extra, |field, extra| field.child(extra))
+            .when_some(self.error, |field, error| {
+                field.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(self.theme.color(0xd9342b)))
+                        .child(error),
+                )
+            })
+    }
+}
 
 pub(super) struct EnvironmentSettings {
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -49,8 +173,8 @@ pub(super) fn environment_settings_panel<V: 'static>(
 }
 
 fn metadata_badge(label: impl Into<gpui::SharedString>, theme: ThemePreset) -> gpui::Div {
-    CountBadge::new(label)
-        .kind(CountBadgeKind::Muted)
+    TagBadge::new(label)
+        .kind(TagBadgeKind::Metadata)
         .theme(theme)
         .render()
 }
@@ -69,6 +193,7 @@ fn action_badge(label: &'static str, enabled: bool, theme: ThemePreset) -> gpui:
     if enabled {
         TagBadge::new(label)
             .kind(TagBadgeKind::RealData)
+            .compact()
             .theme(theme)
             .render()
     } else {
@@ -98,6 +223,96 @@ impl gpui::Render for ActionDrag {
 }
 
 impl Workbench {
+    /// One editor per installation-level setting. The entity outlives re-renders, so typing keeps
+    /// focus and every keystroke is persisted after validation.
+    fn header_setting_entry(
+        &self,
+        key: &str,
+        default: &str,
+        kind: HeaderSettingKind,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextEntry> {
+        let mut cache = self.plugin_setting_entries.borrow_mut();
+        if let Some(cached) = cache.get(key) {
+            return cached.entry.clone();
+        }
+        let current = self
+            .plugin_action_settings
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| default.to_owned());
+        let entry = Self::entry(&current, default, cx);
+        let key = key.to_owned();
+        // The observer owns its own copy so the cache key stays usable below.
+        let watched = key.clone();
+        let fallback = default.to_owned();
+        let subscriptions = vec![cx.observe(&entry, move |this, entry, cx| {
+            let typed = entry.read(cx).value().trim().to_owned();
+            // Storing the default as an empty value keeps the plugin's own setting authoritative.
+            let value = if typed.is_empty() || typed == fallback {
+                String::new()
+            } else if kind == HeaderSettingKind::Headers {
+                // Store the canonical lowercase list; unusable text is kept so the card can say why.
+                match plugins::HeaderNames::parse_setting(&typed) {
+                    Ok(names) => names.setting_text(),
+                    Err(_) => typed,
+                }
+            } else {
+                typed
+            };
+            let previous = this
+                .plugin_action_settings
+                .get(&watched)
+                .cloned()
+                .unwrap_or_default();
+            if previous == value {
+                return;
+            }
+            if value.is_empty() {
+                this.plugin_action_settings.remove(&watched);
+            } else {
+                this.plugin_action_settings
+                    .insert(watched.clone(), value.clone());
+            }
+            match this.workspace.storage.set_plugin_setting(&watched, &value) {
+                Err(error) => this.notice = error,
+                // An unusable setting hides the menu row, so report why while it is typed.
+                Ok(()) => {
+                    if let Err(error) = kind.validate(&value) {
+                        this.notice = format!("{}不可用：{error}", kind.label());
+                    }
+                }
+            }
+            cx.notify();
+        })];
+        let entry_clone = entry.clone();
+        cache.insert(
+            key,
+            PluginSettingEntry {
+                entry: entry_clone,
+                _subscriptions: subscriptions,
+            },
+        );
+        entry
+    }
+
+    /// Whether a field overrides the plugin default, and why the typed value is unusable.
+    fn setting_state(
+        entry: &Entity<TextEntry>,
+        default: &str,
+        kind: HeaderSettingKind,
+        cx: &Context<Self>,
+    ) -> (bool, Option<String>) {
+        let typed = entry.read(cx).value().trim().to_owned();
+        let customized = !typed.is_empty() && typed != default;
+        let error = if customized {
+            kind.validate(&typed).err()
+        } else {
+            None
+        };
+        (customized, error)
+    }
+
     fn action_environment_settings(
         &self,
         plugin: &gpui_glint::plugins::Plugin,
@@ -962,6 +1177,13 @@ impl Workbench {
         });
         let showing_detail =
             self.plugin_manager_tab == 0 && (selected.is_some() || self.host_plugin_detail);
+        if showing_detail {
+            body = body
+                .max_w(px(960.))
+                .mx_auto()
+                .gap_4()
+                .debug_selector(|| "plugin-detail-layout".into());
+        }
         if self.plugin_manager_tab == 1 {
             body = body.child(self.registry_configuration(cx));
         } else if self.host_plugin_detail {
@@ -1055,6 +1277,9 @@ impl Workbench {
                     if has_kind(plugins::EVENT_DECODE) {
                         badges.push("事件解密".into());
                     }
+                    if has_kind(plugins::HEADER_ACTION) && selected.is_none() {
+                        badges.push("响应头动作".into());
+                    }
                     if has_kind(plugins::OAUTH_PRESET) {
                         badges.push("授权预设".into());
                     }
@@ -1083,6 +1308,8 @@ impl Workbench {
                         "解密 WebSocket 事件消息"
                     } else if has_kind(plugins::AGENT_TOOL) {
                         "向 Agent 提供可调用工具"
+                    } else if has_kind(plugins::HEADER_ACTION) {
+                        "在响应头右键菜单执行动作"
                     } else {
                         "在请求发送前执行动作"
                     };
@@ -1108,57 +1335,283 @@ impl Workbench {
                         ));
                         continue;
                     }
+                    let extensions = if plugin.manifest.contributions.is_empty() {
+                        plugin.manifest.hooks.iter().cloned().collect::<Vec<_>>()
+                    } else {
+                        plugin
+                            .manifest
+                            .contributions
+                            .iter()
+                            .map(|c| c.kind.clone())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    }
+                    .join(" · ");
+                    let capabilities = if plugin.manifest.capabilities.is_empty() {
+                        "无".to_owned()
+                    } else {
+                        plugin
+                            .manifest
+                            .capabilities
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    let metadata = plugin_card_details(self.theme)
+                        .bg(rgb(p.surface_subtle))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(p.text))
+                                .child("插件信息"),
+                        )
+                        .child(
+                            plugin_meta_item("插件 ID", plugin.manifest.id.clone(), self.theme)
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("plugin-details-body-{id}")
+                                }),
+                        )
+                        .child(plugin_meta_item("扩展点", extensions, self.theme))
+                        .child(plugin_meta_item("权限", capabilities, self.theme));
+                    let mut details = div().flex().flex_col().gap_5().child(metadata);
+                    // Declarative actions are configured per installation, here.
+                    let configs = plugins::header_action_configs(plugin);
+                    if !configs.is_empty() {
+                        let mut section =
+                            div().flex().flex_col().gap_3().child(plugin_section_title(
+                                "动作配置",
+                                "修改自动保存，对所有工作区生效。留空使用插件默认值。",
+                                self.theme,
+                            ));
+                        let placeholder_color = p.text;
+                        for config in &configs {
+                            let template_kind = match config.action {
+                                plugins::BuiltinAction::Copy => HeaderSettingKind::CopyTemplate,
+                                plugins::BuiltinAction::OpenUrl => HeaderSettingKind::UrlTemplate,
+                            };
+                            let headers_entry = self.header_setting_entry(
+                                &config.headers_key,
+                                &config.default_headers,
+                                HeaderSettingKind::Headers,
+                                cx,
+                            );
+                            let template_entry = self.header_setting_entry(
+                                &config.template_key,
+                                &config.default_template,
+                                template_kind,
+                                cx,
+                            );
+                            let (headers_customized, headers_error) = Self::setting_state(
+                                &headers_entry,
+                                &config.default_headers,
+                                HeaderSettingKind::Headers,
+                                cx,
+                            );
+                            let (template_customized, template_error) = Self::setting_state(
+                                &template_entry,
+                                &config.default_template,
+                                template_kind,
+                                cx,
+                            );
+                            let customized = headers_customized || template_customized;
+                            let badge = if customized {
+                                action_badge("已自定义", true, self.theme)
+                            } else {
+                                metadata_badge("插件默认", self.theme)
+                            };
+                            let action_icon = match config.action {
+                                plugins::BuiltinAction::Copy => Icon::Copy,
+                                plugins::BuiltinAction::OpenUrl => Icon::Globe,
+                            };
+                            let mut head = div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .pb_3()
+                                .border_b_1()
+                                .border_color(rgb(p.border))
+                                .child(
+                                    div()
+                                        .size(px(30.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(7.))
+                                        .bg(rgb(p.accent_tint))
+                                        .text_color(rgb(p.accent))
+                                        .child(action_icon.render(15.)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(13.))
+                                                .text_color(rgb(p.text))
+                                                .child(config.title.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(config.action_id.clone()),
+                                        ),
+                                )
+                                .child(badge);
+                            if customized {
+                                let reset_headers = headers_entry.clone();
+                                let reset_headers_default = config.default_headers.clone();
+                                let reset_template = template_entry.clone();
+                                let reset_template_default = config.default_template.clone();
+                                head = head.child(
+                                    Button::new("恢复默认")
+                                        .kind(ButtonKind::Plain)
+                                        .size(ButtonSize::Mini)
+                                        .theme(self.theme)
+                                        .render()
+                                        .debug_selector(move || {
+                                            format!("header-reset-{}", config.action_id)
+                                        })
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            reset_headers.update(cx, |entry, cx| {
+                                                entry.set_value(reset_headers_default.clone(), cx)
+                                            });
+                                            reset_template.update(cx, |entry, cx| {
+                                                entry.set_value(reset_template_default.clone(), cx)
+                                            });
+                                        })),
+                                );
+                            }
+                            let mut chips = div().flex().flex_wrap().items_center().gap_1().child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("插入变量"),
+                            );
+                            for (index, placeholder) in [
+                                plugins::HEADER_NAME_PLACEHOLDER,
+                                plugins::HEADER_VALUE_PLACEHOLDER,
+                                plugins::HEADER_STATUS_PLACEHOLDER,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let insert_into = template_entry.clone();
+                                let chip_debug = config.action_id.clone();
+                                chips = chips.child(
+                                    div()
+                                        .id(format!(
+                                            "header-placeholder-{}-{index}",
+                                            config.action_id
+                                        ))
+                                        .h(px(20.))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(rgb(p.border))
+                                        .bg(rgb(p.surface))
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .cursor_pointer()
+                                        .hover(move |style| {
+                                            style.text_color(rgb(placeholder_color))
+                                        })
+                                        .debug_selector(move || {
+                                            format!(
+                                                "header-template-placeholder-{chip_debug}-{index}"
+                                            )
+                                        })
+                                        .child(match index {
+                                            0 => "响应头名称",
+                                            1 => "响应头值",
+                                            _ => "状态码",
+                                        })
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            insert_into.update(cx, |entry, cx| {
+                                                entry.insert_text(placeholder, cx)
+                                            });
+                                        })),
+                                );
+                            }
+                            let headers_hint = div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(
+                                    "* 表示全部；多个名称用逗号分隔，如 location, content-location",
+                                )
+                                .into_any_element();
+                            let headers_field = SettingField {
+                                field: "headers",
+                                label: "匹配响应头",
+                                entry: headers_entry,
+                                customized: headers_customized,
+                                error: headers_error,
+                                extra: Some(headers_hint),
+                                theme: self.theme,
+                            }
+                            .render(&config.action_id);
+                            let template_field = SettingField {
+                                field: "template",
+                                label: config.template_label(),
+                                entry: template_entry,
+                                customized: template_customized,
+                                error: template_error,
+                                extra: Some(chips.into_any_element()),
+                                theme: self.theme,
+                            }
+                            .render(&config.action_id);
+                            let card_id = config.action_id.clone();
+                            section = section.child(
+                                plugin_setting_card(self.theme)
+                                    .p_4()
+                                    .gap_4()
+                                    .min_w_0()
+                                    .debug_selector(move || format!("header-action-{card_id}"))
+                                    .child(head)
+                                    .children(config.value_filter.as_ref().map(|filter| {
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(format!("值谓词 {filter}"))
+                                    }))
+                                    .child(headers_field)
+                                    .child(template_field),
+                            );
+                        }
+                        details = details.child(section);
+                    }
+
                     let mut card = div()
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(plugin_row(summary, toggle))
-                        .child(
-                            plugin_card_details(self.theme)
+                        .child(plugin_row(
+                            summary,
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
                                 .child(
                                     div()
-                                        .child(format!("插件 ID  {}", plugin.manifest.id))
-                                        .debug_selector({
-                                            let id = id.clone();
-                                            move || format!("plugin-details-body-{id}")
-                                        }),
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(if enabled { "已启用" } else { "已停用" }),
                                 )
-                                .child(div().child(format!(
-                                        "扩展点：{}",
-                                        if plugin.manifest.contributions.is_empty() {
-                                            plugin
-                                                .manifest
-                                                .hooks
-                                                .iter()
-                                                .cloned()
-                                                .collect::<Vec<_>>()
-                                        } else {
-                                            plugin
-                                                .manifest
-                                                .contributions
-                                                .iter()
-                                                .map(|c| c.kind.clone())
-                                                .collect::<std::collections::BTreeSet<_>>()
-                                                .into_iter()
-                                                .collect()
-                                        }
-                                        .join(" · ")
-                                    )))
-                                .child(div().child(format!(
-                                    "权限：{}",
-                                    if plugin.manifest.capabilities.is_empty() {
-                                        "无".to_owned()
-                                    } else {
-                                        plugin
-                                            .manifest
-                                            .capabilities
-                                            .iter()
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                            .join(" · ")
-                                    }
-                                ))),
-                        );
+                                .child(toggle),
+                        ))
+                        .child(details);
                     let mut actions = div().flex().flex_wrap().items_center().gap_2();
                     let agent_tool = self.host_shell.is_some()
                         && plugin
@@ -1558,6 +2011,264 @@ mod enable_tests {
                     .disabled_plugins()
                     .unwrap()
                     .contains(&first.family_identity())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn plugin_detail_saves_the_header_url_template(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header-template.sqlite3");
+        let key = plugins::header_setting_key("com.glint.response-headers", "open-url");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.open_plugin_manager(cx);
+            host.selected_plugin_detail = Some("com.glint.response-headers".into());
+            host
+        });
+        window.update(|window, _| window.refresh());
+        // Both declarative actions expose a header list and a template in their details card.
+        assert!(window.debug_bounds("header-action-open-url").is_some());
+        assert!(window.debug_bounds("header-headers-open-url").is_some());
+        assert!(window.debug_bounds("header-template-open-url").is_some());
+        assert!(window.debug_bounds("header-action-copy-value").is_some());
+        assert!(window.debug_bounds("header-headers-copy-value").is_some());
+        assert!(window.debug_bounds("header-template-copy-value").is_some());
+        host.update(window, |host, cx| {
+            let entry = host
+                .plugin_setting_entries
+                .borrow()
+                .get(&key)
+                .expect("cached template editor")
+                .entry
+                .clone();
+            entry.update(cx, |entry, cx| {
+                entry.set_value("https://example.test/r?next={{header.value}}&t=1", cx)
+            });
+        });
+        host.update(window, |host, _| {
+            assert_eq!(
+                host.plugin_action_settings.get(&key).map(String::as_str),
+                Some("https://example.test/r?next={{header.value}}&t=1")
+            );
+            // A relative header value becomes openable only because of this template.
+            assert!(
+                plugins::header_menu(
+                    &host.plugin_catalog,
+                    &host.plugin_action_settings,
+                    "Location",
+                    "/callback",
+                    Some(302),
+                )
+                .iter()
+                .any(|entry| entry.action_id == "open-url")
+            );
+            assert_eq!(
+                host.workspace
+                    .storage
+                    .plugin_settings()
+                    .unwrap()
+                    .get(&key)
+                    .map(String::as_str),
+                Some("https://example.test/r?next={{header.value}}&t=1")
+            );
+        });
+        let reopened =
+            window.new(|cx| Workbench::with_store(storage::Store::open(&path).unwrap(), cx));
+        reopened.update(window, |host, _| {
+            assert_eq!(
+                host.plugin_action_settings.get(&key).map(String::as_str),
+                Some("https://example.test/r?next={{header.value}}&t=1")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn header_template_detail_shows_state_and_resets_through_the_ui(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header-template-ui.sqlite3");
+        let key = plugins::header_setting_key("com.glint.response-headers", "open-url");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.open_plugin_manager(cx);
+            host.selected_plugin_detail = Some("com.glint.response-headers".into());
+            host
+        });
+        // Each field is its own editable block, and the default state offers no reset.
+        assert!(window.debug_bounds("header-template-open-url").is_some());
+        assert!(
+            window
+                .debug_bounds("header-template-status-open-url")
+                .is_some()
+        );
+        assert!(window.debug_bounds("header-reset-open-url").is_none());
+
+        // A placeholder chip inserts into the same cached editor the card renders.
+        let chip = window
+            .debug_bounds("header-template-placeholder-open-url-2")
+            .unwrap();
+        window.simulate_click(chip.center(), gpui::Modifiers::default());
+        let inserted = format!(
+            "{}{}",
+            plugins::HEADER_VALUE_PLACEHOLDER,
+            plugins::HEADER_STATUS_PLACEHOLDER
+        );
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&key].entry.clone();
+            assert_eq!(entry.read(cx).value(), inserted);
+            assert_eq!(
+                host.plugin_action_settings.get(&key).map(String::as_str),
+                Some(inserted.as_str())
+            );
+        });
+        window.update(|window, _| window.refresh());
+        assert!(window.debug_bounds("header-reset-open-url").is_some());
+
+        // Resetting clears the overrides and restores the plugin's own settings.
+        let reset = window.debug_bounds("header-reset-open-url").unwrap();
+        window.simulate_click(reset.center(), gpui::Modifiers::default());
+        window.update(|window, _| window.refresh());
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&key].entry.clone();
+            assert_eq!(entry.read(cx).value(), plugins::DEFAULT_HEADER_TEMPLATE);
+            assert!(host.plugin_action_settings.get(&key).is_none());
+            assert!(
+                host.workspace
+                    .storage
+                    .plugin_settings()
+                    .unwrap()
+                    .get(&key)
+                    .is_none()
+            );
+        });
+        assert!(window.debug_bounds("header-reset-open-url").is_none());
+    }
+
+    #[gpui::test]
+    fn header_names_field_narrows_the_menu_per_header(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header-names.sqlite3");
+        let headers_key =
+            plugins::header_names_setting_key("com.glint.response-headers", "open-url");
+        let template_key = plugins::header_setting_key("com.glint.response-headers", "open-url");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            host.open_plugin_manager(cx);
+            host.selected_plugin_detail = Some("com.glint.response-headers".into());
+            host
+        });
+        window.update(|window, _| window.refresh());
+        // The default list is the plugin's own wildcard.
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&headers_key]
+                .entry
+                .clone();
+            assert_eq!(entry.read(cx).value(), "*");
+        });
+
+        // Narrowing the list to one header hides the row everywhere else, without a restart.
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&headers_key]
+                .entry
+                .clone();
+            entry.update(cx, |entry, cx| entry.set_value("Location", cx));
+        });
+        window.update(|window, _| window.refresh());
+        host.update(window, |host, _| {
+            assert_eq!(
+                host.plugin_action_settings
+                    .get(&headers_key)
+                    .map(String::as_str),
+                Some("location"),
+                "typed names are normalised before they are stored"
+            );
+            let actions = |name: &str| {
+                plugins::header_menu(
+                    &host.plugin_catalog,
+                    &host.plugin_action_settings,
+                    name,
+                    "https://example.test/cb",
+                    Some(302),
+                )
+                .into_iter()
+                .map(|entry| entry.action_id)
+                .collect::<Vec<_>>()
+            };
+            // Matching stays case-insensitive, and the other action keeps its own wildcard.
+            assert_eq!(actions("location"), ["copy-value", "open-url"]);
+            assert_eq!(actions("Content-Type"), ["copy-value"]);
+        });
+        assert!(
+            window
+                .debug_bounds("header-headers-status-open-url")
+                .is_some()
+        );
+        assert!(window.debug_bounds("header-reset-open-url").is_some());
+
+        // An unusable list is reported in place and hides the row instead of matching anything.
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&headers_key]
+                .entry
+                .clone();
+            entry.update(cx, |entry, cx| entry.set_value("bad/header", cx));
+        });
+        window.update(|window, _| window.refresh());
+        host.update(window, |host, _| {
+            assert_eq!(
+                host.plugin_action_settings
+                    .get(&headers_key)
+                    .map(String::as_str),
+                Some("bad/header")
+            );
+            assert!(
+                plugins::header_menu(
+                    &host.plugin_catalog,
+                    &host.plugin_action_settings,
+                    "location",
+                    "https://example.test/cb",
+                    Some(302),
+                )
+                .iter()
+                .all(|entry| entry.action_id != "open-url")
+            );
+            assert!(
+                host.workspace
+                    .storage
+                    .plugin_settings()
+                    .unwrap()
+                    .contains_key(&headers_key)
+            );
+        });
+
+        // Resetting the card clears both fields, so the wildcard applies again.
+        let reset = window.debug_bounds("header-reset-open-url").unwrap();
+        window.simulate_click(reset.center(), gpui::Modifiers::default());
+        window.update(|window, _| window.refresh());
+        host.update(window, |host, cx| {
+            let entry = host.plugin_setting_entries.borrow()[&headers_key]
+                .entry
+                .clone();
+            assert_eq!(entry.read(cx).value(), "*");
+            assert!(host.plugin_action_settings.get(&headers_key).is_none());
+            assert!(host.plugin_action_settings.get(&template_key).is_none());
+            assert!(
+                plugins::header_menu(
+                    &host.plugin_catalog,
+                    &host.plugin_action_settings,
+                    "X-Anything",
+                    "https://example.test/cb",
+                    Some(200),
+                )
+                .iter()
+                .any(|entry| entry.action_id == "open-url")
+            );
+            assert!(
+                host.workspace
+                    .storage
+                    .plugin_settings()
+                    .unwrap()
+                    .get(&headers_key)
+                    .is_none()
             );
         });
     }

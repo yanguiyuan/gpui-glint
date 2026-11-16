@@ -79,7 +79,7 @@ use gpui_glint::{
         GlintAssets, Icon, IconButton, MenuItem, Popover, SearchInput, SegmentOption,
         SegmentedControl, Select, SelectEvent, SelectField, SelectFieldEvent, SelectOption, Switch,
         TableCell, TableColumn, TableEvent, TableRow, TextCompletion, TextEntry,
-        TextReferenceResolver, Toast, ToastHost, ToastKind, TreeDrop, TreeListItem,
+        TextReferenceResolver, Toast, ToastHost, ToastKind, Tooltip, TreeDrop, TreeListItem,
         bind_code_card_keys, bind_text_entry_keys,
     },
     theme::ThemePreset,

@@ -13,6 +13,7 @@ pub struct MarkdownView {
     link_replacements: Vec<(std::ops::Range<usize>, String)>,
     pub(super) links_revision: u64,
     pub(super) links_task: Option<Task<()>>,
+    follow_tail: bool,
     _link_subscription: Subscription,
 }
 
@@ -1099,6 +1100,17 @@ impl AgentWorkspace {
         self.markdown_preview(key, text, scrollable, cx)
     }
 
+    /// Thinking text that is still streaming: keep the newest line in view while
+    /// older lines scroll up.
+    pub fn streaming_markdown_text(
+        &self,
+        key: String,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::DocumentEditor> {
+        self.markdown_preview_with(key, text, true, true, cx)
+    }
+
     pub fn scrollable_markdown_text(
         &self,
         key: String,
@@ -1113,6 +1125,17 @@ impl AgentWorkspace {
         key: String,
         text: &str,
         scrollable: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<gpui_glint::components::DocumentEditor> {
+        self.markdown_preview_with(key, text, scrollable, false, cx)
+    }
+
+    fn markdown_preview_with(
+        &self,
+        key: String,
+        text: &str,
+        scrollable: bool,
+        follow_tail: bool,
         cx: &mut Context<Self>,
     ) -> Entity<gpui_glint::components::DocumentEditor> {
         let mut cache = self.markdown_views.borrow_mut();
@@ -1155,10 +1178,17 @@ impl AgentWorkspace {
                 link_replacements: Vec::new(),
                 links_revision: 0,
                 links_task: None,
+                follow_tail: false,
                 _link_subscription: subscription,
             }
         });
         view.last_used = std::time::Instant::now();
+        if view.follow_tail != follow_tail {
+            view.follow_tail = follow_tail;
+            view.editor.update(cx, |editor, cx| {
+                editor.set_follow_preview_tail(follow_tail, cx)
+            });
+        }
         if view.source.as_ref() != text || view.theme != theme {
             let changed = view.source.as_ref() != text;
             if changed {
@@ -1337,6 +1367,9 @@ impl AgentWorkspace {
                             ((text.lines().count() + text.len() / 100).clamp(2, 15) as f32 * 24.
                                 + 16.)
                                 .min(376.);
+                        // Only the streaming action follows its newest line; a
+                        // reopened history panel keeps its own scroll position.
+                        let streaming = active;
                         entry.panel.update(cx, |panel, cx| {
                             panel.set_theme(theme, cx);
                             if active {
@@ -1347,9 +1380,16 @@ impl AgentWorkspace {
                             panel.set_content(
                                 move |_, cx| {
                                     weak.update(cx, |this, cx| {
-                                        div().w_full().min_w_0().h(px(height)).child(
-                                            this.markdown_text(editor_key.clone(), &source, cx),
-                                        )
+                                        let editor = if streaming {
+                                            this.streaming_markdown_text(
+                                                editor_key.clone(),
+                                                &source,
+                                                cx,
+                                            )
+                                        } else {
+                                            this.markdown_text(editor_key.clone(), &source, cx)
+                                        };
+                                        div().w_full().min_w_0().h(px(height)).child(editor)
                                     })
                                     .unwrap_or_else(|_| div())
                                     .into_any_element()
@@ -2066,6 +2106,70 @@ mod tests {
                     .is_expanded()
             )
         });
+    }
+
+    #[gpui::test]
+    fn streaming_thinking_body_follows_its_newest_line(cx: &mut gpui::TestAppContext) {
+        struct Preview {
+            host: Entity<AgentWorkspace>,
+            blocks: Vec<generation::ContentBlock>,
+        }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(800.)).child(self.host.update(cx, |host, cx| {
+                    host.response_view(
+                        "stream-follow",
+                        &self.blocks,
+                        None,
+                        &Default::default(),
+                        false,
+                        cx,
+                    )
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let reasoning = |count: usize| {
+            (0..count)
+                .map(|index| format!("第 {index} 步：核对文件与依赖"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        let (preview, window) = cx.add_window_view(|_, cx| Preview {
+            host: cx
+                .new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)),
+            blocks: vec![Thinking(reasoning(4))],
+        });
+        window.simulate_resize(gpui::size(px(900.), px(600.)));
+        window.run_until_parked();
+        for count in [16, 32, 48] {
+            preview.update(window, |view, cx| {
+                view.blocks = vec![Thinking(reasoning(count))];
+                cx.notify();
+            });
+            window.run_until_parked();
+            let editor = preview.read_with(window, |view, cx| {
+                view.host.read(cx).markdown_views.borrow()["stream-follow:0:thinking"]
+                    .editor
+                    .clone()
+            });
+            editor.read_with(window, |editor, _| {
+                let scroll = editor.preview_scroll();
+                assert!(
+                    scroll.max_offset().y > px(0.),
+                    "the thinking body must have its own scroll range"
+                );
+                assert!(
+                    scroll.max_offset().y + scroll.offset().y <= px(2.),
+                    "the newest reasoning line must stay visible"
+                );
+            });
+        }
     }
 
     #[gpui::test]

@@ -1,4 +1,4 @@
-//! OAuth for developer-owned applications. Credentials never enter workspace serialization.
+//! OAuth for developer-owned applications. Tokens remain in the system credential store.
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ pub struct Config {
     pub authorization_url: String,
     pub token_url: String,
     pub client_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_secret: String,
     pub redirect_uri: String,
     pub scope: String,
     pub pkce: bool,
@@ -39,6 +41,7 @@ impl Default for Config {
             authorization_url: String::new(),
             token_url: String::new(),
             client_id: String::new(),
+            client_secret: String::new(),
             redirect_uri: "http://127.0.0.1:17943/oauth/callback".into(),
             scope: String::new(),
             pkce: true,
@@ -56,6 +59,7 @@ impl Config {
             ("授权地址", &mut config.authorization_url),
             ("Token 地址", &mut config.token_url),
             ("Client ID", &mut config.client_id),
+            ("Client Secret", &mut config.client_secret),
             ("回调地址", &mut config.redirect_uri),
             ("Scope", &mut config.scope),
         ] {
@@ -105,7 +109,9 @@ impl Config {
     }
     /// Include all protocol settings and the environment to isolate credentials and rotations.
     pub fn key(&self, environment: &str) -> String {
-        let bytes = serde_json::to_vec(&(self, environment)).expect("OAuth config serializes");
+        let mut identity = self.clone();
+        identity.client_secret.clear();
+        let bytes = serde_json::to_vec(&(identity, environment)).expect("OAuth config serializes");
         format!("{:x}", Sha256::digest(bytes))
     }
 }
@@ -492,7 +498,11 @@ fn access_using_via(
     }
     let token = token_request_via(
         config,
-        &credential.client_secret,
+        if config.client_secret.is_empty() {
+            &credential.client_secret
+        } else {
+            &config.client_secret
+        },
         vec![("grant_type", "refresh_token"), ("refresh_token", refresh)],
         Some(old),
         proxy,
@@ -675,6 +685,7 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();

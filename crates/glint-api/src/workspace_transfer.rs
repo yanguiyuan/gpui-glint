@@ -373,6 +373,7 @@ mod tests {
         collection.defaults.insert(
             "资源".into(),
             DirectoryDefaults {
+                auth_profiles: vec![],
                 sections: [crate::model::DefaultSection::Auth].into_iter().collect(),
                 draft: Draft {
                     token: "collection-token-fixture".into(),

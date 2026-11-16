@@ -84,6 +84,12 @@ impl Space {
         Ok(Some(space))
     }
 
+    pub fn repositories(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.repositories
+            .iter()
+            .map(|repo| (repo.name.as_str(), repo.path.as_path()))
+    }
+
     pub fn roots(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.root.as_path())
             .chain(self.repositories.iter().map(|r| r.path.as_path()))

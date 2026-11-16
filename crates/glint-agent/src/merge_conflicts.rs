@@ -217,6 +217,15 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
     Ok((files, notes))
 }
 
+/// Include incomplete markers: parsing zero complete hunks alone is not enough.
+pub fn has_markers(text: &str) -> bool {
+    text.lines().any(|line| {
+        ["<<<<<<<", "=======", ">>>>>>>", "|||||||"]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+    })
+}
+
 pub fn save(file: &Conflict, result: &str) -> Result<(), String> {
     if let Some(reason) = &file.limitation {
         return Err(reason.clone());
@@ -225,11 +234,7 @@ pub fn save(file: &Conflict, result: &str) -> Result<(), String> {
         return Err("合并结果必须是 2MB 以内的 UTF-8 文本".into());
     }
     // Reject even malformed leftover markers before staging.
-    if result.lines().any(|line| {
-        ["<<<<<<<", "=======", ">>>>>>>", "|||||||"]
-            .iter()
-            .any(|m| line.starts_with(m))
-    }) {
+    if has_markers(result) {
         return Err("结果仍含冲突标记，请先解决所有冲突".into());
     }
     if file.index.is_empty() || index(&file.root, &file.label)? != file.index {
@@ -310,6 +315,21 @@ pub(crate) mod tests {
         assert!(hunks("<<<<<<< HEAD\na\n=======\nb\n").is_err());
         assert!(hunks("<<<<<<< HEAD\n<<<<<<< nested\n").is_err());
         assert!(hunks("ordinary text\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_markers_prevent_automatic_resolution() {
+        for marker in [
+            "<<<<<<< HEAD",
+            "=======",
+            ">>>>>>> branch",
+            "||||||| base",
+            "<<<<<<<<< HEAD",
+        ] {
+            assert!(has_markers(&format!("prefix\n{marker}\nsuffix\n")));
+        }
+        assert!(!has_markers("ordinary text\n"));
+        assert!(!has_markers(""));
     }
 
     #[test]

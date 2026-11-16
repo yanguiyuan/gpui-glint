@@ -110,7 +110,7 @@ pub struct State {
     aggregates: RefCell<HashMap<String, (Vec<Uuid>, Rc<Vec<Change>>)>>,
     summaries: RefCell<HashMap<String, (Vec<Uuid>, Entity<Summary>)>>,
     diffs: RefCell<HashMap<String, (Uuid, Entity<DiffCard>)>>,
-    workspace_mode: bool,
+    pub(super) workspace_mode: bool,
     selected_staged: bool,
     stage_task: Option<Task<()>>,
     stage_queue: std::collections::VecDeque<StageRequest>,
@@ -126,7 +126,7 @@ pub struct State {
         )>,
     >,
     grouped_width: Cell<gpui::Pixels>,
-    workspace_root: Option<PathBuf>,
+    pub(super) workspace_root: Option<PathBuf>,
     workspace_files: Rc<Vec<Change>>,
     workspace_sources: Rc<HashMap<PathBuf, crate::workspace_diff::Source>>,
     virtual_files: RefCell<Option<VirtualFiles>>,
@@ -443,10 +443,19 @@ impl AgentWorkspace {
                 }
             }
         }
-        self.cached_edits(&format!("session:{}", self.history.active), records)
+        self.filter_repository_edits(
+            self.cached_edits(&format!("session:{}", self.history.active), records),
+        )
     }
 
     pub fn open_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if let Some(path) = &path {
+            self.adopt_panel_repository(
+                crate::panel_repositories::Panel::Diff,
+                &path.to_string_lossy(),
+                cx,
+            );
+        }
         self.file_preview.open = false;
         if !self.terminal_ui.bottom {
             self.terminal_ui.open = false;
@@ -937,7 +946,7 @@ impl AgentWorkspace {
     pub fn edits_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let workspace_mode = self.edits_ui.workspace_mode;
-        let root_matches = self.edits_ui.workspace_root == self.history.active().project;
+        let root_matches = self.edits_ui.workspace_root == self.diff_repository_root();
         let files = if workspace_mode {
             if root_matches {
                 self.edits_ui.workspace_files.clone()
@@ -1121,6 +1130,7 @@ impl AgentWorkspace {
                                 },
                             ),
                     )
+                    .children(self.repository_select(crate::panel_repositories::Panel::Diff, cx))
                     .when(!workspace_mode, |header| {
                         header.child(
                             Button::new("全部撤销")
@@ -1358,6 +1368,7 @@ impl AgentWorkspace {
             })
             .or_else(|| files.first().map(|file| file.path.clone()));
         let mut detail_bar = None;
+        let mut conflict_header = None;
         let mut detail = div()
             .id("expanded-diff-content")
             .debug_selector(|| "expanded-diff-content".into())
@@ -1396,6 +1407,7 @@ impl AgentWorkspace {
                 .find(|view| &view.read(cx).file.path == path)
             {
                 view.update(cx, |view, cx| {
+                    view.reveal(scroll.clone(), self.edits_ui.reveal_revision, cx);
                     if view.tree_depth.take().is_some() {
                         cx.notify();
                     }
@@ -1410,6 +1422,7 @@ impl AgentWorkspace {
                             .update(cx, |editor, cx| editor.set_theme(self.theme, cx));
                     }
                 });
+                conflict_header = Some(view.read(cx).file_header());
                 detail = detail.child(view.clone());
             } else if let Some(file) = files.iter().find(|file| &file.path == path) {
                 detail_bar = None;
@@ -1607,7 +1620,9 @@ impl AgentWorkspace {
                                 .map(|source| file_status_style(source.status, this.theme))
                         };
                         let color = status.map_or(p.text_muted, |(_, color)| color);
+                        let marker = format!("selected-conflict-file:{}", path.display());
                         div()
+                            .relative()
                             .id(SharedString::from(selector.clone()))
                             .debug_selector(move || selector.clone())
                             .w_full()
@@ -1619,9 +1634,26 @@ impl AgentWorkspace {
                             .gap_2()
                             .cursor_pointer()
                             .when(active, |row| {
-                                row.bg(rgb(p.accent_tint)).text_color(rgb(p.accent))
+                                row.bg(rgb(p.accent_tint))
+                                    .text_color(rgb(p.accent))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .when(index < prefix, |row| {
+                                        row.child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top(px(6.))
+                                                .bottom(px(6.))
+                                                .w(px(3.))
+                                                .rounded(px(2.))
+                                                .bg(rgb(p.accent))
+                                                .debug_selector(move || marker.clone()),
+                                        )
+                                    })
                             })
-                            .hover(|style| style.bg(rgb(p.surface_subtle)))
+                            .when(!active, |row| {
+                                row.hover(|style| style.bg(rgb(p.surface_subtle)))
+                            })
                             .child(
                                 icon.render(14.)
                                     .flex_shrink_0()
@@ -1649,6 +1681,7 @@ impl AgentWorkspace {
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.edits_ui.selected = Some(path.clone());
+                                this.edits_ui.reveal_revision += 1;
                                 cx.notify();
                             }))
                             .into_any_element()
@@ -1717,8 +1750,18 @@ impl AgentWorkspace {
                     .min_w_0()
                     .min_h_0()
                     .flex()
-                    .child(detail)
-                    .children(detail_bar),
+                    .flex_col()
+                    .children(conflict_header)
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex()
+                            .child(detail)
+                            .children(detail_bar),
+                    ),
             )
     }
 
@@ -1750,7 +1793,7 @@ impl AgentWorkspace {
         self.edits_ui.stage_queue.push_back(StageRequest {
             sources,
             staged,
-            project: self.history.active().project.clone(),
+            project: self.diff_repository_root(),
         });
         self.edits_ui.workspace_error = None;
         self.start_next_stage(cx);
@@ -1786,7 +1829,7 @@ impl AgentWorkspace {
                 for path in &paths {
                     this.edits_ui.stage_pending.remove(path);
                 }
-                if this.history.active().project == request.project
+                if this.diff_repository_root() == request.project
                     && this.edits_ui.workspace_root == request.project
                 {
                     match result {
@@ -2181,6 +2224,23 @@ impl AgentWorkspace {
             conflict_rows.len() + 1
         };
         let count = prefix + rows.len();
+        let selected = self
+            .edits_ui
+            .selected
+            .clone()
+            .filter(|path| {
+                files.iter().any(|file| &file.path == path)
+                    || conflicts
+                        .iter()
+                        .any(|view| &view.read(cx).file.path == path)
+            })
+            .or_else(|| {
+                conflicts
+                    .first()
+                    .map(|view| view.read(cx).file.path.clone())
+            })
+            .or_else(|| files.first().map(|file| file.path.clone()));
+        let navigation_selected = selected.clone();
         let render_row = {
             let files = files.clone();
             let scope = scope.clone();
@@ -2244,7 +2304,10 @@ impl AgentWorkspace {
                         &file.label
                     };
                     let selector = format!("diff-navigation-file:{}", path.display());
+                    let active = navigation_selected.as_ref() == Some(&path);
+                    let marker = format!("selected-conflict-file:{}", path.display());
                     return div()
+                        .relative()
                         .id(SharedString::from(selector.clone()))
                         .debug_selector(move || selector.clone())
                         .w_full()
@@ -2255,8 +2318,24 @@ impl AgentWorkspace {
                         .items_center()
                         .gap_2()
                         .cursor_pointer()
-                        .when(this.edits_ui.selected.as_ref() == Some(&path), |row| {
+                        .when(active, |row| {
                             row.bg(rgb(p.accent_tint))
+                                .text_color(rgb(p.accent))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top(px(6.))
+                                        .bottom(px(6.))
+                                        .w(px(3.))
+                                        .rounded(px(2.))
+                                        .bg(rgb(p.accent))
+                                        .debug_selector(move || marker.clone()),
+                                )
+                        })
+                        .when(!active, |row| {
+                            row.hover(|style| style.bg(rgb(p.surface_subtle)))
                         })
                         .child(Icon::GitConflict.render(14.))
                         .child(
@@ -2269,6 +2348,7 @@ impl AgentWorkspace {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.edits_ui.selected = Some(path.clone());
+                            this.edits_ui.reveal_revision += 1;
                             cx.notify();
                         }))
                         .into_any_element();
@@ -2361,23 +2441,8 @@ impl AgentWorkspace {
                 .id("grouped-workspace-files")
                 .child(list);
         }
-        let selected = self
-            .edits_ui
-            .selected
-            .clone()
-            .filter(|path| {
-                files.iter().any(|file| &file.path == path)
-                    || conflicts
-                        .iter()
-                        .any(|view| &view.read(cx).file.path == path)
-            })
-            .or_else(|| {
-                conflicts
-                    .first()
-                    .map(|view| view.read(cx).file.path.clone())
-            })
-            .or_else(|| files.first().map(|file| file.path.clone()));
         let mut detail_bar = None;
+        let mut conflict_header = None;
         let mut detail = div()
             .id("expanded-diff-content")
             .debug_selector(|| "expanded-diff-content".into())
@@ -2420,6 +2485,7 @@ impl AgentWorkspace {
                 .find(|view| view.read(cx).file.path == path)
             {
                 view.update(cx, |view, cx| {
+                    view.reveal(scroll.clone(), self.edits_ui.reveal_revision, cx);
                     if view.tree_depth.take().is_some()
                         || !view.expanded
                         || view.theme != self.theme
@@ -2432,6 +2498,7 @@ impl AgentWorkspace {
                     view.editor
                         .update(cx, |editor, cx| editor.set_theme(self.theme, cx));
                 });
+                conflict_header = Some(view.read(cx).file_header());
                 detail = detail.child(view.clone());
             } else if let Some(file) = files.iter().find(|file| file.path == path) {
                 let source = &self.edits_ui.workspace_sources[&file.path];
@@ -2526,14 +2593,24 @@ impl AgentWorkspace {
                     .min_w_0()
                     .min_h_0()
                     .flex()
-                    .child(detail)
-                    .children(detail_bar),
+                    .flex_col()
+                    .children(conflict_header)
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex()
+                            .child(detail)
+                            .children(detail_bar),
+                    ),
             )
     }
     fn workspace_watch_active(&self) -> bool {
         self.edits_ui.open
             && self.edits_ui.workspace_mode
-            && self.edits_ui.workspace_root == self.history.active().project
+            && self.edits_ui.workspace_root == self.diff_repository_root()
             && self.edits_ui.workspace_watch_root.is_some()
     }
 
@@ -2577,7 +2654,7 @@ impl AgentWorkspace {
             return;
         }
         let root = self.edits_ui.workspace_watch_root.clone().unwrap();
-        let project = self.history.active().project.clone();
+        let project = self.diff_repository_root();
         let observed = self.edits_ui.workspace_stamp.clone();
         let work = cx
             .background_executor()
@@ -2589,7 +2666,7 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 if !this.workspace_watch_active()
-                    || this.history.active().project != project
+                    || this.diff_repository_root() != project
                     || this.edits_ui.stage_task.is_some()
                     || this.edits_ui.workspace_stamp != observed
                 {
@@ -2612,7 +2689,7 @@ impl AgentWorkspace {
     ) {
         if !self.edits_ui.open
             || !self.edits_ui.workspace_mode
-            || self.history.active().project.as_ref() != Some(project)
+            || self.diff_repository_root().as_ref() != Some(project)
             || crate::ssh_project::is_remote(project)
         {
             return;
@@ -2628,7 +2705,7 @@ impl AgentWorkspace {
                 }
                 if this.edits_ui.open
                     && this.edits_ui.workspace_mode
-                    && this.history.active().project.as_ref() == Some(&project)
+                    && this.diff_repository_root().as_ref() == Some(&project)
                 {
                     this.load_workspace_edits(true, cx);
                 }
@@ -2636,12 +2713,23 @@ impl AgentWorkspace {
         }));
     }
 
-    fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn repository_change_busy(&self, cx: &App) -> bool {
+        self.edits_ui.stage_task.is_some()
+            || !self.edits_ui.stage_queue.is_empty()
+            || self.edits_ui.undo_task.is_some()
+            || self
+                .edits_ui
+                .conflicts
+                .iter()
+                .any(|view| view.read(cx).task.is_some())
+    }
+
+    pub(super) fn refresh_workspace_edits(&mut self, cx: &mut Context<Self>) {
         self.load_workspace_edits(false, cx);
     }
 
     fn load_workspace_edits(&mut self, background: bool, cx: &mut Context<Self>) {
-        let root = self.history.active().project.clone();
+        let root = self.diff_repository_root();
         if self.edits_ui.stage_task.is_some() && self.edits_ui.workspace_root == root {
             if background {
                 self.edits_ui.workspace_resync_pending = true;
@@ -2719,7 +2807,7 @@ impl AgentWorkspace {
         self.edits_ui.workspace_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
-                if this.history.active().project.as_ref() != Some(&requested_root)
+                if this.diff_repository_root().as_ref() != Some(&requested_root)
                     || this.edits_ui.workspace_root.as_ref() != Some(&requested_root)
                     || this.edits_ui.workspace_revision != revision
                 {
@@ -2795,14 +2883,42 @@ impl AgentWorkspace {
 
     fn start_workspace_conflicts(&mut self, root: PathBuf, revision: u64, cx: &mut Context<Self>) {
         let work_root = root.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { crate::merge_conflicts::load(&work_root) });
+        let drafts: Vec<_> = self
+            .edits_ui
+            .conflicts
+            .iter()
+            .filter_map(|view| {
+                let view = view.read(cx);
+                (view.editor.read(cx).content() != view.file.original || view.task.is_some())
+                    .then(|| view.file.path.clone())
+            })
+            .collect();
+        let work = cx.background_executor().spawn(async move {
+            let (files, mut notes) = crate::merge_conflicts::load(&work_root)?;
+            let mut pending = Vec::new();
+            let mut resolved = false;
+            for file in files {
+                if file.limitation.is_none()
+                    && !drafts.contains(&file.path)
+                    && !crate::merge_conflicts::has_markers(&file.original)
+                {
+                    match crate::merge_conflicts::save(&file, &file.original) {
+                        Ok(()) => {
+                            resolved = true;
+                            continue;
+                        }
+                        Err(error) => notes.push(format!("{}：自动标记失败：{error}", file.label)),
+                    }
+                }
+                pending.push(file);
+            }
+            Ok::<_, String>((pending, notes, resolved))
+        });
         self.edits_ui.workspace_conflicts_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.edits_ui.workspace_revision != revision
-                    || this.history.active().project != this.edits_ui.workspace_root
+                    || this.diff_repository_root() != this.edits_ui.workspace_root
                 {
                     return;
                 }
@@ -2810,8 +2926,11 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 match result {
-                    Ok((files, notes)) => {
+                    Ok((files, notes, resolved)) => {
                         let workspace = cx.entity().downgrade();
+                        if resolved {
+                            this.load_workspace_edits(true, cx);
+                        }
                         let existing: HashMap<_, _> = this
                             .edits_ui
                             .conflicts
@@ -2892,7 +3011,7 @@ impl AgentWorkspace {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.edits_ui.workspace_revision != revision
-                    || this.history.active().project != this.edits_ui.workspace_root
+                    || this.diff_repository_root() != this.edits_ui.workspace_root
                 {
                     return;
                 }
@@ -2931,7 +3050,7 @@ impl AgentWorkspace {
     }
 }
 
-/// Drafts stay in memory until the user explicitly saves and stages the file.
+/// Drafts save and stage automatically once all conflict markers are removed.
 struct ConflictView {
     tree_depth: Option<usize>,
     list_link: ListLink,
@@ -2948,6 +3067,10 @@ struct ConflictView {
     editor: Entity<CodeCard>,
     /// Scroll chain for the capped merge-result viewport inside the list.
     result_scroll: gpui::ScrollHandle,
+    detail_scroll: Option<gpui::ScrollHandle>,
+    reveal_revision: Option<u64>,
+    reveal_pending: Rc<Cell<bool>>,
+    auto_resolve_task: Option<Task<()>>,
     /// Read-only highlighted previews keyed by (hunk index, side).
     sides: RefCell<HashMap<(usize, usize), Entity<CodeCard>>>,
     notice: Option<String>,
@@ -2978,6 +3101,38 @@ pub(crate) fn conflict_submission(
 }
 
 impl ConflictView {
+    fn file_header(&self) -> gpui::Div {
+        let p = self.theme.palette();
+        div()
+            .debug_selector(|| "current-conflict-file".into())
+            .h(px(38.))
+            .flex_shrink_0()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface))
+            .text_size(px(12.))
+            .text_color(rgb(p.text))
+            .child(Icon::GitConflict.render(14.).text_color(rgb(p.accent)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.file.label.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child("正在解决冲突"),
+            )
+    }
+
     fn ask_agent(&mut self, cx: &mut Context<Self>) {
         if self.task.is_some() {
             return;
@@ -2993,7 +3148,7 @@ impl ConflictView {
         let result = self
             .workspace
             .update(cx, |workspace, cx| -> Result<(), String> {
-                if workspace.history.active().project.as_ref() != Some(&self.project) {
+                if workspace.diff_repository_root().as_ref() != Some(&self.project) {
                     return Err("项目已切换，请回到原项目后重试".into());
                 }
                 if workspace.any_run_busy()
@@ -3048,8 +3203,9 @@ impl ConflictView {
                 .theme(theme)
                 .show_header(false)
         });
-        cx.subscribe(&editor, |_, _, event: &CodeCardEvent, cx| {
+        cx.subscribe(&editor, |this, _, event: &CodeCardEvent, cx| {
             if matches!(event, CodeCardEvent::Changed(_)) {
+                this.schedule_auto_resolve(cx);
                 cx.notify();
             }
         })
@@ -3067,10 +3223,44 @@ impl ConflictView {
             count,
             editor,
             result_scroll: gpui::ScrollHandle::new(),
+            detail_scroll: None,
+            reveal_revision: None,
+            reveal_pending: Rc::new(Cell::new(false)),
+            auto_resolve_task: None,
             sides: Default::default(),
             notice: None,
             task: None,
         }
+    }
+
+    fn reveal(&mut self, scroll: gpui::ScrollHandle, revision: u64, cx: &mut Context<Self>) {
+        self.detail_scroll = Some(scroll);
+        if self.reveal_revision != Some(revision) {
+            self.reveal_revision = Some(revision);
+            self.reveal_pending.set(true);
+            self.expanded = true;
+            cx.notify();
+        }
+    }
+
+    fn schedule_auto_resolve(&mut self, cx: &mut Context<Self>) {
+        self.auto_resolve_task = None;
+        if self.file.limitation.is_some()
+            || crate::merge_conflicts::has_markers(self.editor.read(cx).content())
+        {
+            return;
+        }
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(600));
+        self.auto_resolve_task = Some(cx.spawn(async move |weak, cx| {
+            timer.await;
+            let _ = weak.update(cx, |this, cx| {
+                if !crate::merge_conflicts::has_markers(this.editor.read(cx).content()) {
+                    this.save(cx);
+                }
+            });
+        }));
     }
 
     fn choose(&mut self, index: usize, choice: usize, cx: &mut Context<Self>) {
@@ -3114,7 +3304,7 @@ impl ConflictView {
                     Ok(()) => {
                         this.notice = Some("已保存并暂存，冲突已解决".into());
                         let _ = this.workspace.update(cx, |workspace, cx| {
-                            if workspace.history.active().project.as_ref() == Some(&this.project)
+                            if workspace.diff_repository_root().as_ref() == Some(&this.project)
                                 && workspace
                                     .edits_ui
                                     .conflicts
@@ -3157,14 +3347,32 @@ impl ConflictView {
             })
             .find(|(_, line)| line.starts_with("======="))
             .map_or(raw.len(), |(offset, _)| offset);
-        let mut actions = div().flex().flex_wrap().items_center().gap_1().pl(px(64.));
+        let p = self.theme.palette();
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .bg(rgb(p.surface_subtle))
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .mr_2()
+                    .child(format!("冲突 {} · L{first}", index + 1)),
+            );
         for (choice, label) in ["采用当前侧", "采用传入侧", "保留双方"]
             .into_iter()
             .enumerate()
         {
             actions = actions.child(
                 Button::new(label)
-                    .kind(ButtonKind::Plain)
+                    .size(ButtonSize::Small)
+                    .kind(ButtonKind::Tinted)
                     .theme(self.theme)
                     .when(busy, |button| button.disabled())
                     .render()
@@ -3172,8 +3380,10 @@ impl ConflictView {
                     .on_click(cx.listener(move |this, _, _, cx| this.choose(index, choice, cx))),
             );
         }
-        actions = actions.child(
-            Button::new("让 Agent 解决")
+        actions = actions.child(div().flex_1()).child(
+            Button::new("Agent 解决")
+                .icon(Icon::Sparkles)
+                .size(ButtonSize::Small)
                 .kind(ButtonKind::Plain)
                 .theme(self.theme)
                 .when(busy, |button| button.disabled())
@@ -3204,8 +3414,32 @@ impl ConflictView {
                 cx,
             )
         });
+        let scroll = self.detail_scroll.clone();
+        let pending = self.reveal_pending.clone();
+        let id = cx.entity_id();
         div()
+            .on_children_prepainted(move |bounds, _, cx| {
+                if index == 0 && pending.get() {
+                    if let (Some(scroll), Some(target)) = (&scroll, bounds.first()) {
+                        if scroll.bounds().size.height > px(0.) {
+                            pending.set(false);
+                            let offset = scroll.offset();
+                            scroll.set_offset(point(
+                                offset.x,
+                                (offset.y + scroll.bounds().origin.y - target.origin.y + px(8.))
+                                    .min(px(0.)),
+                            ));
+                            cx.defer(move |cx| cx.notify(id));
+                        }
+                    }
+                }
+            })
             .debug_selector(move || format!("merge-hunk:{index}"))
+            .my_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .overflow_hidden()
             .flex()
             .flex_col()
             .child(actions)
@@ -3289,10 +3523,15 @@ impl Render for ConflictView {
         };
         let (status_label, status_color) = conflict_status_style(self.file.kind(), self.theme);
         let busy = self.task.is_some();
-        let badge = if self.count > 0 {
-            format!("{status_label} · {}", self.count)
+        let remaining = crate::merge_conflicts::hunks(self.editor.read(cx).content())
+            .map(|hunks| hunks.len())
+            .unwrap_or(self.count);
+        let badge = if remaining > 0 {
+            format!("{status_label} · {remaining} 处待解决")
+        } else if crate::merge_conflicts::has_markers(self.editor.read(cx).content()) {
+            "冲突标记待检查".to_owned()
         } else {
-            status_label.to_owned()
+            "无冲突标记".to_owned()
         };
         let mut row = div()
             .w_full()
@@ -3388,8 +3627,7 @@ impl Render for ConflictView {
                 );
             }
             let text = self.editor.read(cx).content().to_owned();
-            let mut content = div().pb_3().flex().flex_col()
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("当前侧 / 传入侧对应 Git ours / theirs；rebase 时当前侧通常为变基目标。保存会暂存此文件，外部文件变化后刷新会重新读取。"));
+            let mut content = div().px_3().pb_3().flex().flex_col().gap_2();
             let mut show_editor = self.manual_edit;
             match crate::merge_conflicts::hunks(&text) {
                 Ok(hunks) => {
@@ -3398,7 +3636,11 @@ impl Render for ConflictView {
                             && ((*hunk == usize::MAX && *context <= hunks.len())
                                 || *hunk < hunks.len())
                     });
-                    if hunks.is_empty() {
+                    if hunks.is_empty() && crate::merge_conflicts::has_markers(&text) {
+                        show_editor = true;
+                        content = content
+                            .child(self.notice_banner("冲突标记不完整，请手动编辑结果".into()));
+                    } else if hunks.is_empty() {
                         show_editor = true;
                         content = content.child(
                             div()
@@ -3413,7 +3655,7 @@ impl Render for ConflictView {
                                 .text_size(px(12.))
                                 .text_color(rgb(colors.added_marker))
                                 .child(Icon::CheckCircle.render(13.))
-                                .child("已无冲突标记，检查无误后保存并标记已解决。"),
+                                .child("已无冲突标记，将自动保存并标记解决。"),
                         );
                     } else {
                         let mut offset = 0;
@@ -3464,7 +3706,7 @@ impl Render for ConflictView {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(p.text_muted))
-                        .child("保存会暂存此文件"),
+                        .child("冲突消除后自动保存并暂存"),
                 )
                 .child(
                     Button::new(if self.manual_edit {
@@ -3472,6 +3714,7 @@ impl Render for ConflictView {
                     } else {
                         "手动编辑"
                     })
+                    .size(ButtonSize::Small)
                     .kind(ButtonKind::Plain)
                     .theme(self.theme)
                     .when(busy, |button| button.disabled())
@@ -3516,16 +3759,36 @@ impl Render for ConflictView {
                     )
                 })
                 .child(
-                    Button::new(if busy {
-                        "正在保存…"
-                    } else {
-                        "保存并标记已解决"
-                    })
-                    .theme(self.theme)
-                    .when(busy, |button| button.disabled())
-                    .render()
-                    .debug_selector(|| "save-merge-conflict".into())
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(
+                                    "当前侧 = ours · 传入侧 = theirs（rebase 时当前侧为变基目标）",
+                                ),
+                        )
+                        .child(
+                            Button::new(if busy {
+                                "正在保存…"
+                            } else {
+                                "保存并标记已解决"
+                            })
+                            .size(ButtonSize::Small)
+                            .theme(self.theme)
+                            .when(
+                                busy || crate::merge_conflicts::has_markers(&text),
+                                |button| button.disabled(),
+                            )
+                            .render()
+                            .debug_selector(|| "save-merge-conflict".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                        ),
                 );
             if let Some(notice) = self.notice.clone() {
                 content = content.child(self.notice_banner(notice));
@@ -4219,21 +4482,20 @@ mod tests {
         window.simulate_resize(size(px(1440.), px(900.)));
         window.run_until_parked();
         let initial = started.elapsed();
-        let list =
-            host.read_with(window, |host, cx| {
-                let views = host.edits_ui.file_views.borrow();
-                assert!(views.len() < 64, "created {} views", views.len());
-                assert!(views.values().all(
+        let list = host.read_with(window, |host, cx| {
+            let views = host.edits_ui.file_views.borrow();
+            assert!(views.len() < 64, "created {} views", views.len());
+            assert!(views.values().all(
                     |view| view.read(cx).loaded.is_none() && view.read(cx).load_task.is_none()
                 ));
-                host.edits_ui
-                    .grouped_list
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .2
-                    .clone()
-            });
+            host.edits_ui
+                .grouped_list
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .2
+                .clone()
+        });
         // Leave room below the target so the following row remains visible
         // after opening the Diff; off-screen rows are intentionally not rendered.
         host.update(window, |_, cx| {
@@ -4304,7 +4566,16 @@ mod tests {
         cx.executor().allow_parking();
         let repo = crate::merge_conflicts::tests::vendor_update(1, 4);
         let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
-        let (conflicts, _) = crate::merge_conflicts::load(repo.path()).unwrap();
+        let (mut conflicts, _) = crate::merge_conflicts::load(repo.path()).unwrap();
+        for file in &mut conflicts {
+            file.original = format!(
+                "{}{}{}",
+                "// context\n".repeat(300),
+                file.original,
+                "// after\n".repeat(100)
+            );
+            std::fs::write(&file.path, &file.original).unwrap();
+        }
         let root = inventory.root.clone();
         let data = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4333,6 +4604,15 @@ mod tests {
         });
         window.simulate_resize(size(px(1440.), px(1000.)));
         window.run_until_parked();
+        let first_path = host.read_with(window, |host, cx| {
+            host.edits_ui.conflicts[0].read(cx).file.path.clone()
+        });
+        let first_marker: &'static str =
+            Box::leak(format!("selected-conflict-file:{}", first_path.display()).into_boxed_str());
+        assert!(
+            window.debug_bounds(first_marker).is_some(),
+            "default file must be highlighted without a click"
+        );
         let path = root.join("vendor/group_1/conflict-1.go");
         let selector =
             Box::leak(format!("diff-navigation-file:{}", path.display()).into_boxed_str());
@@ -4344,6 +4624,34 @@ mod tests {
         );
         window.simulate_click(row.center(), Default::default());
         window.run_until_parked();
+        let selected_marker: &'static str =
+            Box::leak(format!("selected-conflict-file:{}", path.display()).into_boxed_str());
+        assert!(window.debug_bounds(selected_marker).is_some());
+        assert!(window.debug_bounds(first_marker).is_none());
+        let header = window.debug_bounds("current-conflict-file").unwrap();
+        let viewport = window.debug_bounds("expanded-diff-content").unwrap();
+        assert!(
+            header.bottom() <= viewport.top(),
+            "file identity stays outside the scrolled content"
+        );
+        let hunk = window.debug_bounds("merge-hunk:0").unwrap();
+        let detail = window.debug_bounds("expanded-diff-content").unwrap();
+        assert!(
+            hunk.origin.y >= detail.origin.y && hunk.origin.y < detail.origin.y + px(40.),
+            "selecting a conflict reveals the first hunk: {hunk:?}, viewport={detail:?}"
+        );
+        // Re-selecting must return to the conflict after scrolling elsewhere.
+        host.update(window, |host, cx| {
+            for scroll in host.edits_ui.detail_scrolls.borrow().values() {
+                scroll.set_offset(point(px(0.), px(0.)));
+            }
+            cx.notify();
+        });
+        window.run_until_parked();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        let hunk = window.debug_bounds("merge-hunk:0").unwrap();
+        assert!(hunk.origin.y >= detail.origin.y && hunk.origin.y < detail.origin.y + px(40.));
         let draft = host.read_with(window, |host, cx| {
             host.edits_ui
                 .conflicts
@@ -4567,7 +4875,45 @@ mod tests {
     }
 
     #[gpui::test]
-    fn conflict_choices_edit_a_draft_before_explicit_save(cx: &mut gpui::TestAppContext) {
+    fn clean_disk_conflicts_are_automatically_staged_on_refresh(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::merge_conflicts::tests::conflicted();
+        let file = crate::merge_conflicts::load(repo.path())
+            .unwrap()
+            .0
+            .remove(0);
+        std::fs::write(&file.path, "resolved externally\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let root = file.root.clone();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.workspace_root = Some(root.clone());
+            host
+        });
+        host.update(window, |host, cx| {
+            host.start_workspace_conflicts(root, host.edits_ui.workspace_revision, cx);
+        });
+        window.run_until_parked();
+        assert!(
+            crate::merge_conflicts::load(repo.path())
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path).unwrap(),
+            "resolved externally\n"
+        );
+    }
+
+    #[gpui::test]
+    fn conflict_choices_auto_save_after_the_last_marker_is_removed(cx: &mut gpui::TestAppContext) {
         let repo = crate::merge_conflicts::tests::conflicted();
         let data = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4620,8 +4966,9 @@ mod tests {
             assert!(view.notice.as_deref().unwrap().contains("未保存"));
         });
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let button = window.debug_bounds("save-merge-conflict").unwrap();
-        window.simulate_click(button.center(), Default::default());
+        window
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(600));
         window.run_until_parked();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "ours\ntheirs\n");
         assert!(

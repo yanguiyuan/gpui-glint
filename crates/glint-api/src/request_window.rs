@@ -15,6 +15,58 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::Duration;
 
+    #[gpui::test]
+    fn auth_profile_secret_in_shared_editor_persists_to_owner_sqlite(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-auth.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| setup(&path, cx));
+        host.update(window, |host, cx| {
+            host.workspace.collections[0].defaults.insert(
+                String::new(),
+                model::DirectoryDefaults {
+                    auth_profiles: vec![model::AuthProfile {
+                        id: "user-auth".into(),
+                        name: "用户授权".into(),
+                        token: String::new(),
+                        oauth: Some(oauth::Config {
+                            client_id: "app".into(),
+                            client_secret: "before".into(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                },
+            );
+            let draft = Draft {
+                auth_profile: Some("user-auth".into()),
+                ..host.snapshot(cx)
+            };
+            host.load(&draft, cx);
+            host.persist(cx);
+        });
+        let editor = open(&host, 0, window);
+        editor.update(window, |editor, cx| {
+            assert_eq!(editor.oauth.secret.read(cx).value(), "before");
+            editor
+                .oauth
+                .secret
+                .update(cx, |e, cx| e.set_value("after", cx));
+        });
+        window.run_until_parked();
+        host.update(window, |host, cx| host.persist(cx));
+        let data = storage::Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(
+            data.collections[0].defaults[""].auth_profiles[0]
+                .oauth
+                .as_ref()
+                .unwrap()
+                .client_secret,
+            "after"
+        );
+    }
+
     fn wait_for(
         window: &mut gpui::VisualTestContext,
         mut condition: impl FnMut(&mut gpui::VisualTestContext) -> bool,
@@ -841,7 +893,7 @@ impl Workbench {
                 .workspace
                 .collections
                 .iter()
-                .map(|c| (&c.id, &c.environments))
+                .map(|c| (&c.id, &c.environments, &c.defaults))
                 .collect::<Vec<_>>(),
             selected_environment,
         ))
@@ -859,6 +911,31 @@ impl Workbench {
                 .iter_mut()
                 .find(|c| c.id == collection.id)
             {
+                // Publish only profiles changed by this editor; other windows may
+                // have independently edited a different scheme in the directory.
+                for (path, defaults) in &collection.defaults {
+                    let old = baseline.and_then(|c| c.defaults.get(path));
+                    if !target.contains(path) {
+                        continue;
+                    }
+                    for profile in &defaults.auth_profiles {
+                        let previous =
+                            old.and_then(|d| d.auth_profiles.iter().find(|p| p.id == profile.id));
+                        if previous == Some(profile) {
+                            continue;
+                        }
+                        let profiles = &mut target
+                            .defaults
+                            .entry(path.clone())
+                            .or_default()
+                            .auth_profiles;
+                        if let Some(saved) = profiles.iter_mut().find(|p| p.id == profile.id) {
+                            *saved = profile.clone();
+                        } else if previous.is_none() {
+                            profiles.push(profile.clone());
+                        }
+                    }
+                }
                 for (environment, variables) in &collection.environments {
                     let old = baseline.and_then(|c| c.environments.get(environment));
                     let target = target.environments.entry(environment.clone()).or_default();
@@ -965,6 +1042,8 @@ impl Workbench {
                 editor.trigger_requests = Some(self.workspace.requests.clone());
                 editor.sync_pair_tables(cx);
                 editor.workspace.collections = self.workspace.collections.clone();
+                editor.sync_inherited_auth(cx);
+                editor.refresh_auth_profiles(cx);
                 editor.workspace.environment_names = self.workspace.environment_names.clone();
                 editor.workspace.environment_inputs = self.workspace.environment_inputs.clone();
                 editor.workspace.proxies = self.workspace.proxies.clone();

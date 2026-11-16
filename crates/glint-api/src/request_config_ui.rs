@@ -300,9 +300,7 @@ impl Workbench {
     }
 
     pub(super) fn default_configuration_height(&self, cx: &Context<Self>) -> f32 {
-        if self.config == 1
-            && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")
-        {
+        if self.config == 1 && self.auth_is_oauth(cx) {
             384.
         } else if matches!(self.config, 5 | 6) {
             360.
@@ -329,8 +327,29 @@ impl Workbench {
             1=>self.authentication_configuration(cx),
             5=>self.plugin_configuration(cx),
             6=>div().flex().flex_col().gap_3()
-                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("提取环境变量"))
-                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("响应后写入所属集合在发送时环境下的变量，不修改全局变量；集合内同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。有效期填响应中的 JSONPath（如 $.expires_in），单位秒，留空表示不过期。"))
+                .child(
+                    div().flex().items_center().gap_1()
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("提取环境变量"))
+                        .child(
+                            Tooltip::new(
+                                div()
+                                    .size(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("?"),
+                                "响应后写入所属集合在发送时环境下的变量，不修改全局变量；集合内同名变量覆盖。例：api_token → $.data.token。多个匹配保存为 JSON 数组；任一规则失败则不写入。有效期填响应中的 JSONPath（如 $.expires_in），单位秒，留空表示不过期。",
+                            )
+                            .theme(self.theme)
+                            .render(cx)
+                            .debug_selector(|| "extractors-help".into()),
+                        ),
+                )
                 .child(self.extractors_table.clone()),
             3=>self.body_configuration(cx),
             _=>div().w_full().flex().flex_col()
@@ -374,16 +393,12 @@ impl Workbench {
             .debug_selector(|| "request-config-scroll".into())
             .h(px(self.configuration_height(cx)))
             .flex_shrink_0()
-            .when(
-                self.config == 1
-                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"),
-                |view| view.overflow_hidden(),
-            )
-            .when(
-                !(self.config == 1
-                    && self.authentication.read(cx).value().selected.as_deref() == Some("oauth2")),
-                |view| view.overflow_y_scroll(),
-            )
+            .when(self.config == 1 && self.auth_is_oauth(cx), |view| {
+                view.overflow_hidden()
+            })
+            .when(!(self.config == 1 && self.auth_is_oauth(cx)), |view| {
+                view.overflow_y_scroll()
+            })
             .px_5()
             .py_3()
             .child(view)

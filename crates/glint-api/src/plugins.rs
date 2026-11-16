@@ -15,6 +15,9 @@ pub const HOOK: &str = "request.before-send";
 pub const EVENT_DECODE: &str = "websocket.message.decode";
 pub const OAUTH_PRESET: &str = "oauth.preset";
 pub const AGENT_TOOL: &str = "agent.tool";
+/// Response header right-click actions: a declarative match for the menu, one isolated hook per click.
+pub const HEADER_ACTION: &str = "response.header.action";
+pub const HEADER_READ: &str = "response.read";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,17 +65,460 @@ impl AgentTool {
         format!("plugin_{label}_{}", &hash[..24])
     }
 }
-const MAX_JOB: u64 = 12 * 1024 * 1024;
-const MAX_OUTPUT: u64 = 64 * 1024;
-fn output_limit(job: &Job) -> u64 {
-    if job
-        .plugin
+/// Placeholders a declarative copy / open-URL template may reference.
+pub const HEADER_NAME_PLACEHOLDER: &str = "{{header.name}}";
+pub const HEADER_VALUE_PLACEHOLDER: &str = "{{header.value}}";
+pub const HEADER_STATUS_PLACEHOLDER: &str = "{{response.status}}";
+/// The bare placeholder keys accepted inside `{{ }}`.
+const HEADER_PLACEHOLDER_KEYS: [&str; 3] = ["header.name", "header.value", "response.status"];
+/// Default template for both declarative actions: the header value itself.
+pub const DEFAULT_HEADER_TEMPLATE: &str = HEADER_VALUE_PLACEHOLDER;
+/// Bounds a template before any substitution, so storage stays small.
+pub const MAX_HEADER_TEMPLATE: usize = 2048;
+
+/// The only actions the host performs itself, letting a plugin skip JavaScript entirely.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuiltinAction {
+    Copy,
+    OpenUrl,
+}
+
+/// Declarative match and action for one response header. The host evaluates it as-is, so opening
+/// the context menu never executes plugin code.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderMatch {
+    /// One lowercase header name, a list of names, or `*` for every response header.
+    pub header: HeaderNames,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<HeaderValueMatch>,
+    /// Host-implemented action; a contribution with an action must not declare a hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<BuiltinAction>,
+    /// Copy template; defaults to the header value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Open-URL template; the plugin detail page may override it for this installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The response headers a contribution applies to: one exact name, a list of them, or `*`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderNames(Vec<String>);
+
+/// Accepts either `"location"` or `["location", "content-location"]`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawHeaderNames {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for HeaderNames {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(match RawHeaderNames::deserialize(deserializer)? {
+            RawHeaderNames::One(name) => vec![name],
+            RawHeaderNames::Many(names) => names,
+        }))
+    }
+}
+
+/// Bounds how many headers one contribution may list.
+const MAX_HEADER_NAMES: usize = 32;
+
+impl HeaderNames {
+    /// Editable form of the same list, so the detail page round-trips through its field.
+    pub fn setting_text(&self) -> String {
+        if self.0.iter().any(|name| name == "*") {
+            "*".to_owned()
+        } else {
+            self.0.join(", ")
+        }
+    }
+
+    /// Parsed from the detail-page field: `*`, or names separated by `,` / spaces / `·`.
+    pub fn parse_setting(text: &str) -> Result<Self, String> {
+        let mut names: Vec<String> = Vec::new();
+        for name in text
+            .split([',', '，', ';', ' ', '\t', '\n', '·'])
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let name = name.to_ascii_lowercase();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if names.is_empty() {
+            return Err("请填写 * 或至少一个响应头名".into());
+        }
+        if names.len() > MAX_HEADER_NAMES {
+            return Err(format!("最多匹配 {MAX_HEADER_NAMES} 个响应头"));
+        }
+        let parsed = Self(names);
+        if !parsed.is_valid() {
+            return Err("响应头名称只能包含字母、数字和连字符，例如 location".into());
+        }
+        Ok(parsed)
+    }
+
+    /// Exact lowercase names only, without duplicates; `*` alone covers every response header.
+    fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= MAX_HEADER_NAMES
+            && self.0.iter().all(|name| {
+                name == "*"
+                    || (name == &name.to_ascii_lowercase()
+                        && reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok())
+            })
+            && self.0.iter().collect::<BTreeSet<_>>().len() == self.0.len()
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        self.0
+            .iter()
+            .any(|candidate| candidate == "*" || candidate.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Explicit substring predicates instead of regular expressions: linear time, no new dependency.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderValueMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<String>,
+}
+
+impl HeaderMatch {
+    pub(crate) fn parse(
+        contribution: &gpui_glint::plugins::Contribution,
+    ) -> Result<Self, PluginError> {
+        let invalid = || PluginError("Invalid response header action".into());
+        let matched: Self = serde_json::from_value(contribution.data.clone().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        // Either the host performs the action, or the click must run a declared hook.
+        let hooked = !contribution.hook.is_empty();
+        if !matched.is_valid() || hooked == matched.action.is_some() {
+            return Err(invalid());
+        }
+        Ok(matched)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.header.is_valid()
+            && self.value.as_ref().is_none_or(HeaderValueMatch::is_valid)
+            && match self.action {
+                None => self.text.is_none() && self.url.is_none(),
+                Some(BuiltinAction::Copy) => {
+                    self.url.is_none() && self.text.as_deref().is_none_or(valid_template)
+                }
+                Some(BuiltinAction::OpenUrl) => {
+                    self.text.is_none() && self.url.as_deref().is_none_or(valid_url_template)
+                }
+            }
+    }
+
+    /// `headers` is the effective list: the installation override when the user set one.
+    pub(crate) fn matches_with(&self, headers: &HeaderNames, name: &str, value: &str) -> bool {
+        headers.matches(name)
+            && self
+                .value
+                .as_ref()
+                .is_none_or(|matcher| matcher.matches(value))
+    }
+
+    /// The template the host uses before any installation-level override.
+    fn template(&self) -> &str {
+        match self.action {
+            Some(BuiltinAction::Copy) => self.text.as_deref(),
+            Some(BuiltinAction::OpenUrl) => self.url.as_deref(),
+            None => None,
+        }
+        .unwrap_or(DEFAULT_HEADER_TEMPLATE)
+    }
+}
+
+/// Accepted template shape: bounded, and only the documented placeholders.
+fn valid_template(template: &str) -> bool {
+    if template.is_empty() || template.len() > MAX_HEADER_TEMPLATE {
+        return false;
+    }
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let Some(end) = rest[start + 2..].find("}}") else {
+            return false;
+        };
+        if !HEADER_PLACEHOLDER_KEYS.contains(&&rest[start + 2..start + 2 + end]) {
+            return false;
+        }
+        rest = &rest[start + 2 + end + 2..];
+    }
+    true
+}
+
+/// An open-URL template must already look like an absolute address, or be the header value.
+fn valid_url_template(template: &str) -> bool {
+    if !valid_template(template) {
+        return false;
+    }
+    let trimmed = template.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || trimmed == DEFAULT_HEADER_TEMPLATE
+}
+
+/// Reported by the plugin detail page while a template is typed; empty restores the default.
+pub fn validate_header_url_template(template: &str) -> Result<(), String> {
+    let trimmed = template.trim();
+    if trimmed.len() > MAX_HEADER_TEMPLATE {
+        return Err(format!("URL 模板不能超过 {MAX_HEADER_TEMPLATE} 个字符"));
+    }
+    if trimmed.is_empty() || valid_url_template(trimmed) {
+        return Ok(());
+    }
+    Err(format!(
+        "URL 模板需以 http:// 或 https:// 开头，且只能使用 {}、{}、{}",
+        HEADER_NAME_PLACEHOLDER, HEADER_VALUE_PLACEHOLDER, HEADER_STATUS_PLACEHOLDER
+    ))
+}
+
+/// Copy templates have no address requirement, only the documented placeholders.
+pub fn validate_header_copy_template(template: &str) -> Result<(), String> {
+    let trimmed = template.trim();
+    if trimmed.len() > MAX_HEADER_TEMPLATE {
+        return Err(format!("复制模板不能超过 {MAX_HEADER_TEMPLATE} 个字符"));
+    }
+    if trimmed.is_empty() || valid_template(trimmed) {
+        return Ok(());
+    }
+    Err(format!(
+        "复制模板只能使用 {}、{}、{}",
+        HEADER_NAME_PLACEHOLDER, HEADER_VALUE_PLACEHOLDER, HEADER_STATUS_PLACEHOLDER
+    ))
+}
+
+/// Reported by the plugin detail page while the header list is typed; empty restores the default.
+pub fn validate_header_names_setting(text: &str) -> Result<(), String> {
+    HeaderNames::parse_setting(text).map(|_| ())
+}
+
+/// Substitute the supported placeholders; unknown or unterminated ones fail instead of leaking text.
+fn expand_header_template(
+    template: &str,
+    name: &str,
+    value: &str,
+    status: Option<u16>,
+) -> Result<String, String> {
+    let status = status.map(|code| code.to_string()).unwrap_or_default();
+    let mut expanded = String::with_capacity(template.len() + value.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        expanded.push_str(&rest[..start]);
+        let tail = &rest[start + 2..];
+        let end = tail.find("}}").ok_or("模板中的占位符未闭合")?;
+        expanded.push_str(match &tail[..end] {
+            "header.name" => name,
+            "header.value" => value,
+            "response.status" => status.as_str(),
+            _ => return Err("模板包含不支持的占位符".into()),
+        });
+        rest = &tail[end + 2..];
+    }
+    expanded.push_str(rest);
+    if expanded.len() > MAX_HEADER_COPY {
+        return Err("模板展开结果过大".into());
+    }
+    Ok(expanded)
+}
+
+/// Only absolute http(s) addresses may reach the browser; shared by hooks and templates.
+fn header_url(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    let parsed =
+        reqwest::Url::parse(text).map_err(|_| "只允许在浏览器打开 http/https 地址".to_owned())?;
+    if text.len() > MAX_HEADER_URL
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+    {
+        return Err("只允许在浏览器打开 http/https 地址".into());
+    }
+    Ok(text.to_owned())
+}
+
+/// Installation-level overrides, keyed by `identity::action` (template) and
+/// `identity::action::headers` (header match).
+pub type HeaderActionSettings = BTreeMap<String, String>;
+
+/// Template override for one action.
+pub fn header_setting_key(identity: &str, action_id: &str) -> String {
+    format!("{identity}::{action_id}")
+}
+
+/// Header match override for one action: which response headers show the row.
+pub fn header_names_setting_key(identity: &str, action_id: &str) -> String {
+    format!("{identity}::{action_id}::headers")
+}
+
+/// One declarative action the plugin detail page can configure: the headers it appears on, and
+/// the template it copies or opens.
+pub struct HeaderActionConfig {
+    pub action_id: String,
+    pub title: String,
+    pub action: BuiltinAction,
+    pub default_template: String,
+    pub template_key: String,
+    /// Editable default header list, e.g. `*` or `location, content-location`.
+    pub default_headers: String,
+    pub headers_key: String,
+    /// Optional value predicate summary, for the detail page.
+    pub value_filter: Option<String>,
+}
+
+impl HeaderActionConfig {
+    /// Label above the template editor.
+    pub fn template_label(&self) -> &'static str {
+        match self.action {
+            BuiltinAction::Copy => "复制内容模板",
+            BuiltinAction::OpenUrl => "打开 URL 模板",
+        }
+    }
+}
+
+/// Declarative actions this plugin exposes, with their effective defaults.
+pub fn header_action_configs(plugin: &Plugin) -> Vec<HeaderActionConfig> {
+    plugin
         .manifest
         .contributions
         .iter()
-        .any(|c| c.id == job.action_id && c.kind == EVENT_DECODE)
-    {
+        .filter(|c| c.kind == HEADER_ACTION)
+        .filter_map(|c| {
+            let matched: HeaderMatch = serde_json::from_value(c.data.clone()?).ok()?;
+            let action = matched.action?;
+            Some(HeaderActionConfig {
+                action_id: c.id.clone(),
+                title: c.title.clone(),
+                action,
+                default_template: matched.template().to_owned(),
+                template_key: header_setting_key(&plugin.identity(), &c.id),
+                default_headers: matched.header.setting_text(),
+                headers_key: header_names_setting_key(&plugin.identity(), &c.id),
+                value_filter: matched.value.as_ref().and_then(HeaderValueMatch::describe),
+            })
+        })
+        .collect()
+}
+
+/// The installation header list wins over the manifest one; empty falls back to the plugin.
+fn effective_headers(
+    settings: &HeaderActionSettings,
+    identity: &str,
+    action_id: &str,
+    matched: &HeaderMatch,
+) -> Result<HeaderNames, String> {
+    match settings.get(&header_names_setting_key(identity, action_id)) {
+        Some(text) if !text.trim().is_empty() => HeaderNames::parse_setting(text),
+        _ => Ok(matched.header.clone()),
+    }
+}
+
+/// The installation template wins over the manifest one; empty falls back to the plugin.
+fn effective_template<'a>(
+    settings: &'a HeaderActionSettings,
+    identity: &str,
+    action_id: &str,
+    matched: &'a HeaderMatch,
+) -> &'a str {
+    settings
+        .get(&header_setting_key(identity, action_id))
+        .map(|template| template.trim())
+        .filter(|template| !template.is_empty())
+        .unwrap_or_else(|| matched.template())
+}
+
+impl HeaderValueMatch {
+    fn is_valid(&self) -> bool {
+        let predicates = [&self.prefix, &self.suffix, &self.contains, &self.equals];
+        predicates.iter().any(|predicate| predicate.is_some())
+            && predicates.iter().all(|predicate| {
+                predicate
+                    .as_ref()
+                    .is_none_or(|text| !text.is_empty() && text.len() <= 256)
+            })
+    }
+
+    /// One-line predicate summary, e.g. `前缀 https://`, for the detail page.
+    fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        for (label, text) in [
+            ("前缀", &self.prefix),
+            ("后缀", &self.suffix),
+            ("包含", &self.contains),
+            ("等于", &self.equals),
+        ] {
+            if let Some(text) = text {
+                parts.push(format!("{label} {text}"));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        self.prefix
+            .as_ref()
+            .is_none_or(|text| value.starts_with(text.as_str()))
+            && self
+                .suffix
+                .as_ref()
+                .is_none_or(|text| value.ends_with(text.as_str()))
+            && self
+                .contains
+                .as_ref()
+                .is_none_or(|text| value.contains(text.as_str()))
+            && self.equals.as_ref().is_none_or(|text| value == text)
+    }
+}
+
+/// One host-rendered menu entry; the plugin and action are resolved again when it is clicked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderEntry {
+    pub identity: String,
+    pub action_id: String,
+    pub title: String,
+}
+
+/// The only top-level results a header action may request from the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderAction {
+    Copy(String),
+    OpenUrl(String),
+}
+
+const MAX_HEADER_COPY: usize = 64 * 1024;
+const MAX_HEADER_URL: usize = 2048;
+
+const MAX_JOB: u64 = 12 * 1024 * 1024;
+const MAX_OUTPUT: u64 = 64 * 1024;
+fn output_limit(job: &Job) -> u64 {
+    let kind = |kind: &str| {
+        job.plugin
+            .manifest
+            .contributions
+            .iter()
+            .any(|c| c.id == job.action_id && c.kind == kind)
+    };
+    if kind(EVENT_DECODE) {
         2 * 1024 * 1024
+    } else if kind(HEADER_ACTION) {
+        1024 * 1024
     } else {
         MAX_OUTPUT
     }
@@ -124,7 +570,13 @@ pub fn catalog() -> (Vec<Plugin>, Vec<String>) {
         include_str!("../plugins/wps2/main.js"),
     )
     .expect("valid bundled WPS-2 plugin");
-    let mut plugins = vec![builtin, oauth, feishu, decoder, wps2];
+    // Declarative response header actions: copy and open the header value without any script.
+    let headers = Plugin::from_source(
+        include_str!("../plugins/response-headers/glint-plugin.json"),
+        include_str!("../plugins/response-headers/main.js"),
+    )
+    .expect("valid bundled response header actions");
+    let mut plugins = vec![builtin, oauth, feishu, decoder, wps2, headers];
     let mut errors = vec![];
     if let Ok(directory) = directory() {
         if let Ok(entries) = std::fs::read_dir(directory) {
@@ -179,11 +631,17 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
         .iter()
         .any(|c| c.kind == EVENT_DECODE);
     let agent_tools = manifest.contributions.iter().any(|c| c.kind == AGENT_TOOL);
+    let header_actions = manifest
+        .contributions
+        .iter()
+        .any(|c| c.kind == HEADER_ACTION);
     if (events && !manifest.capabilities.contains("event.read"))
         || (actions && !manifest.capabilities.contains("request.read"))
+        || (header_actions && !manifest.capabilities.contains(HEADER_READ))
         || (manifest.contributions.is_empty() && manifest.hooks != BTreeSet::from([HOOK.into()]))
         || (!actions
             && !events
+            && !header_actions
             && ((!agent_tools && !manifest.hooks.is_empty()) || !manifest.capabilities.is_empty()))
     {
         return Err(PluginError("Unsupported API plugin extension".into()));
@@ -194,6 +652,9 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
             }
             AGENT_TOOL => {
                 AgentTool::parse(contribution)?;
+            }
+            HEADER_ACTION => {
+                HeaderMatch::parse(contribution)?;
             }
             OAUTH_PRESET if contribution.hook.is_empty() => {
                 let preset: OAuthPreset = serde_json::from_value(
@@ -211,7 +672,7 @@ pub fn validate_manifest(manifest: &gpui_glint::plugins::Manifest) -> Result<(),
         }
     }
     for c in &manifest.capabilities {
-        if c == "crypto" || c == "request.read" || c == "event.read" {
+        if c == "crypto" || c == "request.read" || c == "event.read" || c == HEADER_READ {
             continue;
         }
         if let Some(name) = c.strip_prefix("environment.read.") {
@@ -247,7 +708,7 @@ fn action_hook<'a>(plugin: &'a Plugin, action_id: &str) -> Result<&'a str, Strin
         .ok_or("前置动作不可用".into())
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthPreset {
     pub authorization_url: String,
@@ -289,7 +750,7 @@ impl OAuthPreset {
         Ok(config)
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PresetEntry {
     pub key: String,
     pub title: String,
@@ -337,6 +798,7 @@ pub fn is_bundled(plugin: &Plugin) -> bool {
             "com.wps.oauth",
             "com.feishu.oauth",
             "com.wps.event-decrypt",
+            "com.glint.response-headers",
         ]
         .contains(&plugin.manifest.id.as_str())
 }
@@ -378,10 +840,18 @@ pub fn run_job(job: Job) -> Result<Value, String> {
         .contributions
         .iter()
         .find(|c| c.id == job.action_id && c.kind == EVENT_DECODE);
-    let hook = if let Some(action) = event_hook {
-        action.hook.as_str()
+    let header_hook = job
+        .plugin
+        .manifest
+        .contributions
+        .iter()
+        .find(|c| c.id == job.action_id && c.kind == HEADER_ACTION);
+    let (hook, read_capability) = if let Some(action) = header_hook {
+        (action.hook.as_str(), HEADER_READ)
+    } else if let Some(action) = event_hook {
+        (action.hook.as_str(), "event.read")
     } else {
-        action_hook(&job.plugin, &job.action_id)?
+        (action_hook(&job.plugin, &job.action_id)?, "request.read")
     };
     let allowed: BTreeSet<String> = job
         .plugin
@@ -393,28 +863,20 @@ pub fn run_job(job: Job) -> Result<Value, String> {
     let mut host = HostRegistry::default().with_crypto();
     // Per-name access is checked here, beyond the generic host-call capability gate.
     let variables = job.variables;
-    host.register(
-        "environment.get",
-        if event_hook.is_some() {
-            "event.read"
-        } else {
-            "request.read"
-        },
-        move |args| {
-            let key = args
-                .get(0)
-                .and_then(Value::as_str)
-                .ok_or_else(|| PluginError("Invalid variable name".into()))?;
-            if !allowed.contains(key) {
-                return Err(PluginError("Variable access denied".into()));
-            }
-            variables
-                .get(key)
-                .cloned()
-                .map(Value::String)
-                .ok_or_else(|| PluginError("Missing environment variable".into()))
-        },
-    )
+    host.register("environment.get", read_capability, move |args| {
+        let key = args
+            .get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| PluginError("Invalid variable name".into()))?;
+        if !allowed.contains(key) {
+            return Err(PluginError("Variable access denied".into()));
+        }
+        variables
+            .get(key)
+            .cloned()
+            .map(Value::String)
+            .ok_or_else(|| PluginError("Missing environment variable".into()))
+    })
     .map_err(|e| e.to_string())?;
     let grants = job.plugin.manifest.capabilities.clone();
     let mut runtime = PluginRuntime::activate(&job.plugin, host, grants, Limits::default())
@@ -821,6 +1283,185 @@ fn event_presentation(output: Value) -> Result<DecodedEvent, String> {
         data: serde_json::to_string(data).map_err(|_| "无法读取事件解密结果")?,
         title,
     })
+}
+
+/// Menu entries for one response header. Matching and templating are declarative, so opening the
+/// menu never starts a worker; a click may run a declarative action or an isolated hook.
+pub fn header_menu(
+    catalog: &[Plugin],
+    settings: &HeaderActionSettings,
+    name: &str,
+    value: &str,
+    status: Option<u16>,
+) -> Vec<HeaderEntry> {
+    let mut entries = vec![];
+    for plugin in catalog {
+        // Several installed versions may be listed; only the newest one contributes.
+        if catalog.iter().any(|other| {
+            other.family_identity() == plugin.family_identity()
+                && semver::Version::parse(&other.manifest.version).ok()
+                    > semver::Version::parse(&plugin.manifest.version).ok()
+        }) || validate(plugin).is_err()
+        {
+            continue;
+        }
+        let identity = plugin.identity();
+        for contribution in plugin
+            .manifest
+            .contributions
+            .iter()
+            .filter(|c| c.kind == HEADER_ACTION)
+        {
+            let Some(matched) = contribution
+                .data
+                .clone()
+                .and_then(|data| serde_json::from_value::<HeaderMatch>(data).ok())
+            else {
+                continue;
+            };
+            // The detail page may narrow or widen the manifest header list; an unusable setting
+            // hides the row instead of acting on a header the user did not choose.
+            let Ok(headers) = effective_headers(settings, &identity, &contribution.id, &matched)
+            else {
+                continue;
+            };
+            if !matched.matches_with(&headers, name, value) {
+                continue;
+            }
+            // A declarative row only appears when its effective template can produce the result.
+            match matched.action {
+                // An unusable copy template would only fail on click, so hide it up front.
+                Some(BuiltinAction::Copy) => {
+                    let template =
+                        effective_template(settings, &identity, &contribution.id, &matched);
+                    if expand_header_template(template, name, value, status).is_err() {
+                        continue;
+                    }
+                }
+                Some(BuiltinAction::OpenUrl) => {
+                    let template =
+                        effective_template(settings, &identity, &contribution.id, &matched);
+                    if expand_header_template(template, name, value, status)
+                        .and_then(|url| header_url(&url))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                None => {}
+            }
+            entries.push(HeaderEntry {
+                identity: identity.clone(),
+                action_id: contribution.id.clone(),
+                title: contribution.title.clone(),
+            });
+        }
+    }
+    entries
+}
+
+/// Runs a declarative action or the click hook in the supervised worker.
+pub fn run_header_action(
+    catalog: &[Plugin],
+    settings: &HeaderActionSettings,
+    entry: &HeaderEntry,
+    name: &str,
+    value: &str,
+    status: Option<u16>,
+    variables: &super::environment::EnvironmentValues,
+) -> Result<HeaderAction, String> {
+    let plugin = catalog
+        .iter()
+        .find(|plugin| plugin.identity() == entry.identity)
+        .ok_or("响应头动作所属插件已不可用")?;
+    validate(plugin).map_err(|error| error.to_string())?;
+    let contribution = plugin
+        .manifest
+        .contributions
+        .iter()
+        .find(|c| c.id == entry.action_id && c.kind == HEADER_ACTION)
+        .ok_or("响应头动作已不可用")?;
+    let matched: HeaderMatch = contribution
+        .data
+        .clone()
+        .and_then(|data| serde_json::from_value(data).ok())
+        .ok_or("响应头动作配置无效")?;
+    // Re-check the effective matcher so a menu left open cannot act on a header the user excluded.
+    let headers = effective_headers(settings, &entry.identity, &entry.action_id, &matched)
+        .map_err(|error| format!("匹配响应头配置不可用：{error}"))?;
+    if !matched.matches_with(&headers, name, value) {
+        return Err("响应头动作与当前响应头不匹配".into());
+    }
+    // Declarative actions never start a worker and need no environment inputs.
+    if let Some(action) = matched.action {
+        let template = effective_template(settings, &entry.identity, &entry.action_id, &matched);
+        return match action {
+            BuiltinAction::Copy => {
+                let text = expand_header_template(template, name, value, status)?;
+                if text.is_empty() {
+                    return Err("响应头内容为空，没有可复制的内容".into());
+                }
+                if text.len() > MAX_HEADER_COPY {
+                    return Err("复制内容过大".into());
+                }
+                Ok(HeaderAction::Copy(text))
+            }
+            BuiltinAction::OpenUrl => {
+                let url = expand_header_template(template, name, value, status)?;
+                header_url(&url).map(HeaderAction::OpenUrl)
+            }
+        };
+    }
+    let mut inputs = BTreeMap::new();
+    for key in plugin
+        .manifest
+        .capabilities
+        .iter()
+        .filter_map(|capability| capability.strip_prefix("environment.read."))
+    {
+        let input = variables
+            .0
+            .get(key)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("请在当前环境配置 {key}"))?;
+        inputs.insert(key.to_owned(), input.clone());
+    }
+    let output = isolated(&Job {
+        plugin: plugin.clone(),
+        action_id: contribution.id.clone(),
+        request: json!({
+            "header": { "name": name, "value": value },
+            "response": { "status": status },
+        }),
+        variables: inputs,
+    })?;
+    header_action_output(output)
+}
+
+fn header_action_output(output: Value) -> Result<HeaderAction, String> {
+    if let Some(error) = output.get("error").and_then(Value::as_str) {
+        return Err(error.chars().take(300).collect());
+    }
+    match output.get("action").and_then(Value::as_str) {
+        Some("copy") => {
+            let text = output
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("插件没有返回要复制的文本")?;
+            if text.is_empty() || text.len() > MAX_HEADER_COPY {
+                return Err("插件返回的复制内容为空或过大".into());
+            }
+            Ok(HeaderAction::Copy(text.to_owned()))
+        }
+        Some("open-url") => {
+            let url = output
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("插件没有返回要打开的地址")?;
+            header_url(url).map(HeaderAction::OpenUrl)
+        }
+        _ => Err("插件返回了不支持的动作".into()),
+    }
 }
 
 #[cfg(test)]
@@ -1566,6 +2207,657 @@ mod event_decode_tests {
                 .contains("权限")
         );
         assert!(action_hook(&plugin, "decrypt-event").is_err());
+    }
+
+    fn header_action_plugin(contributions: Value, capabilities: &[&str], source: &str) -> Plugin {
+        let manifest = json!({
+            "id": "com.example.header-actions",
+            "name": "响应头动作",
+            "version": "1.0.0",
+            "api_version": 1,
+            "entry": "main.js",
+            "capabilities": capabilities,
+            "hooks": ["response.header.action"],
+            "contributions": contributions
+        });
+        Plugin::from_source(&manifest.to_string(), source).expect("valid header action plugin")
+    }
+
+    const HEADER_HOOK: &str = "glint.on('response.header.action', (input) => \
+        ({ action: 'copy', text: input.header.name + ': ' + input.header.value }));";
+
+    #[test]
+    fn response_header_menu_matches_declared_name_and_value_predicates() {
+        let plugin = header_action_plugin(
+            json!([
+                {
+                    "id": "open-callback",
+                    "kind": "response.header.action",
+                    "title": "在浏览器打开回跳地址",
+                    "hook": "response.header.action",
+                    "data": { "header": "location", "value": { "prefix": "https://" } }
+                },
+                {
+                    "id": "copy-www-authenticate",
+                    "kind": "response.header.action",
+                    "title": "复制认证失败原因",
+                    "hook": "response.header.action",
+                    "data": { "header": "www-authenticate", "value": { "contains": "invalid_token" } }
+                }
+            ]),
+            &["response.read"],
+            HEADER_HOOK,
+        );
+        let no_settings = HeaderActionSettings::new();
+        let entries = header_menu(
+            &[plugin.clone()],
+            &no_settings,
+            "Location",
+            "https://example.test/cb?code=1",
+            Some(302),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action_id, "open-callback");
+        assert_eq!(entries[0].title, "在浏览器打开回跳地址");
+        // Header names are compared case-insensitively; values must still satisfy the predicates.
+        assert!(
+            header_menu(
+                &[plugin.clone()],
+                &no_settings,
+                "LOCATION",
+                "/relative/cb",
+                None
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            header_menu(
+                &[plugin.clone()],
+                &no_settings,
+                "www-authenticate",
+                "Bearer error=\"invalid_token\"",
+                None,
+            )
+            .len(),
+            1
+        );
+        assert!(
+            header_menu(
+                &[plugin],
+                &no_settings,
+                "x-trace",
+                "https://example.test",
+                None
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn header_actions_can_target_a_list_of_specific_response_headers() {
+        // One contribution may cover several exact headers, so the menu stays focused on them.
+        let plugin = header_action_plugin(
+            json!([
+                {
+                    "id": "copy-redirect",
+                    "kind": "response.header.action",
+                    "title": "复制回跳地址",
+                    "hook": "response.header.action",
+                    "data": { "header": ["location", "content-location"] }
+                },
+                {
+                    "id": "copy-trace",
+                    "kind": "response.header.action",
+                    "title": "复制追踪号",
+                    "hook": "response.header.action",
+                    "data": { "header": ["x-request-id"] }
+                }
+            ]),
+            &["response.read"],
+            HEADER_HOOK,
+        );
+        let settings = HeaderActionSettings::new();
+        let ids = |name: &str| -> Vec<String> {
+            header_menu(
+                std::slice::from_ref(&plugin),
+                &settings,
+                name,
+                "https://example.test",
+                None,
+            )
+            .into_iter()
+            .map(|entry| entry.action_id)
+            .collect()
+        };
+        assert_eq!(ids("Location"), ["copy-redirect".to_owned()]);
+        assert_eq!(ids("Content-Location"), ["copy-redirect".to_owned()]);
+        assert_eq!(ids("x-request-id"), ["copy-trace".to_owned()]);
+        assert!(ids("x-trace").is_empty());
+        // A single name and a wildcard keep working exactly as before.
+        for header in [
+            json!("location"),
+            json!(["location"]),
+            json!("*"),
+            json!(["*"]),
+        ] {
+            let single = header_action_plugin(
+                json!([{
+                    "id": "copy-any",
+                    "kind": "response.header.action",
+                    "title": "复制",
+                    "hook": "response.header.action",
+                    "data": { "header": header }
+                }]),
+                &["response.read"],
+                HEADER_HOOK,
+            );
+            assert_eq!(
+                header_menu(&[single], &settings, "location", "v", None).len(),
+                1,
+                "{header}"
+            );
+        }
+        // Anything ambiguous is rejected up front instead of silently matching nothing.
+        let mut too_many = vec![];
+        for index in 0..MAX_HEADER_NAMES + 1 {
+            too_many.push(format!("x-h{index}"));
+        }
+        for header in [
+            json!([]),
+            json!(["Location"]),
+            json!(["location", "location"]),
+            json!(["location", "not a header"]),
+            json!([""]),
+            json!(7),
+            json!(too_many),
+        ] {
+            let invalid = header_action_plugin(
+                json!([{
+                    "id": "copy-any",
+                    "kind": "response.header.action",
+                    "title": "复制",
+                    "hook": "response.header.action",
+                    "data": { "header": header }
+                }]),
+                &["response.read"],
+                HEADER_HOOK,
+            );
+            assert!(
+                validate_manifest(&invalid.manifest).is_err(),
+                "expected {header} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn header_action_requires_the_response_capability_and_a_declared_hook() {
+        let contribution = json!([{
+            "id": "copy-location",
+            "kind": "response.header.action",
+            "title": "复制 Location",
+            "hook": "response.header.action",
+            "data": { "header": "location" }
+        }]);
+        let missing = header_action_plugin(contribution.clone(), &[], HEADER_HOOK);
+        assert!(validate_manifest(&missing.manifest).is_err());
+        let granted = header_action_plugin(contribution, &["response.read"], HEADER_HOOK);
+        assert!(validate_manifest(&granted.manifest).is_ok());
+        // A menu entry is inert data, so the click hook can never be empty.
+        let unhooked = header_action_plugin(
+            json!([{
+                "id": "no-hook",
+                "kind": "response.header.action",
+                "title": "没有钩子",
+                "data": { "header": "location" }
+            }]),
+            &["response.read"],
+            HEADER_HOOK,
+        );
+        assert!(validate_manifest(&unhooked.manifest).is_err());
+        for data in [
+            json!({ "header": "Location" }),
+            json!({ "header": "location", "value": {} }),
+            json!({ "header": "location", "value": { "prefix": "" } }),
+            json!({ "header": "location", "pattern": "^https" }),
+        ] {
+            let invalid = header_action_plugin(
+                json!([{
+                    "id": "copy-location",
+                    "kind": "response.header.action",
+                    "title": "复制 Location",
+                    "hook": "response.header.action",
+                    "data": data
+                }]),
+                &["response.read"],
+                HEADER_HOOK,
+            );
+            assert!(validate_manifest(&invalid.manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn header_action_output_accepts_only_copy_and_http_urls() {
+        assert_eq!(
+            header_action_output(json!({"action": "copy", "text": "value"})).unwrap(),
+            HeaderAction::Copy("value".into())
+        );
+        assert_eq!(
+            header_action_output(json!({"action": "open-url", "url": " https://a.test/x "}))
+                .unwrap(),
+            HeaderAction::OpenUrl("https://a.test/x".into())
+        );
+        assert_eq!(
+            header_action_output(json!({"action": "open-url", "url": "http://a.test/x"})).unwrap(),
+            HeaderAction::OpenUrl("http://a.test/x".into())
+        );
+        for output in [
+            json!({"action": "open-url", "url": "file:///etc/passwd"}),
+            json!({"action": "open-url", "url": "javascript:alert(1)"}),
+            json!({"action": "open-url", "url": "https://"}),
+            json!({"action": "open-url", "url": "not a url"}),
+            json!({"action": "open-url"}),
+            json!({"action": "copy"}),
+            json!({"action": "copy", "text": ""}),
+            json!({"action": "copy", "text": "x".repeat(MAX_HEADER_COPY + 1)}),
+            json!({"action": "run", "text": "rm -rf /"}),
+            json!({"text": "value"}),
+        ] {
+            assert!(header_action_output(output.clone()).is_err(), "{output}");
+        }
+        assert_eq!(
+            header_action_output(json!({"error": "缺少参数"})),
+            Err("缺少参数".into())
+        );
+    }
+
+    #[test]
+    fn response_header_hook_receives_the_header_and_returns_a_validated_action() {
+        let plugin = header_action_plugin(
+            json!([{
+                "id": "open-callback",
+                "kind": "response.header.action",
+                "title": "在浏览器打开回跳地址",
+                "hook": "response.header.action",
+                "data": { "header": "location" }
+            }]),
+            &["response.read"],
+            "glint.on('response.header.action', (input) => input.response.status === 302 \
+                ? { action: 'open-url', url: input.header.value } \
+                : { error: '状态码 ' + input.response.status });",
+        );
+        let output = run_job(Job {
+            plugin: plugin.clone(),
+            action_id: "open-callback".into(),
+            request: json!({
+                "header": {"name": "location", "value": "https://example.test/cb"},
+                "response": {"status": 302}
+            }),
+            variables: BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            header_action_output(output).unwrap(),
+            HeaderAction::OpenUrl("https://example.test/cb".into())
+        );
+        let output = run_job(Job {
+            plugin,
+            action_id: "open-callback".into(),
+            request: json!({
+                "header": {"name": "location", "value": "https://example.test/cb"},
+                "response": {"status": 200}
+            }),
+            variables: BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(header_action_output(output), Err("状态码 200".into()));
+    }
+
+    fn bundled_header_plugin() -> Plugin {
+        Plugin::from_source(
+            include_str!("../plugins/response-headers/glint-plugin.json"),
+            include_str!("../plugins/response-headers/main.js"),
+        )
+        .expect("valid bundled response header actions")
+    }
+
+    fn no_variables() -> crate::environment::EnvironmentValues {
+        crate::environment::EnvironmentValues::new(BTreeMap::new())
+    }
+
+    #[test]
+    fn bundled_header_actions_copy_and_open_urls_without_any_hook() {
+        let plugin = bundled_header_plugin();
+        validate(&plugin).unwrap();
+        assert!(is_bundled(&plugin));
+        assert!(plugin.manifest.hooks.is_empty());
+        let identity = plugin.identity();
+        assert_eq!(
+            header_action_configs(&plugin)
+                .iter()
+                .map(|action| (
+                    action.action_id.as_str(),
+                    action.default_template.as_str(),
+                    action.default_headers.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("copy-value", DEFAULT_HEADER_TEMPLATE, "*"),
+                ("open-url", DEFAULT_HEADER_TEMPLATE, "*"),
+            ]
+        );
+        let run = |action_id: &str, name: &str, value: &str, status: Option<u16>, settings| {
+            run_header_action(
+                std::slice::from_ref(&plugin),
+                settings,
+                &HeaderEntry {
+                    identity: identity.clone(),
+                    action_id: action_id.to_owned(),
+                    title: String::new(),
+                },
+                name,
+                value,
+                status,
+                &no_variables(),
+            )
+        };
+        let settings = HeaderActionSettings::new();
+        // Copy is template-expanded data only; it never starts the isolated worker.
+        assert_eq!(
+            run(
+                "copy-value",
+                "Location",
+                "/callback?code=1",
+                Some(302),
+                &settings
+            )
+            .unwrap(),
+            HeaderAction::Copy("/callback?code=1".into())
+        );
+        assert_eq!(
+            run(
+                "open-url",
+                "Location",
+                "https://example.test/cb",
+                Some(302),
+                &settings
+            )
+            .unwrap(),
+            HeaderAction::OpenUrl("https://example.test/cb".into())
+        );
+        // A relative header value is not an address, so the row is neither offered nor executed.
+        assert!(run("open-url", "Location", "/callback", Some(302), &settings).is_err());
+        assert!(
+            header_menu(
+                &[plugin.clone()],
+                &settings,
+                "Location",
+                "/callback",
+                Some(302)
+            )
+            .iter()
+            .all(|entry| entry.action_id == "copy-value")
+        );
+        // An installation template can turn any header into an address, and may use the status.
+        let key = header_setting_key(&identity, "open-url");
+        let mut configured = HeaderActionSettings::new();
+        configured.insert(
+            key.clone(),
+            "https://example.test/redirect?next={{header.value}}&t=1".into(),
+        );
+        assert_eq!(
+            run("open-url", "Location", "/cb", Some(302), &configured).unwrap(),
+            HeaderAction::OpenUrl("https://example.test/redirect?next=/cb&t=1".into())
+        );
+        assert_eq!(
+            header_menu(
+                std::slice::from_ref(&plugin),
+                &configured,
+                "Location",
+                "/cb",
+                Some(302),
+            )
+            .iter()
+            .map(|entry| entry.action_id.as_str())
+            .collect::<Vec<_>>(),
+            ["copy-value", "open-url"]
+        );
+        let mut with_status = HeaderActionSettings::new();
+        with_status.insert(
+            key,
+            "https://example.test/s?code={{response.status}}&h={{header.name}}".into(),
+        );
+        assert_eq!(
+            run("open-url", "X-Trace", "trace-1", Some(404), &with_status).unwrap(),
+            HeaderAction::OpenUrl("https://example.test/s?code=404&h=X-Trace".into())
+        );
+        // The status is part of the menu decision too, so the two views cannot drift apart.
+        assert!(
+            header_menu(
+                std::slice::from_ref(&plugin),
+                &with_status,
+                "X-Trace",
+                "trace-1",
+                Some(404),
+            )
+            .iter()
+            .any(|entry| entry.action_id == "open-url")
+        );
+    }
+
+    #[test]
+    fn header_names_setting_narrows_the_menu_for_the_current_install() {
+        let plugin = bundled_header_plugin();
+        let identity = plugin.identity();
+        let config = header_action_configs(&plugin)
+            .into_iter()
+            .find(|config| config.action_id == "open-url")
+            .unwrap();
+        // The wildcard is the plugin default; the detail page edits it per installation.
+        assert_eq!(config.default_headers, "*");
+        assert_eq!(
+            config.headers_key,
+            header_names_setting_key(&identity, "open-url")
+        );
+        assert_eq!(config.template_label(), "打开 URL 模板");
+
+        fn ids(plugin: &Plugin, settings: &HeaderActionSettings, name: &str) -> Vec<String> {
+            header_menu(
+                std::slice::from_ref(plugin),
+                settings,
+                name,
+                "https://example.test/cb",
+                Some(302),
+            )
+            .into_iter()
+            .map(|entry| entry.action_id)
+            .collect()
+        }
+        let mut settings = HeaderActionSettings::new();
+        settings.insert(
+            config.headers_key.clone(),
+            "location, content-location".into(),
+        );
+        assert_eq!(
+            ids(&plugin, &settings, "Location"),
+            ["copy-value".to_owned(), "open-url".to_owned()]
+        );
+        assert_eq!(
+            ids(&plugin, &settings, "Content-Location"),
+            ["copy-value".to_owned(), "open-url".to_owned()]
+        );
+        // The copy action keeps its own wildcard, so only the narrowed row disappears.
+        assert_eq!(
+            ids(&plugin, &settings, "content-type"),
+            ["copy-value".to_owned()]
+        );
+
+        // A click re-checks the same effective list, so a menu left open cannot act elsewhere.
+        let entry = HeaderEntry {
+            identity: identity.clone(),
+            action_id: "open-url".into(),
+            title: String::new(),
+        };
+        let run = |name: &str, settings: &HeaderActionSettings| {
+            run_header_action(
+                std::slice::from_ref(&plugin),
+                settings,
+                &entry,
+                name,
+                "https://example.test/cb",
+                Some(302),
+                &no_variables(),
+            )
+        };
+        assert!(run("location", &settings).is_ok());
+        assert!(run("x-other", &settings).unwrap_err().contains("不匹配"));
+
+        // An unusable list hides the row and names the reason instead of matching nothing.
+        let mut broken = HeaderActionSettings::new();
+        broken.insert(config.headers_key.clone(), "location/".into());
+        assert!(
+            ids(&plugin, &broken, "location")
+                .iter()
+                .all(|id| id != "open-url")
+        );
+        assert!(run("location", &broken).unwrap_err().contains("匹配响应头"));
+
+        // The copy template is an installation setting too, with no address requirement.
+        let mut copy = HeaderActionSettings::new();
+        copy.insert(
+            header_setting_key(&identity, "copy-value"),
+            "{{header.name}}: {{header.value}}".into(),
+        );
+        let copy_entry = HeaderEntry {
+            identity: identity.clone(),
+            action_id: "copy-value".into(),
+            title: String::new(),
+        };
+        assert_eq!(
+            run_header_action(
+                std::slice::from_ref(&plugin),
+                &copy,
+                &copy_entry,
+                "Location",
+                "/cb",
+                Some(302),
+                &no_variables(),
+            )
+            .unwrap(),
+            HeaderAction::Copy("Location: /cb".into())
+        );
+
+        // The same rule applies to copy: an unusable template hides the row instead of failing later.
+        let mut broken_copy = HeaderActionSettings::new();
+        broken_copy.insert(
+            header_setting_key(&identity, "copy-value"),
+            "{{env.token}}".into(),
+        );
+        assert!(
+            ids(&plugin, &broken_copy, "location")
+                .iter()
+                .all(|id| id != "copy-value")
+        );
+
+        // Typed lists are normalised, so the stored value always round-trips through the field.
+        for (text, expected) in [
+            ("*", "*"),
+            (" Location ", "location"),
+            ("location, Location", "location"),
+            ("location · content-location", "location, content-location"),
+            ("location，content-location", "location, content-location"),
+        ] {
+            assert_eq!(
+                HeaderNames::parse_setting(text).unwrap().setting_text(),
+                expected,
+                "{text}"
+            );
+        }
+        for text in ["", "   ", "location/", "x@y", "内容"] {
+            assert!(validate_header_names_setting(text).is_err(), "{text}");
+        }
+        let too_many = (0..MAX_HEADER_NAMES + 1)
+            .map(|index| format!("x-h{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_header_names_setting(&too_many).is_err());
+        assert!(validate_header_names_setting("location").is_ok());
+        assert!(validate_header_copy_template("").is_ok());
+        assert!(validate_header_copy_template("{{header.name}}: {{header.value}}").is_ok());
+        assert!(validate_header_copy_template("{{env.token}}").is_err());
+    }
+
+    #[test]
+    fn declarative_header_actions_reject_unusable_templates() {
+        let declarative = |data: Value| {
+            header_action_plugin(
+                json!([{
+                    "id": "action",
+                    "kind": "response.header.action",
+                    "title": "动作",
+                    "data": data
+                }]),
+                &["response.read"],
+                "",
+            )
+        };
+        for data in [
+            json!({ "header": "location", "action": "copy", "text": "{{env.token}}" }),
+            json!({ "header": "location", "action": "copy", "text": "{{header.value" }),
+            json!({ "header": "location", "action": "open-url", "url": "ftp://example.test/x" }),
+            json!({ "header": "location", "action": "open-url", "text": "{{header.value}}" }),
+            json!({ "header": "location", "action": "copy", "url": "https://example.test" }),
+            json!({ "header": "location", "action": "run" }),
+            json!({ "header": "location", "text": "{{header.value}}" }),
+        ] {
+            assert!(
+                validate_manifest(&declarative(data.clone()).manifest).is_err(),
+                "{data}"
+            );
+        }
+        // An action and a hook are mutually exclusive; the empty script proves no worker runs.
+        let both = header_action_plugin(
+            json!([{
+                "id": "action",
+                "kind": "response.header.action",
+                "title": "动作",
+                "hook": "response.header.action",
+                "data": { "header": "location", "action": "copy" }
+            }]),
+            &["response.read"],
+            HEADER_HOOK,
+        );
+        assert!(validate_manifest(&both.manifest).is_err());
+        // Empty text and empty header values are refused instead of copying nothing.
+        let empty = declarative(json!({
+            "header": "location", "action": "copy", "text": "{{header.value}}"
+        }));
+        assert!(
+            run_header_action(
+                &[empty],
+                &HeaderActionSettings::new(),
+                &HeaderEntry {
+                    identity: "com.example.header-actions".into(),
+                    action_id: "action".into(),
+                    title: String::new(),
+                },
+                "location",
+                "",
+                None,
+                &no_variables(),
+            )
+            .unwrap_err()
+            .contains("为空")
+        );
+        assert!(expand_header_template("{{header.value}}", "a", "b", None).is_ok());
+        assert!(expand_header_template("{{unknown}}", "a", "b", None).is_err());
+        assert!(expand_header_template("{{header.value", "a", "b", None).is_err());
+        assert!(validate_header_url_template("").is_ok());
+        assert!(validate_header_url_template(DEFAULT_HEADER_TEMPLATE).is_ok());
+        assert!(
+            validate_header_url_template("https://example.test?q={{header.value}}&t=1").is_ok()
+        );
+        assert!(validate_header_url_template("example.test?q={{header.value}}").is_err());
+        assert!(validate_header_url_template("https://example.test/{{x}}").is_err());
     }
 }
 

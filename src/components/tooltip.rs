@@ -60,6 +60,7 @@ impl Render for TooltipLabel {
             }))
             .text_color(rgb(0xffffff))
             .text_size(px(12.))
+            .max_w(px(320.))
             .shadow_md()
             .child(self.0.clone())
     }

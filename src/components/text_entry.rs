@@ -267,6 +267,15 @@ impl TextEntry {
         cx.notify();
     }
 
+    /// Inserts text at the caret or replaces the selection, like a paste without the clipboard.
+    /// Newlines collapse to spaces because the entry is single-line.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.replace_selection(&text.replace(['\n', '\r'], " "), cx);
+    }
+
     pub fn new(
         cx: &mut Context<Self>,
         placeholder: impl Into<SharedString>,

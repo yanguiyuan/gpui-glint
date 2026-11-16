@@ -200,6 +200,17 @@ fn action_command(action: &Action) -> String {
 }
 
 impl AgentWorkspace {
+    pub(super) fn running_project_action_tasks(&self, cx: &App) -> Vec<(PathBuf, String)> {
+        let mut tasks: Vec<_> = self
+            .project_actions
+            .runs
+            .iter()
+            .filter(|(_, run)| run.terminal.read(cx).busy())
+            .map(|(root, run)| (root.clone(), run.action.name.clone()))
+            .collect();
+        tasks.sort_by(|a, b| a.0.cmp(&b.0));
+        tasks
+    }
     pub(super) fn sync_project_actions(&mut self, cx: &mut Context<Self>) {
         for run in self.project_actions.runs.values() {
             run.terminal

@@ -1,6 +1,9 @@
 use super::*;
 use model::{DefaultSection as Section, DirectoryDefaults};
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "directory_auth_ui.rs"]
+mod auth_profiles_ui;
+use auth_profiles_ui::ProfileInput;
 
 struct ActionEnvironmentSettings {
     fields: Vec<(String, Entity<TextEntry>)>,
@@ -20,6 +23,11 @@ pub(super) struct DirectorySettings {
     authentication: Entity<SelectField>,
     oauth: Option<oauth::Config>,
     oauth_source: Option<oauth::Config>,
+    auth_profiles: Vec<ProfileInput>,
+    inherited_profiles: Vec<model::AuthProfile>,
+    auth_error: Option<String>,
+    auth_presets: Vec<plugins::PresetEntry>,
+    auth_add: Entity<Select>,
     body: Entity<CodeCard>,
     body_format: BodyFormat,
     binary_body: Option<model::BinaryBody>,
@@ -97,6 +105,25 @@ impl DirectorySettings {
             };
         }
         let draft = groups.request_defaults(&path);
+        let auth_profiles = own
+            .auth_profiles
+            .iter()
+            .enumerate()
+            .map(|(index, p)| {
+                let mut profile = ProfileInput::new(p, theme, &completions, cx);
+                profile.expanded = index == 0;
+                profile
+            })
+            .collect();
+        let inherited_profiles: Vec<_> = if path.is_empty() {
+            vec![]
+        } else {
+            groups
+                .auth_profiles(RequestGroups::parent(&path))
+                .into_iter()
+                .map(|(_, p)| p.clone())
+                .collect()
+        };
         let endpoint = cx.new(|cx| {
             let mut field = SelectField::new(
                 [
@@ -122,14 +149,28 @@ impl DirectorySettings {
                 "Token / {{api_token}}",
                 cx,
             );
+            let mut options = vec![
+                SelectOption::new("none", "No Auth"),
+                SelectOption::new("bearer", "Bearer"),
+                SelectOption::new("oauth2", "OAuth 2.0").disabled(draft.oauth.is_none()),
+            ];
+            options.extend(groups.auth_profiles(&path).into_iter().map(|(_, p)| {
+                SelectOption::new(
+                    format!("profile:{}", p.id),
+                    format!("默认使用 · {}", p.name),
+                )
+            }));
+            field.set_options(options, cx);
             field.set_selected(
                 Some(
-                    if draft.oauth.is_some() {
-                        "oauth2"
+                    if let Some(id) = &draft.auth_profile {
+                        format!("profile:{id}")
+                    } else if draft.oauth.is_some() {
+                        "oauth2".into()
                     } else if draft.auth {
-                        "bearer"
+                        "bearer".into()
                     } else {
-                        "none"
+                        "none".into()
                     }
                     .into(),
                 ),
@@ -255,6 +296,24 @@ impl DirectorySettings {
                 );
             }
         }
+        let auth_add = cx.new(|cx| {
+            Select::new(
+                [
+                    SelectOption::new("blank:bearer", "空白 Bearer 方案"),
+                    SelectOption::new("blank:oauth2", "空白 OAuth 2.0 方案"),
+                ],
+                cx,
+            )
+            .placeholder("添加方案…")
+            .searchable(true)
+            .width(220.)
+            .theme(theme)
+        });
+        cx.subscribe(&auth_add, |this, _, event: &SelectEvent, cx| {
+            let SelectEvent::Changed(choice) = event;
+            this.add_auth_profile(choice.as_ref(), cx);
+        })
+        .detach();
         Self {
             collection,
             path: path.clone(),
@@ -272,6 +331,11 @@ impl DirectorySettings {
             authentication,
             oauth: draft.oauth.clone(),
             oauth_source: None,
+            auth_profiles,
+            inherited_profiles,
+            auth_error: None,
+            auth_presets: vec![],
+            auth_add,
             body,
             body_format: draft.body_format,
             binary_body: draft.binary_body.clone(),
@@ -294,6 +358,11 @@ impl DirectorySettings {
         cx: &mut Context<Self>,
     ) {
         self.theme = theme;
+        self.auth_add
+            .update(cx, |select, cx| select.set_theme(theme, cx));
+        for profile in &self.auth_profiles {
+            profile.set_context(theme, &completions, cx);
+        }
         self.completions = completions.clone();
         for settings in self.action_settings.values() {
             for (_, entry) in &settings.fields {
@@ -363,6 +432,14 @@ impl DirectorySettings {
             oauth: (self.authentication.read(cx).value().selected.as_deref() == Some("oauth2"))
                 .then(|| self.oauth.clone())
                 .flatten(),
+            auth_profile: self
+                .authentication
+                .read(cx)
+                .value()
+                .selected
+                .as_deref()
+                .and_then(|s| s.strip_prefix("profile:"))
+                .map(str::to_owned),
             auth: self.authentication.read(cx).value().selected.as_deref() == Some("bearer"),
             token: self.authentication.read(cx).value().text.to_string(),
             params: pairs(&self.rows[&Section::Params]),
@@ -406,11 +483,22 @@ impl DirectorySettings {
             section.apply(&draft, &mut active);
         }
         DirectoryDefaults {
+            auth_profiles: self.auth_profiles.iter().map(|p| p.snapshot(cx)).collect(),
             sections: self.sections.clone(),
             draft: active,
         }
     }
     pub(super) fn save(&mut self, cx: &mut Context<Self>) {
+        let mut names = BTreeSet::new();
+        for profile in &self.auth_profiles {
+            let profile = profile.snapshot(cx);
+            if profile.name.is_empty() || !names.insert(profile.name) {
+                self.auth_error = Some("授权方案名称不能为空或重复".into());
+                cx.notify();
+                return;
+            }
+        }
+        self.auth_error = None;
         cx.emit(SaveDefaults {
             collection: self.collection,
             path: self.path.clone(),
@@ -554,7 +642,15 @@ impl DirectorySettings {
                 }
             ),
             Section::Auth => {
-                if d.auth {
+                if let Some(id) = &d.auth_profile {
+                    self.inherited_profiles
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| format!("默认继承 · {}", p.name))
+                        .unwrap_or_else(|| "授权方案不可用".into())
+                } else if d.oauth.is_some() {
+                    "OAuth 2.0".into()
+                } else if d.auth {
                     "Bearer · 已配置 Token 模板".into()
                 } else {
                     "No Auth".into()
@@ -616,7 +712,11 @@ impl Render for DirectorySettings {
                 .justify_between()
                 .child(format!(
                     "{} · {}",
-                    section.label(),
+                    if section == Section::Auth {
+                        "新请求默认值"
+                    } else {
+                        section.label()
+                    },
                     if overridden {
                         "当前目录覆盖".to_owned()
                     } else {
@@ -646,6 +746,20 @@ impl Render for DirectorySettings {
                         .debug_selector(|| "directory-override".into()),
                 ),
         );
+        if section == Section::Auth {
+            panel = div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(self.auth_profiles_view(cx))
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(rgb(p.border))
+                        .pt_3()
+                        .child(panel),
+                );
+        }
         if !overridden {
             panel = panel.child(
                 div()
@@ -658,15 +772,43 @@ impl Render for DirectorySettings {
         } else {
             panel = panel.child(match section {
                 Section::Endpoint => div().child(self.endpoint.clone()),
-                Section::Auth => div().flex().flex_col().gap_2().child(self.authentication.clone())
-                    .child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("OAuth 配置可从当前请求复制；目录与新建请求共享连接，同一环境复用系统凭据。"))
-                    .when(self.oauth_source.is_some(), |view| view.child(Button::new("使用当前请求的 OAuth 配置").kind(ButtonKind::Plain).theme(self.theme).render().on_click(cx.listener(|this, _, _, cx| {
-                        this.oauth = this.oauth_source.clone();
-                        this.authentication.update(cx, |field, cx| {
-                            field.set_options([SelectOption::new("none", "No Auth"), SelectOption::new("bearer", "Bearer"), SelectOption::new("oauth2", "OAuth 2.0")], cx);
-                            field.set_selected(Some("oauth2".into()), cx); field.set_text("", cx);
-                        }); cx.notify();
-                    })))),
+                Section::Auth => {
+                    self.auth_default_view(cx)
+                        .when(self.oauth_source.is_some(), |view| {
+                            view.child(
+                                Button::new("添加当前请求的 OAuth 为授权方案")
+                                    .kind(ButtonKind::Plain)
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let profile = model::AuthProfile {
+                                            id: model::new_id(),
+                                            name: format!(
+                                                "用户授权 {}",
+                                                this.auth_profiles.len() + 1
+                                            ),
+                                            token: String::new(),
+                                            oauth: this.oauth_source.clone(),
+                                        };
+                                        let id = profile.id.clone();
+                                        this.auth_profiles.push(ProfileInput::new(
+                                            &profile,
+                                            this.theme,
+                                            &this.completions,
+                                            cx,
+                                        ));
+                                        this.sync_auth_options(cx);
+                                        this.authentication.update(cx, |field, cx| {
+                                            field.set_selected(
+                                                Some(format!("profile:{id}").into()),
+                                                cx,
+                                            )
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                }
                 Section::Params | Section::Headers | Section::Cookies | Section::Extractors => {
                     self.pairs_view(section, false, cx)
                 }
@@ -712,7 +854,11 @@ impl Render for DirectorySettings {
                                 },
                                 cx,
                             )
-                            .children(self.binary_file_variable.as_ref().map(|name| format!("已绑定集合文件变量：{name}")))
+                            .children(
+                                self.binary_file_variable
+                                    .as_ref()
+                                    .map(|name| format!("已绑定集合文件变量：{name}")),
+                            )
                             .children(self.binary_body_error.clone())
                         } else {
                             div().h(px(300.)).child(self.body.clone())
@@ -741,70 +887,136 @@ impl Render for DirectorySettings {
                         .child("按列表顺序执行，使用箭头调整顺序。");
                     for (i, (title, binding)) in self.actions.iter().enumerate() {
                         let owner = cx.entity();
-                        let settings = self.action_settings.get(&(binding.id.clone(), binding.action_id.clone()));
+                        let settings = self
+                            .action_settings
+                            .get(&(binding.id.clone(), binding.action_id.clone()));
                         let header = div()
-                                .id(("directory-action", i))
+                            .id(("directory-action", i))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(title.clone()))
+                            .child(
+                                Button::new("↑")
+                                    .kind(ButtonKind::Plain)
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if i > 0 {
+                                            this.actions.swap(i, i - 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("↓")
+                                    .kind(ButtonKind::Plain)
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if i + 1 < this.actions.len() {
+                                            this.actions.swap(i, i + 1);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Switch::new("")
+                                    .checked(binding.enabled)
+                                    .theme(self.theme)
+                                    .on_change(move |checked, _, cx| {
+                                        owner.update(cx, |this, cx| {
+                                            this.actions[i].1.enabled = checked;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .render(),
+                            );
+                        list = list.child(
+                            div()
+                                .id(("directory-action-card", i))
+                                .p_3()
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .rounded_md()
                                 .flex()
-                                .items_center()
+                                .flex_col()
                                 .gap_2()
-                                .child(div().flex_1().min_w_0().truncate().child(title.clone()))
-                                .child(
-                                    Button::new("↑")
-                                        .kind(ButtonKind::Plain)
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if i > 0 {
-                                                this.actions.swap(i, i - 1);
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("↓")
-                                        .kind(ButtonKind::Plain)
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if i + 1 < this.actions.len() {
-                                                this.actions.swap(i, i + 1);
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Switch::new("")
-                                        .checked(binding.enabled)
-                                        .theme(self.theme)
-                                        .on_change(move |checked, _, cx| {
-                                            owner.update(cx, |this, cx| {
-                                                this.actions[i].1.enabled = checked;
-                                                cx.notify();
-                                            });
-                                        })
-                                        .render(),
-                                );
-                        list = list.child(div().id(("directory-action-card", i))
-                            .p_3().border_1().border_color(rgb(p.border)).rounded_md()
-                            .flex().flex_col().gap_2().child(header)
-                            .when_some(settings, |card, settings| card
-                                .child(div().text_size(px(11.)).text_color(rgb(p.text_muted))
-                                    .child(format!("所需环境变量：{}", settings.fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join("、"))))
-                                .child(settings.panel.clone())));
+                                .child(header)
+                                .when_some(settings, |card, settings| {
+                                    card.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(format!(
+                                                "所需环境变量：{}",
+                                                settings
+                                                    .fields
+                                                    .iter()
+                                                    .map(|(name, _)| name.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join("、")
+                                            )),
+                                    )
+                                    .child(settings.panel.clone())
+                                }),
+                        );
                     }
                     list
                 }
             });
         }
-        div().debug_selector(|| "directory-settings".into())
-            .on_key_down(cx.listener(|this,event: &gpui::KeyDownEvent,_,cx| {
-                if event.keystroke.key=="escape" && this.pair_delete.is_some() {this.pair_delete=None;cx.stop_propagation();cx.notify();}
-            })).size_full().flex().flex_col().bg(rgb(p.surface)).p_5().gap_4()
-            .child(div().flex().items_center().gap_3().child(div().flex_1().min_w_0().truncate().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(format!("{} · 目录设置",self.title)))
-                .child(Button::new("保存默认配置").theme(self.theme).render().debug_selector(|| "save-directory-defaults".into()).on_click(cx.listener(|this,_,_,cx| this.save(cx)))))
-            .child(div().text_color(rgb(p.text_muted)).child("保存后，仅在此目录及子目录新建请求时使用。各项独立继承；开启覆盖后，空配置会清除父目录的对应默认值。"))
+        div()
+            .debug_selector(|| "directory-settings".into())
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.pair_delete.is_some() {
+                    this.pair_delete = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.surface))
+            .p_5()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} · 目录设置", self.title)),
+                    )
+                    .child(
+                        Button::new("保存配置")
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "save-directory-defaults".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(rgb(p.text_muted))
+                    .child("授权方案供请求共享使用；其他配置作为当前目录及子目录的新请求默认值。"),
+            )
             .child(tabs)
-            .child(div().id("directory-settings-scroll").flex_1().min_h_0().overflow_y_scroll().child(panel))
+            .child(
+                div()
+                    .id("directory-settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(panel),
+            )
     }
 }
 impl Workbench {
@@ -828,10 +1040,12 @@ impl Workbench {
         let theme = self.theme;
         let completions = self.environment_completions_for(cx, Some(&groups.collection));
         let oauth_source = self.snapshot(cx).oauth;
+        let presets = plugins::oauth_presets(&self.enabled_plugin_catalog());
         let editor = cx.new(|cx| {
             let mut editor =
                 DirectorySettings::new(collection, path, &groups, &catalog, theme, completions, cx);
             editor.oauth_source = oauth_source;
+            editor.set_auth_presets(presets, cx);
             editor
         });
         self.directory_subscription =
@@ -867,6 +1081,7 @@ mod tests {
 
     fn defaults(sections: &[Section], draft: Draft) -> DirectoryDefaults {
         DirectoryDefaults {
+            auth_profiles: vec![],
             sections: sections.iter().copied().collect(),
             draft,
         }

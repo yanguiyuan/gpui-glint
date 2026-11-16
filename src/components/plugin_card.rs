@@ -1,4 +1,4 @@
-use super::{Button, ButtonKind, ButtonSize, CountBadge, CountBadgeKind, Icon};
+use super::{Button, ButtonKind, ButtonSize, Icon, TagBadge, TagBadgeKind};
 use crate::theme::ThemePreset;
 use gpui::{Div, FontWeight, IntoElement, SharedString, div, prelude::*, px, rgb};
 
@@ -55,8 +55,8 @@ pub fn plugin_summary(
                         .gap_2()
                         .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))
                         .children(badges.into_iter().map(|label| {
-                            CountBadge::new(label)
-                                .kind(CountBadgeKind::Muted)
+                            TagBadge::new(label)
+                                .kind(TagBadgeKind::Metadata)
                                 .theme(theme)
                                 .render()
                         })),
@@ -92,6 +92,86 @@ pub fn plugin_card_details(theme: ThemePreset) -> Div {
         .border_color(rgb(theme.palette().border))
         .text_size(px(12.))
         .text_color(rgb(theme.palette().text_muted))
+}
+
+/// One read-only key/value line inside a plugin detail card.
+pub fn plugin_meta_item(
+    label: &'static str,
+    value: impl Into<SharedString>,
+    theme: ThemePreset,
+) -> Div {
+    let palette = theme.palette();
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .w(px(56.))
+                .flex_shrink_0()
+                .text_color(rgb(palette.text_muted))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(rgb(palette.text))
+                .child(value.into()),
+        )
+}
+
+/// Editable settings block, separated from the read-only metadata above it.
+pub fn plugin_settings_section(theme: ThemePreset) -> Div {
+    let palette = theme.palette();
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .mt_1()
+        .pt_3()
+        .border_t_1()
+        .border_color(rgb(palette.border))
+}
+
+/// Caption above one settings group.
+pub fn plugin_section_title(
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    theme: ThemePreset,
+) -> Div {
+    let palette = theme.palette();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(palette.text))
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(palette.text_muted))
+                .child(hint.into()),
+        )
+}
+
+/// Bordered card holding one editable setting together with its own explanation.
+pub fn plugin_setting_card(theme: ThemePreset) -> Div {
+    let palette = theme.palette();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.surface))
 }
 
 pub fn plugin_details_back(theme: ThemePreset) -> gpui::Stateful<Div> {

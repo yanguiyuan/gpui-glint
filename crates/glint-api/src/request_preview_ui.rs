@@ -30,11 +30,19 @@ impl Workbench {
         }
         let request = self.workspace.requests.get(index)?;
         let active = index == self.active;
-        let draft = if active {
+        let mut draft = if active {
             self.snapshot(cx)
         } else {
             request.draft.clone()
         };
+        if let Some(groups) = self
+            .workspace
+            .collections
+            .iter()
+            .find(|g| g.collection == request.collection)
+        {
+            let _ = groups.resolve_auth(&request.group, &mut draft);
+        }
         let events = (draft.method == "WS").then(|| {
             let log = if active {
                 Some(&self.ws_log)

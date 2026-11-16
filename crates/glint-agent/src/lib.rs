@@ -1,4 +1,5 @@
 mod ask_question;
+mod background_tasks_ui;
 mod history_rows;
 pub mod host_tools;
 mod hosting;
@@ -18,6 +19,7 @@ mod code_mode;
 mod command_output;
 mod command_runner;
 mod executable;
+mod panel_repositories;
 mod vault_environment;
 pub use code_mode::worker_main as run_code_mode_worker;
 mod commands;
@@ -135,8 +137,12 @@ pub struct AgentWorkspace {
     commands: commands::State,
     right_sidebar_width: f32,
     right_sidebar_resize: Option<(gpui::Pixels, f32)>,
+    panel_repositories: panel_repositories::State,
     file_preview: file_preview::State,
     terminal_ui: terminal_ui::State,
+    show_background_tasks: bool,
+    host_background_tasks: bool,
+    background_tasks_refresh: Option<Task<()>>,
     project_actions: project_actions::State,
     ssh_ui: ssh_ui::State,
     channels: channels::ui::State,
@@ -664,8 +670,12 @@ impl AgentWorkspace {
             commands: commands::State::new(cx),
             right_sidebar_width: 480.,
             right_sidebar_resize: None,
+            panel_repositories: Default::default(),
             file_preview: file_preview::State::new(cx),
             terminal_ui: terminal_ui::State::new(history.terminal_default_position),
+            show_background_tasks: false,
+            host_background_tasks: false,
+            background_tasks_refresh: None,
             project_actions: project_actions::State::new(&path, cx),
             ssh_ui: ssh_ui::State::new(cx),
             channels: channels::ui::State::new(&path, cx),
@@ -774,6 +784,7 @@ impl AgentWorkspace {
             },
         ));
         workspace.start_storage(cx);
+        workspace.start_background_tasks_refresh(cx);
         workspace.refresh_project_metadata(workspace.history.projects.clone(), cx);
         workspace.restore_code_font(cx);
         workspace.restore_draft(cx);
@@ -1775,6 +1786,9 @@ impl AgentWorkspace {
                     && self.page != crate::Page::Channels,
                 |bar| bar.child(self.project_action_trigger(cx)),
             )
+            .when(!self.host_background_tasks, |bar| {
+                bar.child(self.background_tasks_menu(cx))
+            })
     }
 
     fn rail(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2748,6 +2762,7 @@ impl AgentWorkspace {
 
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_panel_repositories(window, cx);
         self.sync_terminal_theme(cx);
         self.sync_workspace_watch(cx);
         self.sync_project_actions(cx);

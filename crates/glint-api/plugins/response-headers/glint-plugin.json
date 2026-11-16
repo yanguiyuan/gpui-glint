@@ -1,0 +1,31 @@
+{
+  "id": "com.glint.response-headers",
+  "name": "响应头动作",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "main.js",
+  "capabilities": ["response.read"],
+  "hooks": [],
+  "contributions": [
+    {
+      "id": "copy-value",
+      "kind": "response.header.action",
+      "title": "复制响应头值",
+      "data": {
+        "header": "*",
+        "action": "copy",
+        "text": "{{header.value}}"
+      }
+    },
+    {
+      "id": "open-url",
+      "kind": "response.header.action",
+      "title": "在浏览器打开",
+      "data": {
+        "header": "*",
+        "action": "open-url",
+        "url": "{{header.value}}"
+      }
+    }
+  ]
+}

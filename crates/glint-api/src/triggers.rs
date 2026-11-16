@@ -2,7 +2,7 @@
 use super::{
     environment::{EnvironmentValues, EnvironmentVariables, ProxySettings},
     http,
-    model::{Draft, Request, TriggerAction, TriggerCondition},
+    model::{Draft, Request, RequestGroups, TriggerAction, TriggerCondition},
     plugins, post_actions,
 };
 
@@ -23,6 +23,7 @@ pub fn needs_refresh(
 }
 
 pub struct TriggerContext {
+    pub collections: Vec<RequestGroups>,
     pub requests: Vec<Request>,
     pub collection: String,
     pub global: EnvironmentVariables,
@@ -63,12 +64,19 @@ impl TriggerContext {
         Box::pin(async move {
             match action {
                 TriggerAction::RunRequest { request_id } => {
-                    let target = self
+                    let mut target = self
                         .requests
                         .iter()
                         .find(|r| r.id == *request_id && r.collection == self.collection)
                         .cloned()
                         .ok_or_else(|| "触发器的目标请求不存在或不属于当前集合".to_owned())?;
+                    if target.draft.auth_profile.is_some() {
+                        self.collections
+                            .iter()
+                            .find(|g| g.collection == target.collection)
+                            .ok_or("刷新请求的授权所属集合不存在")?
+                            .resolve_auth(&target.group, &mut target.draft)?;
+                    }
                     if stack.contains(&target.id) {
                         return Err("触发器请求存在循环依赖".to_owned());
                     }
@@ -169,6 +177,7 @@ mod tests {
     }
     fn context() -> TriggerContext {
         TriggerContext {
+            collections: vec![],
             requests: vec![],
             collection: "API".into(),
             global: Default::default(),

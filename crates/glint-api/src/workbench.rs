@@ -87,6 +87,9 @@ pub struct Workbench {
     pub(super) config: usize,
     pub(super) plugin_catalog: Vec<gpui_glint::plugins::Plugin>,
     pub(super) plugin_environment_settings: super::plugin_ui::EnvironmentSettingsCache,
+    /// Header action overrides keyed by `identity::action`, plus their cached detail-page editors.
+    pub(super) plugin_action_settings: plugins::HeaderActionSettings,
+    pub(super) plugin_setting_entries: super::plugin_ui::PluginSettingCache,
     pub(super) disabled_plugins: HashSet<String>,
     pub(super) approved_agent_plugins: HashSet<String>,
     pub(super) plugin_errors: Vec<String>,
@@ -189,6 +192,10 @@ pub struct Workbench {
     pub(super) json_pick: Option<usize>,
     pub(super) json_hover: Option<usize>,
     pub(super) json_menu: Option<(json_picker::JsonNode, gpui::Point<gpui::Pixels>)>,
+    /// Response header context menu: the header row index and the right-click position.
+    pub(super) response_header_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    /// One plugin header action at a time; dropping the task cancels its worker.
+    pub(super) response_header_task: Option<gpui::Task<()>>,
     pub(super) response_data: Option<HttpResponse>,
     pub(super) status: Option<u16>,
     pub(super) pretty: bool,
@@ -226,6 +233,7 @@ pub struct Workbench {
         std::collections::HashMap<String, background_tasks_ui::WsSessionState>,
     pub(super) ws_background_update: bool,
     pub(super) show_background_tasks: bool,
+    pub(super) host_background_tasks: bool,
     pub(super) ws_environment: Option<environment::EnvironmentValues>,
     pub(super) ws_sequence: u64,
     pub(super) ws_history: Option<(String, String, Instant)>,
@@ -425,6 +433,22 @@ impl Workbench {
             }));
         }
         subscriptions.push(cx.observe(&authentication, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&oauth.secret, |this: &mut Self, _, cx| {
+            this.oauth_secret_changed(cx);
+            cx.notify();
+        }));
+        subscriptions.push(cx.subscribe(
+            &oauth.inheritance,
+            |this: &mut Self, _, event: &SelectEvent, cx| {
+                let SelectEvent::Changed(value) = event;
+                this.authentication
+                    .update(cx, |f, cx| f.set_selected(Some(value.clone()), cx));
+                this.sync_inherited_auth(cx);
+                this.refresh_auth_profiles(cx);
+                this.schedule_persist(cx);
+                cx.notify();
+            },
+        ));
         subscriptions.push(cx.subscribe(
             &authentication,
             |this: &mut Self, field, event: &SelectFieldEvent, cx| {
@@ -433,6 +457,7 @@ impl Workbench {
                 let SelectFieldEvent::Changed(value) = event;
                 let disabled = value.selected.as_deref() != Some("bearer");
                 field.update(cx, |field, cx| field.set_input_disabled(disabled, cx));
+                this.sync_inherited_auth(cx);
                 cx.notify();
             },
         ));
@@ -666,6 +691,7 @@ impl Workbench {
             .collect();
         let sent_requests = data.previews;
         let (plugin_catalog, plugin_errors) = plugins::catalog();
+        let plugin_action_settings = storage.plugin_settings().expect("无法读取插件动作配置");
         let disabled_plugins = storage.disabled_plugins().expect("无法读取插件启用状态");
         let approved_agent_plugins = storage
             .approved_agent_plugins()
@@ -823,6 +849,8 @@ impl Workbench {
             config: 0,
             plugin_catalog,
             plugin_environment_settings: Default::default(),
+            plugin_action_settings,
+            plugin_setting_entries: Default::default(),
             disabled_plugins,
             approved_agent_plugins,
             plugin_errors,
@@ -921,6 +949,8 @@ impl Workbench {
             json_pick: None,
             json_hover: None,
             json_menu: None,
+            response_header_menu: None,
+            response_header_task: None,
             response_data: None,
             status: None,
             pretty: true,
@@ -956,6 +986,7 @@ impl Workbench {
             ws_background: Default::default(),
             ws_background_update: false,
             show_background_tasks: false,
+            host_background_tasks: false,
             ws_environment: None,
             ws_sequence: 0,
             ws_history: None,

@@ -47,6 +47,7 @@ struct FolderNode {
 }
 
 pub struct FilePreview {
+    header_accessory: Option<gpui::AnyView>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     html: Option<String>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -92,6 +93,7 @@ impl FilePreview {
             html: None,
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             browser: None,
+            header_accessory: None,
             expanded: false,
             navigation: None,
             navigation_scroll: Default::default(),
@@ -135,6 +137,20 @@ impl FilePreview {
         self.markdown.is_some()
     }
     /// Synchronize the host layout with the preview's expand/collapse button.
+    /// Optional host control shown alongside the path in the fixed header.
+    pub fn set_header_accessory(
+        &mut self,
+        accessory: Option<gpui::AnyView>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.header_accessory.as_ref().map(|view| view.entity_id())
+            != accessory.as_ref().map(|view| view.entity_id())
+        {
+            self.header_accessory = accessory;
+            cx.notify();
+        }
+    }
+
     pub fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
         if self.expanded != expanded {
             self.expanded = expanded;
@@ -741,6 +757,7 @@ impl Render for FilePreview {
                             .text_size(px(12.))
                             .child(display_path(&self.path)),
                     )
+                    .children(self.header_accessory.clone())
                     .when(
                         self.expanded
                             && !self.markdown_preview

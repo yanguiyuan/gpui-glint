@@ -1,4 +1,6 @@
+mod background_tasks;
 mod badge;
+pub use background_tasks::{BackgroundTask, BackgroundTasksMenu};
 mod button;
 mod calendar;
 mod closable_tabs;
@@ -60,7 +62,8 @@ pub use inputs::{
 pub use layout::{AppLayout, ShellRenderer, WorkspaceSlots, window_drag_region};
 pub use mermaid::{MermaidDiagram, MermaidEvent, MermaidSvg, render_mermaid};
 pub use plugin_card::{
-    plugin_card_details, plugin_details_back, plugin_group, plugin_row, plugin_summary,
+    plugin_card_details, plugin_details_back, plugin_group, plugin_meta_item, plugin_row,
+    plugin_section_title, plugin_setting_card, plugin_settings_section, plugin_summary,
 };
 pub use popover::Popover;
 pub use select::{Select, SelectEvent, SelectOption};

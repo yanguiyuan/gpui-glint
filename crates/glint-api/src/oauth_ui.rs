@@ -2,6 +2,8 @@ use super::*;
 use std::sync::{Arc, atomic::Ordering};
 
 pub(super) struct Inputs {
+    pub inheritance: Entity<Select>,
+    pub inherited_mode: usize,
     pub config: oauth::Config,
     pub fields: [Entity<TextEntry>; 5],
     pub secret: Entity<TextEntry>,
@@ -20,6 +22,8 @@ pub(super) struct Inputs {
 impl Inputs {
     pub fn new(cx: &mut Context<Workbench>) -> Self {
         Self {
+            inheritance: cx.new(|cx| Select::new([], cx).placeholder("选择目录授权方案")),
+            inherited_mode: 2,
             config: oauth::Config::default(),
             fields: std::array::from_fn(|index| {
                 Workbench::entry(
@@ -34,7 +38,7 @@ impl Inputs {
                     cx,
                 )
             }),
-            secret: Workbench::entry("", "留空使用已保存的密钥", cx),
+            secret: Workbench::entry("", "Client Secret 或 {{client_secret}}", cx),
             callback: Workbench::entry("", "粘贴含 code 与 state 的完整回调地址", cx),
             ready: None,
             message: "尚未授权".into(),
@@ -55,6 +59,7 @@ impl Inputs {
         config.client_id = self.fields[2].read(cx).value().trim().into();
         config.redirect_uri = self.fields[3].read(cx).value().trim().into();
         config.scope = self.fields[4].read(cx).value().trim().into();
+        config.client_secret = self.secret.read(cx).value().into();
         config
     }
     pub fn is_busy(&self) -> bool {
@@ -79,12 +84,14 @@ impl Inputs {
         ]) {
             field.update(cx, |entry, cx| entry.set_value(value.clone(), cx));
         }
+        let secret = config.client_secret.clone();
         self.config = config;
         self.show_advanced = false;
         self.show_presets = false;
         self.form_scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.ready = None;
-        self.secret.update(cx, |entry, cx| entry.set_value("", cx));
+        self.secret
+            .update(cx, |entry, cx| entry.set_value(secret, cx));
         self.callback
             .update(cx, |entry, cx| entry.set_value("", cx));
         self.message = "发送时自动读取系统凭据；未授权时请先授权".into();
@@ -97,7 +104,299 @@ impl Drop for Inputs {
     }
 }
 
+#[cfg(test)]
+mod auth_profile_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn auth_profile_switches_modes_and_persists_secret_in_sqlite(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.sqlite3");
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(storage::Store::open(&path).unwrap(), cx);
+            let mut groups = RequestGroups::create_collection("API", &[]).unwrap();
+            groups.defaults.insert(
+                String::new(),
+                model::DirectoryDefaults {
+                    auth_profiles: vec![
+                        model::AuthProfile {
+                            id: "application".into(),
+                            name: "应用授权".into(),
+                            token: "{{app_token}}".into(),
+                            oauth: None,
+                        },
+                        model::AuthProfile {
+                            id: "user".into(),
+                            name: "用户授权".into(),
+                            token: String::new(),
+                            oauth: Some(oauth::Config {
+                                client_id: "app".into(),
+                                client_secret: "stored-secret".into(),
+                                ..Default::default()
+                            }),
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            host.workspace.collections.push(groups);
+            host.add_request(cx);
+            host.config = 1;
+            host.change_auth_mode(1, false, cx);
+            host
+        });
+        assert!(window.debug_bounds("bearer-token-input").is_some());
+        let switch = window.debug_bounds("auth-inherit-switch").unwrap();
+        window.simulate_click(switch.center(), gpui::Modifiers::default());
+        host.update(window, |host, cx| {
+            let mut draft = host.snapshot(cx);
+            assert_eq!(draft.auth_profile.as_deref(), Some("application"));
+            host.resolve_request_auth(&mut draft).unwrap();
+            assert_eq!(draft.token, "{{app_token}}");
+            host.change_auth_mode(2, true, cx);
+            assert_eq!(host.snapshot(cx).auth_profile.as_deref(), Some("user"));
+            assert_eq!(host.oauth.secret.read(cx).value(), "stored-secret");
+            host.oauth
+                .secret
+                .update(cx, |entry, cx| entry.set_value("edited-secret", cx));
+        });
+        window.run_until_parked();
+        host.update(window, |host, cx| {
+            host.persist(cx);
+        });
+        let mut store = storage::Store::open(&path).unwrap();
+        let workspace = store.load().unwrap();
+        assert_eq!(
+            workspace.collections[0].defaults[""].auth_profiles[1]
+                .oauth
+                .as_ref()
+                .unwrap()
+                .client_secret,
+            "edited-secret"
+        );
+        host.update(window, |host, cx| {
+            let draft = host.snapshot(cx);
+            host.load(&draft, cx);
+            assert_eq!(host.oauth.secret.read(cx).value(), "edited-secret");
+            host.change_auth_mode(0, false, cx);
+            assert!(host.snapshot(cx).auth_profile.is_none());
+            assert!(!host.snapshot(cx).auth);
+        });
+        assert!(window.debug_bounds("bearer-token-input").is_none());
+        assert!(window.debug_bounds("auth-inherit-switch").is_some());
+    }
+}
+
 impl Workbench {
+    pub(super) fn oauth_secret_changed(&mut self, cx: &mut Context<Self>) {
+        let secret = self.oauth.secret.read(cx).value().to_owned();
+        if let Some(id) = self.snapshot(cx).auth_profile {
+            if let Some(request) = self.workspace.requests.get(self.active) {
+                if let Some(groups) = self
+                    .workspace
+                    .collections
+                    .iter_mut()
+                    .find(|g| g.collection == request.collection)
+                {
+                    let path = groups
+                        .auth_profiles(&request.group)
+                        .into_iter()
+                        .find(|(_, p)| p.id == id)
+                        .map(|(path, _)| path.to_owned());
+                    if let Some(path) = path {
+                        if let Some(config) = groups
+                            .defaults
+                            .get_mut(&path)
+                            .and_then(|d| d.auth_profiles.iter_mut().find(|p| p.id == id))
+                            .and_then(|p| p.oauth.as_mut())
+                        {
+                            if config.client_secret != secret {
+                                config.client_secret = secret;
+                                self.workspace.storage_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.schedule_persist(cx);
+    }
+    pub(super) fn refresh_auth_profiles(&mut self, cx: &mut Context<Self>) {
+        let selected = self.authentication.read(cx).value().selected.clone();
+        let options = self.request_auth_options();
+        self.authentication
+            .update(cx, |field, cx| field.set_options(options, cx));
+        let mode = self.oauth.inherited_mode;
+        let mut options = Vec::new();
+        if let Some(request) = self.workspace.requests.get(self.active) {
+            if let Some(groups) = self
+                .workspace
+                .collections
+                .iter()
+                .find(|g| g.collection == request.collection)
+            {
+                options.extend(
+                    groups
+                        .auth_profiles(&request.group)
+                        .into_iter()
+                        .filter(|(_, p)| {
+                            if mode == 2 {
+                                p.oauth.is_some()
+                            } else if mode == 1 {
+                                p.oauth.is_none()
+                            } else {
+                                false
+                            }
+                        })
+                        .map(|(path, p)| {
+                            SelectOption::new(
+                                format!("profile:{}", p.id),
+                                format!(
+                                    "{} / {}",
+                                    if path.is_empty() {
+                                        &groups.collection
+                                    } else {
+                                        path
+                                    },
+                                    p.name
+                                ),
+                            )
+                        }),
+                );
+            }
+        }
+        self.oauth.inheritance.update(cx, |field, cx| {
+            field.set_options(options, cx);
+            field.set_selected(selected.filter(|v| v.starts_with("profile:")), cx);
+        });
+    }
+    fn change_auth_mode(&mut self, mode: usize, inherit: bool, cx: &mut Context<Self>) {
+        let mode = if inherit && mode == 0 {
+            self.workspace
+                .requests
+                .get(self.active)
+                .and_then(|r| {
+                    let groups = self
+                        .workspace
+                        .collections
+                        .iter()
+                        .find(|g| g.collection == r.collection)?;
+                    let profiles = groups.auth_profiles(&r.group);
+                    let default = groups.request_defaults(&r.group).auth_profile;
+                    let profile = profiles
+                        .iter()
+                        .find(|(_, p)| Some(&p.id) == default.as_ref())
+                        .or_else(|| profiles.first())?
+                        .1;
+                    Some(if profile.oauth.is_some() { 2 } else { 1 })
+                })
+                .unwrap_or(2)
+        } else {
+            mode
+        };
+        self.oauth.cancel();
+        self.oauth.ready = None;
+        self.oauth.error = None;
+        self.oauth.inherited_mode = mode;
+        let mut selected = ["none", "bearer", "oauth2"][mode].to_owned();
+        if inherit {
+            selected = "profile:".into();
+            if let Some(r) = self.workspace.requests.get(self.active) {
+                if let Some(g) = self
+                    .workspace
+                    .collections
+                    .iter()
+                    .find(|g| g.collection == r.collection)
+                {
+                    if let Some((_, p)) = g.auth_profiles(&r.group).into_iter().find(|(_, p)| {
+                        mode == 2 && p.oauth.is_some() || mode == 1 && p.oauth.is_none()
+                    }) {
+                        selected = format!("profile:{}", p.id);
+                    }
+                }
+            }
+        }
+        self.authentication.update(cx, |f, cx| {
+            f.set_selected(Some(selected.into()), cx);
+            f.set_input_disabled(inherit || mode != 1, cx);
+        });
+        self.sync_inherited_auth(cx);
+        self.refresh_auth_profiles(cx);
+        self.schedule_persist(cx);
+        cx.notify();
+    }
+    pub(super) fn auth_is_oauth(&self, cx: &App) -> bool {
+        let selected = self.authentication.read(cx).value().selected.as_deref();
+        selected == Some("oauth2")
+            || selected.is_some_and(|s| s.starts_with("profile:")) && self.oauth.inherited_mode == 2
+    }
+    pub(super) fn request_auth_options(&self) -> Vec<SelectOption> {
+        let mut options = vec![
+            SelectOption::new("none", "No Auth"),
+            SelectOption::new("bearer", "Bearer（独立配置）"),
+            SelectOption::new("oauth2", "OAuth 2.0（独立配置）"),
+        ];
+        if let Some(request) = self.workspace.requests.get(self.active) {
+            if let Some(groups) = self
+                .workspace
+                .collections
+                .iter()
+                .find(|g| g.collection == request.collection)
+            {
+                options.extend(groups.auth_profiles(&request.group).into_iter().map(
+                    |(path, profile)| {
+                        SelectOption::new(
+                            format!("profile:{}", profile.id),
+                            format!(
+                                "继承 · {} / {}",
+                                if path.is_empty() {
+                                    &groups.collection
+                                } else {
+                                    path
+                                },
+                                profile.name
+                            ),
+                        )
+                    },
+                ));
+            }
+        }
+        options
+    }
+    pub(super) fn resolve_request_auth(&self, draft: &mut Draft) -> Result<(), String> {
+        if draft.auth_profile.is_none() {
+            return Ok(());
+        }
+        let request = self
+            .workspace
+            .requests
+            .get(self.active)
+            .ok_or("请求不存在")?;
+        self.workspace
+            .collections
+            .iter()
+            .find(|g| g.collection == request.collection)
+            .ok_or("授权所属集合不存在")?
+            .resolve_auth(&request.group, draft)
+    }
+    pub(super) fn sync_inherited_auth(&mut self, cx: &mut Context<Self>) {
+        let mut draft = self.snapshot(cx);
+        if draft.auth_profile.is_some() {
+            match self.resolve_request_auth(&mut draft) {
+                Ok(()) => {
+                    self.oauth.inherited_mode = if draft.oauth.is_some() { 2 } else { 1 };
+                    let config = draft.oauth.unwrap_or_default();
+                    if self.oauth.snapshot(cx) != config {
+                        self.oauth.load(config, cx);
+                    }
+                }
+                Err(error) => {
+                    self.oauth.load(oauth::Config::default(), cx);
+                    self.oauth.error = Some(error);
+                }
+            }
+        }
+    }
     fn oauth_resolve(&self, config: &oauth::Config, cx: &App) -> Result<oauth::Config, String> {
         let values = self.active_environment_values(cx);
         config.resolve(&template::TemplateResolver::new(&values))
@@ -118,7 +417,14 @@ impl Workbench {
     }
     pub(super) fn oauth_before_send(&mut self, cx: &mut Context<Self>) -> bool {
         let draft = self.snapshot(cx);
-        let Some(config) = draft.oauth.clone() else {
+        let mut resolved = draft.clone();
+        if let Err(error) = self.resolve_request_auth(&mut resolved) {
+            self.error = Some(error.clone());
+            self.oauth.error = Some(error);
+            cx.notify();
+            return true;
+        }
+        let Some(config) = resolved.oauth.clone() else {
             return false;
         };
         let config = match self.oauth_resolve(&config, cx) {
@@ -212,6 +518,12 @@ impl Workbench {
         if self.sending.is_some() || self.oauth.task.is_some() || self.oauth.pending.is_some() {
             return;
         }
+        let mut draft = self.snapshot(cx);
+        if let Err(error) = self.resolve_request_auth(&mut draft) {
+            self.oauth.error = Some(error);
+            cx.notify();
+            return;
+        }
         let config = match self.oauth_resolve(&self.oauth.snapshot(cx), cx) {
             Ok(config) => config,
             Err(error) => {
@@ -247,9 +559,6 @@ impl Workbench {
         cx.open_url(&session.url);
         if !config.manual_callback {
             let key = self.oauth_key(&config, cx);
-            self.oauth
-                .secret
-                .update(cx, |entry, cx| entry.set_value("", cx));
             let proxy = self.effective_proxy(self.selected_environment(cx));
             let generation = self.oauth.generation;
             self.oauth.task = Some(cx.spawn(async move |this, cx| {
@@ -302,9 +611,6 @@ impl Workbench {
             }
         };
         let key = self.oauth_key(&session.config, cx);
-        self.oauth
-            .secret
-            .update(cx, |entry, cx| entry.set_value("", cx));
         self.oauth
             .callback
             .update(cx, |entry, cx| entry.set_value("", cx));
@@ -529,23 +835,19 @@ impl Workbench {
     }
     pub(super) fn authentication_configuration(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        if self.authentication.read(cx).value().selected.as_deref() != Some("oauth2") {
-            return div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(div().text_size(px(11.)).child("验证方式 / Token"))
-                .child(self.authentication.clone())
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgb(p.text_muted))
-                        .child(
-                            "Bearer 支持 Token 或 {{api_token}}；No Auth 不生成 Authorization。",
-                        ),
-                );
-        }
+        let selected = self.authentication.read(cx).value().selected.as_deref();
+        let inherited = selected.is_some_and(|s| s.starts_with("profile:"));
+        let mode = if inherited {
+            self.oauth.inherited_mode
+        } else {
+            match selected {
+                Some("oauth2") => 2,
+                Some("bearer") => 1,
+                _ => 0,
+            }
+        };
         let owner = cx.entity().downgrade();
+        let switch_owner = owner.clone();
         let header = div()
             .flex()
             .items_center()
@@ -553,31 +855,95 @@ impl Workbench {
             .gap_3()
             .flex_shrink_0()
             .child(
-                SegmentedControl::new([
-                    SegmentOption::new("No Auth"),
-                    SegmentOption::new("Bearer"),
-                    SegmentOption::new("OAuth 2.0"),
-                ])
-                .id("oauth-auth-mode")
-                .selected(2)
-                .theme(self.theme)
-                .on_change(move |index, _, cx| {
-                    let _ = owner.update(cx, |this, cx| {
-                        this.oauth.cancel();
-                        this.oauth.ready = None;
-                        this.authentication.update(cx, |field, cx| {
-                            field
-                                .set_selected(Some(["none", "bearer", "oauth2"][index].into()), cx);
-                            field.set_input_disabled(index != 1, cx);
-                        });
-                        cx.notify();
-                    });
-                })
-                .render(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        SegmentedControl::new([
+                            SegmentOption::new("No Auth"),
+                            SegmentOption::new("Bearer"),
+                            SegmentOption::new("OAuth 2.0"),
+                        ])
+                        .id("oauth-auth-mode")
+                        .selected(mode)
+                        .theme(self.theme)
+                        .on_change(move |index, _, cx| {
+                            let _ = owner.update(cx, |this, cx| {
+                                this.change_auth_mode(index, inherited && index != 0, cx)
+                            });
+                        })
+                        .render(),
+                    )
+                    .child(
+                        Switch::new("继承")
+                            .checked(inherited)
+                            .theme(self.theme)
+                            .on_change(move |value, _, cx| {
+                                let _ = switch_owner
+                                    .update(cx, |this, cx| this.change_auth_mode(mode, value, cx));
+                            })
+                            .render()
+                            .debug_selector(|| "auth-inherit-switch".into()),
+                    ),
             )
-            .when_some(self.oauth_preset_menu(cx), |header, menu| {
-                header.child(menu)
+            .when(mode == 2 && !inherited, |header| {
+                header.when_some(self.oauth_preset_menu(cx), |header, menu| {
+                    header.child(menu)
+                })
             });
+        let inherited_picker = || {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_size(px(11.)).child("目录授权方案"))
+                .child(self.oauth.inheritance.clone())
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child(
+                            "配置跟随目录更新；同一环境复用授权。切换类型可选择对应的授权方案。",
+                        ),
+                )
+        };
+        if mode != 2 {
+            let mut view = div().flex().flex_col().gap_3().child(header);
+            if inherited {
+                view = view
+                    .child(inherited_picker())
+                    .children(self.oauth.error.clone());
+            } else if mode == 1 {
+                view = view
+                    .child(div().text_size(px(11.)).child("Token"))
+                    .child(
+                        div()
+                            .id("bearer-token-input")
+                            .debug_selector(|| "bearer-token-input".into())
+                            .h(px(32.))
+                            .px_3()
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .rounded_md()
+                            .child(self.authentication.read(cx).text_input()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child("支持直接输入 Token 或使用 {{access_token}} 等环境变量。"),
+                    );
+            } else {
+                view = view.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child("此请求不自动生成 Authorization 请求头。"),
+                );
+            }
+            return view;
+        }
         let mut form = div()
             .id("oauth-form-scroll")
             .track_scroll(&self.oauth.form_scroll)
@@ -760,7 +1126,9 @@ impl Workbench {
                     div()
                         .text_size(px(10.))
                         .text_color(rgb(p.text_muted))
-                        .child("回调地址需在服务商后台登记。Secret 留空时沿用已保存的密钥。"),
+                        .child(
+                            "回调地址需在服务商后台登记。Secret 随授权配置保存，打开时直接回填。",
+                        ),
                 )
                 .child(
                     div().flex().justify_start().child(
@@ -773,6 +1141,28 @@ impl Workbench {
                     ),
                 );
             form = form.child(advanced);
+        }
+        if inherited {
+            let config = self.oauth.snapshot(cx);
+            form = div()
+                .id("oauth-inherited-form")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(inherited_picker())
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.text_muted))
+                        .child(format!(
+                            "Client ID：{} · Scope：{}",
+                            config.client_id, config.scope
+                        )),
+                )
+                .child(div().text_size(px(11.)).child("Client Secret（选填）"))
+                .child(self.oauth_input(&self.oauth.secret, "oauth-client-secret"));
         }
         let pending = self.oauth.pending.is_some();
         let busy = self.oauth.task.is_some() || self.sending.is_some();
@@ -872,7 +1262,6 @@ impl Workbench {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.oauth.cancel();
                             this.oauth.message = "已取消授权".into();
-                            this.oauth.secret.update(cx, |e, cx| e.set_value("", cx));
                             this.oauth.callback.update(cx, |e, cx| e.set_value("", cx));
                             cx.notify();
                         })),
@@ -1038,12 +1427,12 @@ mod tests {
                 .unwrap();
             assert!(saved.contains("{{wps_app_id}}"));
             assert!(!saved.contains("runtime-access"));
-            assert!(!saved.contains("{{missing_secret}}"));
+            assert!(saved.contains("{{missing_secret}}"));
         });
     }
 
     #[gpui::test]
-    fn oauth_native_configuration_persists_without_secret_and_preserves_legacy_auth(
+    fn oauth_native_configuration_persists_secret_and_preserves_legacy_auth(
         cx: &mut gpui::TestAppContext,
     ) {
         let directory = tempfile::tempdir().unwrap();
@@ -1078,7 +1467,7 @@ mod tests {
                 .query_row("SELECT data FROM workspace", [], |row| row.get(0))
                 .unwrap();
             assert!(saved.contains("test-app-id"));
-            assert!(!saved.contains("transient-private-secret"));
+            assert!(saved.contains("transient-private-secret"));
             host.open_directory_settings(0, String::new(), cx);
             assert!(host.directory_settings.is_some());
             host.directory_settings = None;

@@ -36,7 +36,12 @@ impl Workbench {
             return;
         }
         self.workspace.sent_curls[self.active] = None;
-        let draft = self.snapshot(cx);
+        let mut draft = self.snapshot(cx);
+        if let Err(error) = self.resolve_request_auth(&mut draft) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
         let extraction_collection = self
             .workspace
             .collections
@@ -54,6 +59,7 @@ impl Workbench {
         );
         self.cancel_json_pick(cx);
         self.json_menu = None;
+        self.response_header_menu = None;
         self.json_nodes.clear();
         self.response_json = None;
         self.response_data = None;
@@ -83,6 +89,7 @@ impl Workbench {
                 })
                 .collect();
             Some(triggers::TriggerContext {
+                collections: self.workspace.collections.clone(),
                 requests,
                 collection,
                 local,

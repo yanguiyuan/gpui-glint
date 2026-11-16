@@ -680,7 +680,12 @@ impl Workbench {
             editor.update(cx, |editor, cx| editor.connect_websocket(cx));
             return;
         }
-        let draft = self.snapshot(cx);
+        let mut draft = self.snapshot(cx);
+        if let Err(error) = self.resolve_request_auth(&mut draft) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
         self.ws_begin_history(&draft, cx);
         let environment_index = self.selected_environment(cx);
         let proxy = self.effective_proxy(environment_index);

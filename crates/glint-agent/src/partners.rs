@@ -220,9 +220,17 @@ impl Repository {
     }
 
     pub fn entries(&self, partner: Uuid, project: Option<&Path>) -> Result<Vec<Entry>, String> {
+        self.entries_with_scope(partner, project, false)
+    }
+    fn entries_with_scope(
+        &self,
+        partner: Uuid,
+        project: Option<&Path>,
+        cross_project: bool,
+    ) -> Result<Vec<Entry>, String> {
         let db = database::open(&self.anchor)?;
-        let mut stmt=db.prepare("SELECT m.id,m.kind,m.title,m.summary,m.content,m.project,m.strength,m.touched_at,m.pinned,e.session_id,e.ordinal,e.created_at,EXISTS(SELECT 1 FROM partner_group_memories g WHERE g.memory_id=m.id) FROM partner_memories m LEFT JOIN partner_events e ON e.id=m.event_id WHERE m.partner_id=?1 AND (m.project IS NULL OR m.project=?2) ORDER BY m.touched_at DESC,m.id").map_err(err)?;
-        stmt.query_map(params![partner.to_string(),project.map(|p|p.to_string_lossy().into_owned())], |r| {
+        let mut stmt=db.prepare("SELECT m.id,m.kind,m.title,m.summary,m.content,m.project,m.strength,m.touched_at,m.pinned,e.session_id,e.ordinal,e.created_at,EXISTS(SELECT 1 FROM partner_group_memories g WHERE g.memory_id=m.id) FROM partner_memories m LEFT JOIN partner_events e ON e.id=m.event_id WHERE m.partner_id=?1 AND (?3 OR m.project IS NULL OR m.project=?2) ORDER BY m.touched_at DESC,m.id").map_err(err)?;
+        stmt.query_map(params![partner.to_string(),project.map(|p|p.to_string_lossy().into_owned()),cross_project], |r| {
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,f64>(6)?,r.get::<_,i64>(7)?,r.get::<_,bool>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<i64>>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,bool>(12)?))
         }).map_err(err)?.map(|r| { let(id,kind,title,summary,content,project,strength,touched_at,pinned,session,ordinal,occurred_at,group_shared)=r.map_err(err)?; Ok(Entry{id:Uuid::parse_str(&id).map_err(err)?,kind,title,summary,content,project:project.map(PathBuf::from),strength,touched_at,occurred_at:occurred_at.unwrap_or(touched_at),pinned,group_shared,source:json!({"session_id":session,"evidence":ordinal.map(|n|vec![n.saturating_sub(1),n]),"observed_at":occurred_at})}) }).collect()
     }
@@ -234,13 +242,24 @@ impl Repository {
         dormant: bool,
         limit: usize,
     ) -> Result<Vec<Entry>, String> {
+        self.search_with_scope(partner, project, query, dormant, limit, false)
+    }
+    pub(crate) fn search_with_scope(
+        &self,
+        partner: Uuid,
+        project: Option<&Path>,
+        query: &str,
+        dormant: bool,
+        limit: usize,
+        cross_project: bool,
+    ) -> Result<Vec<Entry>, String> {
         let terms = memory::terms(query);
         if terms.is_empty() {
             return Ok(vec![]);
         }
         let now = Utc::now().timestamp();
         let mut scored: Vec<_> = self
-            .entries(partner, project)?
+            .entries_with_scope(partner, project, cross_project)?
             .into_iter()
             .filter_map(|e| {
                 let text = format!("{} {} {}", e.title, e.summary, e.content).to_lowercase();
@@ -265,8 +284,17 @@ impl Repository {
         project: Option<&Path>,
         id: Uuid,
     ) -> Result<memory::Record, String> {
+        self.read_with_scope(partner, project, id, false)
+    }
+    pub(crate) fn read_with_scope(
+        &self,
+        partner: Uuid,
+        project: Option<&Path>,
+        id: Uuid,
+        cross_project: bool,
+    ) -> Result<memory::Record, String> {
         let entry = self
-            .entries(partner, project)?
+            .entries_with_scope(partner, project, cross_project)?
             .into_iter()
             .find(|e| e.id == id)
             .ok_or("伙伴记忆不存在，或不属于当前可见范围")?;
@@ -720,6 +748,18 @@ mod tests {
         insert(partner, "/a", "主人私聊记忆");
         let foreign = insert(partner, "/b", "其他项目记忆");
         let other_memory = insert(other, "/a", "其他伙伴记忆");
+        assert!(
+            repo.read_with_scope(partner, Some(Path::new("/a")), foreign, true)
+                .is_ok()
+        );
+        assert!(
+            repo.read_with_scope(other, Some(Path::new("/a")), foreign, true)
+                .is_err()
+        );
+        assert!(
+            repo.delete(partner, Some(Path::new("/a")), foreign)
+                .is_err()
+        );
         repo.set_group_shared(partner, visible, true).unwrap();
         repo.set_group_shared(partner, foreign, true).unwrap();
         repo.set_group_shared(other, other_memory, true).unwrap();
