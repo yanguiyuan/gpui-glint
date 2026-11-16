@@ -392,7 +392,7 @@ pub async fn single_request(
     prefix: &[ContentBlock],
 ) -> Result<Completion, String> {
     let started = std::time::Instant::now();
-    let client = http_client().await?;
+    let client = response_http_client(config.response_timeout_seconds).await?;
     let mut token = auth::access(config, None).await?;
     let model = if config.model.trim().is_empty() {
         models(config)
@@ -464,10 +464,13 @@ async fn receive_response(
     let mut stream = ResponseStream::default();
     let mut bytes = 0;
     let mut publish = std::time::Instant::now() - Duration::from_millis(50);
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(180), response.chunk())
-        .await
-        .map_err(|_| "ChatGPT 响应等待超时")?
-        .map_err(|_| "读取 ChatGPT 响应流失败")?
+    while let Some(chunk) = tokio::time::timeout(
+        Duration::from_secs(config.response_timeout_seconds),
+        response.chunk(),
+    )
+    .await
+    .map_err(|_| "ChatGPT 响应等待超时")?
+    .map_err(|_| "读取 ChatGPT 响应流失败")?
     {
         bytes += chunk.len();
         if bytes > 4 * 1024 * 1024 {
@@ -500,9 +503,13 @@ async fn receive_response(
 }
 
 async fn http_client() -> Result<reqwest::Client, String> {
+    response_http_client(180).await
+}
+
+async fn response_http_client(response_timeout_seconds: u64) -> Result<reqwest::Client, String> {
     let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(180))
+        .read_timeout(Duration::from_secs(response_timeout_seconds))
         .redirect(reqwest::redirect::Policy::none());
     #[cfg(target_os = "macos")]
     let builder = {

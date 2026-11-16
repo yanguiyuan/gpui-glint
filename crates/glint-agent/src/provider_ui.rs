@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{InputField, Switch};
+use gpui_glint::components::{CollapsePanel, InputField, Switch};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -7,6 +7,29 @@ enum ChatGptAuth {
     Login,
     Check,
     SignOut,
+}
+
+fn response_timeout_content(
+    entry: Entity<TextEntry>,
+    theme: ThemePreset,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement {
+    move |_, _| {
+        div().flex().flex_col().gap_2()
+            .debug_selector(|| "provider-response-timeout".to_owned())
+            .child(InputField::new("").label("响应空闲超时（秒）").control(entry.clone()).theme(theme).render().w_full())
+            .child(div().text_size(px(11.)).text_color(rgb(theme.palette().text_muted))
+                .child("连续未收到数据时的等待上限，默认 180 秒，可设 1–86400 秒。持续输出时不限制总时长。"))
+            .into_any_element()
+    }
+}
+
+fn parse_response_timeout(value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=86400).contains(seconds))
+        .ok_or_else(|| "响应空闲超时必须为 1–86400 秒的整数".into())
 }
 
 fn parse_context_window(value: &str) -> Result<Option<u64>, String> {
@@ -141,6 +164,8 @@ pub struct Settings {
     protocol: provider::Protocol,
     pub name: Entity<TextEntry>,
     pub url: Entity<TextEntry>,
+    response_timeout: Entity<TextEntry>,
+    more_settings: Entity<CollapsePanel>,
     pub model: Entity<TextEntry>,
     pub key: Entity<TextEntry>,
     pub key_env: Entity<TextEntry>,
@@ -159,6 +184,23 @@ impl Settings {
     ) -> Self {
         let selected = config.map(|config| config.id);
         let config = config.cloned().unwrap_or_default();
+        let response_timeout = cx.new(|cx| {
+            TextEntry::new(
+                cx,
+                "默认 180 秒",
+                config.response_timeout_seconds.to_string(),
+            )
+            .theme(ThemePreset::Moonstone)
+        });
+        let more_settings = cx.new(|_| {
+            CollapsePanel::new("更多设置")
+                .compact()
+                .theme(ThemePreset::Moonstone)
+                .content(response_timeout_content(
+                    response_timeout.clone(),
+                    ThemePreset::Moonstone,
+                ))
+        });
         let mut entry = |hint: &str, value: &str| {
             cx.new(|cx| {
                 TextEntry::new(cx, hint.to_owned(), value.to_owned()).theme(ThemePreset::Moonstone)
@@ -198,6 +240,8 @@ impl Settings {
             search: entry("搜索设置或供应商…", ""),
             name: entry("供应商名称", &config.name),
             url: entry("https://your-provider.example/v1", &config.base_url),
+            response_timeout,
+            more_settings,
             model: entry("输入模型 ID", ""),
             key: entry("输入或替换 API Key", ""),
             key_env: entry(
@@ -220,6 +264,8 @@ impl Settings {
         use_env: bool,
         cx: &mut Context<AgentWorkspace>,
     ) {
+        self.more_settings
+            .update(cx, |panel, cx| panel.set_expanded(false, cx));
         self.discovering = None;
         self.testing = None;
         self.auth_task = None;
@@ -254,6 +300,9 @@ impl Settings {
             .update(cx, |entry, cx| entry.set_value(config.name.clone(), cx));
         self.url
             .update(cx, |entry, cx| entry.set_value(config.base_url.clone(), cx));
+        self.response_timeout.update(cx, |entry, cx| {
+            entry.set_value(config.response_timeout_seconds.to_string(), cx)
+        });
         self.key_env.update(cx, |entry, cx| {
             entry.set_value(config.api_key_env.clone().unwrap_or_default(), cx)
         });
@@ -263,6 +312,13 @@ impl Settings {
     }
 
     pub fn set_theme(&self, theme: ThemePreset, cx: &mut Context<AgentWorkspace>) {
+        self.more_settings.update(cx, |panel, cx| {
+            panel.set_theme(theme, cx);
+            panel.set_content(
+                response_timeout_content(self.response_timeout.clone(), theme),
+                cx,
+            );
+        });
         for entry in self.window_inputs.values() {
             entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }
@@ -271,6 +327,7 @@ impl Settings {
             &self.compaction_threshold,
             &self.name,
             &self.url,
+            &self.response_timeout,
             &self.model,
             &self.new_model_window,
             &self.key,
@@ -375,6 +432,9 @@ impl AgentWorkspace {
         config.kind = settings.kind;
         config.protocol = settings.protocol;
         config.enabled = true;
+        config.response_timeout_seconds =
+            parse_response_timeout(settings.response_timeout.read(cx).value())
+                .unwrap_or(settings.original.response_timeout_seconds);
         config.name = settings.name.read(cx).value().trim().to_owned();
         config.model = settings.default_model.clone();
         config.models = settings.models.clone();
@@ -469,6 +529,7 @@ impl AgentWorkspace {
     fn save_provider(&mut self, activate: bool, cx: &mut Context<Self>) {
         let config = self.edited_provider(cx);
         let result = (|| {
+            parse_response_timeout(self.provider_settings.response_timeout.read(cx).value())?;
             for model in &self.provider_settings.models {
                 if let Some(input) = self.provider_settings.window_inputs.get(model) {
                     parse_context_window(input.read(cx).value())
@@ -808,31 +869,30 @@ impl AgentWorkspace {
                     }),
             )
             .child(
-                div().flex().gap_2().children(
-                    [
-                        (ProviderTab::Connection, "连接".to_owned()),
-                        (
-                            ProviderTab::Models,
-                            format!("模型 · {}", settings.models.len()),
-                        ),
-                    ]
-                    .into_iter()
-                    .map(|(tab, label)| {
-                        Button::new(label)
-                            .kind(if settings.tab == tab {
-                                ButtonKind::Tinted
+                SegmentedControl::new([
+                    SegmentOption::new("连接").debug_selector("provider-tab-connection"),
+                    SegmentOption::new(format!("模型 · {}", settings.models.len()))
+                        .debug_selector("provider-tab-models"),
+                ])
+                .id("provider-tabs")
+                .selected(usize::from(settings.tab == ProviderTab::Models))
+                .theme(self.theme)
+                .on_change({
+                    let weak = cx.entity().downgrade();
+                    move |index, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.provider_settings.tab = if index == 1 {
+                                ProviderTab::Models
                             } else {
-                                ButtonKind::Plain
-                            })
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.provider_settings.tab = tab;
-                                this.provider_settings.message = None;
-                                cx.notify();
-                            }))
-                    }),
-                ),
+                                ProviderTab::Connection
+                            };
+                            this.provider_settings.message = None;
+                            cx.notify();
+                        });
+                    }
+                })
+                .render()
+                .self_start(),
             );
         let field = |label: &str, entry: &Entity<TextEntry>| {
             InputField::new("")
@@ -910,23 +970,27 @@ impl AgentWorkspace {
                             .items_center()
                             .gap_2()
                             .child(div().text_size(px(12.)).child("协议"))
-                            .children(
-                                [
-                                    (provider::Protocol::Anthropic, "Anthropic"),
-                                    (provider::Protocol::OpenAi, "OpenAI 兼容"),
-                                ]
-                                .into_iter()
-                                .map(|(protocol, label)| {
-                                    Button::new(label)
-                                        .kind(if settings.protocol == protocol {
-                                            ButtonKind::Tinted
-                                        } else {
-                                            ButtonKind::Plain
-                                        })
-                                        .size(ButtonSize::Small)
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                            .child(
+                                SegmentedControl::new([
+                                    SegmentOption::new("Anthropic")
+                                        .debug_selector("provider-protocol-anthropic"),
+                                    SegmentOption::new("OpenAI 兼容")
+                                        .debug_selector("provider-protocol-openai"),
+                                ])
+                                .id("provider-protocol")
+                                .selected(usize::from(
+                                    settings.protocol == provider::Protocol::OpenAi,
+                                ))
+                                .theme(self.theme)
+                                .on_change({
+                                    let weak = cx.entity().downgrade();
+                                    move |index, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            let protocol = if index == 1 {
+                                                provider::Protocol::OpenAi
+                                            } else {
+                                                provider::Protocol::Anthropic
+                                            };
                                             this.provider_settings.protocol = protocol;
                                             let address =
                                                 this.provider_settings.url.read(cx).value();
@@ -951,8 +1015,10 @@ impl AgentWorkspace {
                                                     Some("https://api.deepseek.com/models".into());
                                             }
                                             cx.notify();
-                                        }))
-                                }),
+                                        });
+                                    }
+                                })
+                                .render(),
                             ),
                     )
                     .child(field("Base URL", &settings.url))
@@ -962,23 +1028,27 @@ impl AgentWorkspace {
                             .items_center()
                             .gap_2()
                             .child(div().text_size(px(12.)).child("认证方式"))
-                            .children([(true, "环境变量"), (false, "API Key")].into_iter().map(
-                                |(use_env, label)| {
-                                    Button::new(label)
-                                        .kind(if settings.use_env == use_env {
-                                            ButtonKind::Tinted
-                                        } else {
-                                            ButtonKind::Plain
-                                        })
-                                        .size(ButtonSize::Small)
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.provider_settings.use_env = use_env;
+                            .child(
+                                SegmentedControl::new([
+                                    SegmentOption::new("环境变量")
+                                        .debug_selector("provider-auth-env"),
+                                    SegmentOption::new("API Key")
+                                        .debug_selector("provider-auth-key"),
+                                ])
+                                .id("provider-auth")
+                                .selected(usize::from(!settings.use_env))
+                                .theme(self.theme)
+                                .on_change({
+                                    let weak = cx.entity().downgrade();
+                                    move |index, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.provider_settings.use_env = index == 0;
                                             cx.notify();
-                                        }))
-                                },
-                            )),
+                                        });
+                                    }
+                                })
+                                .render(),
+                            ),
                     )
                     .child(if settings.use_env {
                         field("环境变量名", &settings.key_env)
@@ -1008,6 +1078,7 @@ impl AgentWorkspace {
                             )
                     });
             }
+            card = card.child(settings.more_settings.clone());
             card = card.child(
                 div()
                     .pt_2()
@@ -2008,6 +2079,111 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    #[gpui::test]
+    fn provider_response_timeout_setting_validates_persists_and_loads(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let config = provider::Config {
+            name: "Timeout test".into(),
+            model: "test-model".into(),
+            models: vec!["test-model".into()],
+            ..Default::default()
+        };
+        let id = config.id;
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut h = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            h.page = crate::Page::Settings;
+            h.catalog.providers.push(config.clone());
+            h.provider_settings.load(config, String::new(), false, cx);
+            h.provider_settings.section = Section::Provider;
+            h
+        });
+        window.simulate_resize(size(px(1440.), px(1200.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("provider-response-timeout").is_none());
+        for selector in [
+            "provider-auth-env",
+            "provider-auth-key",
+            "provider-protocol-anthropic",
+            "provider-protocol-openai",
+            "provider-tab-models",
+            "provider-tab-connection",
+        ] {
+            let bounds = window.debug_bounds(selector).unwrap();
+            window.simulate_click(bounds.center(), gpui::Modifiers::default());
+            window.run_until_parked();
+            host.read_with(window, |h, _| match selector {
+                "provider-auth-env" => assert!(h.provider_settings.use_env),
+                "provider-auth-key" => assert!(!h.provider_settings.use_env),
+                "provider-protocol-anthropic" => {
+                    assert!(h.provider_settings.protocol == provider::Protocol::Anthropic)
+                }
+                "provider-protocol-openai" => {
+                    assert!(h.provider_settings.protocol == provider::Protocol::OpenAi)
+                }
+                "provider-tab-models" => assert!(h.provider_settings.tab == ProviderTab::Models),
+                "provider-tab-connection" => {
+                    assert!(h.provider_settings.tab == ProviderTab::Connection)
+                }
+                _ => unreachable!(),
+            });
+        }
+        let trigger = window.debug_bounds("glass-collapse-panel-trigger").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("provider-response-timeout").is_some());
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("provider-response-timeout").is_none());
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        host.update(window, |h, cx| {
+            for invalid in ["", "0", "86401", "1.5", "abc"] {
+                h.provider_settings
+                    .response_timeout
+                    .update(cx, |e, cx| e.set_value(invalid, cx));
+                h.save_provider(false, cx);
+                assert!(
+                    h.provider_settings
+                        .message
+                        .as_deref()
+                        .unwrap()
+                        .contains("1–86400")
+                );
+                assert_eq!(
+                    h.catalog
+                        .providers
+                        .iter()
+                        .find(|p| p.id == id)
+                        .unwrap()
+                        .response_timeout_seconds,
+                    180
+                );
+            }
+            h.provider_settings
+                .response_timeout
+                .update(cx, |e, cx| e.set_value("600", cx));
+            h.save_provider(false, cx);
+            let catalog =
+                crate::provider_catalog::ProviderCatalog::load(&h.catalog_path(), &[]).unwrap();
+            let saved = catalog.providers.into_iter().find(|p| p.id == id).unwrap();
+            assert_eq!(saved.response_timeout_seconds, 600);
+            h.provider_settings
+                .load(provider::Config::default(), String::new(), false, cx);
+            assert_eq!(h.provider_settings.response_timeout.read(cx).value(), "180");
+            h.provider_settings.load(saved, String::new(), false, cx);
+            assert_eq!(h.provider_settings.response_timeout.read(cx).value(), "600");
+            assert!(!h.provider_settings.more_settings.read(cx).is_expanded());
+        });
+    }
+
     struct ModelRows {
         added: Vec<String>,
     }

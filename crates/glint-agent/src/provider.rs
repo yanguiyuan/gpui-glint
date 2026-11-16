@@ -85,9 +85,15 @@ impl Thinking {
     }
 }
 
+fn default_response_timeout_seconds() -> u64 {
+    180
+}
+
 /// Non-secret provider configuration. API keys live in a separate SQLite table.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_response_timeout_seconds")]
+    pub response_timeout_seconds: u64,
     /// Runtime-only database anchor; never serialized into provider metadata.
     #[serde(skip)]
     pub(crate) credential_store: Option<PathBuf>,
@@ -119,6 +125,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            response_timeout_seconds: default_response_timeout_seconds(),
             credential_store: None,
             models_url: None,
             protocol: Protocol::OpenAi,
@@ -241,6 +248,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=86400).contains(&self.response_timeout_seconds) {
+            return Err("响应空闲超时必须为 1–86400 秒".into());
+        }
         if self.kind == Kind::ChatGpt {
             return Ok(());
         }
@@ -731,7 +741,9 @@ async fn single_request(
     let endpoint = config.endpoint()?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
+        // Reasoning can stream for minutes. Limit stalls between reads rather
+        // than the total lifetime of an otherwise healthy response.
+        .read_timeout(Duration::from_secs(config.response_timeout_seconds))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "无法初始化 Provider 客户端")?;
@@ -798,11 +810,7 @@ async fn single_request(
         let mut bytes = 0;
         let mut last_context = None;
         let mut last_snapshot = std::time::Instant::now() - Duration::from_millis(50);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "读取 Provider 响应流失败")?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(response_read_error)? {
             bytes += chunk.len();
             if bytes > 4 * 1024 * 1024 {
                 return Err("Provider 响应超过 4MB 限制".into());
@@ -968,15 +976,19 @@ async fn single_request(
     })
 }
 
+fn response_read_error(error: reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "读取 Provider 响应超时：等待后续数据超时，请检查网络或 Provider 状态"
+    } else {
+        "读取 Provider 响应失败：连接中断或响应不完整，请检查网络或 Provider 状态"
+    }
+}
+
 async fn response_json(mut response: reqwest::Response) -> Result<Value, String> {
     let status = response.status();
     // Bound the response body, including chunked responses without Content-Length.
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "读取 Provider 响应失败")?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(response_read_error)? {
         if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
             return Err("Provider 响应超过 4MB 限制".into());
         }
@@ -1000,6 +1012,123 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn response_timeout_defaults_for_old_configs_and_round_trips() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("response_timeout_seconds");
+        let mut config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.response_timeout_seconds, 180);
+        config.response_timeout_seconds = 600;
+        let restored: Config =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(restored.response_timeout_seconds, 600);
+        for invalid in [0, 86401, u64::MAX] {
+            config.response_timeout_seconds = invalid;
+            assert!(config.validate().unwrap_err().contains("响应空闲超时"));
+        }
+    }
+
+    #[test]
+    fn configured_response_timeout_stops_a_stalled_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            socket.flush().unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let result = runtime().unwrap().block_on(single_request(
+            Config {
+                base_url,
+                response_timeout_seconds: 1,
+                ..Default::default()
+            },
+            String::new(),
+            vec![json!({"role":"user","content":"think"})],
+            Thinking::High,
+            None,
+            &[],
+        ));
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert!(result.unwrap_err().contains("等待后续数据超时"));
+    }
+
+    fn check_reasoning_stream(duration: Duration) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap().to_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            socket.read_exact(&mut vec![0; length]).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let started = std::time::Instant::now();
+            while started.elapsed() < duration {
+                socket.write_all(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking \"}}]}\n\n").unwrap();
+                socket.flush().unwrap();
+                std::thread::sleep(
+                    (duration - started.elapsed().min(duration)).min(Duration::from_secs(1)),
+                );
+            }
+            socket.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+        });
+        let reply = runtime()
+            .unwrap()
+            .block_on(single_request(
+                Config {
+                    base_url,
+                    model: "test-model".into(),
+                    ..Default::default()
+                },
+                "test-only-key".into(),
+                vec![json!({"role":"user","content":"think"})],
+                Thinking::High,
+                None,
+                &[],
+            ))
+            .unwrap();
+        assert_eq!(reply.text, "done");
+        assert!(reply.reasoning.starts_with("thinking "));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_stream_preserves_reasoning_and_final_answer() {
+        check_reasoning_stream(Duration::from_millis(50));
+    }
+
+    #[test]
+    #[ignore = "takes 121 seconds to cross the former HTTP total timeout"]
+    fn provider_reasoning_stream_survives_former_total_timeout() {
+        check_reasoning_stream(Duration::from_secs(121));
+    }
 
     #[test]
     fn sqlite_keys_survive_restart_stay_out_of_metadata_and_clear_without_keychain() {

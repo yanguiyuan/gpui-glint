@@ -21,6 +21,8 @@ cargo run -p glint-agent
 
 API 供应商支持 OpenAI Chat Completions 和 Anthropic Messages 协议。设置中添加供应商、填写地址和认证方式，在模型页获取模型列表或手动添加，再保存并启用。未配置时不会生成模拟回复。
 
+供应商的“连接”页展开“更多设置”后，可设置“响应空闲超时（秒）”，范围 1–86400 秒，默认 180 秒。每个供应商单独保存，适用于 API 供应商和 ChatGPT 订阅。只有连续未收到数据达到设定时长才超时，持续输出思考或回答不限制总时长；旧配置自动使用默认值。
+
 API Key 以明文存入本机 `glint-agent.sqlite3` 的独立 `provider_secrets` 表，供应商配置 JSON 和通用配置元数据不包含密钥。也可指定环境变量名，发送时读取应用环境；Finder 启动的应用可能不继承终端环境。两种认证方式二选一，环境变量模式不会回退到 SQLite 密钥。
 
 模型 API Key 仅从 SQLite 或所选环境变量读取，不再包含系统钥匙串访问或导入入口；清除按钮删除 SQLite 中的密钥。ChatGPT 使用独立的浏览器 OAuth 授权，令牌保存到本机 SQLite 的 `chatgpt_auth` 表，不写入供应商配置或通用导出。
