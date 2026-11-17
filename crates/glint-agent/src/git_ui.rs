@@ -1,8 +1,8 @@
 use super::*;
 use gpui::AnimationExt as _;
 use gpui_glint::components::{
-    Dialog, DiffCard, GitGraph, GitGraphEvent, InputField, MenuItem, Toast, ToastHost, ToastKind,
-    Tooltip,
+    Dialog, DiffCard, GitGraph, GitGraphEvent, InputField, MenuItem, Skeleton, Toast, ToastHost,
+    ToastKind, Tooltip,
 };
 use std::time::{Duration, Instant};
 
@@ -1098,7 +1098,34 @@ impl AgentWorkspace {
                         body.child(div().p_3().child(error))
                     })
                     .when(diff.card.is_none() && diff.error.is_none(), |body| {
-                        body.child(div().p_3().child("正在读取提交文件 Diff…"))
+                        body.child(
+                            div()
+                                .p_4()
+                                .flex()
+                                .gap_4()
+                                .debug_selector(|| "commit-diff-loading-skeleton".into())
+                                .children((0..2usize).map(|index| {
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_4()
+                                        .child(
+                                            Skeleton::new(("commit-diff-header-loading", index))
+                                                .width(72.)
+                                                .height(10.)
+                                                .theme(self.theme),
+                                        )
+                                        .child(
+                                            Skeleton::new(("commit-diff-code-loading", index))
+                                                .lines(12)
+                                                .height(12.)
+                                                .gap(14.)
+                                                .theme(self.theme),
+                                        )
+                                })),
+                        )
                     }),
             )
             .into_any_element()

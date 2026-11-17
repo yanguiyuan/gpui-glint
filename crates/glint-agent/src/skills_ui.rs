@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::Switch;
+use gpui_glint::components::{Skeleton, Switch};
 use gpui_glint::paths::display_path as display_skill_path;
 use std::sync::Arc;
 
@@ -448,13 +448,43 @@ impl AgentWorkspace {
                 );
             }
         } else {
-            list = list.child(div().p_3().text_color(rgb(p.text_muted)).child(
-                if state.task.is_some() {
-                    "正在扫描技能…"
-                } else {
-                    "点击刷新技能加载列表。"
-                },
-            ));
+            if state.task.is_some() {
+                list = list.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .debug_selector(|| "skills-loading-skeleton".into())
+                        .children((0..5usize).map(|index| {
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    Skeleton::new(("skill-icon-loading", index))
+                                        .width(24.)
+                                        .height(24.)
+                                        .theme(self.theme),
+                                )
+                                .child(
+                                    div().flex_1().min_w_0().child(
+                                        Skeleton::new(("skill-text-loading", index))
+                                            .lines(2)
+                                            .height(12.)
+                                            .gap(8.)
+                                            .theme(self.theme),
+                                    ),
+                                )
+                        })),
+                );
+            } else {
+                list = list.child(
+                    div()
+                        .p_3()
+                        .text_color(rgb(p.text_muted))
+                        .child("点击刷新技能加载列表。"),
+                );
+            }
         }
         let sidebar = div()
             .w(gpui::relative(0.36))

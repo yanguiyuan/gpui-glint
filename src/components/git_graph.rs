@@ -1,5 +1,5 @@
 //! Reusable Git history and branch comparison viewer. The host owns all Git I/O.
-use super::{Icon, IconButton, Select, SelectEvent, SelectOption};
+use super::{Icon, IconButton, Select, SelectEvent, SelectOption, Skeleton};
 use crate::theme::ThemePreset;
 use gpui::{
     AppContext, Context, Entity, EventEmitter, Render, ScrollHandle, SharedString, Window, div,
@@ -549,7 +549,52 @@ impl Render for GitGraph {
                     .child(error.clone()),
             );
         }
-        if self.loading {
+        let content_empty = if self.comparison_tab {
+            self.data.comparison.is_none() && self.data.comparison_error.is_none()
+        } else {
+            self.data.commits.is_empty()
+        };
+        if self.loading && content_empty {
+            body = body.child(
+                div()
+                    .debug_selector(|| "git-history-loading-skeleton".into())
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children((0..6usize).map(|index| {
+                        div()
+                            .flex()
+                            .gap_3()
+                            .items_start()
+                            .child(
+                                Skeleton::new(("git-node-loading", index))
+                                    .width(12.)
+                                    .height(12.)
+                                    .rounded(6.)
+                                    .theme(self.theme),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        Skeleton::new(("git-title-loading", index))
+                                            .height(12.)
+                                            .theme(self.theme),
+                                    )
+                                    .child(
+                                        Skeleton::new(("git-meta-loading", index))
+                                            .width(140.)
+                                            .height(10.)
+                                            .theme(self.theme),
+                                    ),
+                            )
+                    })),
+            );
+        } else if self.loading {
             body = body.child(div().text_color(rgb(p.text_muted)).child("正在读取 Git…"));
         }
         if self.comparison_tab {

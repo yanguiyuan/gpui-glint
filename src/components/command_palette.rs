@@ -12,7 +12,9 @@ use gpui::{
 pub struct CommandItem {
     pub id: SharedString,
     pub label: SharedString,
+    pub description: Option<SharedString>,
     pub group: SharedString,
+    pub category: SharedString,
     pub keywords: SharedString,
     pub icon: Option<Icon>,
     pub shortcut: Option<SharedString>,
@@ -23,15 +25,25 @@ impl CommandItem {
         Self {
             id: id.into(),
             label: label.into(),
+            description: None,
             group: "".into(),
+            category: "".into(),
             keywords: "".into(),
             icon: None,
             shortcut: None,
             disabled: false,
         }
     }
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
     pub fn group(mut self, value: impl Into<SharedString>) -> Self {
         self.group = value.into();
+        self
+    }
+    pub fn category(mut self, category: impl Into<SharedString>) -> Self {
+        self.category = category.into();
         self
     }
     pub fn keywords(mut self, value: impl Into<SharedString>) -> Self {
@@ -55,6 +67,10 @@ impl CommandItem {
 pub enum CommandPaletteEvent {
     Executed(SharedString),
     Dismissed,
+    SearchChanged {
+        query: String,
+        category: SharedString,
+    },
 }
 
 /// Compact searchable command surface. Register `bind_text_entry_keys` once.
@@ -71,6 +87,8 @@ pub struct CommandPalette {
     scroll_pending: bool,
     open: bool,
     origin: Option<FocusHandle>,
+    categories: Vec<SharedString>,
+    category: SharedString,
     _search_subscription: Subscription,
 }
 impl EventEmitter<CommandPaletteEvent> for CommandPalette {}
@@ -88,6 +106,10 @@ impl CommandPalette {
                 .into_iter()
                 .find(|&i| !this.items[i].disabled);
             this.scroll_pending = true;
+            cx.emit(CommandPaletteEvent::SearchChanged {
+                query: this.query(cx).to_owned(),
+                category: this.category.clone(),
+            });
             cx.notify();
         });
         let items: Vec<_> = items.into_iter().collect();
@@ -95,7 +117,13 @@ impl CommandPalette {
         Self {
             search_terms: items
                 .iter()
-                .map(|i| (i.label.to_lowercase(), i.keywords.to_lowercase()))
+                .map(|i| {
+                    (
+                        i.label.to_lowercase(),
+                        format!("{} {}", i.keywords, i.description.as_deref().unwrap_or(""))
+                            .to_lowercase(),
+                    )
+                })
                 .collect(),
             matches: Default::default(),
             items,
@@ -106,6 +134,8 @@ impl CommandPalette {
             scroll_pending: true,
             open: false,
             origin: None,
+            categories: vec![],
+            category: "全部".into(),
             _search_subscription: subscription,
         }
     }
@@ -128,7 +158,13 @@ impl CommandPalette {
         self.search_terms = self
             .items
             .iter()
-            .map(|i| (i.label.to_lowercase(), i.keywords.to_lowercase()))
+            .map(|i| {
+                (
+                    i.label.to_lowercase(),
+                    format!("{} {}", i.keywords, i.description.as_deref().unwrap_or(""))
+                        .to_lowercase(),
+                )
+            })
             .collect();
         *self.matches.borrow_mut() = None;
         self.active = self
@@ -136,6 +172,31 @@ impl CommandPalette {
             .into_iter()
             .find(|&i| !self.items[i].disabled);
         self.scroll_pending = true;
+        cx.notify();
+    }
+    pub fn set_categories(
+        &mut self,
+        categories: impl IntoIterator<Item = SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.categories = categories.into_iter().collect();
+        self.category = "全部".into();
+        *self.matches.borrow_mut() = None;
+        cx.notify();
+    }
+
+    fn select_category(&mut self, category: SharedString, cx: &mut Context<Self>) {
+        self.category = category;
+        *self.matches.borrow_mut() = None;
+        self.active = self
+            .visible(cx)
+            .into_iter()
+            .find(|&i| !self.items[i].disabled);
+        self.scroll_pending = true;
+        cx.emit(CommandPaletteEvent::SearchChanged {
+            query: self.query(cx).to_owned(),
+            category: self.category.clone(),
+        });
         cx.notify();
     }
     pub fn query<'a>(&'a self, cx: &'a App) -> &'a str {
@@ -187,7 +248,12 @@ impl CommandPalette {
             .search_terms
             .iter()
             .enumerate()
-            .filter(|(_, (label, keywords))| label.contains(&query) || keywords.contains(&query))
+            .filter(|(index, (label, keywords))| {
+                (self.categories.is_empty()
+                    || self.category.as_ref() == "全部"
+                    || self.items[*index].category == self.category)
+                    && (label.contains(&query) || keywords.contains(&query))
+            })
             .map(|(index, _)| index)
             .collect();
         *cache = Some((query, indices.clone()));
@@ -270,6 +336,13 @@ enum PaletteRow {
     Command(usize),
 }
 impl CommandPalette {
+    fn row_height(&self) -> f32 {
+        if self.items.iter().any(|item| item.description.is_some()) {
+            54.
+        } else {
+            36.
+        }
+    }
     fn render_row(&mut self, row: &PaletteRow, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
         let p = theme.palette();
@@ -278,7 +351,7 @@ impl CommandPalette {
                 unreachable!()
             };
             return div()
-                .h(px(36.))
+                .h(px(self.row_height()))
                 .px(px(10.))
                 .flex()
                 .items_center()
@@ -294,7 +367,7 @@ impl CommandPalette {
             .id(("command", i))
             .debug_selector(move || format!("palette-command-{i}"))
             .w_full()
-            .h(px(36.))
+            .h(px(self.row_height()))
             .flex_shrink_0()
             .px(px(10.))
             .flex()
@@ -333,9 +406,19 @@ impl CommandPalette {
             div()
                 .flex_1()
                 .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(item.label.clone()),
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().truncate().child(item.label.clone()))
+                .when_some(item.description.clone(), |column, description| {
+                    column.child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(if active { 0xffffff } else { p.text_muted }))
+                            .child(description),
+                    )
+                }),
         );
         if let Some(shortcut) = &item.shortcut {
             row = row.child(
@@ -409,10 +492,10 @@ impl Render for CommandPalette {
                 .text_center()
                 .text_size(px(13.))
                 .text_color(rgb(p.text_muted))
-                .child("没有匹配的命令或集合")
+                .child("没有匹配的结果")
                 .into_any_element()
         } else {
-            let height = px((rows.len() as f32 * 36.).min(320.));
+            let height = px((rows.len() as f32 * self.row_height()).min(320.));
             let rows = std::rc::Rc::new(rows);
             div()
                 .p(px(6.))
@@ -536,6 +619,24 @@ impl Render for CommandPalette {
                     ),
             )
             .child(list)
+            .when(!self.categories.is_empty(), |root| {
+                root.child(div().flex().items_center().gap_2().px_3().py_2().children(
+                    self.categories.iter().map(|category| {
+                        let value = category.clone();
+                        div()
+                            .id(gpui::ElementId::Name(category.clone()))
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(*category == self.category, |tab| tab.bg(rgb(p.accent_tint)))
+                            .child(category.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_category(value.clone(), cx)
+                            }))
+                    }),
+                ))
+            })
             .child(
                 div()
                     .px(px(16.))
@@ -559,6 +660,26 @@ impl Render for CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn category_filter_preserves_query_and_limits_navigation(cx: &mut gpui::TestAppContext) {
+        let (palette, window) = cx.add_window_view(|_, cx| {
+            CommandPalette::new(
+                [
+                    CommandItem::new("action", "main action").category("操作"),
+                    CommandItem::new("file", "main.rs").category("文件"),
+                ],
+                cx,
+            )
+        });
+        palette.update(window, |palette, cx| {
+            palette.set_categories(["全部", "操作", "文件"].map(Into::into), cx);
+            palette.set_query("main", cx);
+            palette.select_category("文件".into(), cx);
+            assert_eq!(palette.visible(cx), vec![1]);
+            assert_eq!(palette.active, Some(1));
+            assert_eq!(palette.query(cx), "main");
+        });
+    }
     #[gpui::test]
     fn command_rows_fill_the_list_and_hover_in_trailing_space(cx: &mut gpui::TestAppContext) {
         let (palette, window) = cx.add_window_view(|_, cx| {

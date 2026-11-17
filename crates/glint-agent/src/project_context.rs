@@ -24,6 +24,19 @@ impl Index {
         Self::scan_with_limit(root, MAX_PATHS)
     }
     fn scan_with_limit(root: &Path, limit: usize) -> Result<Self, String> {
+        Self::scan_cancelled(root, limit, None)
+    }
+    pub(super) fn scan_cancellable(
+        root: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, String> {
+        Self::scan_cancelled(root, MAX_PATHS, Some(cancelled))
+    }
+    fn scan_cancelled(
+        root: &Path,
+        limit: usize,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, String> {
         let root = root.canonicalize().map_err(|_| "项目目录已不可用")?;
         if !root.is_dir() {
             return Err("当前项目不是目录".into());
@@ -48,6 +61,11 @@ impl Index {
             skipped: 0,
         };
         for (scanned, item) in builder.build().enumerate() {
+            if cancelled
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err("搜索已取消".into());
+            }
             if scanned >= 100_000 || index.entries.len() >= limit {
                 index.truncated = true;
                 break;

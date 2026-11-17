@@ -59,6 +59,10 @@ mod tests {
         assert!(calendar.top() < api.top());
         for (selector, action) in [
             (
+                "nav-projects",
+                Action::Navigate(Route::Agent(glint_agent::Page::Projects)),
+            ),
+            (
                 "nav-api",
                 Action::Navigate(Route::Api(glint_api::Page::Requests)),
             ),
@@ -220,6 +224,10 @@ impl Render for Navigation {
             NavigationItem::new(*id, *title, *icon)
         };
         let mut agent: Vec<_> = routes[..3].iter().map(item).collect();
+        agent.insert(
+            1,
+            NavigationItem::new("nav-projects", "项目", Icon::FolderOpen),
+        );
         agent.push(NavigationItem::new(
             "nav-new-session",
             "新建 Agent 会话",
@@ -232,11 +240,15 @@ impl Render for Navigation {
             "切换明暗主题",
             Icon::HalfCircle,
         ));
-        let selected = routes
-            .iter()
-            .find(|(_, _, _, route)| *route == self.route)
-            .map(|entry| entry.0)
-            .unwrap_or("nav-agent");
+        let selected = if self.route == Route::Agent(Agent::Projects) {
+            "nav-projects"
+        } else {
+            routes
+                .iter()
+                .find(|(_, _, _, route)| *route == self.route)
+                .map(|entry| entry.0)
+                .unwrap_or("nav-agent")
+        };
         NavigationRail::new([])
             .groups([
                 NavigationGroup::new("nav-agent", agent),
@@ -247,6 +259,7 @@ impl Render for Navigation {
             .theme(self.theme)
             .on_select(
                 cx.listener(move |_, id: &gpui::SharedString, _, cx| match id.as_ref() {
+                    "nav-projects" => cx.emit(Action::Navigate(Route::Agent(Agent::Projects))),
                     "nav-new-session" => cx.emit(Action::NewSession),
                     "nav-theme" => cx.emit(Action::ToggleTheme),
                     _ => {

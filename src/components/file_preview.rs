@@ -1,7 +1,7 @@
 //! Reusable read-only file/directory preview. The host supplies data and performs I/O.
 use super::{
     CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, SegmentOption,
-    SegmentedControl, TextEntry,
+    SegmentedControl, Skeleton, TextEntry,
 };
 use crate::paths::display_path;
 use crate::theme::ThemePreset;
@@ -53,8 +53,10 @@ pub struct FilePreview {
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     browser: Option<Result<Entity<super::WebView>, String>>,
     expanded: bool,
+    standalone: bool,
+    content_only: bool,
     navigation: Option<(String, Vec<FilePreviewEntry>)>,
-    navigation_scroll: gpui::ScrollHandle,
+    navigation_scroll: gpui::UniformListScrollHandle,
     folders: std::collections::HashMap<String, FolderNode>,
     next_request: u64,
     path: String,
@@ -66,6 +68,8 @@ pub struct FilePreview {
     scroll: gpui::ScrollHandle,
     search: Entity<TextEntry>,
     search_match: Option<(usize, usize)>,
+    search_open: bool,
+    pending_search: Option<(String, Option<usize>)>,
     _search_subscription: gpui::Subscription,
     subscriptions: Vec<gpui::Subscription>,
 }
@@ -95,6 +99,8 @@ impl FilePreview {
             browser: None,
             header_accessory: None,
             expanded: false,
+            standalone: false,
+            content_only: false,
             navigation: None,
             navigation_scroll: Default::default(),
             folders: Default::default(),
@@ -108,6 +114,8 @@ impl FilePreview {
             scroll: Default::default(),
             search,
             search_match: None,
+            search_open: false,
+            pending_search: None,
             _search_subscription: search_subscription,
             subscriptions: Vec::new(),
         }
@@ -147,6 +155,30 @@ impl FilePreview {
             != accessory.as_ref().map(|view| view.entity_id())
         {
             self.header_accessory = accessory;
+            cx.notify();
+        }
+    }
+
+    /// Synchronize an explorer's selected row without replacing its directory data.
+    pub fn set_selected_path(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.path != path {
+            self.path = path;
+            cx.notify();
+        }
+    }
+
+    /// Render a document pane without the directory navigation owned by its host.
+    pub fn set_content_only(&mut self, content_only: bool, cx: &mut Context<Self>) {
+        if self.content_only != content_only {
+            self.content_only = content_only;
+            cx.notify();
+        }
+    }
+
+    /// Full-page hosts own navigation and do not need sidebar expand/close controls.
+    pub fn set_standalone(&mut self, standalone: bool, cx: &mut Context<Self>) {
+        if self.standalone != standalone {
+            self.standalone = standalone;
             cx.notify();
         }
     }
@@ -276,6 +308,9 @@ impl FilePreview {
         self.page = Page::File(editor);
         self.search_match = None;
         self.search.update(cx, |entry, cx| entry.set_value("", cx));
+        if let Some((query, line)) = self.pending_search.clone() {
+            self.set_document_search(query, line, cx);
+        }
         cx.notify();
     }
     fn step_search(&mut self, previous: bool, cx: &mut Context<Self>) {
@@ -290,6 +325,77 @@ impl FilePreview {
         editor.update(cx, |editor, cx| editor.reveal_search_match(next, cx));
         self.search_match = Some((next, count));
         cx.notify();
+    }
+
+    /// Import a project text-search query, including when the file is still loading.
+    pub fn set_document_search(
+        &mut self,
+        query: String,
+        line: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_search = Some((query.clone(), line));
+        self.search_open = !query.is_empty();
+        self.search
+            .update(cx, |search, cx| search.set_value(query.clone(), cx));
+        if let Page::File(editor) = &self.page {
+            self.search_match = editor.update(cx, |editor, cx| {
+                editor.set_search_query(query, cx);
+                let count = editor.search_match_count();
+                let active = editor.reveal_search_at_line(line.unwrap_or(1), cx);
+                active.map(|index| (index, count))
+            });
+        }
+        cx.notify();
+    }
+
+    /// Controls that a document host can place beside its file tabs.
+    pub fn document_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(
+                self.expanded && !self.markdown_preview && matches!(self.page, Page::File(_)),
+                |row| {
+                    if self.content_only {
+                        row.child(
+                            IconButton::new(Icon::Search, "搜索文件内容")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "file-preview-search-trigger".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.search_open = !this.search_open;
+                                    if this.search_open {
+                                        use gpui::Focusable;
+                                        window.focus(&this.search.focus_handle(cx), cx);
+                                    } else {
+                                        window.blur();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    } else {
+                        row.child(self.search_controls(cx))
+                    }
+                },
+            )
+            .when(self.has_rendered_preview(), |row| {
+                let entity = cx.entity();
+                row.child(
+                    SegmentedControl::new([SegmentOption::new("源码"), SegmentOption::new("预览")])
+                        .selected(usize::from(self.markdown_preview))
+                        .theme(self.theme)
+                        .on_change(move |index, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.markdown_preview = index == 1;
+                                cx.notify();
+                            });
+                        })
+                        .render(),
+                )
+            })
     }
 
     fn search_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -307,8 +413,13 @@ impl FilePreview {
                     .id("file-preview-search-input")
                     .w(px(180.))
                     .h(px(28.))
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "enter" {
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" && this.content_only {
+                            this.search_open = false;
+                            window.blur();
+                            cx.stop_propagation();
+                            cx.notify();
+                        } else if event.keystroke.key == "enter" {
                             this.step_search(event.keystroke.modifiers.shift, cx);
                             cx.stop_propagation();
                         }
@@ -552,72 +663,88 @@ impl FilePreview {
         let p = self.theme.palette();
         let mut rows = Vec::new();
         self.tree_rows(entries, 0, &mut rows);
-        let mut list = div()
-            .id("file-preview-tree")
-            .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.navigation_scroll);
         if rows.is_empty() {
-            list = list.child(div().p_4().child("空目录"));
+            return div()
+                .id("file-preview-tree")
+                .h_full()
+                .child(div().p_4().child("空目录"));
         }
-        for (index, (entry, depth)) in rows.into_iter().enumerate() {
-            let path = entry.path.clone();
-            let expanded = self.folders.get(&path).is_some_and(|node| node.expanded);
-            list = list.child(
-                div()
-                    .id(("tree-entry", index))
-                    .debug_selector(move || format!("preview-entry:{path}"))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pl(px(8. + depth as f32 * 16.))
-                    .pr_2()
-                    .py_1()
-                    .when(entry.path == self.path, |row| row.bg(rgb(p.accent_tint)))
-                    .text_color(rgb(if entry.directory || entry.previewable {
-                        p.text
-                    } else {
-                        p.text_muted
-                    }))
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .when(entry.directory, |row| {
-                                row.child(
-                                    if expanded {
-                                        Icon::ChevronDown
-                                    } else {
-                                        Icon::ChevronRight
-                                    }
-                                    .render(12.),
-                                )
-                            }),
-                    )
-                    .child(
-                        if entry.directory {
-                            Icon::Folder
-                        } else {
-                            Icon::for_file_name(&entry.name)
-                        }
-                        .render(15.),
-                    )
-                    .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
-                    .when(entry.directory || entry.previewable, |row| {
-                        let path = entry.path.clone();
-                        row.cursor_pointer()
-                            .hover(|style| style.bg(rgb(p.surface_subtle)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if entry.directory {
-                                    this.toggle_folder(path.clone(), cx);
+        let rows = std::rc::Rc::new(rows);
+        let count = rows.len();
+        div().id("file-preview-tree").h_full().min_h_0().child(
+            gpui::uniform_list(
+                "file-preview-tree-rows",
+                count,
+                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    range
+                        .map(|index| {
+                            let (entry, depth) = rows[index].clone();
+                            let path = entry.path.clone();
+                            let expanded =
+                                this.folders.get(&path).is_some_and(|node| node.expanded);
+
+                            div()
+                                .id(("tree-entry", index))
+                                .debug_selector(move || format!("preview-entry:{path}"))
+                                .h(px(26.))
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .pl(px(8. + depth as f32 * 16.))
+                                .pr_2()
+                                .py_1()
+                                .when(entry.path == this.path, |row| row.bg(rgb(p.accent_tint)))
+                                .text_color(rgb(if entry.directory || entry.previewable {
+                                    p.text
                                 } else {
-                                    cx.emit(FilePreviewEvent::OpenRequested(path.clone()));
-                                }
-                            }))
-                    }),
-            );
-        }
-        list
+                                    p.text_muted
+                                }))
+                                .child(div().w(px(14.)).flex_shrink_0().when(
+                                    entry.directory,
+                                    |row| {
+                                        row.child(
+                                            if expanded {
+                                                Icon::ChevronDown
+                                            } else {
+                                                Icon::ChevronRight
+                                            }
+                                            .render(12.),
+                                        )
+                                    },
+                                ))
+                                .child(
+                                    if entry.directory {
+                                        Icon::Folder
+                                    } else {
+                                        Icon::for_file_name(&entry.name)
+                                    }
+                                    .render(15.),
+                                )
+                                .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
+                                .when(entry.directory || entry.previewable, |row| {
+                                    let path = entry.path.clone();
+                                    row.cursor_pointer()
+                                        .hover(|style| style.bg(rgb(p.surface_subtle)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if entry.directory {
+                                                this.toggle_folder(path.clone(), cx);
+                                            } else {
+                                                cx.emit(FilePreviewEvent::OpenRequested(
+                                                    path.clone(),
+                                                ));
+                                            }
+                                        }))
+                                })
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .h_full()
+            .w_full()
+            .track_scroll(&self.navigation_scroll),
+        )
     }
 
     /// Retain the folder independently of the currently previewed file.
@@ -689,7 +816,18 @@ impl Render for FilePreview {
                     .size_full()
                     .object_fit(gpui::ObjectFit::Contain),
             ),
-            Page::Loading => body.child(div().p_4().child("正在读取…")),
+            Page::Loading => body.child(
+                div()
+                    .p_4()
+                    .debug_selector(|| "file-preview-loading-skeleton".into())
+                    .child(
+                        Skeleton::new("file-preview-loading")
+                            .lines(12)
+                            .height(12.)
+                            .gap(14.)
+                            .theme(self.theme),
+                    ),
+            ),
             Page::Error(message) => body.child(
                 div()
                     .p_4()
@@ -722,6 +860,7 @@ impl Render for FilePreview {
             };
         }
         div()
+            .relative()
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -729,95 +868,93 @@ impl Render for FilePreview {
             .flex_col()
             .bg(rgb(p.panel))
             .text_color(rgb(p.text))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(p.border))
-                    .when_some(self.parent.clone(), |row, path| {
-                        row.child(
-                            IconButton::new(Icon::ArrowUp, "上级目录")
+            .when(!self.content_only, |root| {
+                root.child(
+                    div()
+                        .debug_selector(|| "file-preview-header".into())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .when_some(
+                            self.parent.clone().filter(|_| !self.standalone),
+                            |row, path| {
+                                row.child(
+                                    IconButton::new(Icon::ArrowUp, "上级目录")
+                                        .plain()
+                                        .theme(self.theme)
+                                        .render()
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(FilePreviewEvent::OpenRequested(path.clone()))
+                                        })),
+                                )
+                            },
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .text_size(px(12.))
+                                .child(
+                                    if self.standalone && matches!(self.page, Page::Directory(_)) {
+                                        "项目文件".to_owned()
+                                    } else if self.standalone {
+                                        std::path::Path::new(&self.path)
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    } else {
+                                        display_path(&self.path)
+                                    },
+                                ),
+                        )
+                        .children(self.header_accessory.clone())
+                        .child(self.document_controls(cx))
+                        .when(!self.standalone, |row| {
+                            row.child(
+                                IconButton::new(
+                                    if self.expanded {
+                                        Icon::Collapse
+                                    } else {
+                                        Icon::Expand
+                                    },
+                                    if self.expanded {
+                                        "恢复侧栏预览"
+                                    } else {
+                                        "展开预览"
+                                    },
+                                )
                                 .plain()
                                 .theme(self.theme)
                                 .render()
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(FilePreviewEvent::OpenRequested(path.clone()))
-                                })),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_ellipsis()
-                            .text_size(px(12.))
-                            .child(display_path(&self.path)),
-                    )
-                    .children(self.header_accessory.clone())
-                    .when(
-                        self.expanded
-                            && !self.markdown_preview
-                            && matches!(self.page, Page::File(_)),
-                        |row| row.child(self.search_controls(cx)),
-                    )
-                    .when(self.has_rendered_preview(), |row| {
-                        let entity = cx.entity();
-                        row.child(
-                            SegmentedControl::new([
-                                SegmentOption::new("源码"),
-                                SegmentOption::new("预览"),
-                            ])
-                            .selected(usize::from(self.markdown_preview))
-                            .theme(self.theme)
-                            .on_change(move |index, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.markdown_preview = index == 1;
-                                    cx.notify();
-                                });
-                            })
-                            .render(),
-                        )
-                    })
-                    .child(
-                        IconButton::new(
-                            if self.expanded {
-                                Icon::Collapse
-                            } else {
-                                Icon::Expand
-                            },
-                            if self.expanded {
-                                "恢复侧栏预览"
-                            } else {
-                                "展开预览"
-                            },
-                        )
-                        .plain()
-                        .theme(self.theme)
-                        .render()
-                        .debug_selector(|| "file-preview-expand".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.emit(FilePreviewEvent::ExpandedChanged(!this.expanded));
-                        })),
-                    )
-                    .child(
-                        IconButton::new(Icon::Close, "关闭预览")
-                            .plain()
-                            .theme(self.theme)
-                            .render()
-                            .on_click(
-                                cx.listener(|_, _, _, cx| {
-                                    cx.emit(FilePreviewEvent::CloseRequested)
-                                }),
-                            ),
-                    ),
-            )
+                                .debug_selector(|| "file-preview-expand".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.emit(FilePreviewEvent::ExpandedChanged(!this.expanded));
+                                    },
+                                )),
+                            )
+                        })
+                        .when(!self.standalone, |row| {
+                            row.child(
+                                IconButton::new(Icon::Close, "关闭预览")
+                                    .plain()
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(FilePreviewEvent::CloseRequested)
+                                    })),
+                            )
+                        }),
+                )
+            })
             .child({
                 let mut content = div().flex_1().min_h_0().min_w_0().flex();
-                if self.expanded && !matches!(self.page, Page::Directory(_)) {
+                if self.expanded && !self.content_only && !matches!(self.page, Page::Directory(_)) {
                     if let Some((path, entries)) = &self.navigation {
                         content = content.child(
                             div()
@@ -832,14 +969,13 @@ impl Render for FilePreview {
                                 .flex_col()
                                 .border_r_1()
                                 .border_color(rgb(p.border))
-                                .child(
-                                    div()
-                                        .px_4()
-                                        .py_2()
-                                        .text_size(px(12.))
-                                        .truncate()
-                                        .child(display_path(path)),
-                                )
+                                .child(div().px_4().py_2().text_size(px(12.)).truncate().child(
+                                    if self.standalone {
+                                        "项目文件".to_owned()
+                                    } else {
+                                        display_path(path)
+                                    },
+                                ))
                                 .child(
                                     div()
                                         .flex_1()
@@ -859,6 +995,44 @@ impl Render for FilePreview {
                         .child(body),
                 )
             })
+            .when(
+                self.content_only
+                    && self.search_open
+                    && !self.markdown_preview
+                    && matches!(self.page, Page::File(_)),
+                |root| {
+                    root.child(
+                        div()
+                            .absolute()
+                            .top(px(8.))
+                            .right(px(12.))
+                            .debug_selector(|| "file-preview-search-capsule".into())
+                            .occlude()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .bg(rgb(p.panel))
+                            .shadow_md()
+                            .child(self.search_controls(cx))
+                            .child(
+                                IconButton::new(Icon::Close, "关闭搜索")
+                                    .plain()
+                                    .theme(self.theme)
+                                    .render()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.search_open = false;
+                                        window.blur();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                },
+            )
     }
 }
 
@@ -867,7 +1041,117 @@ mod tests {
     use super::*;
     use gpui::Focusable;
     use std::{cell::RefCell, rc::Rc};
+    #[gpui::test]
+    fn large_directory_builds_only_visible_rows(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, cx| FilePreview::new(cx));
+        window.simulate_resize(gpui::size(px(600.), px(400.)));
+        view.update(window, |view, cx| {
+            view.set_expanded(true, cx);
+            view.set_directory(
+                "/project".into(),
+                None,
+                (0..1000)
+                    .map(|index| FilePreviewEntry {
+                        name: format!("file-{index}.rs"),
+                        path: format!("/project/file-{index}.rs"),
+                        directory: false,
+                        previewable: true,
+                    })
+                    .collect(),
+                cx,
+            );
+        });
+        assert!(
+            window
+                .debug_bounds("preview-entry:/project/file-0.rs")
+                .is_some()
+        );
+        assert!(
+            window
+                .debug_bounds("preview-entry:/project/file-999.rs")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn project_query_survives_async_file_loading(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, cx| FilePreview::new(cx));
+        view.update(window, |view, cx| {
+            view.set_content_only(true, cx);
+            view.set_loading("main.rs".into(), cx);
+            view.set_document_search("测试".into(), Some(2), cx);
+            view.set_file(
+                "main.rs".into(),
+                None,
+                "rust".into(),
+                "// header\n// 测试\n".into(),
+                cx,
+            );
+        });
+        window.run_until_parked();
+        view.read_with(window, |view, cx| {
+            assert_eq!(view.search.read(cx).value(), "测试");
+            assert!(view.search_open);
+            let Page::File(editor) = &view.page else {
+                panic!("file expected")
+            };
+            assert_eq!(editor.read(cx).search_query(), "测试");
+            assert_eq!(view.search_match, Some((0, 1)));
+        });
+    }
+
+    struct SearchHost(Entity<FilePreview>);
+    impl Render for SearchHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let controls = self.0.update(cx, |view, cx| view.document_controls(cx));
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(controls)
+                .child(div().flex_1().min_h_0().child(self.0.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn document_search_opens_focused_capsule_and_escape_closes_it(cx: &mut gpui::TestAppContext) {
+        let (_host, window) = cx.add_window_view(|_, cx| {
+            SearchHost(cx.new(|cx| {
+                let mut view = FilePreview::new(cx);
+                view.set_content_only(true, cx);
+                view.set_expanded(true, cx);
+                view.set_file(
+                    "/project/main.rs".into(),
+                    None,
+                    "rust".into(),
+                    "fn main() {}".into(),
+                    cx,
+                );
+                view
+            }))
+        });
+        assert!(window.debug_bounds("file-preview-search-capsule").is_none());
+        let trigger = window.debug_bounds("file-preview-search-trigger").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        assert!(window.debug_bounds("file-preview-search-capsule").is_some());
+        window.simulate_keystrokes("escape");
+        assert!(window.debug_bounds("file-preview-search-capsule").is_none());
+    }
+
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
+    #[gpui::test]
+    fn hosted_document_omits_header_and_sidebar_keeps_it(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, cx| FilePreview::new(cx));
+        assert!(window.debug_bounds("file-preview-header").is_some());
+        view.update(window, |view, cx| {
+            view.set_standalone(true, cx);
+            view.set_content_only(true, cx);
+        });
+        assert!(window.debug_bounds("file-preview-header").is_none());
+        view.update(window, |view, cx| view.set_content_only(false, cx));
+        assert!(window.debug_bounds("file-preview-header").is_some());
+    }
+
     #[gpui::test]
     fn html_preview_is_available_without_creating_native_view_until_selected(
         cx: &mut gpui::TestAppContext,

@@ -1424,6 +1424,47 @@ mod tests {
     use std::time::Duration;
 
     #[gpui::test]
+    fn project_page_terminal_stays_below_files_for_command_and_shortcut(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("browse");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        host.update_in(window, |host, window, cx| {
+            host.history.active_mut().project = Some(dir.path().to_path_buf());
+            host.navigate(crate::Page::Projects, window, cx);
+            host.choose_project(root.clone(), cx);
+            host.commands.pending = Some("project-terminal".into());
+            host.execute_pending_command(window, cx);
+            assert_eq!(host.page, crate::Page::Projects);
+            assert!(host.terminal_ui.bottom);
+            assert!(host.terminal_ui.terminals.contains_key(&root));
+            host.terminal_ui.open = false;
+            window.focus(&host.focus, cx);
+        });
+        window.simulate_keystrokes("ctrl-`");
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            assert_eq!(host.page, crate::Page::Projects);
+            assert!(host.terminal_ui.open && host.terminal_ui.bottom);
+            assert!(host.terminal_ui.terminals.contains_key(&root));
+        });
+        let terminal = window.debug_bounds("project-terminal-sidebar").unwrap();
+        assert!(terminal.origin.y > px(300.));
+    }
+
+    #[gpui::test]
     fn terminal_tabs_keep_sessions_when_switching_hiding_and_closing(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2528,7 +2569,8 @@ impl AgentWorkspace {
     }
 
     pub(super) fn set_terminal_position(&mut self, position: Position) {
-        self.terminal_ui.bottom = position == Position::Bottom;
+        self.terminal_ui.bottom =
+            self.page == crate::Page::Projects || position == Position::Bottom;
         if self.terminal_ui.open {
             if self.terminal_ui.bottom {
                 self.project_actions.panel = false;
@@ -2585,7 +2627,11 @@ impl AgentWorkspace {
             self.terminal_ui.terminals.insert(root.clone(), terminal);
             self.background_tasks(cx);
         }
-        self.page = crate::Page::Chat;
+        if self.page == crate::Page::Projects {
+            self.terminal_ui.bottom = true;
+        } else {
+            self.page = crate::Page::Chat;
+        }
         // Expanded project views keep their content above the terminal, even
         // when the user's usual terminal position is the right sidebar.
         if (self.file_preview.open && self.file_preview.expanded)

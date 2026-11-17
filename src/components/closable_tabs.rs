@@ -161,10 +161,12 @@ impl ClosableTabs {
             .min_w_0()
             .flex_shrink_0()
             .rounded_t(px(12.))
-            .bg(if dark {
-                rgba(0xffffff03)
-            } else {
-                rgb(p.canvas)
+            .when(self.trailing.is_none(), |strip| {
+                strip.bg(if dark {
+                    rgba(0xffffff03)
+                } else {
+                    rgb(p.canvas)
+                })
             })
             .pt(px(6.))
             .px(px(6.))
@@ -323,13 +325,19 @@ impl ClosableTabs {
             card.child(
                 div()
                     .debug_selector(|| "closable-tabs-header".into())
+                    .rounded_t(px(12.))
+                    .bg(if dark {
+                        rgba(0xffffff03)
+                    } else {
+                        rgb(p.canvas)
+                    })
                     .w_full()
                     .min_w_0()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .child(strip.w_0().flex_1())
-                    .child(div().flex_shrink_0().px_2().child(trailing)),
+                    .child(div().flex_shrink_0().pt(px(6.)).px_2().child(trailing)),
             )
         } else {
             card.child(strip)

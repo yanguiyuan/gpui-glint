@@ -60,6 +60,7 @@ impl CommandsPage {
                             CommandPaletteEvent::Executed(id) => {
                                 this.feedback = format!("演示：已执行命令 {id}")
                             }
+                            CommandPaletteEvent::SearchChanged { .. } => {}
                             CommandPaletteEvent::Dismissed => {
                                 this.feedback = "已关闭命令面板".into()
                             }

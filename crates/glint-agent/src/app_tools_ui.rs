@@ -154,6 +154,16 @@ pub(super) fn tool_summary(
     (presentation.icon, presentation.summary)
 }
 
+fn tool_succeeded(record: &tools::ToolRecord) -> bool {
+    record.success
+        && !(record.call.name == "run_command"
+            && record
+                .result
+                .strip_prefix("exit: ")
+                .and_then(|result| result.lines().next())
+                .is_some_and(|status| status.trim() != "0"))
+}
+
 fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -> ToolPresentation {
     if record.result == "正在生成参数…"
         || record.result.starts_with("未执行：")
@@ -187,13 +197,7 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
         };
     }
     let running = record.result == "执行中…";
-    let command_failed = record.call.name == "run_command"
-        && record
-            .result
-            .strip_prefix("exit: ")
-            .and_then(|result| result.lines().next())
-            .is_some_and(|status| status.trim() != "0");
-    let success = record.success && !command_failed;
+    let success = tool_succeeded(record);
     let args = &record.call.arguments;
     let path = args["path"].as_str().unwrap_or(".");
     let (icon, action, target) = match record.call.name.as_str() {
@@ -876,6 +880,25 @@ impl AgentWorkspace {
             let scope = format!("{key}:tool:{}", record.call.id);
             let preview_root = self.history.active().project.clone();
             let preview_workspace = cx.entity().downgrade();
+            let operation_title = match record.call.name.as_str() {
+                "run_command" | "command_poll" | "command_stop" => "Shell",
+                "code_mode" => "JavaScript",
+                name => name,
+            }
+            .to_owned();
+            let (status_icon, status_label) = if record.result == "执行中…" {
+                (Icon::Spinner, "执行中")
+            } else if record.result == "正在生成参数…" {
+                (Icon::Clock, "准备中")
+            } else if record.result.starts_with("未执行：") {
+                (Icon::Pause, "未执行")
+            } else if record.result.starts_with("调用已中断：") {
+                (Icon::Pause, "已中断")
+            } else if tool_succeeded(record) {
+                (Icon::CheckCircle, "成功")
+            } else {
+                (Icon::Close, "失败")
+            };
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
                 panel.set_summary(presentation.summary.clone(), cx);
@@ -996,90 +1019,101 @@ impl AgentWorkspace {
                 }
                 panel.set_content(
                     move |_, cx| {
-                        if script.is_some() || output_panel.is_some() || !nested.is_empty() {
-                            return weak
-                                .update(cx, |this, cx| {
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_3()
-                                        .when_some(script.clone(), |body, card| {
-                                            body.child(
+                        let body = (|| {
+                            if script.is_some() || output_panel.is_some() || !nested.is_empty() {
+                                return weak
+                                    .update(cx, |this, cx| {
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_3()
+                                            .when_some(script.clone(), |body, card| {
+                                                body.child(
+                                                    div()
+                                                        .id("code-mode-source")
+                                                        .debug_selector(|| {
+                                                            "code-mode-source".into()
+                                                        })
+                                                        .h(px(source_height))
+                                                        .flex_shrink_0()
+                                                        .overflow_hidden()
+                                                        .rounded(px(8.))
+                                                        .child(card),
+                                                )
+                                            })
+                                            .child(if let Some(output_panel) = &output_panel {
                                                 div()
-                                                    .id("code-mode-source")
-                                                    .debug_selector(|| "code-mode-source".into())
-                                                    .h(px(source_height))
-                                                    .flex_shrink_0()
-                                                    .overflow_hidden()
-                                                    .rounded(px(8.))
-                                                    .child(card),
+                                                    .debug_selector(|| {
+                                                        "code-mode-result-toggle".into()
+                                                    })
+                                                    .child(output_panel.clone())
+                                                    .into_any_element()
+                                            } else {
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .child(result.clone())
+                                                    .into_any_element()
+                                            })
+                                            .children(
+                                                nested.iter().map(|record| {
+                                                    this.tool_panel(&scope, record, cx)
+                                                }),
                                             )
-                                        })
-                                        .child(if let Some(output_panel) = &output_panel {
-                                            div()
-                                                .debug_selector(|| "code-mode-result-toggle".into())
-                                                .child(output_panel.clone())
-                                                .into_any_element()
-                                        } else {
-                                            div()
-                                                .text_size(px(12.))
-                                                .child(result.clone())
-                                                .into_any_element()
-                                        })
-                                        .children(
-                                            nested
-                                                .iter()
-                                                .map(|record| this.tool_panel(&scope, record, cx)),
-                                        )
-                                        .into_any_element()
-                                })
-                                .unwrap_or_else(|_| div().into_any_element());
-                        }
-                        if let Some(change) = &change {
-                            return weak
-                                .update(cx, |this, cx| {
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .id("tool-edit-diff")
-                                                .max_h(px(360.))
-                                                .overflow_y_scroll()
-                                                .child(this.edit_diff(&scope, change, cx)),
-                                        )
-                                        .into_any_element()
-                                })
-                                .unwrap_or_else(|_| div().into_any_element());
-                        }
-                        div()
-                            .id("tool-output")
-                            .debug_selector(|| "tool-output".into())
-                            .w_full()
-                            .min_w_0()
-                            .flex_shrink_0()
-                            .max_h(px(320.))
-                            .relative()
-                            .overflow_y_scroll()
-                            .track_scroll(&result_scroll)
-                            .text_size(px(12.))
-                            .line_height(px(20.))
-                            .font_family("monospace")
-                            .text_color(rgb(p.text_muted))
-                            .child(div().w_full().min_w_0().child(
-                                if let Some(output) = &command_output {
-                                    output.render().into_any_element()
-                                } else {
-                                    div().child(result.clone()).into_any_element()
-                                },
-                            ))
-                            .child(crate::command_output::scroll_guard(&result_scroll, 20.))
-                            .into_any_element()
+                                            .into_any_element()
+                                    })
+                                    .unwrap_or_else(|_| div().into_any_element());
+                            }
+                            if let Some(change) = &change {
+                                return weak
+                                    .update(cx, |this, cx| {
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .id("tool-edit-diff")
+                                                    .max_h(px(360.))
+                                                    .overflow_y_scroll()
+                                                    .child(this.edit_diff(&scope, change, cx)),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .unwrap_or_else(|_| div().into_any_element());
+                            }
+                            div()
+                                .id("tool-output")
+                                .debug_selector(|| "tool-output".into())
+                                .w_full()
+                                .min_w_0()
+                                .flex_shrink_0()
+                                .max_h(px(320.))
+                                .relative()
+                                .overflow_y_scroll()
+                                .track_scroll(&result_scroll)
+                                .text_size(px(12.))
+                                .line_height(px(20.))
+                                .font_family("monospace")
+                                .text_color(rgb(p.text_muted))
+                                .child(div().w_full().min_w_0().child(
+                                    if let Some(output) = &command_output {
+                                        output.render().into_any_element()
+                                    } else {
+                                        div().child(result.clone()).into_any_element()
+                                    },
+                                ))
+                                .child(crate::command_output::scroll_guard(&result_scroll, 20.))
+                                .into_any_element()
+                        })();
+                        gpui_glint::components::OperationPanel::new(operation_title.clone())
+                            .theme(theme)
+                            .child(body)
+                            .status(status_icon, status_label)
+                            .render()
                     },
                     cx,
                 );

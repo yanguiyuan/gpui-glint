@@ -126,6 +126,23 @@ impl AgentWorkspace {
     }
 
     pub fn choose_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.page == crate::Page::Projects {
+            let restored = self.history.removed_projects.remove(&path);
+            let added = !self.history.projects.contains(&path);
+            if added {
+                self.history.projects.push(path.clone());
+            }
+            if added || !self.history.project_metadata.contains_key(&path) {
+                self.refresh_project_metadata(vec![path.clone()], cx);
+            }
+            self.browser_project = Some(path);
+            self.project_picker_open = false;
+            if added || restored {
+                self.save(cx);
+            }
+            self.open_browser_project(cx);
+            return;
+        }
         self.capture_draft(cx);
         self.history.removed_projects.remove(&path);
         if !self.history.projects.contains(&path) {

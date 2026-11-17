@@ -512,6 +512,24 @@ impl CodeCard {
         self.cached_search_matches().len()
     }
 
+    /// Locate the first match on or after a one-based source line.
+    pub fn reveal_search_at_line(&mut self, line: usize, cx: &mut Context<Self>) -> Option<usize> {
+        let offset = self
+            .content
+            .split_inclusive('\n')
+            .take(line.saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>();
+        let matches = self.cached_search_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let index = matches
+            .partition_point(|range| range.start < offset)
+            .min(matches.len() - 1);
+        self.reveal_search_match(index, cx).then_some(index)
+    }
+
     /// Highlight a zero-based match and reveal it in a viewport card, without
     /// moving keyboard focus or changing the text selection.
     pub fn reveal_search_match(&mut self, index: usize, cx: &mut Context<Self>) -> bool {

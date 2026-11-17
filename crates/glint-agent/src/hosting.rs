@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Chat,
+    Projects,
     Calendar,
     Partners,
     Channels,
@@ -41,10 +42,17 @@ impl AgentWorkspace {
     }
 
     pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_files.update(cx, |files, cx| {
+            files.set_visible(page == Page::Projects, cx)
+        });
         self.page = page;
         self.project_picker_open = false;
         self.git_ui.picker_open = false;
         match page {
+            Page::Projects => {
+                self.open_browser_project(cx);
+                window.focus(&self.focus, cx);
+            }
             Page::Chat => {
                 self.sync_skill_context(cx);
                 window.focus(&self.composer.focus_handle(cx), cx);

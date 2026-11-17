@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{CollapsePanel, InputField, Switch};
+use gpui_glint::components::{CollapsePanel, InputField, Skeleton, Switch};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1307,6 +1307,23 @@ impl AgentWorkspace {
                         ),
                 );
             let available: Vec<_> = settings.available_models.iter().collect();
+            if available.is_empty() && settings.discovering.is_some() {
+                page = page.child(
+                    div()
+                        .p_3()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .debug_selector(|| "models-loading-skeleton".into())
+                        .child(
+                            Skeleton::new("available-models-loading")
+                                .lines(5)
+                                .height(12.)
+                                .gap(20.)
+                                .theme(self.theme),
+                        ),
+                );
+            }
             if !available.is_empty() {
                 page = page.child(
                     div()

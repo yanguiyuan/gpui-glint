@@ -4,13 +4,21 @@ use gpui_glint::components::{CommandItem, CommandPalette, CommandPaletteEvent};
 pub struct State {
     pub palette: Entity<CommandPalette>,
     pub pending: Option<SharedString>,
+    pub search: project_search::Search,
 }
 impl State {
     pub fn new(cx: &mut Context<AgentWorkspace>) -> Self {
         let palette = cx.new(|cx| CommandPalette::new([], cx));
         cx.subscribe(&palette, |this, _, event: &CommandPaletteEvent, cx| {
-            if let CommandPaletteEvent::Executed(id) = event {
-                this.commands.pending = Some(id.clone());
+            match event {
+                CommandPaletteEvent::Executed(id) => this.commands.pending = Some(id.clone()),
+                CommandPaletteEvent::SearchChanged { query, category } => {
+                    this.schedule_project_search(query.clone(), category.to_string(), cx)
+                }
+                CommandPaletteEvent::Dismissed => {
+                    this.commands.search.job = None;
+                    this.commands.search.key = None;
+                }
             }
             cx.notify();
         })
@@ -18,6 +26,7 @@ impl State {
         Self {
             palette,
             pending: None,
+            search: Default::default(),
         }
     }
 }
@@ -75,7 +84,10 @@ impl AgentWorkspace {
                 ))
                 .group("项目")
                 .keywords("终端 terminal shell bash gitbash powershell 命令行")
-                .disabled(session.project.is_none()),
+                .disabled(
+                    session.project.is_none()
+                        && !(self.page == crate::Page::Projects && self.browser_project.is_some()),
+                ),
             CommandItem::new("settings", "设置")
                 .icon(Icon::Settings)
                 .group("应用"),
@@ -85,8 +97,19 @@ impl AgentWorkspace {
                 .group("切换会话")
                 .icon(Icon::MessageCircle)
         }));
+        for item in &mut items {
+            item.category = if item.id.starts_with("session:") {
+                "聊天".into()
+            } else {
+                "操作".into()
+            };
+        }
+        self.commands.search.base = items.clone();
+        self.commands.search.key = None;
+        self.commands.search.job = None;
         self.commands.palette.update(cx, |palette, cx| {
             palette.set_theme(self.theme, cx);
+            palette.set_categories(["全部", "操作", "聊天", "文件", "文本"].map(Into::into), cx);
             palette.set_items(items, cx);
             palette.open(window, cx);
         });
@@ -96,6 +119,40 @@ impl AgentWorkspace {
         let Some(command) = self.commands.pending.take() else {
             return;
         };
+        self.commands.search.job = None;
+        if let Some(index) = command
+            .strip_prefix("project-result:")
+            .and_then(|index| index.parse::<usize>().ok())
+        {
+            if let Some((root, path, line)) = self.commands.search.targets.get(index).cloned() {
+                if self.page != crate::Page::Projects {
+                    self.browser_project = Some(root.clone());
+                }
+                self.navigate(crate::Page::Projects, window, cx);
+                let search_query = self.commands.palette.read(cx).query(cx).to_owned();
+                self.project_files.update(cx, |files, cx| {
+                    files.set_root(root.clone(), cx);
+                    let path = if ssh_project::is_remote(&root) {
+                        ssh_project::Remote::from_path(&root)
+                            .map(|remote| {
+                                PathBuf::from(remote.directory)
+                                    .join(&path)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .unwrap_or(path)
+                    } else {
+                        root.join(path).to_string_lossy().into_owned()
+                    };
+                    if line.is_some() {
+                        files.open_search_result(path, line, search_query, cx);
+                    } else {
+                        files.open_at(path, line, cx);
+                    }
+                });
+            }
+            return;
+        }
         match command.as_ref() {
             "new" => self.new_session(window, cx),
             "search" => {

@@ -136,6 +136,8 @@ pub use prompt_editor::{PastedImage, PromptEditor, PromptEditorEvent, bind_promp
 mod group_list;
 pub use group_list::{GroupList, GroupListEvent, GroupListGroup, GroupListHeader, GroupListItem};
 
+mod operation_panel;
+pub use operation_panel::OperationPanel;
 mod collapse_panel;
 pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent};
 

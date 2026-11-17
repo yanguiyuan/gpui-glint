@@ -53,6 +53,9 @@ mod project_actions;
 mod project_context;
 mod project_grouping;
 mod project_ui;
+mod projects_page;
+mod project_files;
+mod project_search;
 mod provider;
 mod provider_catalog;
 mod provider_ui;
@@ -139,6 +142,7 @@ pub struct AgentWorkspace {
     right_sidebar_resize: Option<(gpui::Pixels, f32)>,
     panel_repositories: panel_repositories::State,
     file_preview: file_preview::State,
+    project_files: Entity<project_files::ProjectFiles>,
     terminal_ui: terminal_ui::State,
     show_background_tasks: bool,
     host_background_tasks: bool,
@@ -195,6 +199,8 @@ pub struct AgentWorkspace {
     show_sessions: bool,
     show_auxiliary_sidebar: bool,
     project_picker_open: bool,
+    browser_project: Option<PathBuf>,
+    browser_repositories: projects_page::Repositories,
     project_grouping: project_grouping::State,
     outline: Entity<outline::ConversationOutline>,
     titles: Entity<titles::TitleGenerator>,
@@ -673,6 +679,7 @@ impl AgentWorkspace {
             right_sidebar_resize: None,
             panel_repositories: Default::default(),
             file_preview: file_preview::State::new(cx),
+            project_files: cx.new(project_files::ProjectFiles::new),
             terminal_ui: terminal_ui::State::new(history.terminal_default_position),
             show_background_tasks: false,
             host_background_tasks: false,
@@ -736,6 +743,8 @@ impl AgentWorkspace {
             show_sessions: true,
             show_auxiliary_sidebar: true,
             project_picker_open: false,
+            browser_project: None,
+            browser_repositories: Default::default(),
             project_grouping: project_grouping::State::new(cx),
             git_ui: git_ui::State::new(theme, cx),
             outline,
@@ -1639,6 +1648,9 @@ impl AgentWorkspace {
     }
 
     fn topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.page == crate::Page::Projects {
+            return self.projects_topbar(cx);
+        }
         let p = self.theme.palette();
         div()
             .size_full()
@@ -2876,7 +2888,9 @@ impl Render for AgentWorkspace {
                         self.sidebar(cx)
                     })
                     .into_any_element(),
-                    content: (if self.page == crate::Page::Chat
+                    content: (if self.page == crate::Page::Projects {
+                        self.expanded_project_panel(self.projects_page(cx), cx)
+                    } else if self.page == crate::Page::Chat
                         && self.file_preview.open
                         && self.file_preview.expanded
                     {
@@ -2980,7 +2994,8 @@ impl Render for AgentWorkspace {
                     } else {
                         260.
                     },
-                    sidebar_visible: if self.page == crate::Page::Vault
+                    sidebar_visible: if self.page == crate::Page::Projects
+                        || self.page == crate::Page::Vault
                         || self.page == crate::Page::Partners
                         || self.page == crate::Page::Channels
                     {

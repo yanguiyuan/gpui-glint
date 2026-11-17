@@ -237,7 +237,10 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
-        if event.keystroke.is_ime_in_progress() || self.history.active().project.is_none() {
+        if event.keystroke.is_ime_in_progress()
+            || (self.history.active().project.is_none()
+                && !(self.page == crate::Page::Projects && self.browser_project.is_some()))
+        {
             return;
         }
         let Some(action) = ProjectAction::ALL.into_iter().find(|action| {

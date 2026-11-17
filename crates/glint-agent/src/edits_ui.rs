@@ -1584,8 +1584,27 @@ impl AgentWorkspace {
                     }),
             );
         }
-        if self.edits_ui.expanded {
+        let loading_files = workspace_mode
+            && root_matches
+            && files.is_empty()
+            && self.edits_ui.conflicts.is_empty()
+            && self.edits_ui.workspace_task.is_some();
+        if self.edits_ui.expanded && !loading_files {
             list = self.expanded_edit_files(files, scope, can_undo, root_matches, cx);
+        }
+        if loading_files {
+            list = list.child(
+                div()
+                    .p_3()
+                    .debug_selector(|| "workspace-files-loading-skeleton".into())
+                    .child(
+                        Skeleton::new("workspace-files-loading")
+                            .lines(8)
+                            .height(12.)
+                            .gap(20.)
+                            .theme(self.theme),
+                    ),
+            );
         }
         body.child(list).when(workspace_mode && !self.edits_ui.expanded, |body| {
             body.children(self.git_commit_footer(cx))

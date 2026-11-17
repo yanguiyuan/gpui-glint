@@ -420,7 +420,7 @@ pub async fn decorate_cached(
         replacements,
     })
 }
-enum Loaded {
+pub(super) enum Loaded {
     File(String),
     Image(Vec<u8>),
     Directory(Vec<FilePreviewEntry>, bool),
@@ -461,7 +461,7 @@ async fn load_with_navigation(
     Ok((result, navigation))
 }
 
-async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String> {
+pub(super) async fn load(target: Target) -> Result<(String, Option<String>, Loaded), String> {
     if let Some(root) = target.root.as_deref().filter(|p| ssh_project::is_remote(p)) {
         let remote = ssh_project::Remote::from_path(root)?;
         let value = remote
@@ -930,10 +930,13 @@ impl AgentWorkspace {
             self.open_file_preview_mode(target, true, cx);
         }
     }
-    fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {
+    pub(super) fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {
         self.open_file_preview_mode(target, false, cx);
     }
     pub(super) fn switch_preview_repository(&mut self, cx: &mut Context<Self>) {
+        if self.page == crate::Page::Projects {
+            return;
+        }
         let expanded = self.file_preview.expanded;
         self.file_preview.directory_tasks.clear();
         self.open_project_directory(cx);
@@ -1070,6 +1073,7 @@ impl AgentWorkspace {
             .repository_select(crate::panel_repositories::Panel::Preview, cx)
             .map(gpui::AnyView::from);
         self.file_preview.view.update(cx, |view, cx| {
+            view.set_standalone(false, cx);
             view.set_header_accessory(accessory, cx);
             view.set_theme(self.theme, cx);
             view.set_expanded(self.file_preview.expanded, cx);

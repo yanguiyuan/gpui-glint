@@ -29,6 +29,12 @@ pub(super) struct State {
 
 impl AgentWorkspace {
     pub(super) fn panel_repository_root(&self, panel: Panel) -> Option<PathBuf> {
+        if self.page == crate::Page::Projects && panel == Panel::Terminal {
+            return self
+                .browser_repositories
+                .selected_root()
+                .or_else(|| self.browser_project.clone());
+        }
         let home = self.history.active().project.as_ref()?;
         let state = &self.panel_repositories;
         if state.home.as_ref() == Some(home) {
@@ -86,6 +92,9 @@ impl AgentWorkspace {
         panel: Panel,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Select>> {
+        if self.page == crate::Page::Projects {
+            return None;
+        }
         if self.panel_repositories.home != self.history.active().project
             || self.panel_repositories.options.len() < 2
         {
@@ -128,6 +137,9 @@ impl AgentWorkspace {
     }
 
     pub(super) fn sync_panel_repositories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == crate::Page::Projects {
+            return;
+        }
         let home = self.history.active().project.clone();
         let changed = self.panel_repositories.home != home;
         if changed {
