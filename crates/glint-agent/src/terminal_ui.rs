@@ -16,7 +16,7 @@ use gpui::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::Path,
     sync::{
@@ -533,6 +533,17 @@ pub(super) fn output_color(value: Color, theme: ThemePreset) -> u32 {
 // Use grid cells rather than screen text offsets so wide characters, scrollback,
 // ANSI styling and soft-wrapped paths retain the correct click position.
 fn terminal_logical_line<T: EventListener>(term: &Term<T>, point: TermPoint) -> (String, usize) {
+    let line = terminal_line_snapshot(term, point);
+    (line.text, line.offset)
+}
+
+struct TerminalLine {
+    text: String,
+    offset: usize,
+    cells: Vec<(TermPoint, Range<usize>)>,
+}
+
+fn terminal_line_snapshot<T: EventListener>(term: &Term<T>, point: TermPoint) -> TerminalLine {
     let columns = term.columns();
     let mut first = point.line.0;
     let mut last = first;
@@ -554,6 +565,8 @@ fn terminal_logical_line<T: EventListener>(term: &Term<T>, point: TermPoint) -> 
     }
     let mut text = String::new();
     let mut offset = 0;
+    let mut cells = Vec::new();
+    let mut previous = 0..0;
     for row in first..=last {
         for col in 0..columns {
             let cell = &term.grid()[Line(row)][Column(col)];
@@ -568,14 +581,21 @@ fn terminal_logical_line<T: EventListener>(term: &Term<T>, point: TermPoint) -> 
                 };
             }
             if !spacer {
+                let start = text.len();
                 text.push(cell.c);
                 if let Some(chars) = cell.zerowidth() {
                     text.extend(chars);
                 }
+                previous = start..text.len();
             }
+            cells.push((TermPoint::new(Line(row), Column(col)), previous.clone()));
         }
     }
-    (text, offset)
+    TerminalLine {
+        text,
+        offset,
+        cells,
+    }
 }
 
 fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
@@ -622,6 +642,10 @@ fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
 // Resolve on the background executor. Trying bounded, longest-first spans also
 // handles unquoted paths containing spaces without guessing where the name ends.
 fn resolve_output_path(text: &str, offset: usize, root: &Path) -> Option<PathBuf> {
+    resolve_output_link(text, offset, root).map(|(path, _)| path)
+}
+
+fn resolve_output_link(text: &str, offset: usize, root: &Path) -> Option<(PathBuf, Range<usize>)> {
     if offset >= text.len() || crate::ssh_project::is_remote(root) {
         return None;
     }
@@ -662,7 +686,7 @@ fn resolve_output_path(text: &str, offset: usize, root: &Path) -> Option<PathBuf
             }
             if let Some(path) = output_path(value, root) {
                 if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_dir()) {
-                    return Some(path);
+                    return Some((path, begin..begin + value.len()));
                 }
             }
         }
@@ -686,6 +710,10 @@ pub(super) struct TerminalView {
     exit_notified: bool,
     stop_requested: bool,
     command_output: bool,
+    hover_point: Option<TermPoint>,
+    hover_cells: HashSet<(i32, usize)>,
+    hover_revision: u64,
+    hover_task: Option<Task<()>>,
 }
 impl TerminalView {
     fn new(root: PathBuf, theme: ThemePreset, cx: &mut Context<Self>) -> Self {
@@ -744,6 +772,7 @@ impl TerminalView {
             while receiver.recv().await.is_ok() {
                 if weak
                     .update(cx, |this, cx| {
+                        this.clear_path_hover();
                         if this.command_output {
                             cx.emit(WorkspaceActivity);
                         }
@@ -780,6 +809,10 @@ impl TerminalView {
             exit_notified: false,
             stop_requested: false,
             command_output,
+            hover_point: None,
+            hover_cells: HashSet::new(),
+            hover_revision: 0,
+            hover_task: None,
         }
     }
     pub(super) fn busy(&self) -> bool {
@@ -1012,6 +1045,70 @@ impl TerminalView {
         })
         .detach();
     }
+
+    fn clear_path_hover(&mut self) {
+        self.hover_revision = self.hover_revision.wrapping_add(1);
+        self.hover_task = None;
+        self.hover_point = None;
+        self.hover_cells.clear();
+    }
+
+    fn update_path_hover(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if !self.bounds.contains(&position) || crate::ssh_project::is_remote(&self.root) {
+            if self.hover_point.is_some() {
+                self.clear_path_hover();
+                cx.notify();
+            }
+            return;
+        }
+        let point = self.grid_point(position);
+        if self.hover_point == Some(point)
+            || self.hover_cells.contains(&(point.line.0, point.column.0))
+        {
+            return;
+        }
+        self.clear_path_hover();
+        self.hover_point = Some(point);
+        let Some(session) = &self.session else {
+            return;
+        };
+        let snapshot = terminal_line_snapshot(&session.term.lock(), point);
+        let root = self.root.clone();
+        let revision = self.hover_revision;
+        self.hover_task = Some(cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(60))
+                .await;
+            let cells = cx
+                .background_executor()
+                .spawn(async move {
+                    let Some((_, range)) =
+                        resolve_output_link(&snapshot.text, snapshot.offset, &root)
+                    else {
+                        return HashSet::new();
+                    };
+                    snapshot
+                        .cells
+                        .into_iter()
+                        .filter_map(|(point, bytes)| {
+                            (bytes.start < range.end && bytes.end > range.start)
+                                .then_some((point.line.0, point.column.0))
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.hover_revision == revision {
+                    if let Some(task) = this.hover_task.take() {
+                        task.detach();
+                    }
+                    this.hover_cells = cells;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
     fn paint(
         &mut self,
         bounds: gpui::Bounds<gpui::Pixels>,
@@ -1024,6 +1121,9 @@ impl TerminalView {
             self.font = font;
             self.cell_width = cell_width;
             self.configured_font = configured;
+        }
+        if self.bounds != bounds {
+            self.clear_path_hover();
         }
         self.bounds = bounds;
         let colors = TerminalColors::for_theme(self.theme);
@@ -1059,6 +1159,18 @@ impl TerminalView {
                 window.paint_quad(gpui::fill(
                     gpui::Bounds::new(origin, size(px(self.cell_width), px(CELL_H))),
                     rgb(bg),
+                ));
+            }
+            if self
+                .hover_cells
+                .contains(&(cell.point.line.0, cell.point.column.0))
+            {
+                window.paint_quad(gpui::fill(
+                    gpui::Bounds::new(
+                        origin + point(px(0.), px(CELL_H - 2.)),
+                        size(px(self.cell_width), px(1.)),
+                    ),
+                    rgb(fg),
                 ));
             }
             if cell.flags.intersects(
@@ -1227,6 +1339,7 @@ impl Render for TerminalView {
                         cx.stop_propagation();
                         return;
                     }
+                    this.clear_path_hover();
                     this.dragging = true;
                     let point = this.grid_point(event.position);
                     if let Some(session) = &this.session {
@@ -1246,6 +1359,14 @@ impl Render for TerminalView {
                         }
                     }
                     cx.notify();
+                } else {
+                    this.update_path_hover(event.position, cx);
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.hover_point.is_some() {
+                    this.clear_path_hover();
+                    cx.notify();
                 }
             }))
             .on_mouse_up(
@@ -1257,6 +1378,7 @@ impl Render for TerminalView {
                 cx.listener(|this, _, _, _| this.dragging = false),
             )
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                this.clear_path_hover();
                 if let Some(session) = &this.session {
                     let delta = event.delta.pixel_delta(px(CELL_H));
                     session.term.lock().scroll_display(Scroll::Delta(
@@ -1350,6 +1472,12 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("project-terminal-sidebar").is_some());
         assert!(window.debug_bounds("project-terminal-input").is_some());
+        let header = window.debug_bounds("closable-tabs-header").unwrap();
+        let input = window.debug_bounds("project-terminal-input").unwrap();
+        let hide = window.debug_bounds("project-terminal-hide").unwrap();
+        assert!(header.size.height <= px(48.));
+        assert!((input.top() - header.bottom()).abs() <= px(1.));
+        assert!(hide.top() >= header.top() && hide.bottom() <= header.bottom());
         window.update(|window, cx| {
             host.update(cx, |host, cx| {
                 let remaining = host.terminal_tabs(&root)[0].1.entity_id();
@@ -1407,7 +1535,7 @@ mod tests {
     #[test]
     fn terminal_path_reassembles_soft_wraps_and_unicode_cell_offsets() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("artifact.exe");
+        let file = dir.path().join("产物 artifact.exe");
         std::fs::write(&file, "installer").unwrap();
         let mut term = Term::new(
             Default::default(),
@@ -1429,6 +1557,27 @@ mod tests {
             .point;
         let (line, offset) = terminal_logical_line(&term, point);
         assert_eq!(line.as_bytes()[offset], b'x');
+        let (_, range) = resolve_output_link(&line, offset, dir.path()).unwrap();
+        assert_eq!(&line[range.clone()], file.to_string_lossy());
+        let snapshot = terminal_line_snapshot(&term, point);
+        let linked: Vec<_> = snapshot
+            .cells
+            .iter()
+            .filter(|(_, bytes)| bytes.start < range.end && bytes.end > range.start)
+            .collect();
+        assert!(
+            linked.len() > file.to_string_lossy().chars().count(),
+            "wide characters include their spacer cells"
+        );
+        assert!(
+            linked
+                .iter()
+                .all(|(_, bytes)| bytes.start >= range.start && bytes.end <= range.end)
+        );
+        assert!(
+            linked.first().unwrap().0.line < linked.last().unwrap().0.line,
+            "underline spans wrapped rows"
+        );
         assert_eq!(
             resolve_output_path(&line, offset, dir.path())
                 .unwrap()
@@ -2604,29 +2753,9 @@ impl AgentWorkspace {
                 }
             });
         let terminal = selected.map(|(_, terminal)| terminal.clone());
-        let title = selected
-            .map(|(label, terminal)| format!("{label} · {}", terminal.read(cx).status()))
-            .unwrap_or_else(|| "项目终端".into());
         let busy = terminal
             .as_ref()
             .is_some_and(|terminal| terminal.read(cx).busy());
-        let title = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .when(
-                terminal
-                    .as_ref()
-                    .is_some_and(|terminal| terminal.read(cx).completed_successfully()),
-                |title| {
-                    title.child(
-                        Icon::CheckCircle
-                            .render(16.)
-                            .text_color(rgb(self.theme.color(0x16833a))),
-                    )
-                },
-            )
-            .child(div().min_w_0().truncate().child(title));
         let owner = cx.entity().downgrade();
         let close_owner = owner.clone();
         let add_owner = owner.clone();
@@ -2635,8 +2764,19 @@ impl AgentWorkspace {
         let add_root = root.clone();
         let mut tab_bar =
             gpui_glint::components::ClosableTabs::new(tabs.iter().map(|(label, view)| {
-                gpui_glint::components::ClosableTab::new(view.entity_id().as_u64(), label.clone())
-                    .icon(Icon::Shell)
+                gpui_glint::components::ClosableTab::new(
+                    view.entity_id().as_u64(),
+                    if terminal.as_ref() == Some(view) {
+                        format!("{label} · {}", view.read(cx).status())
+                    } else {
+                        label.clone()
+                    },
+                )
+                .icon(if view.read(cx).completed_successfully() {
+                    Icon::CheckCircle
+                } else {
+                    Icon::Shell
+                })
             }))
             .selected(terminal.as_ref().map(|view| view.entity_id().as_u64()))
             .theme(self.theme)
@@ -2774,9 +2914,7 @@ impl AgentWorkspace {
                     })),
             );
         terminal_panel(
-            title,
-            controls,
-            tab_bar.render(),
+            tab_bar.trailing(controls).render(),
             self.theme,
             action_panel || self.terminal_ui.bottom,
             self.right_sidebar_width,
@@ -2795,8 +2933,6 @@ impl AgentWorkspace {
 
 /// Both dock positions and project actions use this same PTY view and frame.
 pub(super) fn terminal_panel(
-    title: impl IntoElement,
-    controls: gpui::Div,
     tabs: gpui::Div,
     theme: ThemePreset,
     bottom: bool,
@@ -2812,18 +2948,5 @@ pub(super) fn terminal_panel(
         .border_color(rgb(p.border))
         .when(bottom, |view| view.w_full().h(px(280.)).border_t_1())
         .when(!bottom, |view| view.w(px(width)).h_full().border_l_1())
-        .child(
-            div()
-                .debug_selector(|| "project-terminal-header".into())
-                .h(px(46.))
-                .flex_shrink_0()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(Icon::Shell.render(16.).flex_shrink_0())
-                .child(div().flex_1().min_w_0().truncate().child(title))
-                .child(controls),
-        )
         .child(tabs)
 }

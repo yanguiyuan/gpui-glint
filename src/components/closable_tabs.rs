@@ -62,6 +62,7 @@ pub struct ClosableTabs {
     contents: Vec<(u64, AnyElement)>,
     fill_height: bool,
     content_padding: f32,
+    trailing: Option<AnyElement>,
 }
 
 impl ClosableTabs {
@@ -77,6 +78,7 @@ impl ClosableTabs {
             contents: Vec::new(),
             fill_height: false,
             content_padding: 20.,
+            trailing: None,
         }
     }
 
@@ -99,6 +101,12 @@ impl ClosableTabs {
     /// Sets the content panel's padding in pixels. Defaults to 20px.
     pub fn content_padding(mut self, padding: f32) -> Self {
         self.content_padding = padding.max(0.);
+        self
+    }
+
+    /// Fixed actions to the right of the scrollable tab strip.
+    pub fn trailing(mut self, actions: impl IntoElement) -> Self {
+        self.trailing = Some(actions.into_any_element());
         self
     }
 
@@ -135,7 +143,7 @@ impl ClosableTabs {
     }
 
     pub fn render(mut self) -> gpui::Div {
-        if self.tabs.is_empty() && self.on_add.is_none() {
+        if self.tabs.is_empty() && self.on_add.is_none() && self.trailing.is_none() {
             return div();
         }
         let p = self.theme.palette();
@@ -311,7 +319,21 @@ impl ClosableTabs {
                     .border_color(rgba(0xffffff14))
                     .backdrop_blur(px(24.))
             });
-        card = card.child(strip);
+        card = if let Some(trailing) = self.trailing {
+            card.child(
+                div()
+                    .debug_selector(|| "closable-tabs-header".into())
+                    .w_full()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(strip.w_0().flex_1())
+                    .child(div().flex_shrink_0().px_2().child(trailing)),
+            )
+        } else {
+            card.child(strip)
+        };
         let mut panel = div()
             .w_full()
             .min_h(px(96.))
