@@ -1,7 +1,7 @@
 use gpui::{Context, IntoElement, ParentElement, Render, Styled, Window, div, px, rgb};
 use gpui_glint::components::{
     Avatar, AvatarGroup, AvatarShape, ContentBadge, ContentType, CountBadge, CountBadgeKind,
-    OverlayBadge, ReadStatus, ShimmerText, StatusBadge, TagBadge, TagBadgeKind,
+    OverlayBadge, ReadStatus, ShimmerText, Skeleton, StatusBadge, TagBadge, TagBadgeKind,
 };
 use gpui_glint::theme::ThemePreset;
 
@@ -153,6 +153,10 @@ impl Render for BadgesPage {
                 .child(ShimmerText::new("waiting-demo", "正在等待模型回复…").theme(theme))
                 .child(ShimmerText::new("thinking-demo", "Thinking through the details…").theme(theme))
                 .child(ShimmerText::new("settled-demo", "已完成").theme(theme).animated(false)))
+            .child(div().text_size(px(14.)).child("骨架屏加载占位"))
+            .child(div().flex().gap_5().items_start()
+                .child(Skeleton::new("avatar-placeholder").width(44.).height(44.).rounded(22.).theme(theme))
+                .child(div().w(px(260.)).child(Skeleton::new("content-placeholder").lines(4).theme(theme))))
             .child(div().text_size(px(14.)).child("头像与头像组"))
             .child(avatars)
             .child(groups)

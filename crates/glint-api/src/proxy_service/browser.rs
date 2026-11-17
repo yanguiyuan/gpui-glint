@@ -145,9 +145,28 @@ fn profile_directory(directory: &Path, browser: &Browser) -> PathBuf {
 }
 
 pub fn launch(browser: &Browser, directory: &Path, port: u16) -> Result<(), String> {
+    launch_target(browser, directory, port, "about:blank", false)
+}
+pub fn launch_oauth(
+    browser: &Browser,
+    directory: &Path,
+    port: u16,
+    url: &str,
+) -> Result<(), String> {
+    // An existing capture window keeps its startup flags. Use a persistent OAuth
+    // profile so loopback callbacks can bypass the proxy even when it is open.
+    launch_target(browser, &directory.join("oauth"), port, url, true)
+}
+fn launch_target(
+    browser: &Browser,
+    directory: &Path,
+    port: u16,
+    url: &str,
+    oauth: bool,
+) -> Result<(), String> {
     let profile = profile_directory(directory, browser);
     std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
-    let mut command = prepare(browser, &profile, port)?;
+    let mut command = prepare(browser, &profile, port, url, oauth)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -157,7 +176,13 @@ pub fn launch(browser: &Browser, directory: &Path, port: u16) -> Result<(), Stri
         .map_err(|e| format!("无法启动 {}：{e}", browser.name))?;
     Ok(())
 }
-fn prepare(browser: &Browser, profile: &Path, port: u16) -> Result<Command, String> {
+fn prepare(
+    browser: &Browser,
+    profile: &Path,
+    port: u16,
+    url: &str,
+    oauth: bool,
+) -> Result<Command, String> {
     let mut command = Command::new(&browser.path);
     match browser.kind {
         BrowserKind::Chromium => {
@@ -165,14 +190,16 @@ fn prepare(browser: &Browser, profile: &Path, port: u16) -> Result<Command, Stri
                 .arg(format!("--user-data-dir={}", profile.display()))
                 .arg(format!("--proxy-server=http://127.0.0.1:{port}"))
                 .args([
-                    "--proxy-bypass-list=<-loopback>",
                     "--disable-quic",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--new-window",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    "about:blank",
                 ]);
+            if !oauth {
+                command.arg("--proxy-bypass-list=<-loopback>");
+            }
+            command.arg(url);
         }
         BrowserKind::Firefox => {
             std::fs::write(profile.join("user.js"), firefox_preferences(port))
@@ -180,7 +207,7 @@ fn prepare(browser: &Browser, profile: &Path, port: u16) -> Result<Command, Stri
             command
                 .arg("-profile")
                 .arg(profile)
-                .args(["-new-window", "about:blank"]);
+                .args(["-new-window", url]);
         }
     }
     Ok(command)
@@ -205,6 +232,34 @@ user_pref("security.enterprise_roots.enabled", true);
 #[cfg(test)]
 mod tests {
     #[test]
+    fn oauth_chrome_opens_authorization_url_via_proxy_with_direct_loopback_callback() {
+        let directory = tempfile::tempdir().unwrap();
+        let browser = super::Browser {
+            name: "Google Chrome".into(),
+            path: "chrome.exe".into(),
+            kind: super::BrowserKind::Chromium,
+        };
+        let profile = super::profile_directory(&directory.path().join("oauth"), &browser);
+        assert_ne!(
+            profile,
+            super::profile_directory(directory.path(), &browser)
+        );
+        let url = "https://auth.example.test/authorize?state=opaque&redirect_uri=http%3A%2F%2F127.0.0.1%3A17943%2Foauth%2Fcallback";
+        let command = super::prepare(&browser, &profile, 8899, url, true).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:8899".into()));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("<-loopback>") || a.contains("ignore-certificate"))
+        );
+        assert!(args.contains(&"--disable-quic".into()));
+    }
+    #[test]
     fn chromium_launch_uses_a_separate_profile_and_proxies_localhost_without_skipping_certificates()
     {
         let directory = tempfile::tempdir().unwrap();
@@ -213,7 +268,8 @@ mod tests {
             path: "chrome.exe".into(),
             kind: super::BrowserKind::Chromium,
         };
-        let command = super::prepare(&browser, directory.path(), 8899).unwrap();
+        let command =
+            super::prepare(&browser, directory.path(), 8899, "about:blank", false).unwrap();
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())

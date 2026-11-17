@@ -1387,6 +1387,7 @@ impl Workbench {
             .fields
             .iter()
             .chain(std::iter::once(&self.oauth.secret))
+            .chain(self.oauth.inherited_fields.iter())
         {
             entry.update(cx, |entry, cx| {
                 entry.set_reference_resolver(Some(oauth_resolver.clone()), cx);

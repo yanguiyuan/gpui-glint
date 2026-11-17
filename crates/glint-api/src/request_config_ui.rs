@@ -301,7 +301,7 @@ impl Workbench {
 
     pub(super) fn default_configuration_height(&self, cx: &Context<Self>) -> f32 {
         if self.config == 1 && self.auth_is_oauth(cx) {
-            384.
+            408.
         } else if matches!(self.config, 5 | 6) {
             360.
         } else {

@@ -211,6 +211,17 @@ impl AgentWorkspace {
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
         tasks
     }
+    pub(super) fn project_action_task_outcome(
+        &self,
+        root: &std::path::Path,
+        cx: &App,
+    ) -> gpui_glint::components::BackgroundTaskState {
+        self.project_actions
+            .runs
+            .get(root)
+            .map(|run| run.terminal.read(cx).background_task_state())
+            .unwrap_or(gpui_glint::components::BackgroundTaskState::Finished)
+    }
     pub(super) fn sync_project_actions(&mut self, cx: &mut Context<Self>) {
         for run in self.project_actions.runs.values() {
             run.terminal
@@ -286,14 +297,14 @@ impl AgentWorkspace {
         )
         .detach();
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
+        self.select_terminal_tab(root.clone(), terminal.entity_id());
         self.project_actions
             .runs
             .insert(root, Run { action, terminal });
         self.project_actions.open = false;
         self.project_actions.panel = true;
-        if self.terminal_ui.bottom {
-            self.terminal_ui.open = false;
-        }
+        self.background_tasks(cx);
+        self.terminal_ui.open = false;
         self.page = crate::Page::Chat;
         cx.notify();
     }
@@ -646,10 +657,13 @@ impl AgentWorkspace {
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.project_actions.panel = true;
-                            if this.terminal_ui.bottom {
-                                this.terminal_ui.open = false;
+                            if let Some(root) = this.history.active().project.clone() {
+                                if let Some((_, terminal)) = this.project_action_terminal(&root) {
+                                    this.select_terminal_tab(root, terminal.entity_id());
+                                }
                             }
+                            this.project_actions.panel = true;
+                            this.terminal_ui.open = false;
                             this.project_actions.open = false;
                             this.page = crate::Page::Chat;
                             cx.notify();
@@ -751,113 +765,82 @@ impl AgentWorkspace {
             })
             .render()
     }
+    pub(super) fn project_action_terminal(
+        &self,
+        root: &Path,
+    ) -> Option<(String, Entity<terminal_ui::TerminalView>)> {
+        self.project_actions
+            .runs
+            .get(root)
+            .map(|run| (run.action.name.clone(), run.terminal.clone()))
+    }
+    pub(super) fn close_project_action_terminal(&mut self, root: &Path) {
+        self.project_actions.runs.remove(root);
+    }
+    pub(super) fn rerun_project_action_terminal(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(action) = self
+            .project_actions
+            .runs
+            .get(&root)
+            .map(|run| run.action.clone())
+        {
+            self.run_project_action(root, action, window, cx);
+        }
+    }
     pub(super) fn project_action_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = self.theme.palette();
-        let root = self.history.active().project.clone();
-        let run = root.as_ref().and_then(|r| self.project_actions.runs.get(r));
-        let action = run.map(|r| r.action.clone());
-        let terminal = run.map(|r| r.terminal.clone());
-        let busy = terminal.as_ref().is_some_and(|t| t.read(cx).busy());
-        let status = terminal
-            .as_ref()
-            .map(|t| t.read(cx).status())
-            .unwrap_or_else(|| "当前项目暂无运行记录".into());
-        let title = format!(
-            "{} · {status}",
-            action.as_ref().map_or("项目操作", |a| a.name.as_str())
-        );
-        let completed = terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).completed_successfully());
-        let title = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .when(completed, |title| {
-                title.child(
-                    Icon::CheckCircle
-                        .render(16.)
-                        .flex_shrink_0()
-                        .text_color(rgb(self.theme.color(0x16833a))),
-                )
-            })
-            .child(div().flex_1().min_w_0().truncate().child(title));
-        let controls = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .when(busy, |bar| {
-                bar.child(
-                    IconButton::new(Icon::Pause, "停止操作")
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(run) = this
-                                .history
-                                .active()
-                                .project
-                                .as_ref()
-                                .and_then(|r| this.project_actions.runs.get(r))
-                            {
-                                run.terminal.update(cx, |view, cx| view.stop(cx));
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
-            .when(!busy && action.is_some(), |bar| {
-                bar.child(
-                    IconButton::new(Icon::Refresh, "重跑操作")
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let (Some(root), Some(action)) = (root.clone(), action.clone()) {
-                                this.run_project_action(root, action, window, cx);
-                            }
-                        })),
-                )
-            })
-            .child(
-                IconButton::new(Icon::Copy, "复制输出")
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(run) = this
-                            .history
-                            .active()
-                            .project
-                            .as_ref()
-                            .and_then(|r| this.project_actions.runs.get(r))
-                        {
-                            run.terminal.update(cx, |view, cx| view.copy_output(cx));
-                        }
-                    })),
-            )
-            .child(
-                IconButton::new(Icon::Close, "收起输出（继续运行）")
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.project_actions.panel = false;
-                        cx.notify();
-                    })),
-            );
-        terminal_ui::terminal_panel(
-            terminal,
-            title,
-            controls,
-            self.theme,
-            true,
-            self.right_sidebar_width,
-        )
-        .debug_selector(|| "project-action-output".into())
-        .border_color(rgb(p.border))
+        self.tabbed_terminal_panel(self.history.active().project.clone(), true, cx)
+            .debug_selector(|| "project-action-output".into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn terminal_tabs_share_action_output_and_interactive_shells(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.history.active_mut().project = Some(root.clone());
+                host.run_project_action(
+                    root.clone(),
+                    Action {
+                        name: "test action".into(),
+                        command: "exit 0".into(),
+                        target: None,
+                    },
+                    window,
+                    cx,
+                );
+                let action = host.project_actions.runs[&root].terminal.clone();
+                host.new_terminal_tab(root.clone(), window, cx);
+                assert_eq!(host.project_actions.runs[&root].terminal, action);
+                assert!(action.read(cx).busy());
+            })
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("project-action-output").is_some());
+        host.update(window, |host, cx| {
+            let terminal = host.project_actions.runs[&root].terminal.clone();
+            terminal.update(cx, |view, cx| view.stop(cx));
+        });
+    }
     #[test]
     fn discovers_literal_rules_without_recipes_assignments_or_patterns() {
         let source = "VAR := value\n.PHONY: test clean\nall test: dep\n\techo bad: fake\nclean::\n%.o: %.c\n$(DYNAMIC):\n$(shell echo injected):\nfoo bar &: dep\ndefine SCRIPT\nnot-a-target: text\nendef\nnext:; echo okay\n构建:\n";

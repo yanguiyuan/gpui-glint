@@ -156,6 +156,7 @@ pub struct Workbench {
     pub(super) authentication: Entity<SelectField>,
     pub(super) oauth: oauth_ui::Inputs,
     pub(super) oauth_namespace: String,
+    pub(super) oauth_browser_opener: Option<super::proxy_listener_ui::OAuthBrowserOpener>,
     pub(super) skip_tls_verification: bool,
     pub(super) endpoint: Entity<SelectField>,
     pub(super) environment: Entity<Select>,
@@ -234,6 +235,8 @@ pub struct Workbench {
     pub(super) ws_background_update: bool,
     pub(super) show_background_tasks: bool,
     pub(super) host_background_tasks: bool,
+    pub(super) background_task_inbox:
+        std::cell::RefCell<gpui_glint::components::BackgroundTaskInbox>,
     pub(super) ws_environment: Option<environment::EnvironmentValues>,
     pub(super) ws_sequence: u64,
     pub(super) ws_history: Option<(String, String, Instant)>,
@@ -913,6 +916,7 @@ impl Workbench {
             authentication,
             oauth,
             oauth_namespace,
+            oauth_browser_opener: None,
             skip_tls_verification: false,
             endpoint,
             environment,
@@ -987,6 +991,7 @@ impl Workbench {
             ws_background_update: false,
             show_background_tasks: false,
             host_background_tasks: false,
+            background_task_inbox: Default::default(),
             ws_environment: None,
             ws_sequence: 0,
             ws_history: None,
@@ -1038,6 +1043,7 @@ impl Workbench {
         this.load(&initial, cx);
         this.restore_response(cx);
         let subscription = cx.observe_self(|this, cx| {
+            this.background_tasks(cx);
             // Keep the local draft current for rendering; defer workspace-wide work.
             this.capture_draft(cx);
             this.schedule_persist(cx);

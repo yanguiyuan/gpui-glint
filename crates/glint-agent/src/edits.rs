@@ -48,6 +48,13 @@ impl Change {
             .get_or_init(|| diff_lines(self.before.as_deref().unwrap_or(""), &self.after))
             .clone()
     }
+    /// Move a newly loaded diff into its renderer without retaining a second
+    /// per-line vector in the content snapshot. Shared snapshots keep their cache.
+    pub(super) fn take_lines(&mut self) -> Vec<DiffLine> {
+        Arc::get_mut(&mut self.lines)
+            .and_then(|cache| cache.take())
+            .unwrap_or_else(|| self.lines())
+    }
     fn count(&mut self) {
         let lines = self.lines();
         self.added = lines

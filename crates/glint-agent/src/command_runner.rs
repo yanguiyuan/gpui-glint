@@ -143,21 +143,65 @@ pub(super) struct ActiveCommand {
     pub session: Option<uuid::Uuid>,
     pub root: Option<PathBuf>,
     pub label: String,
+    pub state: gpui_glint::components::BackgroundTaskState,
 }
+#[cfg(test)]
 pub(super) fn active_commands(anchor: &Path) -> Vec<ActiveCommand> {
-    let runs = registry().lock().unwrap();
+    command_tasks(anchor, false)
+}
+pub(super) fn background_commands(anchor: &Path) -> Vec<ActiveCommand> {
+    command_tasks(anchor, true)
+}
+fn command_tasks(anchor: &Path, include_finished: bool) -> Vec<ActiveCommand> {
+    let runs: Vec<_> = registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, run)| (*id, run.clone()))
+        .collect();
     let mut active: Vec<_> = runs
         .iter()
-        .filter(|(_, run)| run.scope.anchor == anchor && !run.finished.load(Ordering::Acquire))
+        .filter(|(_, run)| {
+            run.scope.anchor == anchor
+                && (include_finished || !run.finished.load(Ordering::Acquire))
+        })
         .map(|(id, run)| ActiveCommand {
             id: *id,
             session: run.scope.session,
             root: run.scope.root.clone(),
-            label: format!("{} · {}", run.program, &id.to_string()[..8]),
+            label: format!(
+                "{} · {}",
+                gpui_glint::paths::display_path(&run.program),
+                &id.to_string()[..8]
+            ),
+            state: background_command_outcome(anchor, *id),
         })
         .collect();
     active.sort_by_key(|r| r.id);
     active
+}
+pub(super) fn background_command_outcome(
+    anchor: &Path,
+    id: uuid::Uuid,
+) -> gpui_glint::components::BackgroundTaskState {
+    use gpui_glint::components::BackgroundTaskState as State;
+    let run = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .filter(|r| r.scope.anchor == anchor)
+        .cloned();
+    let Some(run) = run else {
+        return State::Finished;
+    };
+    let state = run.state.lock().unwrap();
+    match state.result.status.as_str() {
+        "running" => State::Running,
+        "completed" => State::Completed,
+        "cancelled" => State::Cancelled,
+        "failed" | "timed_out" | "timeout" => State::Failed,
+        _ => State::Finished,
+    }
 }
 
 /// UI cancellation is scoped to the conversation and the exact tool call.

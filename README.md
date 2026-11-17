@@ -106,6 +106,8 @@ let input = SearchInput::new("搜索").control(query.clone()).render();
 
 等待状态可使用 `ShimmerText::new("reply-pending", "正在等待模型回复…").theme(theme)`。组件继承父容器的字号，高光从左向右扫过文字；每个实例使用稳定且唯一的 ID。可通过 `.duration(Duration::from_millis(2200))` 调整周期、`.animated(false)` 关闭动效，也会自动遵循系统减少动态效果的设置。
 
+加载内容可使用 `Skeleton::new("pending-code").lines(8).height(12.).gap(14.).theme(theme)` 显示骨架屏。默认是铺满容器宽度的单条占位，支持 `.width()`、`.height()`、`.rounded()` 组合文本、头像和内容块；`.duration()` 调整呼吸动画周期，`.animated(false)` 关闭动画，并自动遵循系统减少动态效果设置。
+
 按使用的编辑器注册快捷键：
 
 | 使用场景 | 启动时调用 |

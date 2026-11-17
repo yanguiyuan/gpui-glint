@@ -215,17 +215,25 @@ impl Workbench {
             })
             .collect()
     }
-    pub fn background_tasks(&self, _cx: &App) -> Vec<gpui_glint::components::BackgroundTask> {
+    pub fn background_tasks(&self, cx: &App) -> Vec<gpui_glint::components::BackgroundTask> {
         use gpui_glint::components::BackgroundTask;
         let mut tasks: Vec<_> = self
             .running_request_tasks()
             .into_iter()
-            .map(|(id, label)| BackgroundTask {
+            .filter(|(id, _)| !self.request_editors.contains_key(id))
+            .map(|(id, _)| BackgroundTask {
+                label: self
+                    .workspace
+                    .requests
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_else(|| id.clone()),
                 id,
-                label,
                 detail: String::new(),
                 group: "API 请求".into(),
                 icon: Icon::Workflow,
+                state: gpui_glint::components::BackgroundTaskState::Running,
             })
             .collect();
         tasks.extend(self.workspace.proxies.iter().filter_map(|profile| {
@@ -236,27 +244,58 @@ impl Workbench {
                 detail: service.endpoint(),
                 group: "代理服务".into(),
                 icon: Icon::Globe,
+                state: gpui_glint::components::BackgroundTaskState::Running,
             })
         }));
-        tasks
+        for shared in self.request_editors.values() {
+            tasks.extend(
+                shared
+                    .editor
+                    .read(cx)
+                    .background_tasks(cx)
+                    .into_iter()
+                    .filter(|task| task.group == "API 请求"),
+            );
+        }
+        self.background_task_inbox.borrow_mut().update(tasks, |_| {
+            gpui_glint::components::BackgroundTaskState::Finished
+        })
     }
     pub fn focus_background_task(
         &mut self,
         id: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        self.background_tasks(cx);
+        let mut opened = false;
         self.show_background_tasks = false;
         if let Some(id) = id.strip_prefix("proxy:") {
             if let Some(index) = self.workspace.proxies.iter().position(|p| p.id == id) {
                 self.editing_proxy = index;
                 self.page = crate::Page::Proxies;
+                opened = true;
             }
         } else if let Some(index) = self.workspace.requests.iter().position(|r| r.id == id) {
             self.choose(index, cx);
             self.page = crate::Page::Requests;
+            opened = true;
+        }
+        if opened {
+            self.background_task_inbox
+                .borrow_mut()
+                .acknowledge_transient(id);
+            if let Some(shared) = self.request_editors.get(id) {
+                shared
+                    .editor
+                    .read(cx)
+                    .background_task_inbox
+                    .borrow_mut()
+                    .acknowledge_transient(id);
+            }
         }
         cx.notify();
+        opened
     }
     pub fn set_host_background_tasks(&mut self, hosted: bool) {
         self.host_background_tasks = hosted;
@@ -438,6 +477,22 @@ mod tests {
                     .iter()
                     .any(|event| event.log_text().contains("first:background"))
             );
+        });
+        host.read_with(window, |host, cx| {
+            let tasks = host.background_tasks(cx);
+            assert_eq!(tasks.len(), 2);
+            assert!(tasks.iter().all(|task| !task.state.is_running()));
+        });
+        let trigger = window.debug_bounds("background-tasks-trigger").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        let selector: &'static str = Box::leak(format!("background-task-{first}").into_boxed_str());
+        let row = window.debug_bounds(selector).unwrap();
+        window.simulate_click(row.center(), gpui::Modifiers::default());
+        host.read_with(window, |host, cx| {
+            assert_eq!(host.workspace.requests[host.active].id, first);
+            let tasks = host.background_tasks(cx);
+            assert_eq!(tasks.len(), 1);
+            assert_ne!(tasks[0].id, first);
         });
         first_server.join().unwrap();
         second_server.join().unwrap();

@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{BackgroundTask, BackgroundTasksMenu};
+use gpui_glint::components::{BackgroundTask, BackgroundTaskState as State, BackgroundTasksMenu};
 
 #[cfg(test)]
 mod tests {
@@ -48,6 +48,41 @@ mod tests {
             assert!(agent.session_busy(id));
             assert!(!agent.show_background_tasks);
         });
+        agent.update(window, |agent, cx| {
+            agent.run_mut(id).pending.take();
+            agent
+                .history
+                .active_mut()
+                .push(Role::Agent, "任务结果".into());
+            cx.notify();
+        });
+        agent.read_with(window, |agent, cx| {
+            assert_eq!(
+                agent
+                    .background_tasks(cx)
+                    .iter()
+                    .find(|t| t.id == format!("session:{id}"))
+                    .unwrap()
+                    .state,
+                State::Completed
+            );
+        });
+        let trigger = window.debug_bounds("background-tasks-trigger").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        let row = window.debug_bounds(selector).unwrap();
+        window.simulate_click(row.center(), gpui::Modifiers::default());
+        agent.read_with(window, |agent, cx| {
+            assert_eq!(
+                agent.history.active().messages.last().unwrap().text,
+                "任务结果"
+            );
+            assert!(
+                agent
+                    .background_tasks(cx)
+                    .iter()
+                    .all(|t| t.id != format!("session:{id}"))
+            );
+        });
     }
 }
 
@@ -63,7 +98,7 @@ impl AgentWorkspace {
                     let current: Vec<_> = this
                         .background_tasks(cx)
                         .into_iter()
-                        .map(|task| task.id)
+                        .map(|task| (task.id, task.state))
                         .collect();
                     if current != previous {
                         previous = current;
@@ -95,6 +130,7 @@ impl AgentWorkspace {
                     .unwrap_or_default(),
                 group: "Agent 会话".into(),
                 icon: Icon::Workflow,
+                state: gpui_glint::components::BackgroundTaskState::Running,
             })
             .collect();
         tasks.extend(
@@ -103,24 +139,26 @@ impl AgentWorkspace {
                 .map(|(root, label)| BackgroundTask {
                     id: format!("action:{}", root.to_string_lossy()),
                     label,
-                    detail: root.to_string_lossy().into_owned(),
+                    detail: gpui_glint::paths::display_path(&root),
                     group: "项目操作".into(),
                     icon: Icon::Play,
+                    state: gpui_glint::components::BackgroundTaskState::Running,
                 }),
         );
         tasks.extend(
             self.running_terminal_tasks(cx)
                 .into_iter()
-                .map(|(root, status)| BackgroundTask {
+                .map(|(root, _status)| BackgroundTask {
                     id: format!("terminal:{}", root.to_string_lossy()),
                     label: ssh_project::label(&root),
-                    detail: status,
+                    detail: gpui_glint::paths::display_path(&root),
                     group: "项目终端".into(),
                     icon: Icon::Code,
+                    state: gpui_glint::components::BackgroundTaskState::Running,
                 }),
         );
         tasks.extend(
-            command_runner::active_commands(&self.memory.anchor)
+            command_runner::background_commands(&self.memory.anchor)
                 .into_iter()
                 .map(|run| BackgroundTask {
                     id: run
@@ -135,9 +173,52 @@ impl AgentWorkspace {
                         .unwrap_or_default(),
                     group: "命令进程".into(),
                     icon: Icon::Code,
+                    state: run.state,
                 }),
         );
-        tasks
+        self.background_task_inbox
+            .borrow_mut()
+            .update(tasks, |task| self.background_task_outcome(&task.id, cx))
+    }
+    fn background_task_outcome(&self, id: &str, cx: &App) -> State {
+        if let Some(id) = id
+            .strip_prefix("session:")
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            return self
+                .history
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.messages.last())
+                .map(|message| {
+                    if message.role == Role::Agent {
+                        State::Completed
+                    } else if message.role == Role::Notice && message.text.starts_with("请求失败")
+                    {
+                        State::Failed
+                    } else if message.role == Role::Notice && message.text.contains("已停止") {
+                        State::Cancelled
+                    } else {
+                        State::Finished
+                    }
+                })
+                .unwrap_or(State::Finished);
+        }
+        if let Some(root) = id.strip_prefix("action:") {
+            return self.project_action_task_outcome(std::path::Path::new(root), cx);
+        }
+        if let Some(root) = id.strip_prefix("terminal:") {
+            return self.terminal_task_outcome(std::path::Path::new(root), cx);
+        }
+        if let Some(id) = id
+            .strip_prefix("command:")
+            .and_then(|s| s.rsplit(':').next())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            return command_runner::background_command_outcome(&self.memory.anchor, id);
+        }
+        State::Finished
     }
     fn focus_background_project(&mut self, root: &std::path::Path, cx: &mut Context<Self>) {
         if self.history.active().project.as_deref() == Some(root) {
@@ -161,16 +242,28 @@ impl AgentWorkspace {
         });
         self.switch(id, cx);
     }
-    pub fn focus_background_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_background_task(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.background_tasks(cx);
+        let mut opened = false;
         self.show_background_tasks = false;
         if let Some(id) = id.strip_prefix("session:") {
             if let Ok(id) = Uuid::parse_str(id) {
                 if self.history.sessions.iter().any(|s| s.id == id) {
                     self.switch(id, cx);
+                    opened = true;
                 }
             }
         } else if let Some(root) = id.strip_prefix("action:") {
             self.focus_background_project(std::path::Path::new(root), cx);
+            if let Some((_, terminal)) = self.project_action_terminal(std::path::Path::new(root)) {
+                self.select_terminal_tab(root.into(), terminal.entity_id());
+            }
+            opened = true;
             self.page = crate::Page::Chat;
             self.project_actions.panel = true;
             self.terminal_ui.open = false;
@@ -189,18 +282,23 @@ impl AgentWorkspace {
             {
                 self.focus_background_project(root, cx);
             }
+            self.restore_completed_terminal(root);
             self.open_project_terminal(window, cx);
+            opened = true;
         } else if let Some(id) = id.strip_prefix("command:") {
             if let Some((session, _)) = id.split_once(':') {
                 if let Ok(session) = Uuid::parse_str(session) {
                     if self.history.sessions.iter().any(|s| s.id == session) {
                         self.switch(session, cx);
+                        self.background_task_inbox
+                            .borrow_mut()
+                            .acknowledge(&format!("command:{id}"));
                         cx.notify();
-                        return;
+                        return true;
                     }
                 }
             }
-            if let Some(run) = command_runner::active_commands(&self.memory.anchor)
+            if let Some(run) = command_runner::background_commands(&self.memory.anchor)
                 .into_iter()
                 .find(|run| run.id.to_string() == id)
             {
@@ -209,12 +307,18 @@ impl AgentWorkspace {
                     .filter(|id| self.history.sessions.iter().any(|s| s.id == *id))
                 {
                     self.switch(id, cx);
+                    opened = true;
                 } else if let Some(root) = run.root {
                     self.focus_background_project(&root, cx);
+                    opened = true;
                 }
             }
         }
+        if opened {
+            self.background_task_inbox.borrow_mut().acknowledge(id);
+        }
         cx.notify();
+        opened
     }
     pub(super) fn background_tasks_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity().downgrade();

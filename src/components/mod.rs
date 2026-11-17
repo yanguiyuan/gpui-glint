@@ -1,6 +1,8 @@
 mod background_tasks;
 mod badge;
-pub use background_tasks::{BackgroundTask, BackgroundTasksMenu};
+pub use background_tasks::{
+    BackgroundTask, BackgroundTaskInbox, BackgroundTaskState, BackgroundTasksMenu,
+};
 mod button;
 mod calendar;
 mod closable_tabs;
@@ -34,6 +36,8 @@ mod search_highlight;
 mod select;
 mod separator;
 pub use scrollbar::{Scrollbar, ScrollbarState};
+mod skeleton;
+pub use skeleton::Skeleton;
 mod shimmer_text;
 mod side_tabs;
 mod tabs;
@@ -136,7 +140,9 @@ mod collapse_panel;
 pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent};
 
 mod diff_card;
-pub use diff_card::{DiffCard, DiffCardEvent, DiffColors, DiffLine, DiffLineKind, diff_lines};
+pub use diff_card::{
+    DiffCard, DiffCardEvent, DiffColors, DiffLine, DiffLineKind, PreparedDiff, diff_lines,
+};
 
 mod scroll_chain;
 pub use scroll_chain::ChainScroll;

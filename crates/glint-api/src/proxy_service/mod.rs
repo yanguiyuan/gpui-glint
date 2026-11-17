@@ -213,6 +213,7 @@ impl Drop for CaptureTransfer {
 
 pub struct RunningProxy {
     pub address: SocketAddr,
+    settings: ProxySettings,
     cancel: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -312,6 +313,7 @@ impl RunningProxy {
         });
         Ok(Self {
             address,
+            settings,
             cancel,
             task,
         })
@@ -322,6 +324,9 @@ impl RunningProxy {
 
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.address.port())
+    }
+    pub(super) fn settings(&self) -> &ProxySettings {
+        &self.settings
     }
 }
 async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(

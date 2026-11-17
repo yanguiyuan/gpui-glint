@@ -3,6 +3,29 @@ use crate::theme::ThemePreset;
 use gpui::{App, IntoElement, Window, div, prelude::*, px, rgb};
 use std::rc::Rc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Finished,
+}
+impl BackgroundTaskState {
+    pub fn is_running(self) -> bool {
+        self == Self::Running
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "运行中",
+            Self::Completed => "已完成",
+            Self::Failed => "失败",
+            Self::Cancelled => "已停止",
+            Self::Finished => "已结束",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BackgroundTask {
     pub id: String,
@@ -10,9 +33,133 @@ pub struct BackgroundTask {
     pub detail: String,
     pub group: String,
     pub icon: Icon,
+    pub state: BackgroundTaskState,
 }
 
-/// Shared topbar entry for live tasks. Owners supply status and navigation;
+/// An in-app inbox: ended work stays until its result is opened. Viewing a
+/// running task never acknowledges the completion that will happen later.
+#[derive(Default)]
+pub struct BackgroundTaskInbox {
+    tasks: Vec<BackgroundTask>,
+    dismissed: std::collections::HashSet<String>,
+}
+impl BackgroundTaskInbox {
+    pub fn update(
+        &mut self,
+        current: Vec<BackgroundTask>,
+        outcome: impl Fn(&BackgroundTask) -> BackgroundTaskState,
+    ) -> Vec<BackgroundTask> {
+        for task in &mut self.tasks {
+            if !current.iter().any(|t| t.id == task.id) {
+                let state = outcome(task);
+                if state != BackgroundTaskState::Finished || task.state.is_running() {
+                    task.state = state;
+                }
+            }
+        }
+        for task in current {
+            if task.state.is_running() {
+                self.dismissed.remove(&task.id);
+            } else if self.dismissed.contains(&task.id) {
+                continue;
+            }
+            if let Some(saved) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                *saved = task;
+            } else {
+                self.tasks.push(task);
+            }
+        }
+        self.tasks.clone()
+    }
+    pub fn acknowledge(&mut self, id: &str) {
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.id == id && !t.state.is_running())
+        {
+            self.tasks.retain(|t| t.id != id);
+            self.dismissed.insert(id.to_owned());
+        }
+    }
+    /// Sources which stop emitting a completion after it is acknowledged do
+    /// not need a tombstone; the same target may immediately run again.
+    pub fn acknowledge_transient(&mut self, id: &str) {
+        self.acknowledge(id);
+        self.dismissed.remove(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn task(state: BackgroundTaskState) -> BackgroundTask {
+        BackgroundTask {
+            id: "job".into(),
+            label: "编译".into(),
+            detail: String::new(),
+            group: "项目操作".into(),
+            icon: Icon::Play,
+            state,
+        }
+    }
+    #[test]
+    fn completions_survive_refresh_and_only_disappear_after_review() {
+        let mut inbox = BackgroundTaskInbox::default();
+        inbox.update(vec![task(BackgroundTaskState::Running)], |_| {
+            BackgroundTaskState::Finished
+        });
+        inbox.acknowledge("job");
+        assert_eq!(
+            inbox.update(vec![], |_| BackgroundTaskState::Failed).len(),
+            1
+        );
+        let ended = inbox.update(vec![], |_| BackgroundTaskState::Finished);
+        assert_eq!(ended[0].state, BackgroundTaskState::Failed);
+        inbox.acknowledge("job");
+        assert!(
+            inbox
+                .update(vec![task(BackgroundTaskState::Failed)], |_| {
+                    BackgroundTaskState::Finished
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            inbox
+                .update(vec![task(BackgroundTaskState::Running)], |_| {
+                    BackgroundTaskState::Finished
+                })
+                .len(),
+            1
+        );
+        assert_eq!(
+            inbox.update(vec![], |_| BackgroundTaskState::Completed)[0].state,
+            BackgroundTaskState::Completed
+        );
+    }
+    #[test]
+    fn fast_completions_are_retained_without_a_running_frame() {
+        let mut inbox = BackgroundTaskInbox::default();
+        assert_eq!(
+            inbox
+                .update(vec![task(BackgroundTaskState::Completed)], |_| {
+                    BackgroundTaskState::Finished
+                })
+                .len(),
+            1
+        );
+        inbox.acknowledge_transient("job");
+        assert_eq!(
+            inbox
+                .update(vec![task(BackgroundTaskState::Completed)], |_| {
+                    BackgroundTaskState::Finished
+                })
+                .len(),
+            1
+        );
+    }
+}
+
+/// Shared topbar entry for running and unreviewed tasks. Owners supply status and navigation;
 /// opening or selecting the menu never starts or stops work.
 pub struct BackgroundTasksMenu {
     tasks: Vec<BackgroundTask>,
@@ -65,7 +212,7 @@ impl BackgroundTasksMenu {
                 div()
                     .p_3()
                     .text_color(rgb(p.text_muted))
-                    .child("暂无运行中的任务"),
+                    .child("暂无后台任务"),
             );
         }
         let mut groups = Vec::<String>::new();
@@ -125,7 +272,17 @@ impl BackgroundTasksMenu {
                                     )
                                 }),
                         )
-                        .child(div().size(px(5.)).rounded_full().bg(rgb(p.accent)))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(match task.state {
+                                    BackgroundTaskState::Running => p.accent,
+                                    BackgroundTaskState::Completed => self.theme.color(0x25845b),
+                                    BackgroundTaskState::Failed => self.theme.color(0xd9342b),
+                                    _ => p.text_muted,
+                                }))
+                                .child(task.state.label()),
+                        )
                         .on_click(move |_, window, cx| {
                             toggle(false, window, cx);
                             select(&id, window, cx);

@@ -1,8 +1,8 @@
 use super::*;
 use crate::edits::Change;
 use gpui_glint::components::{
-    ChainScroll, CodeCard, CodeCardEvent, DiffCard, DiffCardEvent, DiffColors, Scrollbar,
-    ScrollbarState, Tooltip,
+    ChainScroll, CodeCard, CodeCardEvent, Dialog, DiffCard, DiffCardEvent, DiffColors, MenuItem,
+    Scrollbar, ScrollbarState, Skeleton, Tooltip,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -55,6 +55,24 @@ enum GitRow {
 enum StageTarget {
     Files(Vec<crate::workspace_diff::Source>),
     Group(bool),
+}
+
+enum FileAction {
+    DeleteUntracked(crate::workspace_diff::Source),
+    DiscardTracked(crate::workspace_diff::Source),
+}
+impl FileAction {
+    fn source(&self) -> &crate::workspace_diff::Source {
+        match self {
+            Self::DeleteUntracked(source) | Self::DiscardTracked(source) => source,
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::DeleteUntracked(_) => "删除文件",
+            Self::DiscardTracked(_) => "撤销更改",
+        }
+    }
 }
 
 struct StageRequest {
@@ -113,6 +131,9 @@ pub struct State {
     pub(super) workspace_mode: bool,
     selected_staged: bool,
     stage_task: Option<Task<()>>,
+    commit_task: Option<Task<()>>,
+    commit_drafts: RefCell<HashMap<PathBuf, Entity<TextEntry>>>,
+    commit_notice: Option<(PathBuf, String)>,
     stage_queue: std::collections::VecDeque<StageRequest>,
     stage_pending: std::collections::HashSet<PathBuf>,
     stage_refresh_pending: bool,
@@ -149,6 +170,13 @@ pub struct State {
     conflicts: Vec<Entity<ConflictView>>,
     file_views: RefCell<HashMap<String, Entity<FileDiff>>>,
     sidebar_scroll: ScrollHandle,
+    navigation_bar: ScrollbarState,
+    workspace_branch: Option<String>,
+    file_menu: Option<(PathBuf, String, gpui::WindowId, gpui::Point<gpui::Pixels>)>,
+    file_menu_focus: Option<gpui::FocusHandle>,
+    file_action: Option<FileAction>,
+    file_action_focus: Vec<gpui::FocusHandle>,
+    file_action_task: Option<Task<()>>,
     detail_scrolls: RefCell<HashMap<String, ScrollHandle>>,
     detail_scrollbars: RefCell<HashMap<String, ScrollbarState>>,
     navigation_scroll: gpui::UniformListScrollHandle,
@@ -167,6 +195,260 @@ pub struct State {
 }
 
 impl AgentWorkspace {
+    fn open_diff_file_menu(
+        &mut self,
+        path: PathBuf,
+        label: String,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.edits_ui.file_menu_focus = Some(focus);
+        self.edits_ui.file_menu = Some((path, label, window.window_handle().window_id(), position));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn diff_file_overlays(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut overlays = div().absolute().inset_0().size_full();
+        if let Some((path, label, owner, position)) = &self.edits_ui.file_menu
+            && *owner == window.window_handle().window_id()
+            && self.edits_ui.open
+        {
+            let p = self.theme.palette();
+            let absolute = path.to_string_lossy().into_owned();
+            let relative = label.clone();
+            let source = self
+                .edits_ui
+                .workspace_sources
+                .get(path)
+                .filter(|_| {
+                    self.edits_ui.workspace_mode
+                        && self.edits_ui.workspace_root == self.diff_repository_root()
+                })
+                .cloned();
+            let menu = div()
+                .id("diff-file-context-menu")
+                .track_focus(self.edits_ui.file_menu_focus.as_ref().unwrap())
+                .w(px(200.))
+                .p_1()
+                .rounded(px(7.))
+                .bg(rgb(p.surface))
+                .border_1()
+                .border_color(rgb(p.border))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.edits_ui.file_menu = None;
+                    cx.notify();
+                }))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.edits_ui.file_menu = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    MenuItem::new("diff-copy-relative-path", "复制相对路径")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                relative.clone(),
+                            ));
+                            this.edits_ui.file_menu = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    MenuItem::new("diff-copy-absolute-path", "复制绝对路径")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                absolute.clone(),
+                            ));
+                            this.edits_ui.file_menu = None;
+                            cx.notify();
+                        })),
+                )
+                .when_some(source, |menu, source| {
+                    let untracked = source.status == crate::workspace_diff::FileStatus::Untracked;
+                    menu.child(
+                        MenuItem::new(
+                            if untracked {
+                                "diff-delete-untracked"
+                            } else {
+                                "diff-discard-tracked"
+                            },
+                            if untracked {
+                                "删除文件…"
+                            } else {
+                                "撤销更改…"
+                            },
+                        )
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.edits_ui.file_menu = None;
+                                this.edits_ui.file_action = Some(if untracked {
+                                    FileAction::DeleteUntracked(source.clone())
+                                } else {
+                                    FileAction::DiscardTracked(source.clone())
+                                });
+                                this.edits_ui.file_action_focus =
+                                    vec![cx.focus_handle(), cx.focus_handle()];
+                                window.focus(&this.edits_ui.file_action_focus[0], cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                });
+            overlays = overlays.child(
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(*position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu),
+                )
+                .with_priority(80),
+            );
+        }
+        if let Some(action) = &self.edits_ui.file_action {
+            let source = action.source();
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{}？", action.label())),
+                )
+                .child(div().text_size(px(12.)).child(source.label.clone()))
+                .child(match action {
+                    FileAction::DeleteUntracked(_) => "文件将从磁盘永久删除，无法通过 Git 恢复。",
+                    FileAction::DiscardTracked(_) => "将同时撤销此文件的已暂存和未暂存更改，恢复到 HEAD。新增文件将被删除，重命名将恢复原路径。此操作无法撤回。",
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("取消")
+                                .kind(ButtonKind::Plain)
+                                .theme(self.theme)
+                                .render()
+                                .track_focus(&self.edits_ui.file_action_focus[0])
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "enter" {
+                                            this.edits_ui.file_action = None;
+                                            window.focus(&this.composer.focus_handle(cx), cx);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edits_ui.file_action = None;
+                                    window.focus(&this.composer.focus_handle(cx), cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(action.label())
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "confirm-diff-file-action".into())
+                                .track_focus(&self.edits_ui.file_action_focus[1])
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "enter" {
+                                            this.confirm_diff_file_action(cx);
+                                            window.focus(&this.composer.focus_handle(cx), cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_diff_file_action(cx);
+                                    window.focus(&this.composer.focus_handle(cx), cx);
+                                })),
+                        ),
+                );
+            let weak = cx.entity().downgrade();
+            overlays = overlays.child(
+                Dialog::new("diff-file-action-dialog", body)
+                    .width(460.)
+                    .theme(self.theme)
+                    .focus_handles(self.edits_ui.file_action_focus.clone())
+                    .on_close(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.edits_ui.file_action = None;
+                            window.focus(&this.composer.focus_handle(cx), cx);
+                            cx.notify();
+                        });
+                    })
+                    .render(),
+            );
+        }
+        overlays.into_any_element()
+    }
+
+    fn confirm_diff_file_action(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.edits_ui.file_action.take() else {
+            return;
+        };
+        if self.edits_ui.file_action_task.is_some()
+            || self.repository_change_busy(cx)
+            || self.edits_ui.workspace_root != self.diff_repository_root()
+        {
+            self.edits_ui.workspace_error = Some("仓库状态正在变化，请刷新后重试。".into());
+            cx.notify();
+            return;
+        }
+        let root = self.diff_repository_root();
+        let label = action.label();
+        let work = cx.background_executor().spawn(async move {
+            match action {
+                FileAction::DeleteUntracked(source) => {
+                    crate::workspace_diff::delete_untracked(&source)
+                }
+                FileAction::DiscardTracked(source) => {
+                    crate::workspace_diff::discard_tracked(&source)
+                }
+            }
+        });
+        self.edits_ui.file_action_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                this.edits_ui.file_action_task = None;
+                if this.diff_repository_root() == root {
+                    match result {
+                        Ok(()) => this.refresh_workspace_edits(cx),
+                        Err(error) => {
+                            this.edits_ui.workspace_error = Some(format!("{label}失败：{error}"))
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn conflict_rows(
         &self,
         conflicts: &[Entity<ConflictView>],
@@ -765,7 +1047,7 @@ impl AgentWorkspace {
         let link_state = state.clone();
         let weak = cx.entity().downgrade();
         let layout_weak = weak.clone();
-        let list = gpui::list(state, move |index, _, cx| {
+        let list = gpui::list(state.clone(), move |index, _, cx| {
             weak.update(cx, |this, cx| {
                 if prefix > 0 && index == 0 {
                     return div()
@@ -1207,6 +1489,25 @@ impl AgentWorkspace {
                         })
                         .render(),
                     )
+                    .when(workspace_mode && root_matches, |row| {
+                        row.children(self.edits_ui.workspace_branch.as_ref().map(|branch| {
+                            Tooltip::new(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .min_w_0()
+                                    .max_w(px(200.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(Icon::GitBranch.render(13.))
+                                    .child(div().truncate().child(branch.clone())),
+                                format!("当前分支：{branch}"),
+                            )
+                            .theme(self.theme)
+                            .render(cx)
+                        }))
+                    })
                     .child(div().flex_1().min_w_0().overflow_hidden().when_some(
                         workspace_status,
                         |slot, status| {
@@ -1286,7 +1587,9 @@ impl AgentWorkspace {
         if self.edits_ui.expanded {
             list = self.expanded_edit_files(files, scope, can_undo, root_matches, cx);
         }
-        body.child(list).child(
+        body.child(list).when(workspace_mode && !self.edits_ui.expanded, |body| {
+            body.children(self.git_commit_footer(cx))
+        }).child(
             div()
                 .debug_selector(|| "diff-panel-footer".into())
                 .flex_shrink_0()
@@ -1603,6 +1906,18 @@ impl AgentWorkspace {
                                 }
                             }
                         };
+                        let menu_path = path.clone();
+                        let menu_label = navigation_files
+                            .iter()
+                            .find(|file| file.path == path)
+                            .map(|file| file.label.clone())
+                            .or_else(|| {
+                                conflicts.iter().find_map(|view| {
+                                    let file = &view.read(cx).file;
+                                    (file.path == path).then(|| file.label.clone())
+                                })
+                            })
+                            .unwrap_or_else(|| label.clone());
                         let selector = format!("diff-navigation-file:{}", path.display());
                         let active = selected.as_ref() == Some(&path);
                         let status = if index < prefix {
@@ -1679,6 +1994,20 @@ impl AgentWorkspace {
                                     .text_color(rgb(color))
                                     .child(counts),
                             )
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        this.open_diff_file_menu(
+                                            menu_path.clone(),
+                                            menu_label.clone(),
+                                            event.position,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.edits_ui.selected = Some(path.clone());
                                 this.edits_ui.reveal_revision += 1;
@@ -1713,14 +2042,7 @@ impl AgentWorkspace {
             .flex_1()
             .min_h_0()
             .flex()
-            .child(
-                div()
-                    .debug_selector(|| "expanded-diff-navigation".into())
-                    .w(px(self.edits_ui.navigation_width.unwrap_or(260.)))
-                    .flex_shrink_0()
-                    .h_full()
-                    .child(navigation),
-            )
+            .child(self.diff_navigation(navigation, cx))
             .child(
                 div()
                     .id("diff-navigation-resize")
@@ -1765,12 +2087,217 @@ impl AgentWorkspace {
             )
     }
 
+    fn diff_navigation(&self, navigation: impl IntoElement, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .debug_selector(|| "expanded-diff-navigation".into())
+            .w(px(self.edits_ui.navigation_width.unwrap_or(260.)))
+            .flex_shrink_0()
+            .h_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .debug_selector(|| "diff-navigation-tree".into())
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .pr(px(12.))
+                    .child(navigation)
+                    .child(
+                        Scrollbar::vertical(
+                            &self.edits_ui.navigation_scroll.0.borrow().base_handle,
+                            &self.edits_ui.navigation_bar,
+                        )
+                        .theme(self.theme)
+                        .render()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .debug_selector(|| "diff-navigation-scrollbar".into()),
+                    ),
+            )
+            .when(self.edits_ui.workspace_mode, |column| {
+                column.children(self.git_commit_footer(cx))
+            })
+    }
+
+    fn git_commit_footer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let root = self.diff_repository_root()?;
+        if crate::ssh_project::is_remote(&root) {
+            return None;
+        }
+        let p = self.theme.palette();
+        let entry = self
+            .edits_ui
+            .commit_drafts
+            .borrow_mut()
+            .entry(root.clone())
+            .or_insert_with(|| {
+                let entry = cx.new(|cx| TextEntry::new(cx, "输入提交信息…", "").theme(self.theme));
+                cx.observe(&entry, |_, _, cx| cx.notify()).detach();
+                entry
+            })
+            .clone();
+        let matches = self.edits_ui.workspace_root.as_ref() == Some(&root);
+        let staged = if matches {
+            self.edits_ui
+                .workspace_sources
+                .values()
+                .filter(|source| source.staged)
+                .count()
+        } else {
+            0
+        };
+        let disabled = !self.can_commit_workspace(cx);
+        Some(
+            div()
+                .debug_selector(|| "diff-commit-footer".into())
+                .flex_shrink_0()
+                .border_t_1()
+                .border_color(rgb(p.border))
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    gpui_glint::components::InputField::new("输入提交信息…")
+                        .control(entry)
+                        .theme(self.theme)
+                        .render()
+                        .w_full()
+                        .min_w_0()
+                        .debug_selector(|| "diff-commit-message".into()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(if matches && !self.edits_ui.conflicts.is_empty() {
+                                    "请先解决合并冲突".to_owned()
+                                } else if staged == 0 {
+                                    "勾选文件以暂存更改".to_owned()
+                                } else {
+                                    format!("提交 {staged} 个已暂存文件")
+                                }),
+                        )
+                        .child(
+                            Button::new(if self.edits_ui.commit_task.is_some() {
+                                "提交中…"
+                            } else {
+                                "提交"
+                            })
+                            .theme(self.theme)
+                            .when(disabled, |button| button.disabled())
+                            .render()
+                            .debug_selector(|| "diff-commit-submit".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.commit_workspace(cx))),
+                        ),
+                )
+                .when_some(
+                    self.edits_ui
+                        .commit_notice
+                        .as_ref()
+                        .filter(|(project, _)| project == &root),
+                    |footer, (_, notice)| {
+                        footer.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(notice.clone()),
+                        )
+                    },
+                ),
+        )
+    }
+
+    fn can_commit_workspace(&self, cx: &App) -> bool {
+        let Some(root) = self.diff_repository_root() else {
+            return false;
+        };
+        self.edits_ui.workspace_mode
+            && !crate::ssh_project::is_remote(&root)
+            && self.edits_ui.workspace_root.as_ref() == Some(&root)
+            && self.edits_ui.workspace_task.is_none()
+            && self.edits_ui.workspace_conflicts_task.is_none()
+            && self.edits_ui.workspace_error.is_none()
+            && !self.repository_change_busy(cx)
+            && self.edits_ui.conflicts.is_empty()
+            && self
+                .edits_ui
+                .workspace_sources
+                .values()
+                .any(|source| source.staged)
+            && self
+                .edits_ui
+                .commit_drafts
+                .borrow()
+                .get(&root)
+                .is_some_and(|entry| !entry.read(cx).value().trim().is_empty())
+    }
+
+    fn commit_workspace(&mut self, cx: &mut Context<Self>) {
+        if !self.can_commit_workspace(cx) {
+            return;
+        }
+        let root = self.diff_repository_root().unwrap();
+        let entry = self
+            .edits_ui
+            .commit_drafts
+            .borrow()
+            .get(&root)
+            .unwrap()
+            .clone();
+        let message = entry.read(cx).value().to_owned();
+        let project = root.clone();
+        let submitted = message.clone();
+        self.edits_ui.commit_notice = None;
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::workspace_diff::commit_staged(&root, &message) });
+        self.edits_ui.commit_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.edits_ui.commit_task.take() {
+                    task.detach();
+                }
+                let notice = match result {
+                    Ok(()) => {
+                        entry.update(cx, |entry, cx| {
+                            if entry.value() == submitted {
+                                entry.set_value("", cx);
+                            }
+                        });
+                        "提交成功".to_owned()
+                    }
+                    Err(error) => format!("提交失败：{error}"),
+                };
+                this.edits_ui.commit_notice = Some((project.clone(), notice));
+                if this.diff_repository_root().as_ref() == Some(&project) {
+                    this.refresh_workspace_edits(cx);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn stage_workspace_files(
         &mut self,
         sources: Vec<crate::workspace_diff::Source>,
         staged: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.edits_ui.commit_task.is_some() {
+            return;
+        }
         if self.edits_ui.workspace_task.is_some() {
             if !self.edits_ui.workspace_background_refresh {
                 return;
@@ -1918,7 +2445,9 @@ impl AgentWorkspace {
                 }) && available(source)
             }),
         };
-        let busy = !any_available
+        let busy = self.edits_ui.commit_task.is_some()
+            || self.edits_ui.file_action_task.is_some()
+            || !any_available
             || self.edits_ui.workspace_task.is_some()
                 && !self.edits_ui.workspace_background_refresh;
         let mut checkbox = gpui_glint::components::Checkbox::new("")
@@ -2130,6 +2659,8 @@ impl AgentWorkspace {
                 }
                 let (status, color) = file_status_style(source.status, self.theme);
                 let path = file.path.clone();
+                let menu_path = path.clone();
+                let menu_label = file.label.clone();
                 let staged = *staged;
                 let label =
                     if self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree {
@@ -2197,6 +2728,18 @@ impl AgentWorkspace {
                         format!("stage-file:{}:{staged}", path.display()),
                         cx,
                     ))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            this.open_diff_file_menu(
+                                menu_path.clone(),
+                                menu_label.clone(),
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.edits_ui.selected = Some(path.clone());
                         this.edits_ui.selected_staged = staged;
@@ -2304,6 +2847,8 @@ impl AgentWorkspace {
                         &file.label
                     };
                     let selector = format!("diff-navigation-file:{}", path.display());
+                    let menu_path = path.clone();
+                    let menu_label = file.label.clone();
                     let active = navigation_selected.as_ref() == Some(&path);
                     let marker = format!("selected-conflict-file:{}", path.display());
                     return div()
@@ -2345,6 +2890,18 @@ impl AgentWorkspace {
                                 .truncate()
                                 .text_size(px(12.))
                                 .child(label.to_owned()),
+                        )
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                this.open_diff_file_menu(
+                                    menu_path.clone(),
+                                    menu_label.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.edits_ui.selected = Some(path.clone());
@@ -2410,7 +2967,7 @@ impl AgentWorkspace {
             let state = cache.as_ref().unwrap().2.clone();
             let link = state.clone();
             let weak = cx.entity().downgrade();
-            let list = gpui::list(state, move |index, _, cx| {
+            let list = gpui::list(state.clone(), move |index, _, cx| {
                 weak.update(cx, |this, cx| {
                     render_row(this, index, Some((link.clone(), index)), cx)
                 })
@@ -2439,7 +2996,17 @@ impl AgentWorkspace {
                     });
                 })
                 .id("grouped-workspace-files")
-                .child(list);
+                .relative()
+                .pr(px(12.))
+                .child(list)
+                .child(
+                    Scrollbar::vertical_list(&state, &self.edits_ui.navigation_bar)
+                        .theme(self.theme)
+                        .render()
+                        .absolute()
+                        .right_0()
+                        .top_0(),
+                );
         }
         let mut detail_bar = None;
         let mut conflict_header = None;
@@ -2556,14 +3123,7 @@ impl AgentWorkspace {
             .flex_1()
             .min_h_0()
             .flex()
-            .child(
-                div()
-                    .debug_selector(|| "expanded-diff-navigation".into())
-                    .w(px(self.edits_ui.navigation_width.unwrap_or(260.)))
-                    .flex_shrink_0()
-                    .h_full()
-                    .child(navigation),
-            )
+            .child(self.diff_navigation(navigation, cx))
             .child(
                 div()
                     .id("diff-navigation-resize")
@@ -2650,6 +3210,7 @@ impl AgentWorkspace {
             || self.edits_ui.workspace_probe_task.is_some()
             || self.edits_ui.workspace_task.is_some()
             || self.edits_ui.stage_task.is_some()
+            || self.edits_ui.commit_task.is_some()
         {
             return;
         }
@@ -2668,6 +3229,7 @@ impl AgentWorkspace {
                 if !this.workspace_watch_active()
                     || this.diff_repository_root() != project
                     || this.edits_ui.stage_task.is_some()
+                    || this.edits_ui.commit_task.is_some()
                     || this.edits_ui.workspace_stamp != observed
                 {
                     return;
@@ -2715,6 +3277,8 @@ impl AgentWorkspace {
 
     pub(super) fn repository_change_busy(&self, cx: &App) -> bool {
         self.edits_ui.stage_task.is_some()
+            || self.edits_ui.commit_task.is_some()
+            || self.edits_ui.file_action_task.is_some()
             || !self.edits_ui.stage_queue.is_empty()
             || self.edits_ui.undo_task.is_some()
             || self
@@ -2729,6 +3293,9 @@ impl AgentWorkspace {
     }
 
     fn load_workspace_edits(&mut self, background: bool, cx: &mut Context<Self>) {
+        if self.edits_ui.commit_task.is_some() {
+            return;
+        }
         let root = self.diff_repository_root();
         if self.edits_ui.stage_task.is_some() && self.edits_ui.workspace_root == root {
             if background {
@@ -2765,6 +3332,9 @@ impl AgentWorkspace {
                 .retain(|key, _| !key.starts_with("workspace:"));
             self.edits_ui.workspace_files = Rc::new(Vec::new());
             self.edits_ui.workspace_sources = Rc::new(HashMap::new());
+            self.edits_ui.workspace_branch = None;
+            self.edits_ui.file_menu = None;
+            self.edits_ui.file_action = None;
             self.edits_ui.workspace_watch_root = None;
             self.edits_ui.workspace_stamp = None;
             self.edits_ui.workspace_conflict_versions.clear();
@@ -2795,6 +3365,7 @@ impl AgentWorkspace {
                     Vec::new(),
                     inventory.sources,
                     Some((
+                        inventory.branch,
                         inventory.root,
                         inventory.head,
                         inventory.has_conflicts,
@@ -2849,9 +3420,10 @@ impl AgentWorkspace {
                         if !background || this.edits_ui.conflicts.is_empty() {
                             this.edits_ui.workspace_notes = notes;
                         }
-                        if let Some((root, head, has_conflicts, conflict_versions, stamp)) =
+                        if let Some((branch, root, head, has_conflicts, conflict_versions, stamp)) =
                             statistics
                         {
+                            this.edits_ui.workspace_branch = branch;
                             this.edits_ui.workspace_watch_root = Some(root.clone());
                             this.edits_ui.workspace_stamp = stamp;
                             let changed =
@@ -3810,6 +4382,8 @@ struct FileDiff {
     loaded: Option<Change>,
     load_task: Option<Task<()>>,
     load_error: Option<String>,
+    manual_load_available: bool,
+    prepared: Option<gpui_glint::components::PreparedDiff>,
     workspace: Option<gpui::WeakEntity<AgentWorkspace>>,
     undo_visible: bool,
     undo_enabled: bool,
@@ -3832,6 +4406,8 @@ impl FileDiff {
             loaded: None,
             load_task: None,
             load_error: None,
+            manual_load_available: false,
+            prepared: None,
             workspace: None,
             undo_visible: false,
             undo_enabled: false,
@@ -3849,6 +4425,8 @@ impl FileDiff {
             self.file = file.clone();
             self.card = None;
             self.loaded = None;
+            self.prepared = None;
+            self.manual_load_available = false;
             self.load_error = None;
             self.load_task = None;
             cx.notify();
@@ -3874,14 +4452,22 @@ impl FileDiff {
         }
     }
 
-    fn load_diff(&mut self, cx: &mut Context<Self>) {
+    fn load_diff(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.load_task.is_some() {
+            return;
+        }
         let Some(source) = self.source.clone() else {
             return;
         };
         let id = self.file.id;
-        let work = cx
-            .background_executor()
-            .spawn(async move { crate::workspace_diff::load(&source) });
+        let side_by_side = self.side_by_side;
+        self.load_error = None;
+        self.manual_load_available = false;
+        let work = cx.background_executor().spawn(async move {
+            let mut change = crate::workspace_diff::load_with_options(&source, manual)?;
+            let prepared = DiffCard::prepare(change.take_lines(), side_by_side);
+            Ok::<_, crate::workspace_diff::LoadError>((change, prepared))
+        });
         self.load_task = Some(cx.spawn(async move |weak, cx| {
             let result = work.await;
             let _ = weak.update(cx, |this, cx| {
@@ -3892,8 +4478,20 @@ impl FileDiff {
                     task.detach();
                 }
                 match result {
-                    Ok(change) => this.loaded = Some(change),
-                    Err(error) => this.load_error = Some(error),
+                    Ok((change, prepared)) => {
+                        if this.side_by_side != side_by_side {
+                            this.load_diff(manual, cx);
+                            cx.notify();
+                            return;
+                        }
+                        this.loaded = Some(change);
+                        this.prepared = Some(prepared);
+                    }
+                    Err(error) => {
+                        this.manual_load_available =
+                            matches!(error, crate::workspace_diff::LoadError::LargeFile(_));
+                        this.load_error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             });
@@ -3911,7 +4509,7 @@ impl Render for FileDiff {
             && self.load_task.is_none()
             && self.load_error.is_none()
         {
-            self.load_diff(cx);
+            self.load_diff(false, cx);
         }
         let selector = format!("edit-file:{}", self.file.label);
         let path = self.file.path.clone();
@@ -3922,15 +4520,20 @@ impl Render for FileDiff {
                 self.card
                     .get_or_insert_with(|| {
                         cx.new(|cx| {
-                            DiffCard::from_lines(
-                                cx,
-                                edits::language(&self.file.path),
-                                self.loaded.as_ref().unwrap_or(&self.file).lines(),
-                            )
-                            .side_by_side(self.side_by_side)
-                            .fill_height(self.detail)
-                            .header_visible(false)
-                            .theme(self.theme)
+                            let language = edits::language(&self.file.path);
+                            let card = if let Some(prepared) = self.prepared.take() {
+                                DiffCard::from_prepared(cx, language, prepared)
+                            } else {
+                                DiffCard::from_lines(
+                                    cx,
+                                    language,
+                                    self.loaded.as_ref().unwrap_or(&self.file).lines(),
+                                )
+                            };
+                            card.side_by_side(self.side_by_side)
+                                .fill_height(self.detail)
+                                .header_visible(false)
+                                .theme(self.theme)
                         })
                     })
                     .clone(),
@@ -3966,6 +4569,22 @@ impl Render for FileDiff {
             .child(
                 div()
                     .id("file-disclosure")
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                            if let Some(workspace) = &this.workspace {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.open_diff_file_menu(
+                                        this.file.path.clone(),
+                                        this.file.label.clone(),
+                                        event.position,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        }),
+                    )
                     .debug_selector(move || selector.clone())
                     .h(px(48.))
                     .flex_shrink_0()
@@ -4103,6 +4722,8 @@ impl Render for FileDiff {
                         if !this.expanded {
                             this.card = None;
                             this.loaded = None;
+                            this.prepared = None;
+                            this.manual_load_available = false;
                             this.load_task = None;
                             this.load_error = None;
                         }
@@ -4111,31 +4732,88 @@ impl Render for FileDiff {
             );
         if expanded {
             if self.load_task.is_some() {
+                let pane = |id: &'static str| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            Skeleton::new((id, 0usize))
+                                .width(72.)
+                                .height(10.)
+                                .theme(self.theme),
+                        )
+                        .child(
+                            Skeleton::new((id, 1usize))
+                                .lines(12)
+                                .height(12.)
+                                .gap(14.)
+                                .theme(self.theme),
+                        )
+                };
                 return row.child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .text_color(rgb(p.text_muted))
-                        .child("正在加载此文件的 Diff…"),
+                        .px_2()
+                        .pb_2()
+                        .when(self.detail, |body| {
+                            body.flex_1().min_h_0().flex().flex_col()
+                        })
+                        .child(
+                            div()
+                                .id("file-diff-loading")
+                                .debug_selector(|| "file-diff-loading-skeleton".into())
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .flex()
+                                .when(self.detail, |body| body.flex_1().min_h_0())
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .bg(rgb(p.surface))
+                                .child(pane("diff-loading-before"))
+                                .when(self.side_by_side, |body| {
+                                    body.child(div().w(px(1.)).self_stretch().bg(rgb(p.border)))
+                                        .child(pane("diff-loading-after"))
+                                }),
+                        ),
                 );
             }
             if let Some(error) = &self.load_error {
                 return row.child(
                     div()
-                        .px_3()
-                        .py_2()
+                        .w_full()
+                        .min_h(px(180.))
+                        .px_6()
+                        .py_8()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .when(self.detail, |body| body.flex_1().min_h_0())
                         .text_size(px(12.))
                         .text_color(rgb(p.text_muted))
-                        .child(error.clone())
+                        .child(div().text_center().child(error.clone()))
                         .child(
-                            Button::new("重试")
-                                .kind(ButtonKind::Plain)
-                                .theme(self.theme)
-                                .render()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.load_error = None;
+                            Button::new(if self.manual_load_available {
+                                "加载 Diff"
+                            } else {
+                                "重试"
+                            })
+                            .kind(ButtonKind::Primary)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "load-file-diff-manually".into())
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.load_diff(true, cx);
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         ),
                 );
             }
@@ -4278,6 +4956,90 @@ impl Render for Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn commit_footer_keeps_drafts_and_requires_message_and_staged_files(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let repo = tempfile::tempdir().unwrap();
+        crate::workspace_diff::tests::git_ok(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("new.txt"), "staged\n").unwrap();
+        crate::workspace_diff::tests::git_ok(repo.path(), &["add", "new.txt"]);
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.open = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("diff-commit-message").is_some());
+        assert!(window.debug_bounds("diff-commit-submit").is_some());
+        host.update(window, |host, cx| {
+            assert!(!host.can_commit_workspace(cx));
+            let entry = host
+                .edits_ui
+                .commit_drafts
+                .borrow()
+                .get(&root)
+                .unwrap()
+                .clone();
+            entry.update(cx, |entry, cx| entry.set_value("  ", cx));
+            assert!(!host.can_commit_workspace(cx));
+            entry.update(cx, |entry, cx| entry.set_value("feat: sidebar commit", cx));
+            assert!(host.can_commit_workspace(cx));
+            let sources = host.edits_ui.workspace_sources.clone();
+            host.edits_ui.workspace_sources = Rc::new(HashMap::new());
+            assert!(!host.can_commit_workspace(cx));
+            host.edits_ui.workspace_sources = sources;
+            host.edits_ui.workspace_mode = false;
+            assert!(!host.can_commit_workspace(cx));
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.expanded = true;
+            assert_eq!(entry.read(cx).value(), "feat: sidebar commit");
+            assert!(host.can_commit_workspace(cx));
+            cx.notify();
+        });
+        for viewport in [size(px(1440.), px(1000.)), size(px(900.), px(500.))] {
+            window.simulate_resize(viewport);
+            window.run_until_parked();
+            let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
+            let tree = window.debug_bounds("diff-navigation-tree").unwrap();
+            let footer = window.debug_bounds("diff-commit-footer").unwrap();
+            let detail = window.debug_bounds("expanded-diff-content").unwrap();
+            assert!(footer.left() >= navigation.left());
+            assert!(footer.right() <= navigation.right() + px(1.));
+            assert!((footer.bottom() - navigation.bottom()).abs() <= px(1.));
+            assert!(tree.bottom() <= footer.top() + px(1.));
+            assert!(detail.left() >= footer.right());
+            assert!((detail.bottom() - footer.bottom()).abs() <= px(1.));
+        }
+        // Empty inventories use the alternate navigation renderer too.
+        host.update(window, |host, cx| {
+            host.edits_ui.workspace_sources = Rc::new(HashMap::new());
+            host.edits_ui.workspace_files = Rc::new(Vec::new());
+            cx.notify();
+        });
+        window.run_until_parked();
+        let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
+        let footer = window.debug_bounds("diff-commit-footer").unwrap();
+        assert!(footer.right() <= navigation.right() + px(1.));
+        assert!((footer.bottom() - navigation.bottom()).abs() <= px(1.));
+    }
 
     #[gpui::test]
     fn workspace_tree_folders_keep_diff_state_and_settings_switch_back_to_list(
@@ -5607,6 +6369,54 @@ mod tests {
                 .all(|r| r["reverted"] == true)
         );
     }
+    #[gpui::test]
+    fn large_file_waits_for_manual_click_then_installs_background_prepared_diff(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let repo = tempfile::tempdir().unwrap();
+        crate::workspace_diff::tests::git_ok(repo.path(), &["init"]);
+        std::fs::write(
+            repo.path().join("large.yaml"),
+            "key: original value\n".repeat(120_000),
+        )
+        .unwrap();
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let file = inventory.files[0].clone();
+        let source = inventory.sources[&file.path].for_layer(false);
+        let (view, window) = cx.add_window_view(|_, _| {
+            let mut view = FileDiff::new(file, ThemePreset::default());
+            view.source = Some(source);
+            view.expanded = true;
+            view.side_by_side = true;
+            view
+        });
+        window.run_until_parked();
+        view.read_with(window, |view, _| {
+            assert!(view.manual_load_available);
+            assert!(view.loaded.is_none() && view.card.is_none() && view.load_task.is_none());
+        });
+        let button = window.debug_bounds("load-file-diff-manually").unwrap();
+        window.simulate_click(button.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        view.read_with(window, |view, cx| {
+            assert!(view.load_error.is_none(), "{:?}", view.load_error);
+            assert!(view.loaded.as_ref().unwrap().after.len() > 2 * 1024 * 1024);
+            assert!(view.card.as_ref().unwrap().read(cx).stats().0 >= 120_000);
+        });
+        // Explicit loading is not carried over to a later file revision.
+        view.update(window, |view, cx| {
+            let mut next = view.file.clone();
+            next.id = Uuid::new_v4();
+            view.set_file(&next, view.theme, cx);
+        });
+        window.run_until_parked();
+        view.read_with(window, |view, _| {
+            assert!(view.manual_load_available);
+            assert!(view.loaded.is_none() && view.card.is_none());
+        });
+    }
+
     #[gpui::test]
     fn files_expand_independently_and_closed_diffs_are_lazy(cx: &mut gpui::TestAppContext) {
         let (stack, window) = cx.add_window_view(|_, cx| {

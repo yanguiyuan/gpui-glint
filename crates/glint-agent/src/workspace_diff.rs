@@ -128,6 +128,7 @@ impl FileStatus {
 }
 
 pub struct Inventory {
+    pub branch: Option<String>,
     pub root: PathBuf,
     pub head: Option<String>,
     pub files: Vec<Change>,
@@ -157,6 +158,25 @@ fn checked(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Commit the index as-is. Never stage working-tree changes implicitly.
+pub fn commit_staged(root: &Path, message: &str) -> Result<(), String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("请输入提交信息。".into());
+    }
+    if !checked(root, &["ls-files", "--unmerged", "-z"])?.is_empty() {
+        return Err("请先解决所有合并冲突。".into());
+    }
+    let staged = git(root, &["diff", "--cached", "--quiet", "--exit-code"])?;
+    match staged.status.code() {
+        Some(1) => {}
+        Some(0) => return Err("没有已暂存的更改。".into()),
+        _ => return Err(String::from_utf8_lossy(&staged.stderr).trim().to_owned()),
+    }
+    checked(root, &["commit", "-m", message])?;
+    Ok(())
+}
+
 pub fn inventory(root: &Path) -> Result<Inventory, String> {
     let top = checked(root, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(
@@ -169,7 +189,13 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
     let stamp = repository_stamp(&root);
     let status = checked(
         &root,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+        ],
     )?;
     let head = git(&root, &["rev-parse", "--verify", "HEAD"])?;
     let head = if head.status.success() {
@@ -182,12 +208,88 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
     Ok(inventory)
 }
 
+/// Recheck Git immediately before removing a single untracked file.
+pub fn delete_untracked(source: &Source) -> Result<(), String> {
+    let fresh = inventory(&source.root)?;
+    let current = fresh
+        .sources
+        .get(&source.path)
+        .ok_or("文件状态已变化，请刷新后重试")?;
+    if current.status != FileStatus::Untracked || !current.untracked || current.staged {
+        return Err("文件已被 Git 跟踪或暂存，已取消删除".into());
+    }
+    let relative = source
+        .path
+        .strip_prefix(&source.root)
+        .map_err(|_| "文件不在当前仓库内")?;
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("文件路径无效".into());
+    }
+    let parent = source
+        .path
+        .parent()
+        .ok_or("文件路径无效")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !parent.starts_with(&source.root) {
+        return Err("文件不在当前仓库内".into());
+    }
+    let metadata = std::fs::symlink_metadata(&source.path).map_err(|e| e.to_string())?;
+    if metadata.is_dir() {
+        return Err("仅支持删除文件".into());
+    }
+    std::fs::remove_file(&source.path).map_err(|e| e.to_string())
+}
+
+/// Discard both index and worktree changes for this tracked path (including rename pairs).
+pub fn discard_tracked(source: &Source) -> Result<(), String> {
+    let fresh = inventory(&source.root)?;
+    let current = fresh
+        .sources
+        .get(&source.path)
+        .ok_or("文件状态已变化，请刷新后重试")?;
+    if current.untracked || !current.same_version(source) || fresh.head != source.head {
+        return Err("文件或 HEAD 已变化，请刷新后重新确认撤销".into());
+    }
+    if current.old_path != current.label
+        && fresh
+            .sources
+            .get(&current.root.join(&current.old_path))
+            .is_some_and(|other| other.untracked)
+    {
+        return Err("重命名前的路径存在未跟踪文件，已取消撤销".into());
+    }
+    let mut args = vec!["--literal-pathspecs"];
+    if let Some(head) = fresh.head.as_deref() {
+        args.extend([
+            "restore",
+            "--source",
+            head,
+            "--staged",
+            "--worktree",
+            "--",
+            &current.label,
+        ]);
+        if current.old_path != current.label {
+            args.push(&current.old_path);
+        }
+    } else {
+        // An unborn branch has an empty baseline; discarding a staged addition removes it.
+        args.extend(["rm", "--force", "--", &current.label]);
+    }
+    checked(&source.root, &args).map(|_| ())
+}
+
 fn parse_inventory(
     root: PathBuf,
     head: Option<String>,
     status: &[u8],
 ) -> Result<Inventory, String> {
     let mut result = Inventory {
+        branch: None,
         root: root.clone(),
         head: head.clone(),
         files: Vec::new(),
@@ -199,7 +301,25 @@ fn parse_inventory(
     let mut fields = status.split(|b| *b == 0).filter(|f| !f.is_empty());
     while let Some(field) = fields.next() {
         let (status, label, old_path) = match field.first() {
-            Some(b'#' | b'!') => continue,
+            Some(b'#') => {
+                if let Some(branch) = field.strip_prefix(b"# branch.head ") {
+                    let branch = String::from_utf8_lossy(branch);
+                    result.branch = Some(if branch == "(detached)" {
+                        format!(
+                            "游离 HEAD · {}",
+                            head.as_deref()
+                                .unwrap_or("")
+                                .chars()
+                                .take(8)
+                                .collect::<String>()
+                        )
+                    } else {
+                        branch.into_owned()
+                    });
+                }
+                continue;
+            }
+            Some(b'!') => continue,
             Some(b'?') => (
                 b"??".as_slice(),
                 std::str::from_utf8(field.get(2..).ok_or("Git 状态格式无效")?)
@@ -602,7 +722,30 @@ pub fn apply_statistics(
     }
 }
 
-fn blob(source: &Source, spec: &str) -> Result<String, String> {
+#[derive(Debug)]
+pub enum LoadError {
+    LargeFile(String),
+    Other(String),
+}
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LargeFile(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+impl From<&str> for LoadError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_owned())
+    }
+}
+
+fn blob(source: &Source, spec: &str, manual: bool) -> Result<String, LoadError> {
     let size = git(&source.root, &["cat-file", "-s", spec])?;
     if !size.status.success() {
         return Ok(String::new());
@@ -611,11 +754,18 @@ fn blob(source: &Source, spec: &str) -> Result<String, String> {
         .trim()
         .parse()
         .map_err(|_| "Git 文件大小无效")?;
-    if size > 2 * 1024 * 1024 {
-        return Err("Git 版本超过 2 MiB，未加载全文 Diff".into());
+    if !manual && size > 2 * 1024 * 1024 {
+        return Err(LoadError::LargeFile(
+            "Git 版本超过 2 MiB，已跳过自动加载".into(),
+        ));
     }
     let bytes = checked(&source.root, &["cat-file", "blob", spec])?;
     let text = String::from_utf8(bytes).map_err(|_| "Git 文件不是 UTF-8 文本")?;
+    if !manual && text.len() > 2 * 1024 * 1024 {
+        return Err(LoadError::LargeFile(
+            "文件超过 2 MiB，已跳过自动加载".into(),
+        ));
+    }
     if text.contains('\0') {
         return Err("二进制文件不支持文本 Diff".into());
     }
@@ -640,49 +790,60 @@ impl Source {
     }
 }
 
-fn worktree_text(source: &Source) -> Result<String, String> {
+fn worktree_text(source: &Source, manual: bool) -> Result<String, LoadError> {
     let text = match std::fs::symlink_metadata(&source.path) {
         Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
             return Err("链接和子模块不支持文本预览".into());
         }
-        Ok(meta) if meta.len() > 2 * 1024 * 1024 => {
-            return Err(format!(
-                "大文件（{:.1} MiB），为保持流畅已跳过全文 Diff",
+        Ok(meta) if !manual && meta.len() > 2 * 1024 * 1024 => {
+            return Err(LoadError::LargeFile(format!(
+                "大文件（{:.1} MiB），已跳过自动加载",
                 meta.len() as f64 / (1024. * 1024.)
-            ));
+            )));
         }
         Ok(_) => {
             let path = source.path.canonicalize().map_err(|e| e.to_string())?;
             if !path.starts_with(&source.root) {
                 return Err("文件位于仓库外，未读取".into());
             }
-            crate::atomic_file::current(&path)?.ok_or("文件已删除，请刷新后重试")?
+            std::fs::read_to_string(&path).map_err(|e| e.to_string())?
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e.to_string().into()),
     };
+    if !manual && text.len() > 2 * 1024 * 1024 {
+        return Err(LoadError::LargeFile(
+            "文件超过 2 MiB，已跳过自动加载".into(),
+        ));
+    }
     if text.contains('\0') {
         return Err("二进制文件不支持文本 Diff".into());
     }
     Ok(text)
 }
 
+#[cfg(test)]
 pub fn load(source: &Source) -> Result<Change, String> {
+    load_with_options(source, false).map_err(|error| error.to_string())
+}
+
+/// Manual loading relaxes the preview-size limit only for this request.
+pub fn load_with_options(source: &Source, manual: bool) -> Result<Change, LoadError> {
     if let Some(staged) = source.layer {
         let before = if staged {
             match &source.head {
-                Some(head) => blob(source, &format!("{head}:{}", source.old_path))?,
+                Some(head) => blob(source, &format!("{head}:{}", source.old_path), manual)?,
                 None => String::new(),
             }
         } else if source.untracked {
             String::new()
         } else {
-            blob(source, &format!(":0:{}", source.label))?
+            blob(source, &format!(":0:{}", source.label), manual)?
         };
         let after = if staged {
-            blob(source, &format!(":0:{}", source.label))?
+            blob(source, &format!(":0:{}", source.label), manual)?
         } else {
-            worktree_text(source)?
+            worktree_text(source, manual)?
         };
         return Ok(Change::preview(
             source.path.clone(),
@@ -692,7 +853,7 @@ pub fn load(source: &Source) -> Result<Change, String> {
             None,
         ));
     }
-    let after = worktree_text(source)?;
+    let after = worktree_text(source, manual)?;
     let before = if source.untracked || source.head.is_none() {
         None
     } else {
@@ -703,8 +864,10 @@ pub fn load(source: &Source) -> Result<Change, String> {
                 .trim()
                 .parse()
                 .map_err(|_| "Git 文件大小无效")?;
-            if size > 2 * 1024 * 1024 {
-                return Err("HEAD 版本超过 2 MiB，未加载全文 Diff".into());
+            if !manual && size > 2 * 1024 * 1024 {
+                return Err(LoadError::LargeFile(
+                    "HEAD 版本超过 2 MiB，已跳过自动加载".into(),
+                ));
             }
             let bytes = checked(&source.root, &["cat-file", "blob", &spec])?;
             Some(String::from_utf8(bytes).map_err(|_| "HEAD 文件不是 UTF-8 文本")?)
@@ -727,6 +890,57 @@ pub fn load(source: &Source) -> Result<Change, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn commit_staged_preserves_unstaged_changes_and_literal_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_ok(root, &["init"]);
+        git_ok(root, &["config", "user.name", "Workspace Test"]);
+        git_ok(root, &["config", "user.email", "test@example.invalid"]);
+        git_ok(root, &["config", "commit.gpgsign", "false"]);
+        git_ok(root, &["config", "core.hooksPath", "disabled-hooks"]);
+        assert!(commit_staged(root, "  ").is_err());
+        assert!(commit_staged(root, "empty").is_err());
+        let path = root.join("file.txt");
+        std::fs::write(&path, "staged\n").unwrap();
+        git_ok(root, &["add", "file.txt"]);
+        std::fs::write(&path, "unstaged\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "keep").unwrap();
+        let message = "加载 Diff & $(literal) `text` \"quoted\"";
+        commit_staged(root, message).unwrap();
+        assert_eq!(
+            checked(root, &["show", "HEAD:file.txt"]).unwrap(),
+            b"staged\n"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"unstaged\n");
+        assert_eq!(
+            String::from_utf8(checked(root, &["log", "-1", "--format=%B"]).unwrap())
+                .unwrap()
+                .trim(),
+            message
+        );
+        assert!(
+            !git(root, &["cat-file", "-e", "HEAD:untracked.txt"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(commit_staged(root, "nothing staged").is_err());
+    }
+
+    #[test]
+    fn commit_staged_rejects_unresolved_conflicts() {
+        let dir = crate::merge_conflicts::tests::vendor_update(1, 4);
+        let before = checked(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert!(
+            commit_staged(dir.path(), "unresolved")
+                .unwrap_err()
+                .contains("冲突")
+        );
+        assert_eq!(checked(dir.path(), &["rev-parse", "HEAD"]).unwrap(), before);
+    }
+
     pub(crate) fn git_ok(root: &Path, args: &[&str]) {
         let out = crate::child_process::command("git")
             .current_dir(root)
@@ -749,6 +963,121 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    #[test]
+    fn branch_headers_cover_unborn_named_and_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        git_ok(dir.path(), &["init", "-b", "feature/sidebar"]);
+        assert_eq!(
+            inventory(dir.path()).unwrap().branch.as_deref(),
+            Some("feature/sidebar")
+        );
+        std::fs::write(dir.path().join("file.txt"), "test").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        git_ok(dir.path(), &["commit", "-m", "initial"]);
+        assert_eq!(
+            inventory(dir.path()).unwrap().branch.as_deref(),
+            Some("feature/sidebar")
+        );
+        git_ok(dir.path(), &["checkout", "--detach"]);
+        assert!(
+            inventory(dir.path())
+                .unwrap()
+                .branch
+                .unwrap()
+                .starts_with("游离 HEAD · ")
+        );
+    }
+
+    #[test]
+    fn deletion_rechecks_untracked_status_and_only_removes_requested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        git_ok(dir.path(), &["init"]);
+        let path = dir.path().join("中文 [1].txt");
+        let keep = dir.path().join("keep.txt");
+        std::fs::write(&path, "delete me").unwrap();
+        std::fs::write(&keep, "keep me").unwrap();
+        let data = inventory(dir.path()).unwrap();
+        let source = data
+            .sources
+            .values()
+            .find(|s| s.label == "中文 [1].txt")
+            .unwrap()
+            .clone();
+        git_ok(dir.path(), &["add", "--", "中文 [1].txt"]);
+        assert!(delete_untracked(&source).is_err());
+        assert!(path.exists());
+        git_ok(dir.path(), &["rm", "--cached", "--", "中文 [1].txt"]);
+        delete_untracked(&source).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn discard_restores_index_and_worktree_and_preserves_other_files() {
+        let dir = many_files(1);
+        let path = dir.path().canonicalize().unwrap().join("vendor/0000.rs");
+        std::fs::write(&path, "staged edit\n").unwrap();
+        let label = path
+            .strip_prefix(dir.path().canonicalize().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        git_ok(dir.path(), &["add", "--", &label]);
+        std::fs::write(&path, "unstaged edit\n").unwrap();
+        let keep = dir.path().join("untracked.txt");
+        std::fs::write(&keep, "keep me").unwrap();
+        let data = inventory(dir.path()).unwrap();
+        let source = data.sources.get(&path).unwrap();
+        assert!(source.staged && source.unstaged);
+        std::fs::write(&path, "new edit after confirmation opened\n").unwrap();
+        assert!(discard_tracked(source).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "new edit after confirmation opened\n"
+        );
+        let current = inventory(dir.path()).unwrap();
+        discard_tracked(&current.sources[&path]).unwrap();
+        let restored = std::fs::read(&path).unwrap();
+        assert_eq!(
+            restored,
+            checked(dir.path(), &["show", &format!("HEAD:{label}")]).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep me");
+        assert!(!inventory(dir.path()).unwrap().sources.contains_key(&path));
+        assert!(discard_tracked(data.sources.values().find(|s| s.untracked).unwrap()).is_err());
+    }
+
+    #[test]
+    fn discard_handles_rename_deletion_addition_and_unborn_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git_ok(dir.path(), &["init", "-b", "main"]);
+        let original = dir.path().join("中文 [1].txt");
+        std::fs::write(&original, "base\n").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        let data = inventory(dir.path()).unwrap();
+        discard_tracked(data.sources.values().next().unwrap()).unwrap();
+        assert!(!original.exists());
+        std::fs::write(&original, "base\n").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        git_ok(dir.path(), &["commit", "-m", "baseline"]);
+        git_ok(dir.path(), &["mv", "中文 [1].txt", "renamed.txt"]);
+        let data = inventory(dir.path()).unwrap();
+        discard_tracked(data.sources.values().next().unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "base\n");
+        assert!(!dir.path().join("renamed.txt").exists());
+        std::fs::remove_file(&original).unwrap();
+        let data = inventory(dir.path()).unwrap();
+        discard_tracked(data.sources.values().next().unwrap()).unwrap();
+        assert!(original.exists());
+        let added = dir.path().join("added [2].txt");
+        std::fs::write(&added, "new\n").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        let data = inventory(dir.path()).unwrap();
+        discard_tracked(data.sources.values().next().unwrap()).unwrap();
+        assert!(!added.exists());
+        assert!(inventory(dir.path()).unwrap().files.is_empty());
+    }
+
     pub(crate) fn many_files(count: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git_ok(dir.path(), &["init", "-b", "main"]);
@@ -1029,6 +1358,60 @@ pub(crate) mod tests {
             std::fs::read_to_string(dir.path().join("renamed.txt")).unwrap(),
             "base\nnew\n"
         );
+    }
+
+    #[test]
+    fn large_text_requires_manual_loading_for_worktree_index_and_head() {
+        let dir = tempfile::tempdir().unwrap();
+        git_ok(dir.path(), &["init", "-b", "main"]);
+        git_ok(dir.path(), &["config", "core.autocrlf", "false"]);
+        let path = dir.path().join("large.yaml");
+        let base = "key: original value\n".repeat(120_000);
+        assert!(base.len() > 2 * 1024 * 1024);
+        std::fs::write(&path, &base).unwrap();
+        let data = inventory(dir.path()).unwrap();
+        let source = data.sources.values().next().unwrap();
+        assert!(matches!(
+            load_with_options(source, false),
+            Err(LoadError::LargeFile(_))
+        ));
+        let added = load_with_options(source, true).unwrap();
+        assert_eq!(added.after.as_ref(), base);
+        git_ok(dir.path(), &["add", "."]);
+        git_ok(dir.path(), &["commit", "-m", "large baseline"]);
+        let staged = format!("{base}staged: yes\n");
+        std::fs::write(&path, &staged).unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        let worktree = format!("{staged}unstaged: yes\n");
+        std::fs::write(&path, &worktree).unwrap();
+        let data = inventory(dir.path()).unwrap();
+        let source = data.sources.values().next().unwrap();
+        for staged_layer in [true, false] {
+            let layer = source.for_layer(staged_layer);
+            assert!(matches!(
+                load_with_options(&layer, false),
+                Err(LoadError::LargeFile(_))
+            ));
+            let change = load_with_options(&layer, true).unwrap();
+            assert_eq!(
+                change.before.as_deref().unwrap(),
+                if staged_layer { &base } else { &staged }
+            );
+            assert_eq!(
+                change.after.as_ref(),
+                if staged_layer { &staged } else { &worktree }
+            );
+            assert_eq!((change.added, change.removed), (1, 0));
+        }
+        let full = load_with_options(source, true).unwrap();
+        assert_eq!(full.before.as_deref(), Some(base.as_str()));
+        assert_eq!(full.after.as_ref(), worktree);
+        // Manual loading never relaxes binary-file validation.
+        std::fs::write(&path, vec![0; 3 * 1024 * 1024]).unwrap();
+        assert!(matches!(
+            load_with_options(source, true),
+            Err(LoadError::Other(_))
+        ));
     }
 
     #[test]

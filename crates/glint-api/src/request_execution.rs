@@ -419,6 +419,7 @@ impl Workbench {
                 });
             });
         }));
+        self.background_tasks(cx);
         cx.notify();
     }
 

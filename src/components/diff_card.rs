@@ -217,6 +217,19 @@ pub struct DiffCard {
     hide_whitespace: bool,
 }
 
+/// Thread-safe diff preparation result. Build it on a background executor, then
+/// install it on the UI thread without repeating alignment or word comparisons.
+pub struct PreparedDiff {
+    lines: Vec<DiffLine>,
+    word_tints: Vec<Option<(Vec<Range<usize>>, Vec<Range<usize>>)>>,
+    max_columns: usize,
+    totals: (usize, usize),
+    whitespace_pairs: HashSet<usize>,
+    rows: Vec<Row>,
+    row_offsets: Vec<f32>,
+    side_by_side: bool,
+}
+
 impl gpui::EventEmitter<DiffCardEvent> for DiffCard {}
 impl DiffCard {
     /// Opt into title navigation while keeping the disclosure arrow independent.
@@ -269,8 +282,15 @@ impl DiffCard {
         language: impl Into<SharedString>,
         lines: Vec<DiffLine>,
     ) -> Self {
-        let mut card = Self {
-            language: language.into(),
+        let mut card = Self::with_lines(language.into(), lines);
+        card.recompute_word_tints();
+        cx.notify();
+        card
+    }
+
+    fn with_lines(language: SharedString, lines: Vec<DiffLine>) -> Self {
+        Self {
+            language,
             name: "diff".into(),
             path: "".into(),
             lines,
@@ -296,8 +316,41 @@ impl DiffCard {
             totals: (0, 0),
             whitespace_pairs: HashSet::new(),
             hide_whitespace: false,
-        };
+        }
+    }
+
+    /// Compute all initial row metadata away from the UI thread. Syntax styling
+    /// and shaping remain lazy and are limited to the visible viewport.
+    pub fn prepare(lines: Vec<DiffLine>, side_by_side: bool) -> PreparedDiff {
+        let mut card = Self::with_lines("".into(), lines);
+        card.side_by_side = side_by_side;
         card.recompute_word_tints();
+        let _ = card.visible_rows();
+        PreparedDiff {
+            lines: card.lines,
+            word_tints: card.word_tints,
+            max_columns: card.max_columns,
+            totals: card.totals,
+            whitespace_pairs: card.whitespace_pairs,
+            rows: Rc::try_unwrap(card.rows.take().unwrap()).expect("exclusive prepared rows"),
+            row_offsets: card.row_offsets,
+            side_by_side,
+        }
+    }
+
+    pub fn from_prepared(
+        cx: &mut Context<Self>,
+        language: impl Into<SharedString>,
+        prepared: PreparedDiff,
+    ) -> Self {
+        let mut card = Self::with_lines(language.into(), prepared.lines);
+        card.word_tints = prepared.word_tints;
+        card.max_columns = prepared.max_columns;
+        card.totals = prepared.totals;
+        card.whitespace_pairs = prepared.whitespace_pairs;
+        card.rows = Some(Rc::new(prepared.rows));
+        card.row_offsets = prepared.row_offsets;
+        card.side_by_side = prepared.side_by_side;
         cx.notify();
         card
     }
@@ -333,6 +386,9 @@ impl DiffCard {
 
     /// Align old/new lines in two columns, with blank cells for unmatched lines.
     pub fn side_by_side(mut self, enabled: bool) -> Self {
+        if self.side_by_side != enabled {
+            self.rows = None;
+        }
         self.side_by_side = enabled;
         self
     }
@@ -556,6 +612,10 @@ impl DiffCard {
             + 8)
         .min(rows.len());
         self.rendered_rows = start..end;
+        // Bound accumulated syntax runs when browsing very large diffs.
+        if self.runs.len() > 2048 {
+            self.runs.clear();
+        }
         (rows, self.rendered_rows.clone())
     }
 
@@ -1541,6 +1601,34 @@ impl Element for DiffLineElement {
 mod tests {
     use super::*;
     use gpui::AppContext;
+
+    #[gpui::test]
+    fn background_preparation_installs_cached_rows_and_keeps_virtual_rendering(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let prepared = std::thread::spawn(|| {
+            let old = "context: original value\n".repeat(100_000);
+            let new = format!("{old}changed: yes\n");
+            DiffCard::prepare(diff_lines(&old, &new), true)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(prepared.totals, (1, 0));
+        assert!(
+            prepared.rows.len() < 20,
+            "unchanged context stays collapsed"
+        );
+        let (card, window) = cx.add_window_view(|_, cx| {
+            DiffCard::from_prepared(cx, "yaml", prepared).side_by_side(true)
+        });
+        card.read_with(window, |card, _| {
+            assert_eq!(card.stats(), (1, 0));
+            assert!(card.side_by_side);
+            assert!(card.rows.is_some());
+            assert!(card.runs.len() < 64);
+            assert!(card.rendered_rows.len() < 64);
+        });
+    }
 
     #[gpui::test]
     fn fill_height_respects_host_height_instead_of_window_height(cx: &mut gpui::TestAppContext) {

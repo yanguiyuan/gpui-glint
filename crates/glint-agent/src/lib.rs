@@ -142,6 +142,7 @@ pub struct AgentWorkspace {
     terminal_ui: terminal_ui::State,
     show_background_tasks: bool,
     host_background_tasks: bool,
+    background_task_inbox: std::cell::RefCell<gpui_glint::components::BackgroundTaskInbox>,
     background_tasks_refresh: Option<Task<()>>,
     project_actions: project_actions::State,
     ssh_ui: ssh_ui::State,
@@ -675,6 +676,7 @@ impl AgentWorkspace {
             terminal_ui: terminal_ui::State::new(history.terminal_default_position),
             show_background_tasks: false,
             host_background_tasks: false,
+            background_task_inbox: Default::default(),
             background_tasks_refresh: None,
             project_actions: project_actions::State::new(&path, cx),
             ssh_ui: ssh_ui::State::new(cx),
@@ -768,6 +770,7 @@ impl AgentWorkspace {
                 });
             }));
         workspace._subscriptions.push(cx.observe_self(|this, cx| {
+            this.background_tasks(cx);
             if !this.host_owns_vault {
                 this.vault.update(cx, |vault, cx| {
                     vault.set_host_state(this.page == crate::Page::Vault, this.theme, cx);
@@ -1187,6 +1190,7 @@ impl AgentWorkspace {
         if self.history.active == id {
             self.sync_composer_run(cx);
         }
+        self.background_tasks(cx);
         cx.notify();
         Ok(())
     }
@@ -1553,6 +1557,7 @@ impl AgentWorkspace {
             });
         });
         self.run_mut(id).pending = Some((id, task));
+        self.background_tasks(cx);
         if self.history.active == id {
             self.sync_composer_run(cx);
         }
@@ -3014,6 +3019,7 @@ impl Render for AgentWorkspace {
             .when(self.project_grouping.removing.is_some(), |root| {
                 root.child(self.remove_project_dialog(cx))
             })
+            .child(self.diff_file_overlays(window, cx))
             .children(command_overlay)
             .children(image_lightbox)
             .child(self.git_ui.toasts.clone())

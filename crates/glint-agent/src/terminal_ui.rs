@@ -148,6 +148,10 @@ pub struct State {
     pub open: bool,
     pub bottom: bool,
     terminals: HashMap<PathBuf, Entity<TerminalView>>,
+    finished: HashMap<PathBuf, Entity<TerminalView>>,
+    extra: HashMap<PathBuf, Vec<(usize, Entity<TerminalView>)>>,
+    active: HashMap<PathBuf, gpui::EntityId>,
+    next_number: usize,
 }
 
 impl State {
@@ -526,7 +530,148 @@ pub(super) fn output_color(value: Color, theme: ThemePreset) -> u32 {
     color(value, TerminalColors::for_theme(theme))
 }
 
+// Use grid cells rather than screen text offsets so wide characters, scrollback,
+// ANSI styling and soft-wrapped paths retain the correct click position.
+fn terminal_logical_line<T: EventListener>(term: &Term<T>, point: TermPoint) -> (String, usize) {
+    let columns = term.columns();
+    let mut first = point.line.0;
+    let mut last = first;
+    while first > term.topmost_line().0
+        && point.line.0 - first < 16
+        && term.grid()[Line(first - 1)][Column(columns - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    {
+        first -= 1;
+    }
+    while last < term.bottommost_line().0
+        && last - first < 32
+        && term.grid()[Line(last)][Column(columns - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    {
+        last += 1;
+    }
+    let mut text = String::new();
+    let mut offset = 0;
+    for row in first..=last {
+        for col in 0..columns {
+            let cell = &term.grid()[Line(row)][Column(col)];
+            let spacer = cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            if row == point.line.0 && col == point.column.0 {
+                offset = if spacer {
+                    text.len().saturating_sub(1)
+                } else {
+                    text.len()
+                };
+            }
+            if !spacer {
+                text.push(cell.c);
+                if let Some(chars) = cell.zerowidth() {
+                    text.extend(chars);
+                }
+            }
+        }
+    }
+    (text, offset)
+}
+
+fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
+    let mut value = value;
+    for _ in 0..2 {
+        if let Some((path, number)) = value.rsplit_once(':') {
+            if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+                value = path;
+            }
+        }
+    }
+    if value.starts_with("file://") {
+        return reqwest::Url::parse(value).ok()?.to_file_path().ok();
+    }
+    if value.contains("://") || !value.contains(['/', '\\', '.']) {
+        return None;
+    }
+    if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return Some(
+            PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?)
+                .join(relative),
+        );
+    }
+    // Git Bash emits /c/... alongside native C:\... paths.
+    #[cfg(windows)]
+    if value.len() >= 3
+        && value.starts_with('/')
+        && value.as_bytes()[1].is_ascii_alphabetic()
+        && value.as_bytes()[2] == b'/'
+    {
+        return Some(PathBuf::from(format!("{}:{}", &value[1..2], &value[2..])));
+    }
+    let path = PathBuf::from(value);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+// Resolve on the background executor. Trying bounded, longest-first spans also
+// handles unquoted paths containing spaces without guessing where the name ends.
+fn resolve_output_path(text: &str, offset: usize, root: &Path) -> Option<PathBuf> {
+    if offset >= text.len() || crate::ssh_project::is_remote(root) {
+        return None;
+    }
+    let boundary = |c: char| c.is_whitespace() || "\"'`<>|=()[]{}，；,;".contains(c);
+    let mut starts = vec![0];
+    let mut ends = Vec::new();
+    for (index, c) in text.char_indices() {
+        if boundary(c) {
+            if index + c.len_utf8() <= offset {
+                starts.push(index + c.len_utf8());
+            }
+            if index > offset {
+                ends.push(index);
+            }
+        }
+    }
+    ends.push(text.len());
+    let mut spans: Vec<_> = starts
+        .into_iter()
+        .rev()
+        .take(32)
+        .flat_map(|start| ends.iter().take(32).map(move |&end| (start, end)))
+        .collect();
+    spans.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    for (start, end) in spans {
+        let raw = &text[start..end];
+        for value in [
+            raw.trim(),
+            raw.trim_start_matches(boundary)
+                .trim_end_matches(|c: char| boundary(c) || c == '.' || c == ':'),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            let begin = start + raw.find(value)?;
+            if offset < begin || offset >= begin + value.len() {
+                continue;
+            }
+            if let Some(path) = output_path(value, root) {
+                if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_dir()) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(super) struct TerminalView {
+    root: PathBuf,
     font: gpui::Font,
     configured_font: SharedString,
     cell_width: f32,
@@ -563,6 +708,7 @@ impl TerminalView {
         let configured_font = gpui_glint::code_font::family();
         let (font, cell_width) = terminal_font(cx.text_system(), &configured_font);
         let command_output = command.is_some();
+        let session_root = root.clone();
         let start = cx
             .background_executor()
             .spawn(async move { Session::start_command(&root, theme, command.as_deref()) });
@@ -619,6 +765,7 @@ impl TerminalView {
             }
         });
         Self {
+            root: session_root,
             font,
             configured_font,
             cell_width,
@@ -649,6 +796,28 @@ impl TerminalView {
                 session.listener.exited.load(Ordering::Acquire)
                     && *session.listener.exit_code.lock().unwrap() == Some(0)
             })
+    }
+    pub(super) fn background_task_state(&self) -> gpui_glint::components::BackgroundTaskState {
+        use gpui_glint::components::BackgroundTaskState as State;
+        if self.busy() {
+            State::Running
+        } else if self.stop_requested {
+            State::Cancelled
+        } else if self.completed_successfully() {
+            State::Completed
+        } else if self.error.is_some()
+            || self.session.as_ref().is_some_and(|s| {
+                s.listener
+                    .exit_code
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|code| code != 0)
+            })
+        {
+            State::Failed
+        } else {
+            State::Finished
+        }
     }
     pub(super) fn status(&self) -> String {
         if self.error.is_some() {
@@ -817,6 +986,31 @@ impl TerminalView {
         let row =
             ((f32::from(position.y - self.bounds.top()) / CELL_H).max(0.) as usize).min(rows - 1);
         TermPoint::new(Line(row as i32 - offset as i32), Column(col))
+    }
+
+    fn reveal_output_path(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.dragging = false;
+        if crate::ssh_project::is_remote(&self.root) {
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        if !self.bounds.contains(&position) {
+            return;
+        }
+        let point = self.grid_point(position);
+        let (text, offset) = terminal_logical_line(&session.term.lock(), point);
+        let root = self.root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { resolve_output_path(&text, offset, &root) });
+        cx.spawn(async move |_, cx| {
+            if let Some(path) = work.await {
+                let _ = cx.update(|cx| cx.reveal_path(&path));
+            }
+        })
+        .detach();
     }
     fn paint(
         &mut self,
@@ -1028,6 +1222,11 @@ impl Render for TerminalView {
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
+                    if event.modifiers.shift {
+                        this.reveal_output_path(event.position, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.dragging = true;
                     let point = this.grid_point(event.position);
                     if let Some(session) = &this.session {
@@ -1101,6 +1300,146 @@ impl Render for TerminalView {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[gpui::test]
+    fn terminal_tabs_keep_sessions_when_switching_hiding_and_closing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(crate::initialize);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.history.active_mut().project = Some(root.clone());
+                host.open_project_terminal(window, cx);
+                let first = host.terminal_ui.terminals[&root].clone();
+                host.new_terminal_tab(root.clone(), window, cx);
+                let tabs = host.terminal_tabs(&root);
+                assert_eq!(tabs.len(), 2);
+                let second = tabs[1].1.clone();
+                assert_ne!(first.entity_id(), second.entity_id());
+                assert_eq!(host.terminal_ui.active[&root], second.entity_id());
+                host.terminal_ui.open = false;
+                host.open_project_terminal(window, cx);
+                assert_eq!(host.terminal_ui.active[&root], second.entity_id());
+                assert_eq!(host.terminal_ui.terminals[&root], first);
+                host.select_terminal_tab(root.clone(), first.entity_id());
+                host.close_terminal_tab(&root, second.entity_id(), window, cx);
+                assert_eq!(host.terminal_ui.active[&root], first.entity_id());
+                assert!(!first.read(cx).stop_requested);
+                assert!(second.read(cx).stop_requested);
+                host.new_terminal_tab(root.clone(), window, cx);
+                let extra = host.terminal_tabs(&root)[1].1.clone();
+                host.close_terminal_tab(&root, first.entity_id(), window, cx);
+                assert_eq!(host.terminal_ui.active[&root], extra.entity_id());
+                host.open_project_terminal(window, cx);
+                assert_eq!(host.terminal_tabs(&root).len(), 1);
+                assert_eq!(host.terminal_ui.active[&root], extra.entity_id());
+            })
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("project-terminal-sidebar").is_some());
+        assert!(window.debug_bounds("project-terminal-input").is_some());
+        window.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                let remaining = host.terminal_tabs(&root)[0].1.entity_id();
+                host.close_terminal_tab(&root, remaining, window, cx);
+                assert!(host.terminal_tabs(&root).is_empty());
+                assert!(!host.terminal_ui.open);
+            })
+        });
+    }
+
+    #[test]
+    fn terminal_path_resolves_native_quoted_relative_and_location_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("产物 spaces (x64).exe");
+        std::fs::write(&file, "installer").unwrap();
+        for text in [
+            format!("Installer: {}", file.display()),
+            format!("Installer: \"{}\"", file.display()),
+            "Result: './产物 spaces (x64).exe:12:3'".to_owned(),
+            "Result: ./产物 spaces (x64).exe.".to_owned(),
+            reqwest::Url::from_file_path(&file).unwrap().to_string(),
+        ] {
+            let offset = text
+                .find("spaces")
+                .unwrap_or_else(|| text.find("%20").unwrap());
+            let resolved =
+                resolve_output_path(&text, offset, dir.path()).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(
+                resolved.canonicalize().unwrap(),
+                file.canonicalize().unwrap()
+            );
+        }
+        assert!(resolve_output_path("Installer: missing.exe", 15, dir.path()).is_none());
+        let text = format!("Installer: {}", file.display());
+        assert!(resolve_output_path(&text, 1, dir.path()).is_none());
+        assert!(
+            resolve_output_path(&text, text.len() - 2, Path::new("ssh://host/project")).is_none()
+        );
+        #[cfg(windows)]
+        {
+            let native = file.to_string_lossy().replace('\\', "/");
+            // Temp paths normally include a drive prefix; Git Bash uses /c/...
+            let bash = format!("/{}{}", native[..1].to_lowercase(), &native[2..]);
+            let offset = bash.find("spaces").unwrap();
+            assert_eq!(
+                resolve_output_path(&bash, offset, dir.path())
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                file.canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_path_reassembles_soft_wraps_and_unicode_cell_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("artifact.exe");
+        std::fs::write(&file, "installer").unwrap();
+        let mut term = Term::new(
+            Default::default(),
+            &Size {
+                columns: 24,
+                rows: 20,
+            },
+            alacritty_terminal::event::VoidListener,
+        );
+        let text = format!("产物: \x1b[32m{}\x1b[0m", file.display());
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut term, text.as_bytes());
+        let point = term
+            .grid()
+            .display_iter()
+            .find(|cell| cell.c == 'x')
+            .unwrap()
+            .point;
+        let (line, offset) = terminal_logical_line(&term, point);
+        assert_eq!(line.as_bytes()[offset], b'x');
+        assert_eq!(
+            resolve_output_path(&line, offset, dir.path())
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            file.canonicalize().unwrap()
+        );
+        parser.advance(&mut term, b"\r\nmissing.exe");
+        let (line, offset) = terminal_logical_line(&term, term.grid().cursor.point);
+        assert!(resolve_output_path(&line, offset, dir.path()).is_none());
+    }
 
     #[test]
     #[cfg(windows)]
@@ -1305,6 +1644,32 @@ mod tests {
                 host.terminal_ui.terminals[&linked_root].entity_id(),
                 backend
             );
+        });
+    }
+
+    #[gpui::test]
+    fn completed_terminal_task_restores_original_output_view(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        host.update(window, |host, cx| {
+            let terminal = cx.new(|cx| TerminalView::new(dir.path().into(), host.theme, cx));
+            let original = terminal.entity_id();
+            terminal.update(cx, |terminal, cx| terminal.stop(cx));
+            host.terminal_ui
+                .finished
+                .insert(dir.path().into(), terminal);
+            host.restore_completed_terminal(dir.path());
+            assert_eq!(host.terminal_ui.terminals[dir.path()].entity_id(), original);
+            assert!(!host.terminal_ui.finished.contains_key(dir.path()));
+            host.restore_completed_terminal(dir.path());
+            assert_eq!(host.terminal_ui.terminals[dir.path()].entity_id(), original);
         });
     }
 
@@ -1922,15 +2287,73 @@ impl EntityInputHandler for TerminalView {
 
 impl AgentWorkspace {
     pub(super) fn running_terminal_tasks(&self, cx: &App) -> Vec<(PathBuf, String)> {
-        let mut tasks: Vec<_> = self
+        let roots: std::collections::HashSet<_> = self
             .terminal_ui
             .terminals
-            .iter()
-            .filter(|(_, terminal)| terminal.read(cx).busy())
-            .map(|(root, terminal)| (root.clone(), terminal.read(cx).status()))
+            .keys()
+            .chain(self.terminal_ui.extra.keys())
+            .collect();
+        let mut tasks: Vec<_> = roots
+            .into_iter()
+            .filter_map(|root| {
+                self.terminal_tabs(root)
+                    .into_iter()
+                    .filter(|(_, terminal)| {
+                        !self
+                            .project_action_terminal(root)
+                            .is_some_and(|(_, action)| action == *terminal)
+                    })
+                    .find(|(_, terminal)| terminal.read(cx).busy())
+                    .map(|(_, terminal)| (root.clone(), terminal.read(cx).status()))
+            })
             .collect();
         tasks.sort_by(|a, b| a.0.cmp(&b.0));
         tasks
+    }
+    pub(super) fn terminal_task_outcome(
+        &self,
+        root: &std::path::Path,
+        cx: &App,
+    ) -> gpui_glint::components::BackgroundTaskState {
+        use gpui_glint::components::BackgroundTaskState as State;
+        let states: Vec<_> = self
+            .terminal_ui
+            .terminals
+            .get(root)
+            .into_iter()
+            .chain(
+                self.terminal_ui
+                    .extra
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, terminal)| terminal),
+            )
+            .map(|terminal| terminal.read(cx).background_task_state())
+            .collect();
+        for state in [
+            State::Running,
+            State::Failed,
+            State::Cancelled,
+            State::Completed,
+        ] {
+            if states.contains(&state) {
+                return state;
+            }
+        }
+        self.terminal_ui
+            .terminals
+            .get(root)
+            .or_else(|| self.terminal_ui.finished.get(root))
+            .map(|terminal| terminal.read(cx).background_task_state())
+            .unwrap_or(gpui_glint::components::BackgroundTaskState::Finished)
+    }
+    pub(super) fn restore_completed_terminal(&mut self, root: &std::path::Path) {
+        if !self.terminal_ui.terminals.contains_key(root) {
+            if let Some(terminal) = self.terminal_ui.finished.remove(root) {
+                self.terminal_ui.terminals.insert(root.to_owned(), terminal);
+            }
+        }
     }
     pub(super) fn expanded_project_panel(
         &self,
@@ -1969,7 +2392,13 @@ impl AgentWorkspace {
     }
 
     pub(super) fn sync_terminal_theme(&self, cx: &mut Context<Self>) {
-        for terminal in self.terminal_ui.terminals.values() {
+        for terminal in self.terminal_ui.terminals.values().chain(
+            self.terminal_ui
+                .extra
+                .values()
+                .flatten()
+                .map(|(_, terminal)| terminal),
+        ) {
             terminal.update(cx, |terminal, cx| terminal.set_theme(self.theme, cx));
         }
     }
@@ -1978,8 +2407,13 @@ impl AgentWorkspace {
         else {
             return;
         };
-        if !self.terminal_ui.terminals.contains_key(&root) {
-            if self.terminal_ui.terminals.len() >= 16 {
+        if !self.terminal_ui.terminals.contains_key(&root)
+            && self.terminal_ui.extra.get(&root).is_none_or(Vec::is_empty)
+        {
+            if self.terminal_ui.terminals.len()
+                + self.terminal_ui.extra.values().map(Vec::len).sum::<usize>()
+                >= 16
+            {
                 self.git_ui.toasts.update(cx, |toasts, cx| {
                     toasts.push(
                         gpui_glint::components::Toast::new("项目终端已达到 16 个")
@@ -2000,6 +2434,7 @@ impl AgentWorkspace {
             })
             .detach();
             self.terminal_ui.terminals.insert(root.clone(), terminal);
+            self.background_tasks(cx);
         }
         self.page = crate::Page::Chat;
         // Expanded project views keep their content above the terminal, even
@@ -2015,117 +2450,344 @@ impl AgentWorkspace {
         }
         self.git_ui.open = false;
         self.terminal_ui.open = true;
-        if self.terminal_ui.bottom {
-            self.project_actions.panel = false;
-        }
+        self.project_actions.panel = false;
         self.right_sidebar_width = self.right_sidebar_width.max(500.);
-        let terminal = &self.terminal_ui.terminals[&root];
+        let tabs = self.terminal_tabs(&root);
+        let terminal = self
+            .terminal_ui
+            .active
+            .get(&root)
+            .and_then(|id| {
+                tabs.iter()
+                    .find(|(_, terminal)| terminal.entity_id() == *id)
+            })
+            .map(|(_, terminal)| terminal)
+            .unwrap_or(
+                &tabs
+                    .first()
+                    .expect("an open terminal has at least one tab")
+                    .1,
+            );
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
-    pub(super) fn project_terminal_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let root = self.panel_repository_root(crate::panel_repositories::Panel::Terminal);
-        let terminal = root
+    pub(super) fn select_terminal_tab(&mut self, root: PathBuf, id: gpui::EntityId) {
+        self.terminal_ui.active.insert(root, id);
+    }
+
+    fn terminal_tabs(&self, root: &Path) -> Vec<(String, Entity<TerminalView>)> {
+        let mut tabs = Vec::new();
+        if let Some(terminal) = self.terminal_ui.terminals.get(root) {
+            tabs.push(("终端 1".into(), terminal.clone()));
+        }
+        if let Some(extra) = self.terminal_ui.extra.get(root) {
+            tabs.extend(
+                extra
+                    .iter()
+                    .map(|(number, terminal)| (format!("终端 {number}"), terminal.clone())),
+            );
+        }
+        tabs.extend(self.project_action_terminal(root));
+        tabs
+    }
+
+    pub(super) fn new_terminal_tab(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.terminal_ui.terminals.len()
+            + self.terminal_ui.extra.values().map(Vec::len).sum::<usize>();
+        if count >= 16 {
+            self.git_ui.toasts.update(cx, |toasts, cx| {
+                toasts.push(
+                    gpui_glint::components::Toast::new(
+                        "终端已达到 16 个，请先关闭不再使用的终端。",
+                    ),
+                    cx,
+                );
+            });
+            return;
+        }
+        let terminal = cx.new(|cx| TerminalView::new(root.clone(), self.theme, cx));
+        cx.subscribe(&terminal, |_, _, _: &StatusChanged, cx| cx.notify())
+            .detach();
+        let project = root.clone();
+        cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| {
+            this.workspace_terminal_activity(&project, cx)
+        })
+        .detach();
+        if self.terminal_ui.terminals.contains_key(&root) {
+            self.terminal_ui.next_number = self.terminal_ui.next_number.max(1) + 1;
+            self.terminal_ui
+                .extra
+                .entry(root.clone())
+                .or_default()
+                .push((self.terminal_ui.next_number, terminal.clone()));
+        } else {
+            self.terminal_ui
+                .terminals
+                .insert(root.clone(), terminal.clone());
+        }
+        self.select_terminal_tab(root, terminal.entity_id());
+        window.focus(&terminal.read(cx).focus_handle(cx), cx);
+        self.background_tasks(cx);
+        cx.notify();
+    }
+
+    fn close_terminal_tab(
+        &mut self,
+        root: &Path,
+        id: gpui::EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tabs = self.terminal_tabs(root);
+        let Some(index) = tabs.iter().position(|(_, view)| view.entity_id() == id) else {
+            return;
+        };
+        tabs[index].1.update(cx, |terminal, cx| terminal.stop(cx));
+        if self
+            .terminal_ui
+            .terminals
+            .get(root)
+            .is_some_and(|terminal| terminal.entity_id() == id)
+        {
+            if let Some(terminal) = self.terminal_ui.terminals.remove(root) {
+                self.terminal_ui.finished.insert(root.to_owned(), terminal);
+            }
+        } else if self
+            .project_action_terminal(root)
+            .is_some_and(|(_, terminal)| terminal.entity_id() == id)
+        {
+            self.close_project_action_terminal(root);
+        } else if let Some(extra) = self.terminal_ui.extra.get_mut(root) {
+            extra.retain(|(_, terminal)| terminal.entity_id() != id);
+        }
+        let remaining = self.terminal_tabs(root);
+        if remaining.is_empty() {
+            self.terminal_ui.active.remove(root);
+            self.terminal_ui.open = false;
+            self.project_actions.panel = false;
+            window.focus(&self.focus, cx);
+        } else if self.terminal_ui.active.get(root) == Some(&id) {
+            let next = &remaining[index.min(remaining.len() - 1)].1;
+            self.select_terminal_tab(root.to_owned(), next.entity_id());
+            window.focus(&next.read(cx).focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn tabbed_terminal_panel(
+        &self,
+        root: Option<PathBuf>,
+        action_panel: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let tabs = root
+            .as_deref()
+            .map(|root| self.terminal_tabs(root))
+            .unwrap_or_default();
+        let selected = root
             .as_ref()
-            .and_then(|r| self.terminal_ui.terminals.get(r))
-            .cloned();
-        let label = terminal
-            .as_ref()
-            .and_then(|view| {
-                view.read(cx).session.as_ref().map(|s| {
-                    format!(
-                        "{}{}",
-                        s.label,
-                        if s.listener.exited.load(Ordering::Acquire) {
-                            " · 已退出"
-                        } else {
-                            ""
-                        }
-                    )
-                })
+            .and_then(|root| self.terminal_ui.active.get(root))
+            .and_then(|id| {
+                tabs.iter()
+                    .find(|(_, terminal)| terminal.entity_id() == *id)
             })
+            .or_else(|| {
+                if action_panel {
+                    tabs.last()
+                } else {
+                    tabs.first()
+                }
+            });
+        let terminal = selected.map(|(_, terminal)| terminal.clone());
+        let title = selected
+            .map(|(label, terminal)| format!("{label} · {}", terminal.read(cx).status()))
             .unwrap_or_else(|| "项目终端".into());
-        let title = format!(
-            "{label} · {}",
-            root.as_ref()
-                .map(|p| ssh_project::label(p))
-                .unwrap_or_default()
-        );
-        let controls = div()
-            .children(self.repository_select(crate::panel_repositories::Panel::Terminal, cx))
+        let busy = terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).busy());
+        let title = div()
             .flex()
             .items_center()
             .gap_2()
-            .child(
-                IconButton::new(
-                    if self.terminal_ui.bottom {
-                        Icon::Sidebar
-                    } else {
-                        Icon::ChevronDown
-                    },
-                    if self.terminal_ui.bottom {
-                        "移到右侧"
-                    } else {
-                        "移到底部"
-                    },
-                )
-                .theme(self.theme)
-                .render()
-                .debug_selector(|| "project-terminal-dock".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_terminal_position(if this.terminal_ui.bottom {
-                        Position::Right
-                    } else {
-                        Position::Bottom
-                    });
-                    cx.notify();
-                })),
+            .when(
+                terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.read(cx).completed_successfully()),
+                |title| {
+                    title.child(
+                        Icon::CheckCircle
+                            .render(16.)
+                            .text_color(rgb(self.theme.color(0x16833a))),
+                    )
+                },
             )
+            .child(div().min_w_0().truncate().child(title));
+        let owner = cx.entity().downgrade();
+        let close_owner = owner.clone();
+        let add_owner = owner.clone();
+        let select_root = root.clone();
+        let close_root = root.clone();
+        let add_root = root.clone();
+        let mut tab_bar =
+            gpui_glint::components::ClosableTabs::new(tabs.iter().map(|(label, view)| {
+                gpui_glint::components::ClosableTab::new(view.entity_id().as_u64(), label.clone())
+                    .icon(Icon::Shell)
+            }))
+            .selected(terminal.as_ref().map(|view| view.entity_id().as_u64()))
+            .theme(self.theme)
+            .fill_height()
+            .content_padding(0.)
+            .on_select(move |id, window, app| {
+                let _ = owner.update(app, |this, cx| {
+                    if let Some(root) = &select_root {
+                        if let Some((_, view)) = this
+                            .terminal_tabs(root)
+                            .into_iter()
+                            .find(|(_, view)| view.entity_id().as_u64() == id)
+                        {
+                            this.select_terminal_tab(root.clone(), view.entity_id());
+                            window.focus(&view.read(cx).focus_handle(cx), cx);
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .on_close(move |id, window, app| {
+                let _ = close_owner.update(app, |this, cx| {
+                    if let Some(root) = &close_root {
+                        this.close_terminal_tab(root, id.into(), window, cx);
+                    }
+                });
+            })
+            .on_add(move |window, app| {
+                let _ = add_owner.update(app, |this, cx| {
+                    if let Some(root) = &add_root {
+                        this.new_terminal_tab(root.clone(), window, cx);
+                    }
+                });
+            });
+        if let Some(view) = &terminal {
+            tab_bar = tab_bar.content(view.entity_id().as_u64(), view.clone());
+        }
+        let stop_terminal = terminal.clone();
+        let copy_terminal = terminal.clone();
+        let restart_root = root.clone();
+        let restart_terminal = terminal.clone();
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(!action_panel, |controls| {
+                controls.children(
+                    self.repository_select(crate::panel_repositories::Panel::Terminal, cx),
+                )
+            })
+            .when(busy, |controls| {
+                controls.child(
+                    IconButton::new(Icon::Pause, "停止当前终端")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            if let Some(terminal) = &stop_terminal {
+                                terminal.update(cx, |terminal, cx| terminal.stop(cx));
+                            }
+                        })),
+                )
+            })
+            .when(!busy, |controls| {
+                controls.child(
+                    IconButton::new(Icon::Refresh, "重启当前终端")
+                        .theme(self.theme)
+                        .render()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let (Some(root), Some(terminal)) = (&restart_root, &restart_terminal)
+                            {
+                                if this
+                                    .project_action_terminal(root)
+                                    .is_some_and(|(_, action)| action == *terminal)
+                                {
+                                    this.rerun_project_action_terminal(root.clone(), window, cx);
+                                } else {
+                                    this.close_terminal_tab(root, terminal.entity_id(), window, cx);
+                                    this.new_terminal_tab(root.clone(), window, cx);
+                                    if action_panel {
+                                        this.project_actions.panel = true;
+                                    } else {
+                                        this.terminal_ui.open = true;
+                                    }
+                                }
+                            }
+                        })),
+                )
+            })
             .child(
-                IconButton::new(Icon::Refresh, "重启项目终端")
+                IconButton::new(Icon::Copy, "复制输出")
                     .theme(self.theme)
                     .render()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(root) =
-                            this.panel_repository_root(crate::panel_repositories::Panel::Terminal)
-                        {
-                            this.terminal_ui.terminals.remove(&root);
-                            this.open_project_terminal(window, cx);
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(terminal) = &copy_terminal {
+                            terminal.update(cx, |terminal, cx| terminal.copy_output(cx));
                         }
                     })),
             )
-            .child(
-                IconButton::new(Icon::Trash, "结束项目终端")
+            .when(!action_panel, |controls| {
+                controls.child(
+                    IconButton::new(
+                        if self.terminal_ui.bottom {
+                            Icon::Sidebar
+                        } else {
+                            Icon::ChevronDown
+                        },
+                        "切换终端位置",
+                    )
                     .theme(self.theme)
                     .render()
+                    .debug_selector(|| "project-terminal-dock".into())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(root) =
-                            this.panel_repository_root(crate::panel_repositories::Panel::Terminal)
-                        {
-                            this.terminal_ui.terminals.remove(&root);
-                        }
-                        this.terminal_ui.open = false;
+                        this.set_terminal_position(if this.terminal_ui.bottom {
+                            Position::Right
+                        } else {
+                            Position::Bottom
+                        });
                         cx.notify();
                     })),
-            )
+                )
+            })
             .child(
                 IconButton::new(Icon::Close, "隐藏终端（继续运行）")
                     .theme(self.theme)
                     .render()
                     .debug_selector(|| "project-terminal-hide".into())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.terminal_ui.open = false;
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if action_panel {
+                            this.project_actions.panel = false;
+                        } else {
+                            this.terminal_ui.open = false;
+                        }
                         window.focus(&this.focus, cx);
                         cx.notify();
                     })),
             );
         terminal_panel(
-            terminal,
             title,
             controls,
+            tab_bar.render(),
             self.theme,
-            self.terminal_ui.bottom,
+            action_panel || self.terminal_ui.bottom,
             self.right_sidebar_width,
+        )
+    }
+
+    pub(super) fn project_terminal_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        self.tabbed_terminal_panel(
+            self.panel_repository_root(crate::panel_repositories::Panel::Terminal),
+            false,
+            cx,
         )
         .debug_selector(|| "project-terminal-sidebar".into())
     }
@@ -2133,9 +2795,9 @@ impl AgentWorkspace {
 
 /// Both dock positions and project actions use this same PTY view and frame.
 pub(super) fn terminal_panel(
-    terminal: Option<Entity<TerminalView>>,
     title: impl IntoElement,
     controls: gpui::Div,
+    tabs: gpui::Div,
     theme: ThemePreset,
     bottom: bool,
     width: f32,
@@ -2163,5 +2825,5 @@ pub(super) fn terminal_panel(
                 .child(div().flex_1().min_w_0().truncate().child(title))
                 .child(controls),
         )
-        .child(div().flex_1().min_h_0().children(terminal))
+        .child(tabs)
 }

@@ -1,5 +1,7 @@
 use super::*;
 use std::{path::PathBuf, sync::Arc};
+pub(super) type OAuthBrowserOpener =
+    std::rc::Rc<dyn Fn(usize, &str, &mut App) -> Result<(), String>>;
 
 #[derive(Clone, Copy)]
 enum CertificateAction {
@@ -49,6 +51,17 @@ impl Workbench {
             return Ok(());
         }
         let settings = self.profile_draft(index, cx)?;
+        self.start_proxy_service_with(id, settings, cx)
+    }
+    fn start_proxy_service_with(
+        &mut self,
+        id: String,
+        settings: environment::ProxySettings,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.proxy_certificate_task.is_some() {
+            return Err("请等待证书操作完成".into());
+        }
         let authority = Arc::new(proxy_service::ca::Authority::generate(
             &self.proxy_ca_directory(),
         )?);
@@ -66,6 +79,72 @@ impl Workbench {
         cx.notify();
         Ok(())
     }
+    fn proxy_browser_directory() -> Result<PathBuf, String> {
+        Ok(storage::Store::default_path()?
+            .parent()
+            .ok_or("无法确定应用数据目录")?
+            .join("proxy-service"))
+    }
+    pub(super) fn prepare_oauth_proxy(
+        &mut self,
+        environment: usize,
+        directory: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> Result<u16, String> {
+        let settings = self.effective_proxy(environment);
+        settings.validate()?;
+        if !settings.enabled {
+            return Err("当前环境未启用代理".into());
+        }
+        let id = self.workspace.environment_inputs[environment]
+            .proxy_id
+            .clone()
+            .unwrap_or_else(|| format!("oauth-environment-{environment}"));
+        if let Some(service) = self.proxy_services.get(&id) {
+            if service.settings() != &settings {
+                return Err("代理配置已变更，请先在代理页重新启动服务".into());
+            }
+        } else {
+            self.start_proxy_service_with(id.clone(), settings, cx)?;
+        }
+        self.proxy_services[&id].route_browser(directory)
+    }
+    pub(super) fn open_oauth_browser(
+        &mut self,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let environment = self.selected_environment(cx);
+        if !self.effective_proxy(environment).enabled {
+            cx.open_url(url);
+            return Ok(());
+        }
+        if let Some(open) = self.oauth_browser_opener.clone() {
+            return open(environment, url, cx);
+        }
+        self.open_oauth_proxy_browser(environment, url, cx)
+    }
+    pub(super) fn open_oauth_proxy_browser(
+        &mut self,
+        environment: usize,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let browser = self
+            .proxy_browsers
+            .iter()
+            .find(|b| b.name == "Google Chrome")
+            .cloned()
+            .or_else(|| {
+                proxy_service::browser::discover()
+                    .into_iter()
+                    .find(|b| b.name == "Google Chrome")
+            })
+            .ok_or("当前环境已启用代理，但未找到 Google Chrome，请安装后重试")?;
+        let directory = Self::proxy_browser_directory()?;
+        let port = self.prepare_oauth_proxy(environment, &directory, cx)?;
+        proxy_service::browser::launch_oauth(&browser, &directory, port, url)
+    }
     fn launch_proxy_browser(
         &mut self,
         browser: proxy_service::browser::Browser,
@@ -73,11 +152,7 @@ impl Workbench {
     ) {
         self.proxy_app_menu = false;
         let result = self.start_proxy_service(cx).and_then(|_| {
-            let app_data = storage::Store::default_path()?;
-            let directory = app_data
-                .parent()
-                .ok_or("无法确定应用数据目录")?
-                .join("proxy-service");
+            let directory = Self::proxy_browser_directory()?;
             let service = &self.proxy_services[&self.workspace.proxies[self.editing_proxy].id];
             let port = service.route_browser(&directory)?;
             proxy_service::browser::launch(&browser, &directory, port)
@@ -431,6 +506,111 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oauth_proxy_workspace(
+        directory: &std::path::Path,
+        cx: &mut Context<Workbench>,
+    ) -> Workbench {
+        let profile = environment::ProxyProfile {
+            id: model::new_id(),
+            name: "环境代理".into(),
+            settings: environment::ProxySettings {
+                enabled: true,
+                built_in: true,
+                ..Default::default()
+            },
+        };
+        let other = environment::ProxyProfile {
+            id: model::new_id(),
+            name: "另一个代理".into(),
+            settings: profile.settings.clone(),
+        };
+        let mut data = storage::Workspace::default();
+        data.environments.push("Dev".into());
+        let mut variables = EnvironmentVariables::default();
+        variables.proxy_id = Some(profile.id.clone());
+        data.variables.push(variables);
+        data.proxies = vec![profile, other];
+        data.selected_environment = 1;
+        Workbench::with_workspace(
+            storage::Store::open(&directory.join("proxy-oauth.sqlite3")).unwrap(),
+            data,
+            cx,
+        )
+    }
+    #[gpui::test]
+    fn oauth_proxy_uses_environment_binding_and_reuses_running_listener(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let host = cx.new(|cx| oauth_proxy_workspace(directory.path(), cx));
+        host.update(cx, |host, cx| {
+            host.editing_proxy = 1;
+            let port = host.prepare_oauth_proxy(1, directory.path(), cx).unwrap();
+            assert_eq!(
+                host.prepare_oauth_proxy(1, directory.path(), cx).unwrap(),
+                port
+            );
+            assert_eq!(host.editing_proxy, 1);
+            assert_eq!(host.proxy_services.len(), 1);
+            assert!(
+                host.proxy_services
+                    .contains_key(&host.workspace.proxies[0].id)
+            );
+            host.workspace.proxies[0].settings.skip_tls_verification = true;
+            assert!(
+                host.prepare_oauth_proxy(1, directory.path(), cx)
+                    .unwrap_err()
+                    .contains("重新启动")
+            );
+        });
+    }
+    #[gpui::test]
+    fn oauth_proxy_browser_failure_cancels_authorization_and_releases_callback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let host = cx.new(|cx| oauth_proxy_workspace(directory.path(), cx));
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let called = calls.clone();
+        host.update(cx, |host, cx| {
+            host.workspace
+                .collections
+                .push(RequestGroups::create_collection("API", &[]).unwrap());
+            host.add_request(cx);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            host.oauth.load(
+                oauth::Config {
+                    client_id: "test-app".into(),
+                    redirect_uri: format!("http://{address}/oauth/callback"),
+                    manual_callback: false,
+                    ..plugins::test_oauth_config()
+                },
+                cx,
+            );
+            host.authentication.update(cx, |field, cx| {
+                field.set_selected(Some("oauth2".into()), cx)
+            });
+            host.oauth_browser_opener = Some(std::rc::Rc::new(move |environment, url, _| {
+                assert_eq!(environment, 1);
+                assert!(url.starts_with("https://"));
+                called.set(called.get() + 1);
+                Err("代理浏览器启动失败".into())
+            }));
+            host.oauth_authorize(cx);
+            assert_eq!(calls.get(), 1);
+            assert!(host.oauth.error.as_ref().unwrap().contains("代理浏览器"));
+            assert!(host.oauth.pending.is_none());
+            assert!(!host.oauth.is_busy());
+            assert!(std::net::TcpListener::bind(address).is_ok());
+            host.workspace.proxies[0].settings.enabled = false;
+            host.open_oauth_browser("https://auth.example.test/authorize", cx)
+                .unwrap();
+            assert_eq!(calls.get(), 1);
+        });
+    }
     #[gpui::test]
     fn proxy_listener_starts_on_configured_port_captures_and_stops_on_workspace_switch(
         cx: &mut gpui::TestAppContext,

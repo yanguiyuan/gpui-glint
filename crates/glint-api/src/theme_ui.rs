@@ -118,6 +118,7 @@ impl Workbench {
             .fields
             .iter()
             .chain([&self.oauth.secret, &self.oauth.callback])
+            .chain(self.oauth.inherited_fields.iter())
         {
             field.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }

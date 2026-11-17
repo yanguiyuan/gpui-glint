@@ -3,6 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 
 pub(super) struct Inputs {
     pub inheritance: Entity<Select>,
+    pub inherited_fields: [Entity<TextEntry>; 2],
     pub inherited_mode: usize,
     pub config: oauth::Config,
     pub fields: [Entity<TextEntry>; 5],
@@ -23,6 +24,9 @@ impl Inputs {
     pub fn new(cx: &mut Context<Workbench>) -> Self {
         Self {
             inheritance: cx.new(|cx| Select::new([], cx).placeholder("选择目录授权方案")),
+            inherited_fields: std::array::from_fn(|_| {
+                cx.new(|cx| TextEntry::new(cx, "", "").font_size(12.).read_only(true))
+            }),
             inherited_mode: 2,
             config: oauth::Config::default(),
             fields: std::array::from_fn(|index| {
@@ -75,6 +79,13 @@ impl Inputs {
     }
     pub fn load(&mut self, config: oauth::Config, cx: &mut Context<Workbench>) {
         self.cancel();
+        for (field, value) in self
+            .inherited_fields
+            .iter()
+            .zip([&config.client_id, &config.scope])
+        {
+            field.update(cx, |entry, cx| entry.set_value(value.clone(), cx));
+        }
         for (field, value) in self.fields.iter().zip([
             &config.authorization_url,
             &config.token_url,
@@ -107,6 +118,92 @@ impl Drop for Inputs {
 #[cfg(test)]
 mod auth_profile_tests {
     use super::*;
+
+    #[gpui::test]
+    fn inherited_oauth_summary_renders_variables_and_tracks_environment_scope(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = Workbench::with_store(
+                storage::Store::open(&directory.path().join("summary.sqlite3")).unwrap(),
+                cx,
+            );
+            let mut groups = RequestGroups::create_collection("API", &[]).unwrap();
+            groups.defaults.insert(
+                String::new(),
+                model::DirectoryDefaults {
+                    auth_profiles: vec![model::AuthProfile {
+                        id: "user".into(),
+                        name: "用户授权".into(),
+                        token: String::new(),
+                        oauth: Some(oauth::Config {
+                            client_id: "{{app_id}}".into(),
+                            scope: "{{scope}}".into(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                },
+            );
+            host.workspace.collections.push(groups);
+            host.workspace.environment_inputs[0]
+                .save(None, "app_id", "global-app", false)
+                .unwrap();
+            host.workspace.environment_inputs[0]
+                .save(None, "scope", "global-scope", false)
+                .unwrap();
+            host.workspace.environment_names.push("Dev".into());
+            let mut dev = EnvironmentVariables::default();
+            dev.save(None, "app_id", "dev-global-app", false).unwrap();
+            dev.save(None, "scope", "dev-scope", false).unwrap();
+            host.workspace.environment_inputs.push(dev);
+            let mut local = EnvironmentVariables::default();
+            local.save(None, "app_id", "collection-app", false).unwrap();
+            host.workspace.collections[0]
+                .environments
+                .insert("Dev".into(), local);
+            host.add_request(cx);
+            let draft = Draft {
+                auth_profile: Some("user".into()),
+                ..host.snapshot(cx)
+            };
+            host.load(&draft, cx);
+            host.config = 1;
+            host
+        });
+        let client = window.debug_bounds("oauth-client-id").unwrap();
+        let secret = window.debug_bounds("oauth-client-secret").unwrap();
+        let scope = window.debug_bounds("oauth-scope").unwrap();
+        assert_eq!(client.top(), secret.top());
+        assert_eq!(client.size.height, secret.size.height);
+        assert_eq!(client.size.height, scope.size.height);
+        assert!(scope.top() > client.bottom());
+        assert!(scope.bottom() <= window.debug_bounds("oauth-action-bar").unwrap().top());
+        assert!(window.debug_bounds("reference-preview").is_some());
+        let raw = host.update(window, |host, cx| {
+            let resolved = host.oauth_resolve(&host.oauth.snapshot(cx), cx).unwrap();
+            assert_eq!(resolved.client_id, "global-app");
+            let raw = host.oauth.inherited_fields[0].read(cx).value().to_owned();
+            host.oauth.inherited_fields[0].update(cx, |entry, cx| entry.insert_text("changed", cx));
+            assert_eq!(host.oauth.inherited_fields[0].read(cx).value(), raw);
+            host.environment
+                .update(cx, |_, cx| cx.emit(SelectEvent::Changed("1".into())));
+            raw
+        });
+        host.update(window, |host, cx| {
+            let resolved = host.oauth_resolve(&host.oauth.snapshot(cx), cx).unwrap();
+            assert_eq!(resolved.client_id, "collection-app");
+            assert_eq!(resolved.scope, "dev-scope");
+            assert_eq!(host.oauth.inherited_fields[0].read(cx).value(), raw);
+            assert_eq!(host.oauth.snapshot(cx).client_id, "{{app_id}}");
+            host.oauth
+                .secret
+                .update(cx, |entry, cx| entry.set_value("{{missing_secret}}", cx));
+        });
+        // Display resolution is per expression, independent of an invalid secret.
+        assert!(window.debug_bounds("reference-preview").is_some());
+    }
 
     #[gpui::test]
     fn auth_profile_switches_modes_and_persists_secret_in_sqlite(cx: &mut gpui::TestAppContext) {
@@ -514,7 +611,7 @@ impl Workbench {
             Ok(request)
         }
     }
-    fn oauth_authorize(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn oauth_authorize(&mut self, cx: &mut Context<Self>) {
         if self.sending.is_some() || self.oauth.task.is_some() || self.oauth.pending.is_some() {
             return;
         }
@@ -556,7 +653,13 @@ impl Workbench {
         self.oauth.message = "等待浏览器授权，10 分钟后超时".into();
         self.capture_draft(cx);
         self.persist(cx);
-        cx.open_url(&session.url);
+        if let Err(error) = self.open_oauth_browser(&session.url, cx) {
+            self.oauth.cancel();
+            self.oauth.error = Some(error);
+            self.oauth.message = "无法打开授权浏览器".into();
+            cx.notify();
+            return;
+        }
         if !config.manual_callback {
             let key = self.oauth_key(&config, cx);
             let proxy = self.effective_proxy(self.selected_environment(cx));
@@ -813,6 +916,26 @@ impl Workbench {
             .bg(rgb(p.surface))
             .child(div().flex_1().min_w_0().child(entry.clone()))
     }
+    fn oauth_labeled_input(
+        &self,
+        label: &'static str,
+        entry: &Entity<TextEntry>,
+        selector: &'static str,
+    ) -> gpui::Div {
+        div()
+            .flex_shrink_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label),
+            )
+            .child(self.oauth_input(entry, selector))
+    }
     fn oauth_field_row(
         &self,
         label: &'static str,
@@ -960,52 +1083,26 @@ impl Workbench {
                     .gap_3()
                     .pb_1()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Client ID"),
-                            )
-                            .child(self.oauth_input(&self.oauth.fields[2], "oauth-client-id")),
+                        self.oauth_labeled_input(
+                            "Client ID",
+                            &self.oauth.fields[2],
+                            "oauth-client-id",
+                        )
+                        .flex_1(),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child("Client Secret"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(p.text_muted))
-                                            .child("选填"),
-                                    ),
-                            )
-                            .child(self.oauth_input(&self.oauth.secret, "oauth-client-secret")),
+                        self.oauth_labeled_input(
+                            "Client Secret（选填）",
+                            &self.oauth.secret,
+                            "oauth-client-secret",
+                        )
+                        .flex_1(),
                     ),
             )
             .child(self.oauth_field_row("授权地址", 0, "oauth-authorization-url"))
             .child(self.oauth_field_row("Token 地址", 1, "oauth-token-url"))
             .child(self.oauth_field_row("回调地址", 3, "oauth-redirect-uri"))
-            .child(self.oauth_field_row("Scope", 4, "oauth-scope"));
+            .child(self.oauth_labeled_input("Scope", &self.oauth.fields[4], "oauth-scope"));
         let protocol = format!(
             "{}{} · {}",
             if self.oauth.config.pkce {
@@ -1143,7 +1240,6 @@ impl Workbench {
             form = form.child(advanced);
         }
         if inherited {
-            let config = self.oauth.snapshot(cx);
             form = div()
                 .id("oauth-inherited-form")
                 .flex_1()
@@ -1154,15 +1250,30 @@ impl Workbench {
                 .child(inherited_picker())
                 .child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.text_muted))
-                        .child(format!(
-                            "Client ID：{} · Scope：{}",
-                            config.client_id, config.scope
-                        )),
+                        .flex()
+                        .gap_3()
+                        .child(
+                            self.oauth_labeled_input(
+                                "Client ID",
+                                &self.oauth.inherited_fields[0],
+                                "oauth-client-id",
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            self.oauth_labeled_input(
+                                "Client Secret（选填）",
+                                &self.oauth.secret,
+                                "oauth-client-secret",
+                            )
+                            .flex_1(),
+                        ),
                 )
-                .child(div().text_size(px(11.)).child("Client Secret（选填）"))
-                .child(self.oauth_input(&self.oauth.secret, "oauth-client-secret"));
+                .child(self.oauth_labeled_input(
+                    "Scope",
+                    &self.oauth.inherited_fields[1],
+                    "oauth-scope",
+                ));
         }
         let pending = self.oauth.pending.is_some();
         let busy = self.oauth.task.is_some() || self.sending.is_some();

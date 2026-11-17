@@ -9,9 +9,45 @@ use crate::theme::ThemePreset;
 #[derive(Clone, Default)]
 pub struct ScrollbarState(Rc<Cell<Option<Pixels>>>);
 
+#[derive(Clone)]
+enum ScrollTarget {
+    Scroll(ScrollHandle),
+    List(gpui::ListState),
+}
+impl ScrollTarget {
+    fn offset(&self) -> gpui::Point<Pixels> {
+        match self {
+            Self::Scroll(handle) => handle.offset(),
+            Self::List(state) => state.scroll_px_offset_for_scrollbar(),
+        }
+    }
+    fn max_offset(&self) -> gpui::Point<Pixels> {
+        match self {
+            Self::Scroll(handle) => handle.max_offset(),
+            Self::List(state) => state.max_offset_for_scrollbar(),
+        }
+    }
+    fn drag_started(&self) {
+        if let Self::List(state) = self {
+            state.scrollbar_drag_started();
+        }
+    }
+    fn drag_ended(&self) {
+        if let Self::List(state) = self {
+            state.scrollbar_drag_ended();
+        }
+    }
+    fn set_offset(&self, offset: gpui::Point<Pixels>) {
+        match self {
+            Self::Scroll(handle) => handle.set_offset(offset),
+            Self::List(state) => state.set_offset_from_scrollbar(offset),
+        }
+    }
+}
+
 /// A visible, draggable rail for a GPUI scroll handle.
 pub struct Scrollbar {
-    handle: ScrollHandle,
+    handle: ScrollTarget,
     state: ScrollbarState,
     vertical: bool,
     theme: ThemePreset,
@@ -22,8 +58,20 @@ pub struct Scrollbar {
 impl Scrollbar {
     pub fn vertical(handle: &ScrollHandle, state: &ScrollbarState) -> Self {
         Self {
-            handle: handle.clone(),
+            handle: ScrollTarget::Scroll(handle.clone()),
             state: state.clone(),
+            vertical: true,
+            theme: ThemePreset::default(),
+            maximum: None,
+            extent: None,
+        }
+    }
+
+    /// A rail for a virtual list with variable-height rows.
+    pub fn vertical_list(state: &gpui::ListState, drag: &ScrollbarState) -> Self {
+        Self {
+            handle: ScrollTarget::List(state.clone()),
+            state: drag.clone(),
             vertical: true,
             theme: ThemePreset::default(),
             maximum: None,
@@ -145,6 +193,7 @@ impl Scrollbar {
                                 } else {
                                     thumb.size.width / 2.
                                 };
+                                down_handle.drag_started();
                                 down_drag.set(Some(grab));
                                 set_position(
                                     &down_handle,
@@ -170,6 +219,7 @@ impl Scrollbar {
                                 if let Some(grab) = move_drag.get() {
                                     if !event.dragging() {
                                         move_drag.set(None);
+                                        move_handle.drag_ended();
                                     } else {
                                         set_position(
                                             &move_handle,
@@ -188,12 +238,14 @@ impl Scrollbar {
                                 }
                             },
                         );
+                        let up_handle = handle.clone();
                         window.on_mouse_event(
                             move |event: &gpui::MouseUpEvent, phase, window, cx| {
                                 if phase == gpui::DispatchPhase::Capture
                                     && event.button == gpui::MouseButton::Left
                                     && drag.take().is_some()
                                 {
+                                    up_handle.drag_ended();
                                     cx.stop_propagation();
                                     window.refresh();
                                 }
@@ -207,7 +259,7 @@ impl Scrollbar {
 }
 
 fn set_position(
-    handle: &ScrollHandle,
+    handle: &ScrollTarget,
     position: Pixels,
     travel: Pixels,
     maximum: Pixels,

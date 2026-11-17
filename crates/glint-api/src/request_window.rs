@@ -754,6 +754,7 @@ impl Workbench {
             };
             let selected_version = self.current_versions[index];
             let storage_error = self.workspace.storage_error.clone();
+            let browser_owner = owner.downgrade();
             let editor = cx.new(|cx| {
                 let mut editor = Self::with_workspace(storage, data, cx);
                 editor.trigger_requests = Some(self.workspace.requests.clone());
@@ -765,6 +766,14 @@ impl Workbench {
                 });
                 editor.sync_commands(cx);
                 editor.oauth_namespace = namespace;
+                editor.oauth_browser_opener =
+                    Some(std::rc::Rc::new(move |environment, url, cx| {
+                        browser_owner
+                            .update(cx, |owner, cx| {
+                                owner.open_oauth_proxy_browser(environment, url, cx)
+                            })
+                            .map_err(|_| "工作区已关闭，无法打开代理授权浏览器".to_owned())?
+                    }));
                 editor.config = config;
                 editor.disabled_plugins = disabled_plugins;
                 editor.plugin_catalog = plugin_catalog;
