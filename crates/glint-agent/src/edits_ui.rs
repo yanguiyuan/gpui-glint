@@ -1,8 +1,9 @@
 use super::*;
 use crate::edits::Change;
+use gpui::{Animation, AnimationExt};
 use gpui_glint::components::{
     ChainScroll, CodeCard, CodeCardEvent, Dialog, DiffCard, DiffCardEvent, DiffColors, MenuItem,
-    Scrollbar, ScrollbarState, Skeleton, Tooltip,
+    PromptEditor, Scrollbar, ScrollbarState, Skeleton, Tooltip,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -132,7 +133,7 @@ pub struct State {
     selected_staged: bool,
     stage_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
-    commit_drafts: RefCell<HashMap<PathBuf, Entity<TextEntry>>>,
+    commit_drafts: RefCell<HashMap<PathBuf, Entity<PromptEditor>>>,
     commit_notice: Option<(PathBuf, String)>,
     stage_queue: std::collections::VecDeque<StageRequest>,
     stage_pending: std::collections::HashSet<PathBuf>,
@@ -1606,22 +1607,23 @@ impl AgentWorkspace {
                     ),
             );
         }
-        body.child(list).when(workspace_mode && !self.edits_ui.expanded, |body| {
-            body.children(self.git_commit_footer(cx))
-        }).child(
-            div()
-                .debug_selector(|| "diff-panel-footer".into())
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .text_size(px(10.))
-                .text_color(rgb(p.text_muted))
-                .child(if workspace_mode {
-                    "未暂存：暂存区 → 工作区；已暂存：HEAD → 暂存区。勾选暂存，取消勾选移出暂存区。"
-                } else {
-                    "会话内文件工具的累计净变更，含子代理。"
-                }),
-        )
+        body.child(list)
+            .when(workspace_mode && !self.edits_ui.expanded, |body| {
+                body.children(self.git_commit_footer(cx))
+            })
+            .child(
+                div()
+                    .debug_selector(|| "diff-panel-footer".into())
+                    .flex_shrink_0()
+                    .when(!workspace_mode, |footer| {
+                        footer
+                            .px_3()
+                            .py_2()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child("会话内文件工具的累计净变更，含子代理。")
+                    }),
+            )
     }
 
     fn expanded_edit_files(
@@ -2153,11 +2155,16 @@ impl AgentWorkspace {
             .borrow_mut()
             .entry(root.clone())
             .or_insert_with(|| {
-                let entry = cx.new(|cx| TextEntry::new(cx, "输入提交信息…", "").theme(self.theme));
+                let entry = cx.new(|cx| {
+                    PromptEditor::new(cx, "输入提交信息…")
+                        .theme(self.theme)
+                        .min_rows(2)
+                });
                 cx.observe(&entry, |_, _, cx| cx.notify()).detach();
                 entry
             })
             .clone();
+        entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
         let matches = self.edits_ui.workspace_root.as_ref() == Some(&root);
         let staged = if matches {
             self.edits_ui
@@ -2169,6 +2176,39 @@ impl AgentWorkspace {
             0
         };
         let disabled = !self.can_commit_workspace(cx);
+        let submitting = self.edits_ui.commit_task.is_some();
+        let submit = div()
+            .id("diff-commit-submit")
+            .debug_selector(|| "diff-commit-submit".into())
+            .size(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .bg(rgb(if disabled { p.surface_subtle } else { p.accent }))
+            .text_color(rgb(if disabled { p.text_muted } else { 0xffffff }))
+            .when(!disabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.88))
+                    .on_click(cx.listener(|this, _, _, cx| this.commit_workspace(cx)))
+            })
+            .child(if submitting {
+                Icon::Spinner
+                    .render(14.)
+                    .with_animation(
+                        "diff-commit-spinner",
+                        Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                        |spinner, delta| {
+                            spinner.with_transformation(gpui::Transformation::rotate(
+                                gpui::radians(std::f32::consts::TAU * delta),
+                            ))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                Icon::ArrowUp.render(16.).into_any_element()
+            });
         Some(
             div()
                 .debug_selector(|| "diff-commit-footer".into())
@@ -2180,45 +2220,51 @@ impl AgentWorkspace {
                 .flex_col()
                 .gap_2()
                 .child(
-                    gpui_glint::components::InputField::new("输入提交信息…")
-                        .control(entry)
-                        .theme(self.theme)
-                        .render()
+                    div()
+                        .id("diff-commit-message")
+                        .key_context("DiffCommitMessage")
                         .w_full()
                         .min_w_0()
-                        .debug_selector(|| "diff-commit-message".into()),
-                )
-                .child(
-                    div()
                         .flex()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(14.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.surface))
+                        .debug_selector(|| "diff-commit-message".into())
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child(if matches && !self.edits_ui.conflicts.is_empty() {
-                                    "请先解决合并冲突".to_owned()
-                                } else if staged == 0 {
-                                    "勾选文件以暂存更改".to_owned()
-                                } else {
-                                    format!("提交 {staged} 个已暂存文件")
-                                }),
+                                .id("diff-commit-message-scroll")
+                                .max_h(px(117.))
+                                .overflow_y_scroll()
+                                .child(entry),
                         )
                         .child(
-                            Button::new(if self.edits_ui.commit_task.is_some() {
-                                "提交中…"
-                            } else {
-                                "提交"
-                            })
-                            .theme(self.theme)
-                            .when(disabled, |button| button.disabled())
-                            .render()
-                            .debug_selector(|| "diff-commit-submit".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.commit_workspace(cx))),
+                            div().flex().justify_end().child(
+                                Tooltip::new(submit, if submitting { "提交中…" } else { "提交" })
+                                    .theme(self.theme)
+                                    .render(cx),
+                            ),
                         ),
+                )
+                .when_some(
+                    if matches && !self.edits_ui.conflicts.is_empty() {
+                        Some("请先解决合并冲突".to_owned())
+                    } else if staged > 0 {
+                        Some(format!("提交 {staged} 个已暂存文件"))
+                    } else {
+                        None
+                    },
+                    |footer, status| {
+                        footer.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(status),
+                        )
+                    },
                 )
                 .when_some(
                     self.edits_ui
@@ -2259,7 +2305,10 @@ impl AgentWorkspace {
                 .commit_drafts
                 .borrow()
                 .get(&root)
-                .is_some_and(|entry| !entry.read(cx).value().trim().is_empty())
+                .is_some_and(|entry| {
+                    let entry = entry.read(cx);
+                    !entry.is_composing() && !entry.value().trim().is_empty()
+                })
     }
 
     fn commit_workspace(&mut self, cx: &mut Context<Self>) {
@@ -2290,7 +2339,7 @@ impl AgentWorkspace {
                 let notice = match result {
                     Ok(()) => {
                         entry.update(cx, |entry, cx| {
-                            if entry.value() == submitted {
+                            if !entry.is_composing() && entry.value() == submitted {
                                 entry.set_value("", cx);
                             }
                         });
@@ -5006,8 +5055,14 @@ mod tests {
         });
         window.simulate_resize(size(px(1440.), px(1000.)));
         window.run_until_parked();
-        assert!(window.debug_bounds("diff-commit-message").is_some());
-        assert!(window.debug_bounds("diff-commit-submit").is_some());
+        let editor = window.debug_bounds("diff-commit-message").unwrap();
+        let submit = window.debug_bounds("diff-commit-submit").unwrap();
+        assert!(editor.contains(&submit.center()));
+        assert!((editor.right() - submit.right() - px(9.)).abs() <= px(1.));
+        assert!((editor.bottom() - submit.bottom() - px(9.)).abs() <= px(1.));
+        let message = "feat: sidebar commit\n\nDescribe the staged changes.";
+        window.simulate_click(editor.origin + point(px(12.), px(12.)), Default::default());
+        window.simulate_keystrokes("enter");
         host.update(window, |host, cx| {
             assert!(!host.can_commit_workspace(cx));
             let entry = host
@@ -5017,9 +5072,10 @@ mod tests {
                 .get(&root)
                 .unwrap()
                 .clone();
+            assert_eq!(entry.read(cx).value(), "\n");
             entry.update(cx, |entry, cx| entry.set_value("  ", cx));
             assert!(!host.can_commit_workspace(cx));
-            entry.update(cx, |entry, cx| entry.set_value("feat: sidebar commit", cx));
+            entry.update(cx, |entry, cx| entry.set_value(message, cx));
             assert!(host.can_commit_workspace(cx));
             let sources = host.edits_ui.workspace_sources.clone();
             host.edits_ui.workspace_sources = Rc::new(HashMap::new());
@@ -5029,7 +5085,7 @@ mod tests {
             assert!(!host.can_commit_workspace(cx));
             host.edits_ui.workspace_mode = true;
             host.edits_ui.expanded = true;
-            assert_eq!(entry.read(cx).value(), "feat: sidebar commit");
+            assert_eq!(entry.read(cx).value(), message);
             assert!(host.can_commit_workspace(cx));
             cx.notify();
         });

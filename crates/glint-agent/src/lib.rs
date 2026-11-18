@@ -3282,6 +3282,11 @@ pub fn initialize(cx: &mut App) {
     gpui_glint::components::bind_code_card_keys(cx);
     bind_text_entry_keys(cx);
     bind_prompt_editor_keys(cx);
+    cx.bind_keys([KeyBinding::new(
+        "enter",
+        gpui_glint::components::PromptEditorNewline,
+        Some("DiffCommitMessage > GlassPromptEditor"),
+    )]);
     terminal_ui::bind_keys(cx);
     bind_composer_keys(cx);
     for modifier in ["cmd", "ctrl"] {

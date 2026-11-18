@@ -131,7 +131,10 @@ pub use composer::{
 };
 pub use todo_list::{TodoList, TodoListItem, TodoListStatus};
 mod prompt_editor;
-pub use prompt_editor::{PastedImage, PromptEditor, PromptEditorEvent, bind_prompt_editor_keys};
+pub use prompt_editor::{
+    Newline as PromptEditorNewline, PastedImage, PromptEditor, PromptEditorEvent,
+    bind_prompt_editor_keys,
+};
 
 mod group_list;
 pub use group_list::{GroupList, GroupListEvent, GroupListGroup, GroupListHeader, GroupListItem};

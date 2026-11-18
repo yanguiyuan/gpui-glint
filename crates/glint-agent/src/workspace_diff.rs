@@ -907,7 +907,7 @@ pub(crate) mod tests {
         git_ok(root, &["add", "file.txt"]);
         std::fs::write(&path, "unstaged\n").unwrap();
         std::fs::write(root.join("untracked.txt"), "keep").unwrap();
-        let message = "加载 Diff & $(literal) `text` \"quoted\"";
+        let message = "加载 Diff & $(literal) `text` \"quoted\"\n\n保留多行正文。";
         commit_staged(root, message).unwrap();
         assert_eq!(
             checked(root, &["show", "HEAD:file.txt"]).unwrap(),
