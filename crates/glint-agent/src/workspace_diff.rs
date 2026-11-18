@@ -87,7 +87,7 @@ pub struct Source {
     version: (Vec<u8>, Option<FileStamp>),
     pub path: PathBuf,
     pub label: String,
-    old_path: String,
+    pub old_path: String,
     head: Option<String>,
     pub stats: Option<(usize, usize)>,
     pub stats_ready: bool,

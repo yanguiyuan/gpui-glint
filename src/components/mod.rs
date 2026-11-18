@@ -11,9 +11,11 @@ pub(crate) use code_card::TokenKind;
 mod composer_reference;
 mod reference_preview;
 pub use composer_reference::ComposerReference;
+mod change_navigation;
 mod dialog;
 mod file_preview;
 mod git_graph;
+pub use change_navigation::{ChangeNavigation, ChangeNavigationEvent, ChangeRow, ChangeStatus};
 pub use file_preview::{FilePreview, FilePreviewEntry, FilePreviewEvent};
 pub use git_graph::{
     GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraph, GitGraphData,

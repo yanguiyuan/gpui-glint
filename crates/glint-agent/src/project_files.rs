@@ -4,7 +4,11 @@ use crate::file_preview::{Loaded, Target};
 use crate::git_ui::CommitDiff;
 use crate::go_definition::{GoDefinitions, ProcessState};
 use crate::shortcuts::DefinitionModifier;
-use gpui_glint::components::{FilePreview, FilePreviewEvent, GitGraph, GitGraphEvent, Skeleton};
+use gpui::{Animation, AnimationExt};
+use gpui_glint::components::{
+    ChangeNavigation, ChangeNavigationEvent, ChangeRow, ChangeStatus, FilePreview,
+    FilePreviewEvent, GitGraph, GitGraphEvent, PromptEditor, Skeleton, Tooltip,
+};
 use std::{ops::Range, path::Path, time::Duration};
 
 struct Document {
@@ -33,15 +37,46 @@ struct DefinitionHover {
     _task: Task<()>,
 }
 
+/// The explorer column shows exactly one panel at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExplorerMode {
+    Tree,
+    Graph,
+    Changes,
+}
+
+impl ExplorerMode {
+    fn index(self) -> usize {
+        match self {
+            Self::Tree => 0,
+            Self::Graph => 1,
+            Self::Changes => 2,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Graph,
+            2 => Self::Changes,
+            _ => Self::Tree,
+        }
+    }
+}
+
 pub(super) struct ProjectFiles {
     root: Option<PathBuf>,
     tree: Entity<FilePreview>,
     graph: Option<Entity<GitGraph>>,
-    showing_graph: bool,
+    changes: Option<Entity<ChangeNavigation>>,
+    mode: ExplorerMode,
     compare_branch: String,
     history_limit: usize,
     graph_task: Option<Task<()>>,
+    changes_task: Option<Task<()>>,
+    stage_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
+    commit_entry: Option<Entity<PromptEditor>>,
+    commit_notice: Option<String>,
     go_definitions: Option<GoDefinitions>,
     definition_modifier: DefinitionModifier,
     definition_hover: Option<DefinitionHover>,
@@ -63,6 +98,99 @@ async fn read(target: Target) -> Result<(String, Option<String>, Loaded), String
             .await
     } else {
         file_preview::load(target).await
+    }
+}
+
+/// One Git status snapshot, grouped into the same rows the diff sidebar renders.
+fn change_rows(root: &Path) -> Result<Vec<ChangeRow>, String> {
+    let inventory = workspace_diff::inventory(root)?;
+    // The inventory never carries numstat counts, so read them for the whole list
+    // once. Without them every row would look like a binary change.
+    let labels: Vec<String> = inventory
+        .sources
+        .values()
+        .flat_map(|source| {
+            let mut paths = vec![source.label.clone()];
+            if source.old_path != source.label {
+                paths.push(source.old_path.clone());
+            }
+            paths
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let counts = workspace_diff::scoped_statistics(root, &labels);
+    let known = counts.is_ok();
+    let (staged_counts, unstaged_counts) = counts.unwrap_or_default();
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut untracked = Vec::new();
+    for source in inventory.sources.values() {
+        let path = source.path.to_string_lossy().into_owned();
+        if source.staged {
+            let layer = source.for_layer(true);
+            staged.push((
+                source.label.clone(),
+                path.clone(),
+                layer.status,
+                staged_counts.get(&source.label).copied(),
+            ));
+        }
+        if source.unstaged {
+            let layer = source.for_layer(false);
+            let entry = (
+                source.label.clone(),
+                path,
+                layer.status,
+                unstaged_counts.get(&source.label).copied(),
+            );
+            if layer.status == workspace_diff::FileStatus::Untracked {
+                untracked.push(entry);
+            } else {
+                unstaged.push(entry);
+            }
+        }
+    }
+    let groups = [
+        ("已暂存", Some(true), staged),
+        ("未暂存", Some(false), unstaged),
+        ("未跟踪", None, untracked),
+    ];
+    let mut rows = Vec::new();
+    for (title, layer, mut entries) in groups {
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.push(ChangeRow::Group {
+            title: title.to_owned(),
+            count: entries.len(),
+            staged: layer,
+        });
+        rows.extend(entries.into_iter().map(|(label, path, status, stats)| {
+            ChangeRow::File {
+                path,
+                label,
+                depth: 0,
+                status: change_status(status),
+                staged: layer.unwrap_or(false),
+                additions: stats.map(|(added, _)| added),
+                deletions: stats.map(|(_, removed)| removed),
+                // Only trust "no numstat row" once the counts were actually read.
+                binary: known && layer.is_some() && stats.is_none(),
+            }
+        }));
+    }
+    Ok(rows)
+}
+
+fn change_status(status: workspace_diff::FileStatus) -> ChangeStatus {
+    match status {
+        workspace_diff::FileStatus::Added => ChangeStatus::Added,
+        workspace_diff::FileStatus::Deleted => ChangeStatus::Deleted,
+        workspace_diff::FileStatus::Renamed => ChangeStatus::Renamed,
+        workspace_diff::FileStatus::Untracked => ChangeStatus::Untracked,
+        workspace_diff::FileStatus::Modified => ChangeStatus::Modified,
     }
 }
 
@@ -95,11 +223,16 @@ impl ProjectFiles {
             root: None,
             tree,
             graph: None,
-            showing_graph: false,
+            changes: None,
+            mode: ExplorerMode::Tree,
             compare_branch: "master".into(),
             history_limit: git_project::DEFAULT_HISTORY_LIMIT,
             graph_task: None,
+            changes_task: None,
+            stage_task: None,
             commit_task: None,
+            commit_entry: None,
+            commit_notice: None,
             go_definitions: None,
             definition_modifier: Default::default(),
             definition_hover: None,
@@ -121,8 +254,13 @@ impl ProjectFiles {
         }
         self.root = Some(root);
         self.graph = None;
+        self.changes = None;
         self.graph_task = None;
+        self.changes_task = None;
+        self.stage_task = None;
         self.commit_task = None;
+        self.commit_entry = None;
+        self.commit_notice = None;
         self.definition_task = None;
         self.definition_error = None;
         self.compare_branch = "master".into();
@@ -135,13 +273,15 @@ impl ProjectFiles {
         self.documents.clear();
         self.active = None;
         self.refresh(cx);
-        if self.showing_graph {
-            self.show_git_graph(cx);
+        match self.mode {
+            ExplorerMode::Graph => self.show_git_graph(cx),
+            ExplorerMode::Changes => self.show_changes(cx),
+            ExplorerMode::Tree => {}
         }
     }
 
     pub(super) fn show_git_graph(&mut self, cx: &mut Context<Self>) {
-        self.showing_graph = true;
+        self.mode = ExplorerMode::Graph;
         if self.graph.is_none() {
             let graph = cx.new(|cx| {
                 let mut graph = GitGraph::new(cx).header_visible(false);
@@ -163,7 +303,7 @@ impl ProjectFiles {
                     this.load_graph(false, cx);
                 }
                 GitGraphEvent::CloseRequested => {
-                    this.showing_graph = false;
+                    this.mode = ExplorerMode::Tree;
                     cx.notify();
                 }
             })
@@ -209,6 +349,295 @@ impl ProjectFiles {
         }));
     }
 
+    pub(super) fn show_changes(&mut self, cx: &mut Context<Self>) {
+        self.mode = ExplorerMode::Changes;
+        if self.changes.is_none() {
+            let changes = cx.new(|cx| {
+                let mut panel = ChangeNavigation::new(cx).stage_controls(true);
+                panel.set_theme(self.theme, cx);
+                panel
+            });
+            cx.subscribe(
+                &changes,
+                |this, _, event: &ChangeNavigationEvent, cx| match event {
+                    ChangeNavigationEvent::Select { path, staged } => {
+                        this.open_worktree_diff(path.clone(), *staged, cx)
+                    }
+                    ChangeNavigationEvent::Stage { paths, staged } => {
+                        this.stage_changes(Some(paths.clone()), *staged, cx)
+                    }
+                    ChangeNavigationEvent::StageGroup { staged } => {
+                        this.stage_changes(None, *staged, cx)
+                    }
+                    ChangeNavigationEvent::ToggleDirectory { .. }
+                    | ChangeNavigationEvent::Menu { .. } => {}
+                },
+            )
+            .detach();
+            let entry = cx.new(|cx| {
+                PromptEditor::new(cx, "输入提交信息…")
+                    .theme(self.theme)
+                    .min_rows(2)
+            });
+            cx.observe(&entry, |_, _, cx| cx.notify()).detach();
+            self.commit_entry = Some(entry);
+            self.changes = Some(changes);
+        }
+        // Re-read on every switch: the worktree changes while the page stays open.
+        self.refresh_changes(cx);
+        cx.notify();
+    }
+
+    pub(super) fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(changes)) = (self.root.clone(), self.changes.clone()) else {
+            return;
+        };
+        self.changes_task = None;
+        if ssh_project::is_remote(&root) {
+            changes.update(cx, |changes, cx| {
+                changes.set_error(
+                    "SSH 项目暂不支持工作区变更列表，请在终端执行 git status".into(),
+                    cx,
+                )
+            });
+            return;
+        }
+        changes.update(cx, |changes, cx| changes.set_loading(cx));
+        let job = match provider::Job::start(async move { change_rows(&root) }) {
+            Ok(job) => job,
+            Err(error) => {
+                changes.update(cx, |changes, cx| changes.set_error(error, cx));
+                return;
+            }
+        };
+        let changes = changes.downgrade();
+        self.changes_task = Some(cx.spawn(async move |_, cx| {
+            let result = job.result().await;
+            let _ = changes.update(cx, |changes, cx| match result {
+                Ok(rows) => changes.set_rows(rows, cx),
+                Err(error) => changes.set_error(error, cx),
+            });
+        }));
+    }
+
+    /// Move one layer between the index and the worktree, then re-read every row.
+    fn stage_changes(&mut self, paths: Option<Vec<String>>, staged: bool, cx: &mut Context<Self>) {
+        let (Some(root), Some(changes)) = (self.root.clone(), self.changes.clone()) else {
+            return;
+        };
+        if self.stage_task.is_some() {
+            return;
+        }
+        changes.update(cx, |changes, cx| changes.set_loading(cx));
+        let job = provider::Job::start(async move {
+            let inventory = workspace_diff::inventory(&root)?;
+            let sources: Vec<_> = inventory
+                .sources
+                .values()
+                .filter(|source| {
+                    if staged {
+                        source.unstaged
+                    } else {
+                        source.staged
+                    }
+                })
+                .filter(|source| {
+                    paths.as_ref().is_none_or(|paths| {
+                        let path = source.path.to_string_lossy();
+                        paths.iter().any(|candidate| *candidate == path)
+                    })
+                })
+                .cloned()
+                .collect();
+            if sources.is_empty() {
+                return Err("文件已不在变更列表中，请刷新后重试".to_owned());
+            }
+            workspace_diff::stage_and_refresh(&sources, staged).map(|_| ())
+        });
+        let job = match job {
+            Ok(job) => job,
+            Err(error) => {
+                changes.update(cx, |changes, cx| changes.set_error(error, cx));
+                return;
+            }
+        };
+        let panel = changes.downgrade();
+        let weak = cx.entity().downgrade();
+        self.stage_task = Some(cx.spawn(async move |_, cx| {
+            let result = job.result().await;
+            let _ = weak.update(cx, |this, cx| {
+                this.stage_task = None;
+                match result {
+                    Ok(()) => this.refresh_changes(cx),
+                    Err(error) => {
+                        let _ = panel.update(cx, |panel, cx| panel.set_error(error, cx));
+                    }
+                }
+            });
+        }));
+    }
+
+    fn can_commit_changes(&self, cx: &App) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        self.mode == ExplorerMode::Changes
+            && !ssh_project::is_remote(root)
+            && self.stage_task.is_none()
+            && self.commit_task.is_none()
+            && self
+                .changes
+                .as_ref()
+                .is_some_and(|changes| changes.read(cx).staged_count() > 0)
+            && self.commit_entry.as_ref().is_some_and(|entry| {
+                let entry = entry.read(cx);
+                !entry.is_composing() && !entry.value().trim().is_empty()
+            })
+    }
+
+    /// Commit the index from the changes panel, mirroring the diff sidebar footer.
+    fn commit_changes(&mut self, cx: &mut Context<Self>) {
+        if !self.can_commit_changes(cx) {
+            return;
+        }
+        let (Some(root), Some(entry)) = (self.root.clone(), self.commit_entry.clone()) else {
+            return;
+        };
+        let message = entry.read(cx).value().to_owned();
+        let submitted = message.clone();
+        self.commit_notice = None;
+        let work = cx
+            .background_executor()
+            .spawn(async move { workspace_diff::commit_staged(&root, &message) });
+        self.commit_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.commit_task.take() {
+                    task.detach();
+                }
+                this.commit_notice = Some(match result {
+                    Ok(()) => {
+                        entry.update(cx, |entry, cx| {
+                            if !entry.is_composing() && entry.value() == submitted {
+                                entry.set_value("", cx);
+                            }
+                        });
+                        "提交成功".to_owned()
+                    }
+                    Err(error) => format!("提交失败：{error}"),
+                });
+                this.refresh_changes(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn commit_footer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let root = self.root.clone()?;
+        if ssh_project::is_remote(&root) {
+            return None;
+        }
+        let entry = self.commit_entry.clone()?;
+        entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
+        let p = self.theme.palette();
+        let staged = self
+            .changes
+            .as_ref()
+            .map_or(0, |changes| changes.read(cx).staged_count());
+        let disabled = !self.can_commit_changes(cx);
+        let submitting = self.commit_task.is_some();
+        let submit = div()
+            .id("project-commit-submit")
+            .debug_selector(|| "project-commit-submit".into())
+            .size(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .bg(rgb(if disabled { p.surface_subtle } else { p.accent }))
+            .text_color(rgb(if disabled { p.text_muted } else { 0xffffff }))
+            .when(!disabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.88))
+                    .on_click(cx.listener(|this, _, _, cx| this.commit_changes(cx)))
+            })
+            .child(if submitting {
+                Icon::Spinner
+                    .render(14.)
+                    .with_animation(
+                        "project-commit-spinner",
+                        Animation::new(Duration::from_millis(900)).repeat(),
+                        |spinner, delta| {
+                            spinner.with_transformation(gpui::Transformation::rotate(
+                                gpui::radians(std::f32::consts::TAU * delta),
+                            ))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                Icon::ArrowUp.render(16.).into_any_element()
+            });
+        Some(
+            div()
+                .debug_selector(|| "project-commit-footer".into())
+                .flex_shrink_0()
+                .border_t_1()
+                .border_color(rgb(p.border))
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .id("project-commit-message")
+                        .key_context("DiffCommitMessage")
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.surface))
+                        .debug_selector(|| "project-commit-message".into())
+                        .child(
+                            div()
+                                .id("project-commit-message-scroll")
+                                .max_h(px(96.))
+                                .overflow_y_scroll()
+                                .child(entry),
+                        )
+                        .child(
+                            div().flex().justify_end().child(
+                                Tooltip::new(submit, if submitting { "提交中…" } else { "提交" })
+                                    .theme(self.theme)
+                                    .render(cx),
+                            ),
+                        ),
+                )
+                .when(staged > 0 && !submitting, |footer| {
+                    footer.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("提交 {staged} 个已暂存文件")),
+                    )
+                })
+                .when_some(self.commit_notice.clone(), |footer, notice| {
+                    footer.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(notice),
+                    )
+                }),
+        )
+    }
+
     fn load_commit(&mut self, id: String, cx: &mut Context<Self>) {
         let (Some(root), Some(graph)) = (self.root.clone(), self.graph.as_ref()) else {
             return;
@@ -246,6 +675,65 @@ impl ProjectFiles {
         self.next_document_id += 1;
         let id = self.next_document_id;
         let task = match diff.load(root) {
+            Ok(job) => Some(cx.spawn(async move |weak, cx| {
+                let result = job.result().await;
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(document) =
+                        this.documents.iter_mut().find(|document| document.id == id)
+                    else {
+                        return;
+                    };
+                    if let DocumentView::Diff(diff) = &mut document.view {
+                        diff.set_result(result, this.theme, true, cx);
+                        cx.notify();
+                    }
+                });
+            })),
+            Err(error) => {
+                diff.error = Some(error);
+                None
+            }
+        };
+        self.documents.push(Document {
+            id,
+            path,
+            view: DocumentView::Diff(diff),
+            _task: task,
+        });
+        self.activate(self.documents.len() - 1, cx);
+    }
+
+    /// Open one worktree layer of a changed file without leaving the explorer.
+    fn open_worktree_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let note = if staged { "已暂存" } else { "工作区" };
+        if let Some(index) = self.documents.iter().position(|document| {
+            matches!(
+                &document.view,
+                DocumentView::Diff(diff) if diff.commit == note && diff.path == path
+            )
+        }) {
+            self.activate(index, cx);
+            return;
+        }
+        let mut diff = CommitDiff::new(note.to_owned(), path.clone());
+        self.next_document_id += 1;
+        let id = self.next_document_id;
+        let lookup = path.clone();
+        let work = provider::Job::start(async move {
+            let inventory = workspace_diff::inventory(&root)?;
+            let source = inventory
+                .sources
+                .values()
+                .find(|source| source.path.to_string_lossy() == lookup)
+                .ok_or_else(|| "文件已不在变更列表中，请刷新后重试".to_owned())?;
+            let change = workspace_diff::load_with_options(&source.for_layer(staged), false)
+                .map_err(|error| error.to_string())?;
+            Ok(change.lines())
+        });
+        let task = match work {
             Ok(job) => Some(cx.spawn(async move |weak, cx| {
                 let result = job.result().await;
                 let _ = weak.update(cx, |this, cx| {
@@ -818,20 +1306,6 @@ impl Render for ProjectFiles {
                         .min_h_0()
                         .flex()
                         .flex_col()
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .px_3()
-                                .py_2()
-                                .text_size(px(12.))
-                                .text_color(rgb(p.text_muted))
-                                .truncate()
-                                .child(format!(
-                                    "{} · {}",
-                                    gpui_glint::paths::display_path(&diff.path),
-                                    diff.commit.chars().take(12).collect::<String>()
-                                )),
-                        )
                         .when_some(diff.card.clone(), |body, card| body.child(card))
                         .when_some(diff.error.clone(), |body, error| {
                             body.child(div().p_3().child(error))
@@ -857,34 +1331,36 @@ impl Render for ProjectFiles {
                 .items_center()
                 .justify_center()
                 .text_color(rgb(p.text_muted))
-                .child(if self.showing_graph {
-                    "选择提交中的文件以查看差异"
-                } else {
-                    "从左侧目录树打开文件"
+                .child(match self.mode {
+                    ExplorerMode::Graph => "选择提交中的文件以查看差异",
+                    ExplorerMode::Changes => "点击左侧文件查看未提交的差异",
+                    ExplorerMode::Tree => "从左侧目录树打开文件",
                 })
         };
         let weak = cx.entity().downgrade();
         let segments = SegmentedControl::new([
             SegmentOption::new("文件目录").debug_selector("project-directory-segment"),
             SegmentOption::new("Git Graph").debug_selector("project-git-graph-segment"),
+            SegmentOption::new("变更").debug_selector("project-git-changes-segment"),
         ])
         .id("project-explorer-mode")
-        .selected(usize::from(self.showing_graph))
+        .compact()
+        .selected(self.mode.index())
         .theme(self.theme)
         .on_change(move |index, _, cx| {
-            let _ = weak.update(cx, |this, cx| {
-                if index == 1 {
-                    this.show_git_graph(cx);
-                } else {
-                    this.showing_graph = false;
+            let _ = weak.update(cx, |this, cx| match ExplorerMode::from_index(index) {
+                ExplorerMode::Graph => this.show_git_graph(cx),
+                ExplorerMode::Changes => this.show_changes(cx),
+                ExplorerMode::Tree => {
+                    this.mode = ExplorerMode::Tree;
                     cx.notify();
                 }
             });
         });
-        let navigation = if self.showing_graph {
-            self.graph.clone().map(IntoElement::into_any_element)
-        } else {
-            Some(self.tree.clone().into_any_element())
+        let navigation = match self.mode {
+            ExplorerMode::Graph => self.graph.clone().map(IntoElement::into_any_element),
+            ExplorerMode::Changes => self.changes.clone().map(IntoElement::into_any_element),
+            ExplorerMode::Tree => Some(self.tree.clone().into_any_element()),
         };
         div()
             .size_full()
@@ -913,18 +1389,23 @@ impl Render for ProjectFiles {
                             .border_b_1()
                             .border_color(rgb(p.border))
                             .child(segments)
-                            .when(self.showing_graph, |header| {
+                            .when(self.mode != ExplorerMode::Tree, |header| {
                                 header.child(
                                     IconButton::new(Icon::Refresh, "刷新 Git")
                                         .theme(self.theme)
                                         .render()
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.refresh_graph(cx)),
-                                        ),
+                                        .debug_selector(|| "project-explorer-refresh".into())
+                                        .on_click(cx.listener(|this, _, _, cx| match this.mode {
+                                            ExplorerMode::Changes => this.refresh_changes(cx),
+                                            _ => this.refresh_graph(cx),
+                                        })),
                                 )
                             }),
                     )
-                    .child(div().flex_1().min_h_0().children(navigation)),
+                    .child(div().flex_1().min_h_0().children(navigation))
+                    .when(self.mode == ExplorerMode::Changes, |column| {
+                        column.children(self.commit_footer(cx))
+                    }),
             )
             .child(div().flex_1().min_w_0().h_full().child(document_pane))
     }
@@ -1246,5 +1727,258 @@ mod tests {
             assert!(files.documents.is_empty());
             assert!(files.active.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn project_changes_tab_reuses_the_shared_change_rows(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=disabled-hooks",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(root.join("main.rs"), "fn first() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-qm", "First"]);
+        std::fs::write(root.join("main.rs"), "fn changed() {}\n").unwrap();
+        std::fs::write(root.join("new.rs"), "fn added() {}\n").unwrap();
+        // Rows carry the canonical path Git reported, which differs inside /var on macOS.
+        let canonical = root.canonicalize().unwrap();
+        let changed = canonical.join("main.rs").to_string_lossy().into_owned();
+        let added = canonical.join("new.rs").to_string_lossy().into_owned();
+
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(gpui::size(px(900.), px(720.)));
+        files.update(window, |files, cx| files.set_root(root.clone(), cx));
+        let click = |selector: &'static str, window: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                if let Some(bounds) = window.debug_bounds(selector) {
+                    window.simulate_click(bounds.center(), Default::default());
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {selector}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        click("project-git-changes-segment", window);
+        // Both layers come from the shared component, not a bespoke list.
+        click(
+            Box::leak(format!("change-file:{changed}:false").into_boxed_str()),
+            window,
+        );
+        window.run_until_parked();
+        assert!(
+            window
+                .debug_bounds(Box::leak(
+                    format!("change-file:{added}:false").into_boxed_str()
+                ))
+                .is_some()
+        );
+        assert!(window.debug_bounds("stage-group:false").is_some());
+        // Counts are read for the whole list, so a text file is never labelled binary.
+        assert!(window.debug_bounds("change-file-binary").is_none());
+        // The panel owns the commit box, like the diff sidebar footer.
+        assert!(window.debug_bounds("project-commit-footer").is_some());
+        assert!(window.debug_bounds("project-commit-submit").is_some());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            window.run_until_parked();
+            let opened = files.read_with(window, |files, _| {
+                files.documents.iter().any(|document| {
+                    matches!(&document.view, DocumentView::Diff(diff) if diff.path == changed)
+                })
+            });
+            if opened {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree diff failed to open"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
+    fn project_changes_tab_commits_the_index(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=disabled-hooks",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        std::fs::write(root.join("main.rs"), "fn first() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-qm", "First"]);
+        std::fs::write(root.join("new.rs"), "fn added() {}\n").unwrap();
+        git(&["add", "new.rs"]);
+
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(gpui::size(px(900.), px(720.)));
+        files.update(window, |files, cx| files.set_root(root.clone(), cx));
+        let click = |selector: &'static str, window: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                if let Some(bounds) = window.debug_bounds(selector) {
+                    window.simulate_click(bounds.center(), Default::default());
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {selector}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        click("project-git-changes-segment", window);
+        // Rows carry the canonical absolute path, so wait for the staged checkbox.
+        let staged = Box::leak(
+            format!(
+                "stage-file:{}:true",
+                root.canonicalize()
+                    .unwrap()
+                    .join("new.rs")
+                    .to_string_lossy()
+            )
+            .into_boxed_str(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            window.run_until_parked();
+            if window.debug_bounds(staged).is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged change row never rendered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        files.update(window, |files, cx| {
+            let entry = files.commit_entry.clone().expect("commit editor");
+            // A staged file alone is not enough; the message gates the button.
+            assert!(!files.can_commit_changes(cx));
+            entry.update(cx, |entry, cx| entry.set_value("feat: project commit", cx));
+            assert!(files.can_commit_changes(cx));
+            cx.notify();
+        });
+        window.run_until_parked();
+        click("project-commit-submit", window);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            window.run_until_parked();
+            if git(&["log", "--format=%s", "-1"]) == "feat: project commit" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "project commit never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        files.read_with(window, |files, cx| {
+            // The draft clears and the index is empty again.
+            let entry = files.commit_entry.clone().unwrap();
+            assert_eq!(entry.read(cx).value(), "");
+            assert!(!files.can_commit_changes(cx));
+        });
+    }
+
+    #[test]
+    fn change_rows_tell_binary_files_apart_from_loaded_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=disabled-hooks",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(root.join("main.rs"), "fn first() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-qm", "First"]);
+        std::fs::write(root.join("main.rs"), "fn changed() {}\n").unwrap();
+        std::fs::write(root.join("logo.png"), [0u8, 1, 2, 3]).unwrap();
+        git(&["add", "logo.png"]);
+
+        let rows = change_rows(&root).unwrap();
+        let find = |label: &str| {
+            rows.iter().find_map(|row| match row {
+                ChangeRow::File {
+                    label: row_label,
+                    additions,
+                    deletions,
+                    binary,
+                    ..
+                } if row_label == label => Some((*additions, *deletions, *binary)),
+                _ => None,
+            })
+        };
+        // A modified text file reports real counts and no binary flag.
+        assert_eq!(find("main.rs"), Some((Some(1), Some(1), false)));
+        // Git reports binary content as "-\t-\t", so the row is flagged instead.
+        assert_eq!(find("logo.png"), Some((None, None, true)));
     }
 }

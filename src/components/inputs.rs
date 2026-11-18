@@ -316,6 +316,7 @@ pub struct SegmentedControl {
     options: Vec<SegmentOption>,
     selected: usize,
     tinted: bool,
+    compact: bool,
     on_change: Option<ChangeHandler<usize>>,
 }
 
@@ -333,6 +334,7 @@ impl SegmentedControl {
             options: options.into_iter().collect(),
             selected: 0,
             tinted: false,
+            compact: false,
             on_change: None,
         }
     }
@@ -350,6 +352,12 @@ impl SegmentedControl {
 
     pub fn tinted(mut self) -> Self {
         self.tinted = true;
+        self
+    }
+
+    /// Narrower segments for sidebars where three labels must share a small header.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
         self
     }
 
@@ -402,7 +410,7 @@ impl SegmentedControl {
                     format!("glass-segment-{index}").into(),
                 ))
                 .h(px(24.))
-                .px(px(11.))
+                .px(px(if self.compact { 8. } else { 11. }))
                 .flex()
                 .items_center()
                 .gap_1()
