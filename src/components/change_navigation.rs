@@ -109,6 +109,7 @@ pub struct ChangeNavigation {
     selected: Option<(String, bool)>,
     /// Staging is only offered where the host can actually move files between layers.
     stage_controls: bool,
+    background_visible: bool,
     error: Option<String>,
     loading: bool,
     focus: FocusHandle,
@@ -125,6 +126,7 @@ impl ChangeNavigation {
             theme: ThemePreset::default(),
             selected: None,
             stage_controls: false,
+            background_visible: true,
             error: None,
             loading: false,
             focus: cx.focus_handle(),
@@ -143,6 +145,11 @@ impl ChangeNavigation {
 
     pub fn stage_controls(mut self, enabled: bool) -> Self {
         self.stage_controls = enabled;
+        self
+    }
+
+    pub fn background_visible(mut self, visible: bool) -> Self {
+        self.background_visible = visible;
         self
     }
 
@@ -755,7 +762,7 @@ impl Render for ChangeNavigation {
             .flex_col()
             .text_size(px(12.))
             .text_color(rgb(p.text))
-            .bg(rgb(p.surface))
+            .when(self.background_visible, |panel| panel.bg(rgb(p.surface)))
             .track_focus(&self.focus)
             .tab_index(0)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {

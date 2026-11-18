@@ -41,12 +41,11 @@ impl AgentWorkspace {
             .find(|p| p.id == id)
             .map(|p| p.name)
     }
-    pub fn refresh_calendar(&self, cx: &mut Context<Self>) {
-        let mut titles: std::collections::HashMap<_, Vec<String>> = Default::default();
-        if let Ok(mut store) = self.schedules.lock() {
-            let _ = store.refresh();
-            let mut tasks: Vec<_> = store.tasks.iter().collect();
-            tasks.sort_by_key(|task| (task.run_at, task.id));
+    pub fn refresh_calendar(&mut self, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let tasks = database::load_schedules(&path)?.unwrap_or_default();
+            let mut titles: std::collections::HashMap<_, Vec<String>> = Default::default();
             for task in tasks {
                 titles
                     .entry(task.run_at.date_naive())
@@ -62,12 +61,23 @@ impl AgentWorkspace {
                         .push(task.title.clone());
                 }
             }
-        }
-        self.calendar.update(cx, |calendar, cx| {
-            calendar.set_markers(Default::default(), cx);
-            calendar.set_task_titles(titles, cx);
-            calendar.set_theme(self.theme, cx);
+            Ok::<_, String>(titles)
         });
+        self.calendar_refresh = Some(cx.spawn(async move |weak, cx| {
+            let result = load.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.calendar_refresh.take() {
+                    task.detach();
+                }
+                this.calendar.update(cx, |calendar, cx| {
+                    if let Ok(titles) = result {
+                        calendar.set_markers(Default::default(), cx);
+                        calendar.set_task_titles(titles, cx);
+                    }
+                    calendar.set_theme(this.theme, cx);
+                });
+            });
+        }));
     }
 
     fn new_schedule(&mut self, cx: &mut Context<Self>) {

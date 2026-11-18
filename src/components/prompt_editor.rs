@@ -62,6 +62,66 @@ impl PastedImage {
     pub fn source(&self) -> ImageSource {
         ImageSource::Image(self.0.clone())
     }
+
+    pub(super) fn thumbnail_source(&self) -> ImageSource {
+        let image = self.0.clone();
+        ImageSource::Custom(Arc::new(move |window, cx| {
+            window.use_asset::<AttachmentThumbnail>(&image, cx)
+        }))
+    }
+
+    pub(super) fn remove_thumbnail(&self, cx: &mut App) {
+        cx.remove_asset::<AttachmentThumbnail>(&self.0);
+    }
+}
+
+struct AttachmentThumbnail;
+
+impl gpui::Asset for AttachmentThumbnail {
+    type Source = Arc<gpui::Image>;
+    type Output = Result<Arc<gpui::RenderImage>, gpui::ImageCacheError>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let renderer = cx.svg_renderer();
+        async move {
+            let decoded = source.to_image_data(renderer)?;
+            let frames = (0..decoded.frame_count())
+                .filter_map(|index| {
+                    let size = decoded.size(index);
+                    let (width, height) = (u32::from(size.width), u32::from(size.height));
+                    let pixels = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                        width,
+                        height,
+                        decoded.as_bytes(index)?,
+                    )?;
+                    let side = width.min(height);
+                    let crop = image::imageops::crop_imm(
+                        &pixels,
+                        (width - side) / 2,
+                        (height - side) / 2,
+                        side,
+                        side,
+                    );
+                    // GPUI supplies BGRA pixels. Resizing each channel preserves that order.
+                    // The composer displays a 48 px preview. Keep two device pixels per point.
+                    let extent = side.min(96);
+                    Some(image::Frame::from_parts(
+                        image::imageops::thumbnail(&*crop, extent, extent),
+                        0,
+                        0,
+                        decoded.delay(index),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if frames.is_empty() {
+                return Err(gpui::ImageCacheError::Asset("无法生成附件预览".into()));
+            }
+            Ok(Arc::new(gpui::RenderImage::new(frames)))
+        }
+    }
 }
 
 impl From<&gpui::Image> for PastedImage {
@@ -84,7 +144,7 @@ impl EventEmitter<PromptEditorEvent> for PromptEditor {}
 
 /// File paths and embedded bitmaps can represent the same clipboard image.
 /// Prefer the original files, falling back to embedded images for screenshots.
-fn clipboard_images(item: &ClipboardItem) -> Result<Vec<PastedImage>, String> {
+fn clipboard_images(item: ClipboardItem) -> Result<Vec<PastedImage>, String> {
     let mut images = Vec::new();
     let mut paths_seen = std::collections::HashSet::new();
     for entry in item.entries() {
@@ -102,12 +162,12 @@ fn clipboard_images(item: &ClipboardItem) -> Result<Vec<PastedImage>, String> {
         }
     }
     if images.is_empty() {
-        for entry in item.entries() {
+        for entry in item.entries {
             if let ClipboardEntry::Image(image) = entry {
                 if image.bytes.len() > 20 * 1024 * 1024 {
                     return Err("图片原始数据超过 20MB".into());
                 }
-                images.push(PastedImage::from(image));
+                images.push(PastedImage(Arc::new(image)));
             }
         }
     }
@@ -775,7 +835,7 @@ impl PromptEditor {
         let fallback_text = item.text();
         let read = cx
             .background_executor()
-            .spawn(async move { clipboard_images(&item) });
+            .spawn(async move { clipboard_images(item) });
         self.paste_task = Some(cx.spawn(async move |weak, cx| {
             let result = read.await;
             let _ = weak.update(cx, |this, cx| match result {
@@ -1894,10 +1954,10 @@ mod tests {
     fn clipboard_images_come_from_entries_or_image_files() {
         let png = PastedImage::new(ImageFormat::Png, vec![1, 2, 3]);
         let mut item = ClipboardItem::new_string("纯文本".into());
-        assert!(clipboard_images(&item).unwrap().is_empty());
+        assert!(clipboard_images(item).unwrap().is_empty());
 
         item = ClipboardItem::new_image(&gpui::Image::from_bytes(ImageFormat::Tiff, vec![9, 9]));
-        let images = clipboard_images(&item).unwrap();
+        let images = clipboard_images(item).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format(), ImageFormat::Tiff);
         assert_eq!(images[0].media_type(), "image/tiff");
@@ -1911,11 +1971,35 @@ mod tests {
                 vec![path].into(),
             ))],
         };
-        let images = clipboard_images(&item).unwrap();
+        let images = clipboard_images(item).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format(), ImageFormat::Png);
         assert_eq!(images[0].bytes(), &[4, 5, 6]);
         assert_eq!(png, PastedImage::new(ImageFormat::Png, vec![1, 2, 3]));
+    }
+
+    #[gpui::test]
+    fn attachment_thumbnail_is_bounded_and_keeps_the_original(cx: &mut gpui::TestAppContext) {
+        use gpui::Asset as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            512,
+            256,
+            image::Rgba([200, 100, 50, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let original = png.into_inner();
+        let pasted = PastedImage::new(ImageFormat::Png, original.clone());
+        let thumbnail = cx
+            .update(|cx| {
+                futures::executor::block_on(AttachmentThumbnail::load(pasted.0.clone(), cx))
+            })
+            .unwrap();
+        let size = thumbnail.size(0);
+        assert_eq!((u32::from(size.width), u32::from(size.height)), (96, 96));
+        assert_eq!(&thumbnail.as_bytes(0).unwrap()[..4], &[50, 100, 200, 255]);
+        assert_eq!(pasted.bytes(), original);
     }
 
     #[test]
@@ -1934,7 +2018,7 @@ mod tests {
         ] {
             let item = ClipboardItem { entries };
             assert_eq!(
-                clipboard_images(&item).unwrap(),
+                clipboard_images(item).unwrap(),
                 [PastedImage::new(ImageFormat::Png, vec![1, 2, 3]),]
             );
         }
@@ -1947,7 +2031,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            clipboard_images(&item).unwrap(),
+            clipboard_images(item).unwrap(),
             [
                 PastedImage::new(ImageFormat::Png, vec![1, 2, 3]),
                 PastedImage::new(ImageFormat::Jpeg, vec![4, 5, 6]),
@@ -1962,7 +2046,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            clipboard_images(&item).unwrap(),
+            clipboard_images(item).unwrap(),
             [PastedImage::new(ImageFormat::Bmp, vec![7, 8, 9]),]
         );
     }

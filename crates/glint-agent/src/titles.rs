@@ -35,7 +35,7 @@ impl TitleGenerator {
         cx: &mut Context<Self>,
     ) {
         let current_title = (!first_turn).then(|| truncate_chars(&previous, 48));
-        self.start(session, previous, async move {
+        let title = cx.background_executor().spawn(async move {
             let key = config.key().ok()?;
             let messages = vec![
                 serde_json::json!({"role":"system","content":"你是会话标题生成器。根据最新一轮对话，给出不超过 12 个字、概括当前任务意图的标题。若有已有标题且本轮只是追问、确认、补充或延续同一任务，只回复 KEEP_TITLE；若本轮发起新的任务，生成新标题。只回复标题或 KEEP_TITLE，不加引号、句号或解释。"}),
@@ -48,7 +48,8 @@ impl TitleGenerator {
             let request = provider::Request::start(config, key, messages, provider::Thinking::Default).ok()?;
             let completion = request.response().await.ok()?;
             session_title(&completion.text).filter(|title| !title.eq_ignore_ascii_case("KEEP_TITLE"))
-        }, cx);
+        });
+        self.start(session, previous, title, cx);
     }
 
     fn start(

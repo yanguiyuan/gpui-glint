@@ -1043,7 +1043,7 @@ impl Composer {
         self.set_references(Vec::new(), cx);
         self.observed_text = text.clone();
         for image in std::mem::replace(&mut self.attachments, images) {
-            image.source().remove_asset(cx);
+            image.remove_thumbnail(cx);
         }
         self.context_open = false;
         self.editor
@@ -1065,7 +1065,7 @@ impl Composer {
     pub fn clear_attachments(&mut self, cx: &mut Context<Self>) {
         if !self.attachments.is_empty() {
             for image in self.attachments.drain(..) {
-                image.source().remove_asset(cx);
+                image.remove_thumbnail(cx);
             }
             cx.emit(ComposerEvent::AttachmentsChanged);
             cx.notify();
@@ -1090,7 +1090,7 @@ impl Composer {
         };
         if self.clear_on_submit || self.busy {
             for image in &images {
-                image.source().remove_asset(cx);
+                image.remove_thumbnail(cx);
             }
         }
         let references = self
@@ -1259,7 +1259,7 @@ impl Composer {
         let submission = self.queue.remove(index).submission;
         self.set_references(submission.references, cx);
         for image in std::mem::replace(&mut self.attachments, submission.images) {
-            image.source().remove_asset(cx);
+            image.remove_thumbnail(cx);
         }
         cx.emit(ComposerEvent::AttachmentsChanged);
         self.editor
@@ -2094,7 +2094,7 @@ impl Composer {
                 })
                 .overflow_hidden()
                 .child(
-                    img(image.source())
+                    img(image.thumbnail_source())
                         .size(px(48.))
                         .object_fit(ObjectFit::Cover),
                 )
@@ -2117,7 +2117,7 @@ impl Composer {
                         .hover(move |style| style.bg(rgb(p.accent)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if index < this.attachments.len() {
-                                this.attachments.remove(index).source().remove_asset(cx);
+                                this.attachments.remove(index).remove_thumbnail(cx);
                                 cx.emit(ComposerEvent::AttachmentsChanged);
                                 cx.notify();
                             }

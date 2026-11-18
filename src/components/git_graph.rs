@@ -211,6 +211,7 @@ pub struct GitGraph {
     loading: bool,
     comparison_tab: bool,
     header_visible: bool,
+    background_visible: bool,
     focus: FocusHandle,
     scroll: ScrollHandle,
     _search_subscription: gpui::Subscription,
@@ -251,6 +252,7 @@ impl GitGraph {
             loading: false,
             comparison_tab: false,
             header_visible: true,
+            background_visible: true,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             _search_subscription: search_subscription,
@@ -259,6 +261,11 @@ impl GitGraph {
     }
     pub fn header_visible(mut self, visible: bool) -> Self {
         self.header_visible = visible;
+        self
+    }
+
+    pub fn background_visible(mut self, visible: bool) -> Self {
+        self.background_visible = visible;
         self
     }
 
@@ -1076,7 +1083,7 @@ impl Render for GitGraph {
             .flex_col()
             .text_size(px(12.))
             .text_color(rgb(p.text))
-            .bg(rgb(p.surface))
+            .when(self.background_visible, |graph| graph.bg(rgb(p.surface)))
             .when(self.header_visible, |graph| {
                 graph.child(
                     div()

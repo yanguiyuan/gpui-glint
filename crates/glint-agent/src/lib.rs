@@ -161,6 +161,7 @@ pub struct AgentWorkspace {
     queued_requests: std::collections::HashMap<u64, (Uuid, provider::Config)>,
     group_list: Entity<GroupList>,
     calendar: Entity<Calendar>,
+    calendar_refresh: Option<Task<()>>,
 
     vault: Entity<glint_vault::VaultPage>,
     host_owns_vault: bool,
@@ -695,6 +696,7 @@ impl AgentWorkspace {
             page: crate::Page::Chat,
             group_list,
             calendar,
+            calendar_refresh: None,
             schedules,
             schedule_editor,
 

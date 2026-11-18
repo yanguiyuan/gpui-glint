@@ -284,7 +284,9 @@ impl ProjectFiles {
         self.mode = ExplorerMode::Graph;
         if self.graph.is_none() {
             let graph = cx.new(|cx| {
-                let mut graph = GitGraph::new(cx).header_visible(false);
+                let mut graph = GitGraph::new(cx)
+                    .header_visible(false)
+                    .background_visible(false);
                 graph.set_theme(self.theme, cx);
                 graph
             });
@@ -353,7 +355,9 @@ impl ProjectFiles {
         self.mode = ExplorerMode::Changes;
         if self.changes.is_none() {
             let changes = cx.new(|cx| {
-                let mut panel = ChangeNavigation::new(cx).stage_controls(true);
+                let mut panel = ChangeNavigation::new(cx)
+                    .stage_controls(true)
+                    .background_visible(false);
                 panel.set_theme(self.theme, cx);
                 panel
             });
@@ -602,7 +606,7 @@ impl ProjectFiles {
                         .rounded(px(12.))
                         .border_1()
                         .border_color(rgb(p.border))
-                        .bg(rgb(p.surface))
+                        .bg(rgb(p.workspace))
                         .debug_selector(|| "project-commit-message".into())
                         .child(
                             div()
