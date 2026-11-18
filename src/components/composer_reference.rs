@@ -105,20 +105,30 @@ impl ComposerReference {
         }
     }
     pub fn is_present(&self, text: &str) -> bool {
-        if self.token.is_empty() {
-            return false;
-        }
-        text.match_indices(&self.token).any(|(start, _)| {
-            (start == 0
-                || text[..start]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_whitespace))
-                && text[start + self.token.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| c.is_whitespace() || ",，。;；)]}".contains(c))
-        })
+        self.token_ranges(text).next().is_some()
+    }
+
+    pub fn token_ranges<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        Some(&self.token)
+            .filter(|token| !token.is_empty())
+            .into_iter()
+            .flat_map(move |token| text.match_indices(token))
+            .filter_map(move |(start, token)| {
+                let end = start + token.len();
+                let matches = (start == 0
+                    || text[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+                    && text[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || ",，。;；)]}".contains(c));
+                matches.then_some(start..end)
+            })
     }
     pub fn prompt(&self) -> String {
         let range = match (self.start_line, self.end_line) {

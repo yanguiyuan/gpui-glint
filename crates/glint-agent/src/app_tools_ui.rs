@@ -5,14 +5,8 @@ pub struct MarkdownView {
     source: SharedString,
     theme: ThemePreset,
     editor: Entity<gpui_glint::components::DocumentEditor>,
-    pub(super) root: Option<PathBuf>,
-    pub(super) paths: std::collections::HashSet<String>,
+    root: Option<PathBuf>,
     last_used: std::time::Instant,
-    pub(super) links_source: Option<SharedString>,
-    render_source: SharedString,
-    link_replacements: Vec<(std::ops::Range<usize>, String)>,
-    pub(super) links_revision: u64,
-    pub(super) links_task: Option<Task<()>>,
     follow_tail: bool,
     _link_subscription: Subscription,
 }
@@ -616,15 +610,6 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::BatchProgress { call_id, tools } => {
-                                    let previous = this
-                                        .run(id)
-                                        .tool_activity
-                                        .iter()
-                                        .find(|r| r.call.id == call_id)
-                                        .map_or(0, |r| r.nested_tools.len());
-                                    for child in tools.iter().skip(previous) {
-                                        this.invalidate_preview_paths(id, child);
-                                    }
                                     if let Some(record) = this
                                         .run_mut(id)
                                         .tool_activity
@@ -724,17 +709,6 @@ impl AgentWorkspace {
                                     }
                                 }
                                 tools::ToolEvent::Completed(record) => {
-                                    if record.success
-                                        || matches!(
-                                            record.call.name.as_str(),
-                                            "run_command"
-                                                | "command_poll"
-                                                | "command_stop"
-                                                | "code_mode"
-                                        )
-                                    {
-                                        this.invalidate_preview_paths(id, &record);
-                                    }
                                     if record.call.name.starts_with("schedule_") {
                                         this.refresh_calendar(cx);
                                     }
@@ -1203,17 +1177,11 @@ impl AgentWorkspace {
             );
             let source = SharedString::from(text.to_owned());
             MarkdownView {
-                source: source.clone(),
+                source,
                 theme,
                 editor,
                 root: root.clone(),
-                paths: Default::default(),
                 last_used: std::time::Instant::now(),
-                links_source: None,
-                render_source: source,
-                link_replacements: Vec::new(),
-                links_revision: 0,
-                links_task: None,
                 follow_tail: false,
                 _link_subscription: subscription,
             }
@@ -1227,15 +1195,10 @@ impl AgentWorkspace {
         }
         if view.source.as_ref() != text || view.theme != theme {
             let changed = view.source.as_ref() != text;
-            if changed {
-                file_preview::retain_decorations(&view.source, text, &mut view.link_replacements);
-                view.render_source =
-                    file_preview::apply_decorations(text, &view.link_replacements).into();
-            }
             view.editor.update(cx, |editor, cx| {
                 editor.set_theme(theme, cx);
                 if changed {
-                    editor.sync_preview_markdown(&view.render_source, cx);
+                    editor.sync_preview_markdown(text, cx);
                 }
             });
             if changed {
@@ -1243,66 +1206,9 @@ impl AgentWorkspace {
             }
             view.theme = theme;
         }
-        if view.links_source.as_deref() != Some(text) {
-            view.links_source = Some(view.source.clone());
-            view.links_revision += 1;
-            let revision = view.links_revision;
-            let source = view.source.clone();
-            let paths = self.file_preview.paths.clone();
-            let task_key = key.clone();
-            view.links_task = Some(cx.spawn(async move |weak, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(250))
-                    .await;
-                let work_source = source.to_string();
-                let work_root = root.clone();
-                let work = cx.background_executor().spawn(async move {
-                    if work_root.as_deref().is_some_and(ssh_project::is_remote) {
-                        provider::Job::start(file_preview::decorate_cached(
-                            work_source,
-                            work_root,
-                            paths,
-                        ))?
-                        .result()
-                        .await
-                    } else {
-                        file_preview::decorate_cached(work_source, work_root, paths).await
-                    }
-                });
-                let result = work.await;
-                let _ = weak.update(cx, |this, cx| {
-                    let mut cache = this.markdown_views.borrow_mut();
-                    if let Some(view) = cache.get_mut(&task_key) {
-                        if view.links_revision != revision
-                            || view.source != source
-                            || view.root != root
-                        {
-                            return;
-                        }
-                        if let Some(task) = view.links_task.take() {
-                            task.detach();
-                        }
-                        if let Ok(result) = result {
-                            view.paths = result.paths;
-                            view.link_replacements = result.replacements;
-                            let markdown = result.markdown;
-                            if view.render_source.as_ref() != markdown {
-                                view.editor.update(cx, |editor, cx| {
-                                    editor.sync_preview_markdown(&markdown, cx)
-                                });
-                                view.render_source = markdown.into();
-                            }
-                        }
-                    }
-                });
-            }));
-        }
         let editor = view.editor.clone();
         if prune {
-            let mut bytes: usize = cache
-                .values()
-                .map(|v| v.source.len() + v.render_source.len())
-                .sum();
+            let mut bytes: usize = cache.values().map(|v| v.source.len()).sum();
             while cache.len() > 256 || bytes > 16 * 1024 * 1024 && cache.len() > 1 {
                 let oldest = cache
                     .iter()
@@ -1313,7 +1219,7 @@ impl AgentWorkspace {
                     break;
                 };
                 if let Some(old) = cache.remove(&oldest) {
-                    bytes = bytes.saturating_sub(old.source.len() + old.render_source.len());
+                    bytes = bytes.saturating_sub(old.source.len());
                 }
             }
         }
@@ -1984,53 +1890,6 @@ fn process_prefix_len(blocks: &[generation::ContentBlock], complete: bool) -> us
 mod tests {
     use super::*;
     use generation::ContentBlock::{Text, Thinking};
-
-    #[gpui::test]
-    fn streamed_answer_and_thinking_keep_path_decorations_between_lookups(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            directory.path().join("providers.json"),
-            r#"{"providers":[],"active":null,"active_model":""}"#,
-        )
-        .unwrap();
-        let (host, window) = cx.add_window_view(|_, cx| {
-            AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)
-        });
-        host.update(window, |host, cx| {
-            let source = "查看 `src/main.rs`。";
-            for (key, scrollable) in [("stream-answer", false), ("stream-thinking:thinking", true)]
-            {
-                let editor = host.markdown_preview(key.into(), source, scrollable, cx);
-                let range = source.find('`').unwrap()..source.rfind('`').unwrap() + 1;
-                {
-                    let mut cache = host.markdown_views.borrow_mut();
-                    let view = cache.get_mut(key).unwrap();
-                    view.link_replacements =
-                        vec![(range, "[`src/main.rs`](glint-preview:verified)".into())];
-                    view.render_source =
-                        file_preview::apply_decorations(source, &view.link_replacements).into();
-                    editor.update(cx, |editor, cx| {
-                        editor.sync_preview_markdown(&view.render_source, cx)
-                    });
-                }
-                for suffix in ["继续", "继续补充总结", "继续补充总结\n\n下一段"] {
-                    let updated = host.markdown_preview(
-                        key.into(),
-                        &format!("{source}{suffix}"),
-                        scrollable,
-                        cx,
-                    );
-                    assert_eq!(updated.entity_id(), editor.entity_id());
-                    let cache = host.markdown_views.borrow();
-                    let view = &cache[key];
-                    assert!(view.render_source.contains("glint-preview:verified"));
-                    assert!(view.render_source.ends_with(suffix));
-                }
-            }
-        });
-    }
 
     #[gpui::test]
     fn thinking_toggle_survives_a_stream_update_during_click(cx: &mut gpui::TestAppContext) {

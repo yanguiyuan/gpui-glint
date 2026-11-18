@@ -665,14 +665,6 @@ impl AgentWorkspace {
                 };
                 this.edits_ui.undo_notice = Some((session, message));
                 this.edits_ui.aggregates.borrow_mut().clear();
-                this.file_preview.paths.invalidate(&root, None);
-                for view in this.markdown_views.borrow_mut().values_mut() {
-                    if view.root == root {
-                        view.links_source = None;
-                        view.links_revision += 1;
-                        view.links_task = None;
-                    }
-                }
                 this.reload_preview_after_undo(&outcome.restored, cx);
                 if this.edits_ui.open
                     && this.edits_ui.workspace_mode
@@ -3952,10 +3944,6 @@ impl ConflictView {
                                     .any(|view| view.entity_id() == weak.entity_id())
                             {
                                 workspace.refresh_workspace_edits(cx);
-                                workspace
-                                    .file_preview
-                                    .paths
-                                    .invalidate(&Some(this.project.clone()), None);
                             }
                         });
                     }

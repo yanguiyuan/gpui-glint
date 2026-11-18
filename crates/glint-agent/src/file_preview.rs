@@ -1,10 +1,8 @@
-//! Existing path references in chat are resolved off the UI thread, then linked.
+//! Explicit chat file links resolve on activation. File content loads in the background.
 use super::*;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use gpui_glint::components::{FilePreview, FilePreviewEntry, FilePreviewEvent};
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, ops::Range, path::Path};
+use std::{collections::HashMap, path::Path};
 const IMAGE_LIMIT: u64 = 20 * 1024 * 1024;
 fn is_png(path: &Path) -> bool {
     path.extension()
@@ -12,98 +10,12 @@ fn is_png(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 const LIMIT: u64 = 2 * 1024 * 1024;
-const PREFIX: &str = "glint-preview:";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub root: Option<PathBuf>,
     pub path: String,
     pub line: Option<usize>,
-}
-impl Target {
-    fn link(&self) -> String {
-        format!(
-            "{PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap())
-        )
-    }
-    fn decode(link: &str) -> Option<Self> {
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(link.strip_prefix(PREFIX)?).ok()?).ok()
-    }
-}
-struct Candidate {
-    range: Range<usize>,
-    value: String,
-    explicit: bool,
-}
-fn plausible_reference(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && !value
-            .chars()
-            .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
-        && !matches!(value, "or" | "and" | "或" | "且")
-}
-fn candidates(source: &str) -> Vec<Candidate> {
-    let mut result = Vec::new();
-    let mut in_link = false;
-    let mut in_block = false;
-    let mut link_start = None;
-    for (event, range) in Parser::new(source).into_offset_iter() {
-        if result.len() >= 128 {
-            break;
-        }
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => in_block = true,
-            Event::End(TagEnd::CodeBlock) => in_block = false,
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                in_link = true;
-                link_start = Some((range.start, dest_url.to_string()));
-            }
-            Event::End(TagEnd::Link) => {
-                if let Some((start, value)) = link_start.take() {
-                    result.push(Candidate {
-                        range: start..range.end,
-                        value,
-                        explicit: true,
-                    });
-                }
-                in_link = false;
-            }
-            Event::Code(value) if !in_block && !in_link && plausible_reference(&value) => result
-                .push(Candidate {
-                    range,
-                    value: value.to_string(),
-                    explicit: false,
-                }),
-            Event::Text(value)
-                if !in_block && !in_link && source.get(range.clone()) == Some(value.as_ref()) =>
-            {
-                let mut offset = 0;
-                for token in value.split_inclusive(char::is_whitespace) {
-                    let text = token.trim_matches(|c: char| {
-                        c.is_whitespace() || "，。；、,;!?()[]{}\"'<>".contains(c)
-                    });
-                    if plausible_reference(text)
-                        && (text.contains('/') || text.contains('\\') || text.contains('.'))
-                    {
-                        let start = range.start + offset + token.find(text).unwrap();
-                        result.push(Candidate {
-                            range: start..start + text.len(),
-                            value: text.into(),
-                            explicit: false,
-                        });
-                    }
-                    offset += token.len();
-                    if result.len() >= 128 {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    result
 }
 fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
     let mut value = value
@@ -153,8 +65,10 @@ fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
             return None;
         }
         value = cited.directory;
-    } else if value.contains("://") || value.starts_with(PREFIX) || value.contains(['=', '|', '`'])
-    {
+    } else if value.contains("://") || value.contains(['=', '|', '`']) {
+        return None;
+    }
+    if value.is_empty() || value.starts_with('#') {
         return None;
     }
     if remote {
@@ -180,6 +94,27 @@ fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
         line,
     })
 }
+
+fn markdown_target(link: &str, root: &Option<PathBuf>) -> Option<Target> {
+    // Leave web schemes and fragment-only links to their own handlers.
+    // A colon can also be part of a Windows drive or a path:line destination.
+    if link.starts_with('#') || link.starts_with("//") {
+        return None;
+    }
+    if let Some((prefix, rest)) = link.split_once(':')
+        && prefix.starts_with(|c: char| c.is_ascii_alphabetic())
+        && prefix
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
+        && !matches!(prefix, "file" | "ssh")
+        && !rest.starts_with(|c: char| c.is_ascii_digit())
+        && !(cfg!(windows) && prefix.len() == 1 && rest.starts_with(['/', '\\']))
+    {
+        return None;
+    }
+    target(link, root)
+}
+
 fn previewable(path: &Path) -> bool {
     use std::io::Read;
     let Ok(meta) = std::fs::metadata(path) else {
@@ -202,21 +137,6 @@ fn previewable(path: &Path) -> bool {
     match std::str::from_utf8(&bytes) {
         Ok(_) => true,
         Err(e) => e.error_len().is_none(),
-    }
-}
-const PATH_CACHE_LIMIT: usize = 2048;
-const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
-pub struct PathCache {
-    epoch: std::sync::atomic::AtomicU64,
-    values: std::sync::Mutex<HashMap<(Option<PathBuf>, String), (std::time::Instant, bool)>>,
-    // Concurrent messages share completed lookups, including missing files.
-    gate: tokio::sync::Mutex<()>,
-    ttl: std::time::Duration,
-    limit: usize,
-}
-impl Default for PathCache {
-    fn default() -> Self {
-        Self::new(PATH_CACHE_TTL, PATH_CACHE_LIMIT)
     }
 }
 fn path_key(root: &Option<PathBuf>, path: &str) -> String {
@@ -242,183 +162,6 @@ fn path_key(root: &Option<PathBuf>, path: &str) -> String {
         }
     }
     normalized.to_string_lossy().into_owned()
-}
-impl PathCache {
-    fn new(ttl: std::time::Duration, limit: usize) -> Self {
-        Self {
-            epoch: Default::default(),
-            values: Default::default(),
-            gate: Default::default(),
-            ttl,
-            limit: limit.max(1),
-        }
-    }
-    pub fn invalidate(&self, root: &Option<PathBuf>, path: Option<&str>) {
-        self.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = path.map(|path| path_key(root, path));
-        self.values
-            .lock()
-            .unwrap()
-            .retain(|(r, p), _| r != root || path.as_ref().is_some_and(|path| path != p));
-    }
-}
-pub struct Decorated {
-    pub markdown: String,
-    pub paths: std::collections::HashSet<String>,
-    pub replacements: Vec<(Range<usize>, String)>,
-}
-
-pub fn apply_decorations(source: &str, replacements: &[(Range<usize>, String)]) -> String {
-    let mut result = source.to_owned();
-    for (range, replacement) in replacements.iter().rev() {
-        result.replace_range(range.clone(), replacement);
-    }
-    result
-}
-
-/// Keep verified links while new tokens arrive, but re-check Markdown context:
-/// a growing path or a newly opened code fence must not inherit an old link.
-pub fn retain_decorations(
-    previous: &str,
-    source: &str,
-    replacements: &mut Vec<(Range<usize>, String)>,
-) {
-    let previous_candidates = candidates(previous);
-    let candidates = candidates(source);
-    replacements.retain(|(range, _)| {
-        source.get(range.clone()) == previous.get(range.clone())
-            && candidates.iter().any(|candidate| {
-                candidate.range == *range
-                    && previous_candidates.iter().any(|old| {
-                        old.range == *range
-                            && old.value == candidate.value
-                            && old.explicit == candidate.explicit
-                    })
-            })
-    });
-}
-#[cfg(test)]
-pub async fn decorate(source: String, root: Option<PathBuf>) -> Result<String, String> {
-    decorate_cached(source, root, Default::default())
-        .await
-        .map(|r| r.markdown)
-}
-pub async fn decorate_cached(
-    source: String,
-    root: Option<PathBuf>,
-    cache: std::sync::Arc<PathCache>,
-) -> Result<Decorated, String> {
-    let candidates = candidates(&source);
-    // Resolve every candidate once: the normalized key is what the cache stores,
-    // so equivalent spellings of one file share a single lookup.
-    let targets: Vec<_> = candidates
-        .iter()
-        .filter_map(|candidate| {
-            target(&candidate.value, &root).map(|target| {
-                let key = path_key(&root, &target.path);
-                (candidate, target, key)
-            })
-        })
-        .collect();
-    let dependencies = targets.iter().map(|(_, _, key)| key.clone()).collect();
-    let _gate = cache.gate.lock().await;
-    let epoch = cache.epoch.load(std::sync::atomic::Ordering::Relaxed);
-    let mut available = HashMap::new();
-    let mut missing = Vec::new();
-    {
-        let values = cache.values.lock().unwrap();
-        for (_, _, key) in &targets {
-            if available.contains_key(key) || missing.contains(key) {
-                continue;
-            }
-            match values
-                .get(&(root.clone(), key.clone()))
-                .filter(|(checked, _)| checked.elapsed() < cache.ttl)
-            {
-                Some((_, value)) => {
-                    available.insert(key.clone(), *value);
-                }
-                None => missing.push(key.clone()),
-            }
-        }
-    }
-    let mut fresh = HashMap::new();
-    if let Some(root) = root.as_deref().filter(|p| ssh_project::is_remote(p)) {
-        if !missing.is_empty() {
-            let response = ssh_project::Remote::from_path(root)?
-                .action("preview_stat", serde_json::json!({"paths":missing}), true)
-                .await?;
-            for (path, kind) in response.as_object().ok_or("远程预览检查响应无效")? {
-                fresh.insert(
-                    path.clone(),
-                    matches!(kind.as_str(), Some("directory" | "text" | "image")),
-                );
-            }
-        }
-    } else {
-        for key in missing {
-            let exists = {
-                let path = Path::new(&key);
-                path.is_dir() || previewable(path)
-            };
-            fresh.insert(key, exists);
-        }
-    }
-    if !fresh.is_empty() {
-        let mut values = cache.values.lock().unwrap();
-        // Validate the generation under the same lock as the insertion: an
-        // invalidation between a pre-lock check and this lock must win.
-        if cache.epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch {
-            for (key, value) in &fresh {
-                if values.len() >= cache.limit
-                    && let Some(oldest) = values
-                        .iter()
-                        .min_by_key(|(_, v)| v.0)
-                        .map(|(k, _)| k.clone())
-                {
-                    values.remove(&oldest);
-                }
-                values.insert(
-                    (root.clone(), key.clone()),
-                    (std::time::Instant::now(), *value),
-                );
-            }
-        }
-    }
-    available.extend(fresh);
-    let mut replacements = Vec::new();
-    for (candidate, target, key) in targets {
-        if available.get(&key) != Some(&true) {
-            continue;
-        }
-        let original = &source[candidate.range.clone()];
-        let label = if candidate.explicit {
-            // Keep the original link label, replacing only its destination.
-            original
-                .strip_prefix('[')
-                .and_then(|s| {
-                    s.rsplit_once("](")
-                        .or_else(|| s.rsplit_once("]["))
-                        .map(|(label, _)| label)
-                        .or_else(|| s.strip_suffix(']'))
-                })
-                .map(str::to_owned)
-                .unwrap_or_else(|| candidate.value.replace(['[', ']'], ""))
-        } else {
-            original.to_owned()
-        };
-        replacements.push((
-            candidate.range.clone(),
-            format!("[{label}]({})", target.link()),
-        ));
-    }
-    let result = apply_decorations(&source, &replacements);
-    Ok(Decorated {
-        markdown: result,
-        paths: dependencies,
-        replacements,
-    })
 }
 pub(super) enum Loaded {
     File(String),
@@ -621,7 +364,6 @@ pub struct State {
     pub open: bool,
     pub expanded: bool,
     pub view: Entity<FilePreview>,
-    pub paths: std::sync::Arc<PathCache>,
     target: Option<Target>,
     task: Option<Task<()>>,
     revision: u64,
@@ -719,7 +461,6 @@ impl State {
             open: false,
             expanded: false,
             view,
-            paths: Default::default(),
             target: None,
             task: None,
             revision: 0,
@@ -729,63 +470,6 @@ impl State {
     }
 }
 impl AgentWorkspace {
-    pub fn invalidate_preview_paths(&self, id: Uuid, record: &tools::ToolRecord) {
-        let Some(session) = self.history.sessions.iter().find(|s| s.id == id) else {
-            return;
-        };
-        let root = session.project.clone();
-        let path = match record.call.name.as_str() {
-            "write_file" | "replace_in_file" => record
-                .call
-                .arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|p| target(p, &root))
-                .map(|t| t.path),
-            "code_mode" => {
-                for child in record.nested_tools.iter() {
-                    self.invalidate_preview_paths(id, child);
-                }
-                return;
-            }
-            "command_poll" | "command_stop" => {
-                if serde_json::from_str::<serde_json::Value>(&record.result)
-                    .ok()
-                    .is_some_and(|v| v["status"] == "running")
-                {
-                    return;
-                }
-                None
-            }
-            "run_command" => {
-                let program = record.call.arguments["program"].as_str().unwrap_or("");
-                let args = record.call.arguments["args"].as_array();
-                let readonly = matches!(program, "pwd" | "ls" | "cat" | "head" | "tail" | "wc")
-                    || program == "git"
-                        && args
-                            .and_then(|a| a.first())
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|a| matches!(a, "status" | "ls-files"));
-                if readonly {
-                    return;
-                }
-                None
-            }
-            _ => return,
-        };
-        self.file_preview.paths.invalidate(&root, path.as_deref());
-        let key = path.as_deref().map(|p| path_key(&root, p));
-        for view in self.markdown_views.borrow_mut().values_mut() {
-            if view.root == root
-                && (key.as_ref().is_none_or(|p| view.paths.contains(p))
-                    || view.links_task.is_some())
-            {
-                view.links_source = None;
-                view.links_revision += 1;
-                view.links_task = None;
-            }
-        }
-    }
     pub fn reload_preview_after_undo(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         if !self.file_preview.open {
             return;
@@ -868,7 +552,10 @@ impl AgentWorkspace {
         cx.notify();
     }
     pub fn preview_link(&mut self, link: &str, origin: &Option<PathBuf>, cx: &mut Context<Self>) {
-        if let Some(location) = link.strip_prefix("glint-paste://") {
+        if let Some(location) = link
+            .strip_prefix("glint-paste://")
+            .or_else(|| link.strip_prefix("glint-reference://"))
+        {
             let parts: Vec<_> = location.split('/').collect();
             if parts.len() != 3 {
                 return;
@@ -894,6 +581,13 @@ impl AgentWorkspace {
             else {
                 return;
             };
+            if !reference.text_attachment {
+                if let Some(mut target) = target(&reference.path, origin) {
+                    target.line = reference.start_line;
+                    self.open_file_preview(target, cx);
+                }
+                return;
+            }
             let Some(content) = reference.excerpt else {
                 return;
             };
@@ -912,12 +606,10 @@ impl AgentWorkspace {
             cx.notify();
             return;
         }
-        if let Some(target) = Target::decode(link) {
-            if &target.root == origin {
-                self.open_file_preview(target, cx);
-            }
-        } else if link.starts_with("https://") || link.starts_with("http://") {
+        if link.starts_with("https://") || link.starts_with("http://") {
             cx.open_url(link);
+        } else if let Some(target) = markdown_target(link, origin) {
+            self.open_file_preview(target, cx);
         }
     }
     pub(super) fn preview_changed_file(
@@ -1094,8 +786,56 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[gpui::test]
-    fn pasted_attachment_links_open_without_reading_a_project_file(cx: &mut gpui::TestAppContext) {
+    fn streamed_markdown_keeps_explicit_file_links_and_opens_only_on_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        host.update(window, |host, cx| {
+            let root = Some(dir.path().to_path_buf());
+            host.history.active_mut().project = root.clone();
+            let text = "正文 main.rs、`src/main.rs` 和 [入口（第 42 行）](src/main.rs#L42)";
+            let editor = host.markdown_text("answer".into(), text, cx);
+            let updated = format!("{text}。");
+            let same = host.markdown_text("answer".into(), &updated, cx);
+            assert_eq!(editor.entity_id(), same.entity_id());
+            assert_eq!(editor.read(cx).markdown(), updated);
+            assert!(!host.file_preview.open);
+            assert!(host.file_preview.task.is_none());
+
+            editor.update(cx, |_, cx| {
+                cx.emit(gpui_glint::components::DocumentEvent::LinkActivated(
+                    "src/main.rs#L42".into(),
+                ));
+            });
+        });
+        host.update(window, |host, _| {
+            assert!(host.file_preview.open);
+            assert_eq!(
+                host.file_preview.target,
+                Some(Target {
+                    root: Some(dir.path().into()),
+                    path: dir
+                        .path()
+                        .join("src/main.rs")
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: Some(42),
+                })
+            );
+        });
+    }
+    #[gpui::test]
+    fn draft_reference_links_open_their_saved_text_or_file(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("providers.json"),
@@ -1131,6 +871,28 @@ mod tests {
                 host.preview_link(&link, &None, cx);
                 assert!(!host.file_preview.open);
             }
+
+            let root = Some(dir.path().to_path_buf());
+            host.history.active_mut().project = root.clone();
+            let mut reference =
+                gpui_glint::components::ComposerReference::selection("src/main.rs", 7, 9, "...");
+            reference.token = reference.label();
+            let submission = ComposerSubmission {
+                text: format!("{} @main.rs:7-99", reference.token).into(),
+                references: vec![reference],
+                images: vec![],
+            };
+            let display = model::MessageDisplay::from_submission(&submission).unwrap();
+            let link = format!("glint-reference://{id}/0/0");
+            assert_eq!(
+                display.markdown(id, 0),
+                format!("[@main.rs:7-9]({link}) @main.rs:7-99")
+            );
+            host.history.active_mut().messages[0].display = Some(display);
+            host.preview_link(&link, &root, cx);
+            let target = host.file_preview.target.as_ref().unwrap();
+            assert_eq!(Path::new(&target.path), dir.path().join("src/main.rs"));
+            assert_eq!(target.line, Some(7));
         });
     }
     #[gpui::test]
@@ -1159,14 +921,6 @@ mod tests {
                 assert!(!host.edits_ui.open && !host.git_ui.open && !host.terminal_ui.open);
             })
         });
-    }
-    fn rendered(source: &str) -> String {
-        Parser::new(source)
-            .filter_map(|e| match e {
-                Event::Text(s) | Event::Code(s) => Some(s.to_string()),
-                _ => None,
-            })
-            .collect()
     }
     #[tokio::test]
     async fn png_preview_loads_bytes_and_is_available_in_directory() {
@@ -1226,46 +980,6 @@ mod tests {
         assert!(load_excerpt(target, reference).await.is_err());
     }
     #[tokio::test]
-    async fn standalone_path_separators_and_operators_are_not_file_references() {
-        let source = "`document.rs` / `rich_text.rs` 或 `|`、`||`、`/`、`\\`、`&&`。";
-        let candidates = candidates(source);
-        assert!(
-            !candidates.iter().any(|candidate| matches!(
-                candidate.value.as_str(),
-                "/" | "\\" | "|" | "||" | "&&"
-            ))
-        );
-        let result = decorate(source.into(), Some(std::env::temp_dir()))
-            .await
-            .unwrap();
-        assert!(!result.contains(PREFIX));
-    }
-
-    #[tokio::test]
-    async fn existing_references_link_without_changing_visible_text_or_fenced_code() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(dir.path().join("README.md"), "# readme").unwrap();
-        std::fs::write(dir.path().join("image.bin"), [0, 1, 2]).unwrap();
-        let source = "查看 `src/main.rs:12:5`、`src/`、README.md，[入口](src/main.rs#L2)。`missing.rs` `image.bin`\n\n```sh\nsrc/main.rs\n```\n\n[引用][code]\n\n[code]: src/main.rs\n";
-        let result = decorate(source.into(), Some(dir.path().into()))
-            .await
-            .unwrap();
-        assert_eq!(rendered(source), rendered(&result));
-        let targets: Vec<_> = Parser::new(&result)
-            .filter_map(|e| match e {
-                Event::Start(Tag::Link { dest_url, .. }) => Target::decode(&dest_url),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(targets.len(), 5, "{result}");
-        assert_eq!(targets[0].line, Some(12));
-        assert_eq!(targets[3].line, Some(2));
-        assert!(result.contains("```sh\nsrc/main.rs\n```"));
-        assert!(result.contains("`missing.rs` `image.bin`"));
-    }
-    #[tokio::test]
     async fn local_preview_handles_text_directories_binary_and_removed_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("folder")).unwrap();
@@ -1273,7 +987,6 @@ mod tests {
         std::fs::write(dir.path().join("b.bin"), [0, 1, 2]).unwrap();
         let root = Some(dir.path().to_path_buf());
         let t = target("a.txt#L2", &root).unwrap();
-        assert_eq!(Target::decode(&t.link()), Some(t.clone()));
         assert!(
             matches!(load(t.clone()).await.unwrap().2, Loaded::File(ref s) if s.contains("βeta"))
         );
@@ -1292,20 +1005,19 @@ mod tests {
         assert!(load(target("b.bin", &root).unwrap()).await.is_err());
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         assert!(load(t).await.is_err());
-        assert!(
-            !decorate("`a.txt`".into(), root)
-                .await
-                .unwrap()
-                .contains(PREFIX)
-        );
     }
     #[test]
     fn references_do_not_automatically_connect_to_other_ssh_hosts() {
         let root = Some(PathBuf::from("ssh://user@example.com/home/user/project"));
-        assert!(target("ssh://other@example.org/etc/passwd", &root).is_none());
-        assert!(target("ssh://user@example.com/etc/hosts#L4", &root).is_some());
-        assert!(target("https://example.com/path.rs", &root).is_none());
-        assert_eq!(target("src/main.rs:42:5", &root).unwrap().line, Some(42));
+        assert!(markdown_target("ssh://other@example.org/etc/passwd", &root).is_none());
+        assert!(markdown_target("ssh://user@example.com/etc/hosts#L4", &root).is_some());
+        for link in ["https://example.com/path.rs", "mailto:hello@host", "#L42"] {
+            assert!(markdown_target(link, &root).is_none());
+        }
+        assert_eq!(
+            markdown_target("src/main.rs:42:5", &root).unwrap().line,
+            Some(42)
+        );
     }
     #[gpui::test]
     fn ordinary_file_references_load_display_preview_without_sending_source(
@@ -1707,139 +1419,5 @@ mod tests {
             assert!(h.right_sidebar_resize.is_none());
         });
         assert_eq!(std::fs::read_to_string(path).unwrap(), "read only\n");
-    }
-
-    #[tokio::test]
-    async fn streamed_paths_keep_verified_links_and_drop_changed_markdown_context() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
-        let source = "查看 `a.rs`，继续说明。";
-        let decorated = decorate_cached(source.into(), Some(dir.path().into()), Default::default())
-            .await
-            .unwrap();
-        assert_eq!(decorated.replacements.len(), 1);
-        let mut replacements = decorated.replacements.clone();
-        let appended = format!("{source}\n\n新的总结 **结果**");
-        retain_decorations(source, &appended, &mut replacements);
-        assert_eq!(
-            apply_decorations(&appended, &replacements),
-            format!("{}\n\n新的总结 **结果**", decorated.markdown)
-        );
-        let changed = "查看 `a.rsx`，继续说明。";
-        retain_decorations(source, changed, &mut replacements);
-        assert!(replacements.is_empty());
-        let code = "a.rs";
-        let decorated = decorate_cached(code.into(), Some(dir.path().into()), Default::default())
-            .await
-            .unwrap();
-        let mut replacements = decorated.replacements;
-        // Same byte range, but the line now belongs to a setext heading.
-        // It is still a path candidate and can keep its link.
-        retain_decorations(code, "a.rs\n----", &mut replacements);
-        assert_eq!(replacements.len(), 1);
-        retain_decorations(code, "a.rsx", &mut replacements);
-        assert!(replacements.is_empty());
-    }
-
-    #[tokio::test]
-    async fn path_cache_shares_lookups_within_its_ttl_and_after_invalidation() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Some(dir.path().to_path_buf());
-        std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
-        let cache = std::sync::Arc::new(PathCache::default());
-        let decorate = |cache: std::sync::Arc<PathCache>| {
-            let root = root.clone();
-            async move {
-                decorate_cached("`a.rs` 与 `src/../a.rs`".into(), root, cache)
-                    .await
-                    .unwrap()
-            }
-        };
-        let first = decorate(cache.clone()).await;
-        assert!(first.markdown.contains(PREFIX));
-        assert_eq!(first.paths.len(), 1, "equivalent spellings share one key");
-        std::fs::remove_file(dir.path().join("a.rs")).unwrap();
-        // Inside the TTL the cached answer links without touching the disk again.
-        assert!(decorate(cache.clone()).await.markdown.contains(PREFIX));
-        cache.invalidate(&root, Some("a.rs"));
-        assert!(!decorate(cache.clone()).await.markdown.contains(PREFIX));
-    }
-
-    #[tokio::test]
-    async fn expired_entries_and_the_limit_keep_the_cache_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Some(dir.path().to_path_buf());
-        std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
-        let expired = std::sync::Arc::new(PathCache::new(std::time::Duration::ZERO, 8));
-        assert!(
-            decorate_cached("`a.rs`".into(), root.clone(), expired.clone())
-                .await
-                .unwrap()
-                .markdown
-                .contains(PREFIX)
-        );
-        std::fs::remove_file(dir.path().join("a.rs")).unwrap();
-        assert!(
-            !decorate_cached("`a.rs`".into(), root.clone(), expired)
-                .await
-                .unwrap()
-                .markdown
-                .contains(PREFIX)
-        );
-        let bounded = std::sync::Arc::new(PathCache::new(PATH_CACHE_TTL, 2));
-        for name in ["a", "b", "c", "d"] {
-            std::fs::write(dir.path().join(format!("{name}.md")), "x\n").unwrap();
-            let source = format!("`{name}.md`");
-            assert!(
-                decorate_cached(source, root.clone(), bounded.clone())
-                    .await
-                    .unwrap()
-                    .markdown
-                    .contains(PREFIX)
-            );
-        }
-        assert!(bounded.values.lock().unwrap().len() <= 2);
-    }
-
-    #[tokio::test]
-    async fn invalidation_is_scoped_to_one_root_or_path() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        for dir in [first.path(), second.path()] {
-            std::fs::write(dir.join("one.rs"), "1\n").unwrap();
-            std::fs::write(dir.join("two.rs"), "2\n").unwrap();
-        }
-        let roots = [
-            Some(first.path().to_path_buf()),
-            Some(second.path().to_path_buf()),
-        ];
-        let cache = std::sync::Arc::new(PathCache::default());
-        for root in &roots {
-            let decorated =
-                decorate_cached("`one.rs` `two.rs`".into(), root.clone(), cache.clone())
-                    .await
-                    .unwrap();
-            assert_eq!(decorated.paths.len(), 2);
-        }
-        assert_eq!(cache.values.lock().unwrap().len(), 4);
-        std::fs::remove_file(first.path().join("one.rs")).unwrap();
-        cache.invalidate(&roots[0], Some("one.rs"));
-        assert_eq!(cache.values.lock().unwrap().len(), 3);
-        assert!(
-            !decorate_cached("`one.rs`".into(), roots[0].clone(), cache.clone())
-                .await
-                .unwrap()
-                .markdown
-                .contains(PREFIX)
-        );
-        cache.invalidate(&roots[0], None);
-        assert_eq!(cache.values.lock().unwrap().len(), 2);
-        assert!(
-            decorate_cached("`one.rs`".into(), roots[1].clone(), cache.clone())
-                .await
-                .unwrap()
-                .markdown
-                .contains(PREFIX)
-        );
     }
 }

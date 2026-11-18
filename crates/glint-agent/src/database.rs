@@ -221,8 +221,21 @@ pub fn load_history(anchor: &Path) -> Result<Option<Value>, String> {
 pub fn save_ui_state(
     anchor: &Path,
     drafts: &[(uuid::Uuid, String)],
+    draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
     navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
 ) -> Result<(), String> {
+    let draft_attachments = draft_attachments
+        .into_iter()
+        .map(|(id, attachments)| {
+            let files = crate::model::persist_draft_images(anchor, &attachments.images)
+                .map_err(|e| e.to_string())?;
+            Ok((
+                id,
+                serde_json::to_string(&attachments.references).map_err(|e| e.to_string())?,
+                serde_json::to_string(&files).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut connection = open(anchor)?;
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
     if let Some((active, partner)) = navigation {
@@ -250,6 +263,17 @@ pub fn save_ui_state(
             .execute(
                 "UPDATE sessions SET draft=?2 WHERE id=?1",
                 params![id.to_string(), draft],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("草稿所属会话尚未保存，需要重试完整保存".into());
+        }
+    }
+    for (id, references, files) in draft_attachments {
+        let updated = transaction
+            .execute(
+                "UPDATE sessions SET payload=json_set(payload,'$.draft_references',json(?2),'$.draft_image_files',json(?3)) WHERE id=?1",
+                params![id.to_string(), references, files],
             )
             .map_err(|e| e.to_string())?;
         if updated == 0 {

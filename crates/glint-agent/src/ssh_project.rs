@@ -362,17 +362,6 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("file.rs"), "你好\nsource\n").unwrap();
         std::fs::write(dir.path().join("binary.bin"), [0, 255, 0]).unwrap();
-        let kinds = helper(
-            dir.path(),
-            "preview_stat",
-            json!({"paths":["src","file.rs","binary.bin","gone"]}),
-            true,
-        )
-        .unwrap();
-        assert_eq!(kinds["src"], "directory");
-        assert_eq!(kinds["file.rs"], "text");
-        assert!(kinds["binary.bin"].is_null());
-        assert!(kinds["gone"].is_null());
         let text = helper(dir.path(), "preview", json!({"path":"file.rs"}), true).unwrap();
         assert_eq!(text["content"], "你好\nsource\n");
         let listing = helper(dir.path(), "preview", json!({"path":"."}), true).unwrap();

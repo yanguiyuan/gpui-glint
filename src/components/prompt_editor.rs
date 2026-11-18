@@ -13,6 +13,11 @@ use gpui::{
     rgb, size,
 };
 
+#[cfg(target_os = "macos")]
+mod macos_pasteboard;
+
+const MAX_PASTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 actions!(
     glass_prompt_editor,
     [
@@ -164,7 +169,7 @@ fn clipboard_images(item: ClipboardItem) -> Result<Vec<PastedImage>, String> {
     if images.is_empty() {
         for entry in item.entries {
             if let ClipboardEntry::Image(image) = entry {
-                if image.bytes.len() > 20 * 1024 * 1024 {
+                if image.bytes.len() > MAX_PASTE_IMAGE_BYTES {
                     return Err("图片原始数据超过 20MB".into());
                 }
                 images.push(PastedImage(Arc::new(image)));
@@ -191,14 +196,15 @@ fn image_file(path: &Path) -> Result<Option<PastedImage>, String> {
         return Ok(None);
     };
     let file = std::fs::File::open(path).map_err(|_| "无法读取粘贴的图片文件")?;
-    if file.metadata().map_err(|_| "无法读取图片信息")?.len() > 20 * 1024 * 1024 {
+    if file.metadata().map_err(|_| "无法读取图片信息")?.len() > MAX_PASTE_IMAGE_BYTES as u64
+    {
         return Err("图片原始数据超过 20MB".into());
     }
     let mut bytes = Vec::new();
-    file.take(20 * 1024 * 1024 + 1)
+    file.take(MAX_PASTE_IMAGE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "无法读取图片")?;
-    if bytes.len() > 20 * 1024 * 1024 {
+    if bytes.len() > MAX_PASTE_IMAGE_BYTES {
         return Err("图片原始数据超过 20MB".into());
     }
     Ok(Some(PastedImage::new(format, bytes)))
@@ -816,7 +822,13 @@ impl PromptEditor {
         self.replace_selection("\n", cx);
     }
 
-    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Some(image) = macos_pasteboard::image_source(_window) {
+            self.paste_images(async move { image.read() }, None, cx);
+            return;
+        }
+
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -833,9 +845,16 @@ impl PromptEditor {
             return;
         }
         let fallback_text = item.text();
-        let read = cx
-            .background_executor()
-            .spawn(async move { clipboard_images(item) });
+        self.paste_images(async move { clipboard_images(item) }, fallback_text, cx);
+    }
+
+    fn paste_images(
+        &mut self,
+        read: impl Future<Output = Result<Vec<PastedImage>, String>> + Send + 'static,
+        fallback_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let read = cx.background_executor().spawn(read);
         self.paste_task = Some(cx.spawn(async move |weak, cx| {
             let result = read.await;
             let _ = weak.update(cx, |this, cx| match result {

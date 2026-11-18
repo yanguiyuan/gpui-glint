@@ -1,9 +1,16 @@
 //! A serialized background writer, independent from the view's lifetime.
 use super::*;
+use gpui_glint::components::{ComposerReference, PastedImage};
+
+pub(super) struct DraftAttachments {
+    pub images: Vec<PastedImage>,
+    pub references: Vec<ComposerReference>,
+}
 
 pub struct SaveRequest {
     pub history: Option<History>,
     pub drafts: Vec<(Uuid, String)>,
+    draft_attachments: std::collections::HashMap<Uuid, DraftAttachments>,
     pub navigation: Option<(Uuid, Option<Uuid>)>,
     pub revision: u64,
     pub complete: Option<tokio::sync::oneshot::Sender<()>>,
@@ -26,9 +33,11 @@ async fn write_requests(
             if let Some(history) = next.history.take() {
                 request.history = Some(history);
                 request.drafts.clear();
+                request.draft_attachments.clear();
                 request.navigation = None;
             }
             request.drafts.extend(next.drafts);
+            request.draft_attachments.extend(next.draft_attachments);
             if next.navigation.is_some() {
                 request.navigation = next.navigation;
             }
@@ -40,13 +49,24 @@ async fn write_requests(
                     session.draft = draft;
                 }
             }
+            for (id, attachments) in request.draft_attachments {
+                if let Some(session) = history.sessions.iter_mut().find(|s| s.id == id) {
+                    session.draft_images = attachments.images;
+                    session.draft_references = attachments.references;
+                }
+            }
             if let Some((active, partner)) = request.navigation {
                 history.active = active;
                 history.preferred_partner = partner;
             }
             history.save(&path).map_err(|error| error.to_string())
         } else {
-            database::save_ui_state(&path, &request.drafts, request.navigation)
+            database::save_ui_state(
+                &path,
+                &request.drafts,
+                request.draft_attachments,
+                request.navigation,
+            )
         };
         let _ = results.try_send((request.revision, result));
         for complete in barriers {
@@ -133,11 +153,30 @@ impl AgentWorkspace {
         }));
     }
 
+    pub(super) fn save_draft_attachments(&mut self, cx: &mut Context<Self>) {
+        if !self.storage_readable {
+            return;
+        }
+        let session = self.history.active();
+        self.draft_attachments_pending.insert(
+            session.id,
+            DraftAttachments {
+                images: session.draft_images.clone(),
+                references: session.draft_references.clone(),
+            },
+        );
+        self.save_draft(cx);
+    }
+
     fn enqueue_save(&mut self, complete: Option<tokio::sync::oneshot::Sender<()>>) {
         if let Some(sender) = &self.save_sender {
+            if self.save_full_pending {
+                self.draft_attachments_pending.clear();
+            }
             let _ = sender.try_send(SaveRequest {
                 history: self.save_full_pending.then(|| self.history.clone()),
                 drafts: self.save_drafts_pending.drain().collect(),
+                draft_attachments: std::mem::take(&mut self.draft_attachments_pending),
                 navigation: Some((self.history.active, self.history.preferred_partner)),
                 revision: self.save_revision,
                 complete,
@@ -150,6 +189,36 @@ impl AgentWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn adding_and_removing_composer_images_only_queues_the_active_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace =
+            cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+        let (sender, receiver) = async_channel::unbounded();
+        let (id, composer) = workspace.update(cx, |workspace, _| {
+            workspace.save_full_pending = false;
+            workspace.save_sender = Some(sender);
+            (workspace.history.active, workspace.composer.clone())
+        });
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        composer.update(cx, |composer, cx| {
+            composer.set_draft("draft", vec![image.clone()], cx);
+            cx.emit(ComposerEvent::AttachmentsChanged);
+        });
+        workspace.update(cx, |workspace, _| workspace.enqueue_save(None));
+        let request = receiver.try_recv().unwrap();
+        assert!(request.history.is_none());
+        assert_eq!(request.draft_attachments[&id].images, vec![image]);
+
+        composer.update(cx, |composer, cx| composer.clear_attachments(cx));
+        workspace.update(cx, |workspace, _| workspace.enqueue_save(None));
+        let request = receiver.try_recv().unwrap();
+        assert!(request.history.is_none());
+        assert!(request.draft_attachments[&id].images.is_empty());
+    }
 
     #[gpui::test]
     fn switching_saves_only_navigation_and_all_pending_drafts(cx: &mut gpui::TestAppContext) {
@@ -216,6 +285,7 @@ mod tests {
                         history: Some(history.clone()),
                         drafts: vec![],
                         navigation: None,
+                        draft_attachments: Default::default(),
                         revision: 1,
                         complete: None,
                     })
@@ -229,6 +299,7 @@ mod tests {
                         (second, "second draft".into()),
                     ],
                     navigation: Some((second, None)),
+                    draft_attachments: Default::default(),
                     revision: 2,
                     complete: None,
                 })
@@ -255,6 +326,8 @@ mod tests {
             .active_mut()
             .push(Role::User, "large history".repeat(1000));
         let id = history.active;
+        let image = PastedImage::new(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        let reference = ComposerReference::file("src/main.rs", false);
         let (sender, receiver) = async_channel::unbounded();
         let (results, completed) = async_channel::unbounded();
         sender
@@ -262,6 +335,7 @@ mod tests {
                 navigation: None,
                 history: Some(history),
                 drafts: vec![],
+                draft_attachments: Default::default(),
                 revision: 1,
                 complete: None,
             })
@@ -271,6 +345,14 @@ mod tests {
                 navigation: None,
                 history: None,
                 drafts: vec![(id, "new draft".into())],
+                draft_attachments: [(
+                    id,
+                    DraftAttachments {
+                        images: vec![image.clone()],
+                        references: vec![reference.clone()],
+                    },
+                )]
+                .into(),
                 revision: 2,
                 complete: None,
             })
@@ -280,6 +362,8 @@ mod tests {
         completed.recv().await.unwrap().1.unwrap();
         let saved = History::load(&path).unwrap();
         assert_eq!(saved.active().draft, "new draft");
+        assert_eq!(saved.active().draft_images, vec![image]);
+        assert_eq!(saved.active().draft_references, vec![reference]);
         assert_eq!(
             saved.active().messages[0].text,
             "large history".repeat(1000)
@@ -293,6 +377,14 @@ mod tests {
                 navigation: None,
                 history: None,
                 drafts: vec![(id, "latest".into())],
+                draft_attachments: [(
+                    id,
+                    DraftAttachments {
+                        images: vec![],
+                        references: vec![],
+                    },
+                )]
+                .into(),
                 revision: 3,
                 complete: None,
             })
@@ -302,6 +394,8 @@ mod tests {
         completed.recv().await.unwrap().1.unwrap();
         let saved = History::load(&path).unwrap();
         assert_eq!(saved.active().draft, "latest");
+        assert!(saved.active().draft_images.is_empty());
+        assert!(saved.active().draft_references.is_empty());
         assert_eq!(
             saved.active().messages[0].text,
             "large history".repeat(1000)
@@ -322,6 +416,7 @@ mod tests {
                 navigation: None,
                 history: Some(history.clone()),
                 drafts: Vec::new(),
+                draft_attachments: Default::default(),
                 revision: 1,
                 complete: Some(done_one),
             })
@@ -333,6 +428,7 @@ mod tests {
                 navigation: None,
                 history: Some(history),
                 drafts: Vec::new(),
+                draft_attachments: Default::default(),
                 revision: 2,
                 complete: Some(done_two),
             })

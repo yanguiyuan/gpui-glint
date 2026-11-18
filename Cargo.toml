@@ -43,6 +43,11 @@ plugin-registry = ["dep:glint-plugin-registry"]
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 wry = { version = "0.55", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }
+
 [dependencies]
 futures = "0.3"
 async-channel = { version = "2", optional = true }
@@ -75,9 +80,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
 encoding_rs = "0.8"
 gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11", "test-support"] }
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-objc2 = "0.6"
 
 [[example]]
 name = "webview"

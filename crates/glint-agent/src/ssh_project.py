@@ -24,12 +24,6 @@ def run(q):
             return path.lower().endswith('.png') and stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 20 * 1024 * 1024
         except OSError:
             return False
-    if q['op'] == 'preview_stat':
-        result = {}
-        for path in q.get('args', {}).get('paths', [])[:128]:
-            resolved = os.path.realpath(os.path.join(root, os.path.expanduser(path)))
-            result[path] = 'directory' if os.path.isdir(resolved) else 'image' if png_file(resolved) else 'text' if text_file(resolved) else None
-        return result
     op = q['op']
     if op == 'probe':
         return {'root': root}
