@@ -175,6 +175,7 @@ pub struct SearchInput {
     control: Option<AnyElement>,
     shortcut: Option<SharedString>,
     width: f32,
+    full_width: bool,
     focused: bool,
 }
 
@@ -191,6 +192,7 @@ impl SearchInput {
             control: None,
             shortcut: None,
             width: 250.,
+            full_width: false,
             focused: false,
         }
     }
@@ -208,6 +210,13 @@ impl SearchInput {
 
     pub fn width(mut self, width: f32) -> Self {
         self.width = width.max(0.);
+        self.full_width = false;
+        self
+    }
+
+    /// Stretch to the available width instead of the fixed width.
+    pub fn full_width(mut self) -> Self {
+        self.full_width = true;
         self
     }
 
@@ -218,26 +227,30 @@ impl SearchInput {
 
     pub fn render(self) -> gpui::Div {
         let theme = self.theme;
-        let mut field = div()
-            .w(px(self.width))
-            .min_w_0()
-            .h(px(30.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(7.))
-            .border_1()
-            .border_color(rgb(if self.focused {
-                theme.color(0x087bfa)
-            } else {
-                theme.color(0xe1e5e2)
-            }))
-            .bg(rgb(theme.color(0xfcfdfc)))
-            .shadow_sm()
-            .text_size(px(13.))
-            .text_color(rgb(theme.color(0x92979a)))
-            .child(Icon::Search.render(13.).flex_shrink_0());
+        let field = div();
+        let mut field = (if self.full_width {
+            field.w_full()
+        } else {
+            field.w(px(self.width))
+        })
+        .min_w_0()
+        .h(px(30.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(7.))
+        .border_1()
+        .border_color(rgb(if self.focused {
+            theme.color(0x087bfa)
+        } else {
+            theme.color(0xe1e5e2)
+        }))
+        .bg(rgb(theme.color(0xfcfdfc)))
+        .shadow_sm()
+        .text_size(px(13.))
+        .text_color(rgb(theme.color(0x92979a)))
+        .child(Icon::Search.render(13.).flex_shrink_0());
 
         field = field.child(if let Some(control) = self.control {
             div().flex_1().min_w_0().child(control)
@@ -265,6 +278,7 @@ pub struct SegmentOption {
     pub label: SharedString,
     pub count: Option<SharedString>,
     selector: Option<SharedString>,
+    disabled: bool,
 }
 
 impl SegmentOption {
@@ -273,7 +287,14 @@ impl SegmentOption {
             label: label.into(),
             count: None,
             selector: None,
+            disabled: false,
         }
+    }
+
+    /// Render the segment muted and ignore clicks, for options that are temporarily unavailable.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     pub fn count(mut self, count: impl Into<SharedString>) -> Self {
@@ -351,14 +372,19 @@ impl SegmentedControl {
 
         for (index, option) in self.options.into_iter().enumerate() {
             let selected = index == self.selected;
-            let color = if selected && self.tinted {
+            let disabled = option.disabled;
+            let color = if disabled {
+                theme.color(0xaeb2b6)
+            } else if selected && self.tinted {
                 0xffffff
             } else if selected {
                 theme.color(0x292d32)
             } else {
                 theme.color(0x555b59)
             };
-            let background = if selected && self.tinted {
+            let background = if disabled {
+                theme.color(0xe9ece9)
+            } else if selected && self.tinted {
                 theme.color(0x087bfa)
             } else if selected {
                 if theme.is_dark() {
@@ -400,18 +426,22 @@ impl SegmentedControl {
                 );
             }
 
-            if selected {
+            if selected && !disabled {
                 button = button.shadow_sm();
             }
             if let Some(selector) = option.selector {
                 button = button.debug_selector(move || selector.to_string());
             }
             if let Some(on_change) = self.on_change.clone() {
-                button = button
-                    .cursor_pointer()
-                    .on_click(move |_: &ClickEvent, window, cx| {
-                        on_change(index, window, cx);
-                    });
+                if disabled {
+                    button = button.opacity(0.55);
+                } else {
+                    button = button
+                        .cursor_pointer()
+                        .on_click(move |_: &ClickEvent, window, cx| {
+                            on_change(index, window, cx);
+                        });
+                }
             }
             track = track.child(button);
         }

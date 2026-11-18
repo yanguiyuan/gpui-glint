@@ -23,6 +23,7 @@ pub struct State {
     switching: bool,
     revision: u64,
     graph_revision: u64,
+    history_limit: usize,
     target: String,
     diff: Option<CommitDiff>,
     diff_revision: u64,
@@ -121,6 +122,10 @@ impl State {
                     this.refresh_git_repository(true, cx);
                     this.refresh_git_graph(cx);
                 }
+                GitGraphEvent::LoadMore => {
+                    this.git_ui.history_limit += git_project::DEFAULT_HISTORY_LIMIT;
+                    this.load_git_graph(false, cx);
+                }
                 GitGraphEvent::CloseRequested => this.git_ui.open = false,
             }
             cx.notify();
@@ -142,6 +147,7 @@ impl State {
             switching: false,
             revision: 0,
             graph_revision: 0,
+            history_limit: git_project::DEFAULT_HISTORY_LIMIT,
             target: "master".into(),
             diff: None,
             diff_revision: 0,
@@ -943,6 +949,10 @@ impl AgentWorkspace {
         cx.notify();
     }
     fn refresh_git_graph(&mut self, cx: &mut Context<Self>) {
+        self.load_git_graph(true, cx);
+    }
+    /// Extend the history window without clearing rows that are already visible.
+    fn load_git_graph(&mut self, show_loading: bool, cx: &mut Context<Self>) {
         self.git_ui.graph_revision += 1;
         let revision = self.git_ui.graph_revision;
         let Some(root) = self.history.active().project.clone() else {
@@ -952,15 +962,19 @@ impl AgentWorkspace {
             return;
         };
         let target = self.git_ui.target.clone();
-        let job = match provider::Job::start(async move { git_project::graph(&root, target).await })
-        {
+        let limit = self.git_ui.history_limit;
+        let job = match provider::Job::start(async move {
+            git_project::graph_window(&root, target, limit).await
+        }) {
             Ok(job) => job,
             Err(error) => {
                 self.git_error("读取 Git 失败", error, cx);
                 return;
             }
         };
-        self.git_ui.graph.update(cx, |g, cx| g.set_loading(cx));
+        if show_loading {
+            self.git_ui.graph.update(cx, |g, cx| g.set_loading(cx));
+        }
         cx.spawn(async move |weak, cx| {
             let result = job.result().await;
             let _ = weak.update(cx, |this, cx| {

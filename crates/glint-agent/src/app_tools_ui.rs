@@ -886,6 +886,7 @@ impl AgentWorkspace {
                 name => name,
             }
             .to_owned();
+            let status_animation_id = SharedString::from(format!("tool-status:{}", record.call.id));
             let (status_icon, status_label) = if record.result == "执行中…" {
                 (Icon::Spinner, "执行中")
             } else if record.result == "正在生成参数…" {
@@ -1113,6 +1114,7 @@ impl AgentWorkspace {
                             .theme(theme)
                             .child(body)
                             .status(status_icon, status_label)
+                            .status_animation_id(status_animation_id.clone())
                             .render()
                     },
                     cx,

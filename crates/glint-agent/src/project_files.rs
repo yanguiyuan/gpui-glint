@@ -39,6 +39,7 @@ pub(super) struct ProjectFiles {
     graph: Option<Entity<GitGraph>>,
     showing_graph: bool,
     compare_branch: String,
+    history_limit: usize,
     graph_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
     go_definitions: Option<GoDefinitions>,
@@ -96,6 +97,7 @@ impl ProjectFiles {
             graph: None,
             showing_graph: false,
             compare_branch: "master".into(),
+            history_limit: git_project::DEFAULT_HISTORY_LIMIT,
             graph_task: None,
             commit_task: None,
             go_definitions: None,
@@ -124,6 +126,7 @@ impl ProjectFiles {
         self.definition_task = None;
         self.definition_error = None;
         self.compare_branch = "master".into();
+        self.history_limit = git_project::DEFAULT_HISTORY_LIMIT;
         for document in &self.documents {
             if let DocumentView::File(view) = &document.view {
                 view.update(cx, |view, cx| view.set_active(false, cx));
@@ -155,6 +158,10 @@ impl ProjectFiles {
                     this.open_diff(commit.clone(), path.clone(), cx)
                 }
                 GitGraphEvent::Refresh => this.refresh_graph(cx),
+                GitGraphEvent::LoadMore => {
+                    this.history_limit += git_project::DEFAULT_HISTORY_LIMIT;
+                    this.load_graph(false, cx);
+                }
                 GitGraphEvent::CloseRequested => {
                     this.showing_graph = false;
                     cx.notify();
@@ -168,15 +175,24 @@ impl ProjectFiles {
     }
 
     pub(super) fn refresh_graph(&mut self, cx: &mut Context<Self>) {
+        self.load_graph(true, cx);
+    }
+
+    /// Extend the history window without clearing rows that are already visible.
+    fn load_graph(&mut self, show_loading: bool, cx: &mut Context<Self>) {
         let (Some(root), Some(graph)) = (self.root.clone(), self.graph.clone()) else {
             return;
         };
         self.graph_task = None;
         self.commit_task = None;
         let branch = self.compare_branch.clone();
-        graph.update(cx, |graph, cx| graph.set_loading(cx));
-        let job = match provider::Job::start(async move { git_project::graph(&root, branch).await })
-        {
+        let limit = self.history_limit;
+        if show_loading {
+            graph.update(cx, |graph, cx| graph.set_loading(cx));
+        }
+        let job = match provider::Job::start(async move {
+            git_project::graph_window(&root, branch, limit).await
+        }) {
             Ok(job) => job,
             Err(error) => {
                 graph.update(cx, |graph, cx| graph.set_error(error, cx));

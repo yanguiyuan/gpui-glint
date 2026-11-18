@@ -363,11 +363,14 @@ fn commits(source: &str) -> Vec<GitCommit> {
         .collect()
 }
 
-async fn log(root: &Path, revision: &str) -> Result<Vec<GitCommit>, String> {
+async fn log(root: &Path, revision: &str, limit: usize) -> Result<(Vec<GitCommit>, bool), String> {
+    // Read one extra commit so the viewer knows whether a wider window exists.
+    let limit = limit.max(1);
+    let max_count = format!("--max-count={}", limit + 1);
     let mut args = vec![
         "log",
         "--topo-order",
-        "--max-count=100",
+        max_count.as_str(),
         "--date=short",
         FORMAT,
         revision,
@@ -376,10 +379,26 @@ async fn log(root: &Path, revision: &str) -> Result<Vec<GitCommit>, String> {
         args.push("HEAD");
     }
     args.push("--");
-    Ok(commits(&text(run(root, &args).await?)?))
+    let mut commits = commits(&text(run(root, &args).await?)?);
+    let has_more = commits.len() > limit;
+    commits.truncate(limit);
+    Ok((commits, has_more))
 }
 
+/// Commits fetched in one page before the viewer offers "load more".
+pub const DEFAULT_HISTORY_LIMIT: usize = 100;
+
+/// Read one default history window; hosts page with [`graph_window`] instead.
+#[cfg(test)]
 pub async fn graph(root: &Path, target: String) -> Result<GitGraphData, String> {
+    graph_window(root, target, DEFAULT_HISTORY_LIMIT).await
+}
+
+pub async fn graph_window(
+    root: &Path,
+    target: String,
+    limit: usize,
+) -> Result<GitGraphData, String> {
     let repo = repository(root)
         .await?
         .ok_or("当前项目尚未初始化 Git 仓库")?;
@@ -394,7 +413,9 @@ pub async fn graph(root: &Path, target: String) -> Result<GitGraphData, String> 
         return Ok(data);
     } // An initialized, unborn repository.
     let head = text(head)?;
-    data.commits = log(root, "--all").await?;
+    let (commits, has_more) = log(root, "--all", limit).await?;
+    data.commits = commits;
+    data.has_more = has_more;
     if !data.branches.contains(&target) {
         data.comparison_error = Some(format!("分支 {target} 不存在，请选择对比分支"));
         return Ok(data);
@@ -416,8 +437,8 @@ pub async fn graph(root: &Path, target: String) -> Result<GitGraphData, String> 
     data.comparison = Some(GitComparison {
         target_count: counts.first().and_then(|v| v.parse().ok()).unwrap_or(0),
         current_count: counts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0),
-        current_only: log(root, &format!("{target_id}..{head}")).await?,
-        target_only: log(root, &format!("{head}..{target_id}")).await?,
+        current_only: log(root, &format!("{target_id}..{head}"), limit).await?.0,
+        target_only: log(root, &format!("{head}..{target_id}"), limit).await?.0,
     });
     Ok(data)
 }

@@ -1,10 +1,20 @@
 //! Reusable Git history and branch comparison viewer. The host owns all Git I/O.
-use super::{Icon, IconButton, Select, SelectEvent, SelectOption, Skeleton};
+use super::{
+    Button, ButtonKind, ButtonSize, Icon, IconButton, SearchInput, SegmentOption, SegmentedControl,
+    Select, SelectEvent, SelectOption, Skeleton, TextEntry, search_highlight,
+};
 use crate::theme::ThemePreset;
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, Render, ScrollHandle, SharedString, Window, div,
-    point, prelude::*, px, rgb,
+    AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
+    ScrollHandle, SharedString, StyledText, Window, div, point, prelude::*, px, rgb,
 };
+
+/// Row height when the commit carries branch or tag decorations.
+const ROW_HEIGHT: f32 = 68.;
+/// Shorter row without a decoration line, so undecorated history stays dense.
+const ROW_HEIGHT_COMPACT: f32 = 52.;
+/// Decorations rendered before the remaining ones collapse into a `+N` chip.
+const VISIBLE_REFERENCE_CHIPS: usize = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitCommit {
@@ -13,6 +23,7 @@ pub struct GitCommit {
     pub summary: String,
     pub author: String,
     pub date: String,
+    /// Git's `%D` decoration, e.g. `HEAD -> main, origin/main, tag: v1`.
     pub references: String,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -50,13 +61,20 @@ pub struct GitGraphData {
     pub commits: Vec<GitCommit>,
     pub comparison: Option<GitComparison>,
     pub comparison_error: Option<String>,
+    /// True when the host truncated the history window; the viewer then offers `LoadMore`.
+    pub has_more: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitGraphEvent {
     CompareBranch(String),
     SelectCommit(String),
-    OpenFile { commit: String, path: String },
+    OpenFile {
+        commit: String,
+        path: String,
+    },
     Refresh,
+    /// Request a wider history window from the host.
+    LoadMore,
     CloseRequested,
 }
 
@@ -68,6 +86,9 @@ struct LaneRow {
     width: usize,
 }
 fn lanes(commits: &[GitCommit]) -> Vec<LaneRow> {
+    lanes_for(&commits.iter().collect::<Vec<_>>())
+}
+fn lanes_for(commits: &[&GitCommit]) -> Vec<LaneRow> {
     let mut active = Vec::<String>::new();
     commits
         .iter()
@@ -110,20 +131,89 @@ fn lanes(commits: &[GitCommit]) -> Vec<LaneRow> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefKind {
+    Head,
+    Local,
+    Remote,
+    Tag,
+}
+
+fn classify_reference(name: &str) -> RefKind {
+    if name == "HEAD" || name.ends_with("/HEAD") {
+        RefKind::Head
+    } else if name.contains('/') {
+        RefKind::Remote
+    } else {
+        RefKind::Local
+    }
+}
+
+/// Split Git's `%D` decoration into one entry per reference, dropping the `->` arrow.
+fn reference_chips(references: &str) -> Vec<(String, RefKind)> {
+    let mut chips = Vec::new();
+    for token in references
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Some(tag) = token.strip_prefix("tag: ") {
+            chips.push((tag.to_owned(), RefKind::Tag));
+        } else if let Some((from, to)) = token.split_once("->") {
+            chips.push((from.trim().to_owned(), RefKind::Head));
+            let name = to.trim();
+            if !name.is_empty() {
+                chips.push((name.to_owned(), classify_reference(name)));
+            }
+        } else {
+            chips.push((token.to_owned(), classify_reference(token)));
+        }
+    }
+    chips
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Decorate one text run with search matches while keeping truncation intact.
+fn highlighted(text: &str, query: &str, theme: ThemePreset) -> StyledText {
+    let highlights = search_highlight::match_ranges(text, query.trim())
+        .into_iter()
+        .map(|range| {
+            (
+                range,
+                HighlightStyle {
+                    background_color: Some(search_highlight::color(theme.is_dark())),
+                    ..Default::default()
+                },
+            )
+        });
+    StyledText::new(SharedString::from(text.to_owned())).with_highlights(highlights)
+}
+
 pub struct GitGraph {
     data: GitGraphData,
     lanes: Vec<LaneRow>,
     theme: ThemePreset,
     compare: Entity<Select>,
+    search: Entity<TextEntry>,
+    query: String,
+    merge_only: bool,
+    labeled_only: bool,
     selected: Option<String>,
     details: Option<String>,
     commit_details: Option<GitCommitDetails>,
     copied_hash: bool,
+    copied_message: bool,
+    copied_commit: Option<String>,
     error: Option<String>,
     loading: bool,
     comparison_tab: bool,
     header_visible: bool,
+    focus: FocusHandle,
     scroll: ScrollHandle,
+    _search_subscription: gpui::Subscription,
     _subscription: gpui::Subscription,
 }
 impl EventEmitter<GitGraphEvent> for GitGraph {}
@@ -134,20 +224,36 @@ impl GitGraph {
             let SelectEvent::Changed(branch) = event;
             cx.emit(GitGraphEvent::CompareBranch(branch.to_string()));
         });
+        let search = cx.new(|cx| TextEntry::new(cx, "搜索提交、Hash、作者", "").font_size(11.));
+        let search_subscription = cx.observe(&search, |this: &mut Self, search, cx| {
+            let query = search.read(cx).value().to_owned();
+            if this.query != query {
+                this.query = query;
+                cx.notify();
+            }
+        });
         Self {
             data: GitGraphData::default(),
             lanes: Vec::new(),
             theme: ThemePreset::default(),
             compare,
+            search,
+            query: String::new(),
+            merge_only: false,
+            labeled_only: false,
             selected: None,
             details: None,
             commit_details: None,
             copied_hash: false,
+            copied_message: false,
+            copied_commit: None,
             error: None,
             loading: false,
             comparison_tab: false,
             header_visible: true,
+            focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            _search_subscription: search_subscription,
             _subscription: subscription,
         }
     }
@@ -160,6 +266,7 @@ impl GitGraph {
         if self.theme != theme {
             self.theme = theme;
             self.compare.update(cx, |s, cx| s.set_theme(theme, cx));
+            self.search.update(cx, |s, cx| s.set_theme(theme, cx));
             cx.notify();
         }
     }
@@ -174,9 +281,13 @@ impl GitGraph {
             s.set_selected(Some(data.compare_branch.clone().into()), cx);
         });
         self.lanes = lanes(&data.commits);
+        if data.compare_branch.is_empty() {
+            self.comparison_tab = false;
+        }
         self.data = data;
         self.error = None;
         self.loading = false;
+        self.copied_commit = None;
         cx.notify();
     }
     /// Clear previous-project state before an asynchronous reload.
@@ -187,6 +298,8 @@ impl GitGraph {
         self.details = None;
         self.commit_details = None;
         self.copied_hash = false;
+        self.copied_message = false;
+        self.copied_commit = None;
         self.compare.update(cx, |s, cx| {
             s.set_options([], cx);
             s.set_selected(None, cx);
@@ -203,6 +316,8 @@ impl GitGraph {
         self.details = None;
         self.commit_details = None;
         self.copied_hash = false;
+        self.copied_message = false;
+        self.copied_commit = None;
         cx.notify();
     }
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -215,6 +330,7 @@ impl GitGraph {
             self.details = Some(text);
             self.commit_details = None;
             self.copied_hash = false;
+            self.copied_message = false;
             cx.notify();
         }
     }
@@ -223,7 +339,176 @@ impl GitGraph {
             self.commit_details = Some(details);
             self.details = None;
             self.copied_hash = false;
+            self.copied_message = false;
             cx.notify();
+        }
+    }
+    fn comparison_available(&self) -> bool {
+        !self.data.compare_branch.is_empty()
+    }
+    fn filter_active(&self) -> bool {
+        self.merge_only || self.labeled_only || !self.query.trim().is_empty()
+    }
+    /// Client-side filtering keeps the host payload untouched.
+    fn visible_commits(&self) -> Vec<&GitCommit> {
+        let query = self.query.trim().to_lowercase();
+        self.data
+            .commits
+            .iter()
+            .filter(|commit| {
+                (!self.merge_only || commit.parents.len() > 1)
+                    && (!self.labeled_only || !commit.references.is_empty())
+                    && (query.is_empty()
+                        || commit.summary.to_lowercase().contains(&query)
+                        || commit.id.to_lowercase().contains(&query)
+                        || commit.author.to_lowercase().contains(&query))
+            })
+            .collect()
+    }
+    fn select_commit(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.selected = Some(id.to_owned());
+        self.details = None;
+        self.commit_details = None;
+        self.copied_hash = false;
+        self.copied_message = false;
+        cx.emit(GitGraphEvent::SelectCommit(id.to_owned()));
+        cx.notify();
+    }
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.details = None;
+        self.commit_details = None;
+        self.copied_hash = false;
+        self.copied_message = false;
+        cx.notify();
+    }
+    /// Move the selection through the filtered rows and reveal it.
+    fn step_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let rows = self.visible_commits();
+        if rows.is_empty() {
+            return;
+        }
+        let index = self
+            .selected
+            .as_ref()
+            .and_then(|id| rows.iter().position(|commit| &commit.id == id));
+        let next = match (index, forward) {
+            (Some(current), true) => (current + 1).min(rows.len() - 1),
+            (Some(current), false) => current.saturating_sub(1),
+            (None, _) => 0,
+        };
+        let id = rows[next].id.clone();
+        self.scroll.scroll_to_item(next);
+        self.select_commit(&id, cx);
+    }
+    fn ref_chip(&self, label: &str, kind: RefKind) -> gpui::Div {
+        let p = self.theme.palette();
+        let (background, foreground, border) = match kind {
+            RefKind::Head => (
+                self.theme.color(0xdcecff),
+                self.theme.color(0x087bfa),
+                self.theme.color(0xdcecff),
+            ),
+            RefKind::Local => (
+                self.theme.color(0xf0f2ee),
+                self.theme.color(0x4e5451),
+                self.theme.color(0xdfe4df),
+            ),
+            RefKind::Remote => (p.surface, p.text_muted, p.border),
+            RefKind::Tag => (
+                self.theme.color(0xf3f5f8),
+                self.theme.color(0xb37716),
+                p.border,
+            ),
+        };
+        div()
+            .h(px(16.))
+            .max_w(px(132.))
+            .px(px(5.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(rgb(border))
+            .bg(rgb(background))
+            .text_color(rgb(foreground))
+            .text_size(px(9.5))
+            .child(div().min_w_0().truncate().child(label.to_owned()))
+    }
+    fn reference_row(&self, chips: &[(String, RefKind)]) -> gpui::Div {
+        let mut row = div().flex().items_center().gap_1().overflow_hidden();
+        for (label, kind) in chips.iter().take(VISIBLE_REFERENCE_CHIPS) {
+            row = row.child(self.ref_chip(label, *kind));
+        }
+        if chips.len() > VISIBLE_REFERENCE_CHIPS {
+            row = row.child(self.ref_chip(
+                &format!("+{}", chips.len() - VISIBLE_REFERENCE_CHIPS),
+                RefKind::Remote,
+            ));
+        }
+        row
+    }
+    fn filter_chip(
+        &self,
+        label: &'static str,
+        active: bool,
+        selector: &'static str,
+        toggle: fn(&mut Self),
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = self.theme.palette();
+        div()
+            .id(SharedString::from(format!("git-filter:{selector}")))
+            .debug_selector(move || selector.to_string())
+            .h(px(24.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(rgb(if active {
+                self.theme.color(0x087bfa)
+            } else {
+                p.border
+            }))
+            .bg(rgb(if active {
+                self.theme.color(0xdcecff)
+            } else {
+                p.surface
+            }))
+            .text_color(rgb(if active {
+                self.theme.color(0x087bfa)
+            } else {
+                p.text_muted
+            }))
+            .text_size(px(11.))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(p.surface_subtle)))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle(this);
+                cx.notify();
+            }))
+    }
+    fn load_more_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        Button::new("加载更多")
+            .kind(ButtonKind::Glass)
+            .size(ButtonSize::Small)
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "git-load-more".into())
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::LoadMore)))
+    }
+    fn refresh_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let button = IconButton::new(Icon::Refresh, "刷新 Git")
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "git-refresh".into());
+        if self.loading {
+            button.opacity(0.45)
+        } else {
+            button.on_click(cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::Refresh)))
         }
     }
     fn details_panel(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -246,6 +531,13 @@ impl GitGraph {
             );
         };
         let id = details.id.clone();
+        let message = details.message.clone();
+        let subject = details
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
         panel = panel
             .child(
                 div()
@@ -287,14 +579,42 @@ impl GitGraph {
                     ),
             )
             .child(
-                div().mb_2().font_weight(gpui::FontWeight::SEMIBOLD).child(
-                    details
-                        .message
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned(),
-                ),
+                // 复制信息的按钮跟随标题，避免和 Hash 复制按钮在两个图标并排时难以区分。
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .mb_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(subject),
+                    )
+                    .child(
+                        IconButton::new(
+                            if self.copied_message {
+                                Icon::CheckCircle
+                            } else {
+                                Icon::Copy
+                            },
+                            if self.copied_message {
+                                "已复制提交信息"
+                            } else {
+                                "复制提交信息"
+                            },
+                        )
+                        .theme(self.theme)
+                        .render()
+                        .id("copy-commit-message")
+                        .debug_selector(|| "copy-commit-message".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(message.clone()));
+                            this.copied_message = true;
+                            cx.notify();
+                        })),
+                    ),
             )
             .when_some(
                 details
@@ -428,10 +748,44 @@ impl GitGraph {
         let p = self.theme.palette();
         let id = commit.id.clone();
         let selected = self.selected.as_ref() == Some(&id);
+        let chips = reference_chips(&commit.references);
+        let height = if chips.is_empty() {
+            ROW_HEIGHT_COMPACT
+        } else {
+            ROW_HEIGHT
+        };
+        let mut text = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .truncate()
+                    .child(highlighted(&commit.summary, &self.query, self.theme)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .truncate()
+                    .child(format!(
+                        "{} · {} · {}",
+                        short_id(&commit.id),
+                        commit.author,
+                        commit.date
+                    )),
+            );
+        if !chips.is_empty() {
+            text = text.child(self.reference_row(&chips));
+        }
+        let copy_hash = commit.id.clone();
+        let copied = self.copied_commit.as_deref() == Some(commit.id.as_str());
         div()
             .id(SharedString::from(format!("git-commit:{id}")))
             .debug_selector(move || format!("git-commit:{id}"))
-            .h(px(68.))
+            .h(px(height))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -493,45 +847,43 @@ impl GitGraph {
                     .flex_shrink_0(),
                 )
             })
+            .child(text)
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .id(SharedString::from(format!("git-copy:{}", commit.id)))
+                    .debug_selector({
+                        let copy = commit.id.clone();
+                        move || format!("git-copy:{copy}")
+                    })
+                    .size(px(22.))
+                    .flex_shrink_0()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().truncate().child(commit.summary.clone()))
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
-                            .truncate()
-                            .child(format!(
-                                "{} · {} · {}",
-                                commit.id.chars().take(8).collect::<String>(),
-                                commit.author,
-                                commit.date
-                            )),
-                    )
-                    .when(!commit.references.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .truncate()
-                                .text_size(px(10.))
-                                .text_color(rgb(p.accent))
-                                .child(commit.references.clone()),
-                        )
-                    }),
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .text_color(rgb(if copied {
+                        self.theme.color(0x087bfa)
+                    } else {
+                        p.text_muted
+                    }))
+                    .hover(|s| s.bg(rgb(p.border)))
+                    .child(Icon::Copy.render(12.).text_color(rgb(if copied {
+                        self.theme.color(0x087bfa)
+                    } else {
+                        p.text_muted
+                    })))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_hash.clone()));
+                        this.copied_commit = Some(copy_hash.clone());
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
             )
             .on_click({
                 let id = commit.id.clone();
-                cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(id.clone());
-                    this.details = None;
-                    this.commit_details = None;
-                    this.copied_hash = false;
-                    cx.emit(GitGraphEvent::SelectCommit(id.clone()));
-                    cx.notify();
+                cx.listener(move |this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.select_commit(&id, cx);
                 })
             })
     }
@@ -539,12 +891,36 @@ impl GitGraph {
 impl Render for GitGraph {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
+        let comparison_tab = self.comparison_tab && self.comparison_available();
         let mut body = div()
             .id("git-graph-scroll")
+            .debug_selector(|| "git-graph-scroll".into())
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .track_focus(&self.focus)
+            .tab_index(0)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.search.focus_handle(cx).is_focused(window) {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "up" => {
+                        this.step_selection(false, cx);
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        this.step_selection(true, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" if this.selected.is_some() => {
+                        this.clear_selection(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .p_3()
             .flex()
             .flex_col()
@@ -552,11 +928,25 @@ impl Render for GitGraph {
         if let Some(error) = &self.error {
             body = body.child(
                 div()
-                    .text_color(rgb(self.theme.color(0xd9342b)))
-                    .child(error.clone()),
+                    .debug_selector(|| "git-error".into())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(self.theme.color(0xffdeda)))
+                    .bg(rgb(self.theme.color(0xffe9e7)))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(self.theme.color(0xd9342b)))
+                            .child(error.clone()),
+                    )
+                    .child(self.refresh_button(cx)),
             );
         }
-        let content_empty = if self.comparison_tab {
+        let content_empty = if comparison_tab {
             self.data.comparison.is_none() && self.data.comparison_error.is_none()
         } else {
             self.data.commits.is_empty()
@@ -604,7 +994,7 @@ impl Render for GitGraph {
         } else if self.loading {
             body = body.child(div().text_color(rgb(p.text_muted)).child("正在读取 Git…"));
         }
-        if self.comparison_tab {
+        if comparison_tab {
             if let Some(comparison) = &self.data.comparison {
                 for (title, count, commits) in [
                     (
@@ -631,27 +1021,50 @@ impl Render for GitGraph {
                         body = body.child(self.commit_row(commit, None, cx));
                     }
                     if count > commits.len() {
-                        body = body.child(format!("仅显示前 {} 条", commits.len()));
+                        body = body.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(format!("仅显示前 {} 条", commits.len())),
+                        );
                     }
                 }
             } else if let Some(error) = &self.data.comparison_error {
                 body = body.child(error.clone());
             } else if !self.loading {
-                body = body.child("尚无可对比的提交");
+                body = body.child(
+                    div()
+                        .text_color(rgb(p.text_muted))
+                        .child("选一个对比分支查看差异"),
+                );
             }
         } else {
             // Each canvas ends at its row boundary. Keep graph rows contiguous;
             // the outer body's gap is only for notices and the history footer.
+            let visible = self.visible_commits();
+            let lanes = lanes_for(&visible);
             let mut history = div().flex().flex_col().flex_shrink_0();
-            for (commit, lane) in self.data.commits.iter().zip(self.lanes.iter().cloned()) {
+            for (commit, lane) in visible.iter().copied().zip(lanes) {
                 history = history.child(self.commit_row(commit, Some(lane), cx));
             }
             body = body.child(history);
-            if self.data.commits.is_empty() && !self.loading && self.error.is_none() {
-                body = body.child("尚无提交");
+            if visible.is_empty() && !self.loading && self.error.is_none() {
+                body = body.child(div().text_color(rgb(p.text_muted)).child(
+                    if self.data.commits.is_empty() {
+                        "尚无提交"
+                    } else {
+                        "没有匹配的提交"
+                    },
+                ));
             }
-            if self.data.commits.len() >= 100 {
-                body = body.child("显示最近 100 条提交");
+            if self.data.has_more {
+                body = body.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .pt_1()
+                        .child(self.load_more_button(cx)),
+                );
             }
         }
         div()
@@ -676,14 +1089,7 @@ impl Render for GitGraph {
                         .border_color(rgb(p.border))
                         .child(Icon::GitBranch.render(16.))
                         .child(div().flex_1().child("GitGraph"))
-                        .child(
-                            IconButton::new(Icon::Refresh, "刷新 Git")
-                                .theme(self.theme)
-                                .render()
-                                .on_click(
-                                    cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::Refresh)),
-                                ),
-                        )
+                        .child(self.refresh_button(cx))
                         .child(
                             IconButton::new(Icon::Close, "关闭 GitGraph")
                                 .theme(self.theme)
@@ -694,52 +1100,93 @@ impl Render for GitGraph {
                         ),
                 )
             })
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .truncate()
-                            .child(format!("当前：{}", self.data.current_branch)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child("对比")
-                            .child(self.compare.clone()),
-                    )
-                    .child(div().flex().gap_2().children(
-                        [(false, "提交历史"), (true, "分支差异")].into_iter().map(
-                            |(compare, label)| {
-                                div()
-                                    .id(label)
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(5.))
-                                    .cursor_pointer()
-                                    .when(self.comparison_tab == compare, |d| {
-                                        d.bg(rgb(p.surface_subtle)).text_color(rgb(p.accent))
-                                    })
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.comparison_tab = compare;
-                                        cx.notify();
-                                    }))
-                            },
-                        ),
-                    )),
-            )
+            .child(self.filter_bar(comparison_tab, cx))
             .child(body)
             .when(self.selected.is_some(), |root| {
                 root.child(self.details_panel(cx))
             })
+    }
+}
+impl GitGraph {
+    fn filter_bar(&self, comparison_tab: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let weak = cx.entity().downgrade();
+        div()
+            .px_3()
+            .py_2()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(format!("当前：{}", self.data.current_branch)),
+                    )
+                    .when(self.filter_active(), |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(p.text_muted))
+                                .child(format!("{} 条", self.visible_commits().len())),
+                        )
+                    })
+                    .child(self.filter_chip(
+                        "合并",
+                        self.merge_only,
+                        "git-filter-merges",
+                        |this| this.merge_only = !this.merge_only,
+                        cx,
+                    ))
+                    .child(self.filter_chip(
+                        "有标记",
+                        self.labeled_only,
+                        "git-filter-labeled",
+                        |this| this.labeled_only = !this.labeled_only,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child("对比")
+                    .child(self.compare.clone()),
+            )
+            .child(
+                SegmentedControl::new([
+                    SegmentOption::new("提交历史").debug_selector("git-tab-history"),
+                    SegmentOption::new("分支差异")
+                        .debug_selector("git-tab-comparison")
+                        .disabled(!self.comparison_available()),
+                ])
+                .id("git-graph-tabs")
+                .theme(self.theme)
+                .selected(usize::from(comparison_tab))
+                .on_change(move |index, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.comparison_tab = index == 1;
+                        cx.notify();
+                    });
+                }),
+            )
+            .child(
+                SearchInput::new("搜索提交、Hash、作者")
+                    .theme(self.theme)
+                    .full_width()
+                    .control(self.search.clone())
+                    .render(),
+            )
     }
 }
 
@@ -782,6 +1229,15 @@ mod tests {
         window.simulate_click(copy.center(), Default::default());
         window.run_until_parked();
         assert_eq!(window.read_from_clipboard().unwrap().text().unwrap(), ID);
+        let message = window.debug_bounds("copy-commit-message").unwrap();
+        // 复制信息的按钮跟随标题，不与 Hash 复制图标并排，避免看起来像重复按钮。
+        assert!(message.origin.y > copy.origin.y);
+        window.simulate_click(message.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "A clear summary"
+        );
         let file = window.debug_bounds("git-file:src/main.rs").unwrap();
         window.simulate_click(file.center(), Default::default());
         window.run_until_parked();
@@ -851,8 +1307,149 @@ mod tests {
                 next.left(),
                 "Graph lanes must share a horizontal origin"
             );
-            assert_eq!(previous.size.height, px(68.));
+            assert_eq!(previous.size.height, px(ROW_HEIGHT));
         }
+    }
+    #[gpui::test]
+    fn undecorated_rows_are_compact_and_still_touch(cx: &mut gpui::TestAppContext) {
+        let plain = |id: &str, parents: &[&str]| GitCommit {
+            id: id.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            summary: format!("Commit {id}"),
+            ..Default::default()
+        };
+        let (_, window) = cx.add_window_view(|_, cx| {
+            let mut graph = GitGraph::new(cx);
+            graph.set_data(
+                GitGraphData {
+                    commits: vec![
+                        GitCommit {
+                            references: "HEAD -> main, tag: v1".into(),
+                            ..plain("tagged", &["plain"])
+                        },
+                        plain("plain", &[]),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            );
+            graph
+        });
+        window.simulate_resize(gpui::size(px(400.), px(700.)));
+        window.run_until_parked();
+        let tagged = window.debug_bounds("git-commit:tagged").unwrap();
+        let plain_row = window.debug_bounds("git-commit:plain").unwrap();
+        assert_eq!(tagged.size.height, px(ROW_HEIGHT));
+        assert_eq!(plain_row.size.height, px(ROW_HEIGHT_COMPACT));
+        assert_eq!(tagged.bottom(), plain_row.top());
+    }
+    #[gpui::test]
+    fn search_and_filters_hide_rows_without_changing_host_data(cx: &mut gpui::TestAppContext) {
+        let commit = |id: &str, summary: &str, parents: &[&str], references: &str| GitCommit {
+            id: id.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            summary: summary.into(),
+            references: references.into(),
+            ..Default::default()
+        };
+        let (graph, window) = cx.add_window_view(|_, cx| {
+            let mut graph = GitGraph::new(cx);
+            graph.set_data(
+                GitGraphData {
+                    current_branch: "main".into(),
+                    branches: vec!["main".into()],
+                    compare_branch: "main".into(),
+                    commits: vec![
+                        commit(
+                            "ffffff",
+                            "Merge release",
+                            &["aaaaaa", "bbbbbb"],
+                            "HEAD -> main",
+                        ),
+                        commit("aaaaaa", "Add search", &["cccccc"], ""),
+                        commit("bbbbbb", "Add filters", &["cccccc"], "tag: v1"),
+                        commit("cccccc", "Initial commit", &[], ""),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            );
+            graph
+        });
+        window.simulate_resize(gpui::size(px(420.), px(700.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("git-commit:aaaaaa").is_some());
+        graph.update(window, |graph, cx| {
+            graph.merge_only = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("git-commit:ffffff").is_some());
+        assert!(window.debug_bounds("git-commit:aaaaaa").is_none());
+        graph.update(window, |graph, cx| {
+            graph.merge_only = false;
+            graph.labeled_only = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("git-commit:bbbbbb").is_some());
+        assert!(window.debug_bounds("git-commit:cccccc").is_none());
+        graph.update(window, |graph, cx| {
+            graph.labeled_only = false;
+            graph.query = "search".into();
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("git-commit:aaaaaa").is_some());
+        assert!(window.debug_bounds("git-commit:ffffff").is_none());
+        graph.read_with(window, |graph, _| {
+            assert_eq!(graph.visible_commits().len(), 1);
+            assert_eq!(graph.data.commits.len(), 4);
+        });
+    }
+    #[gpui::test]
+    fn truncated_history_offers_load_more(cx: &mut gpui::TestAppContext) {
+        let (graph, window) = cx.add_window_view(|_, cx| {
+            let mut graph = GitGraph::new(cx);
+            graph.set_data(
+                GitGraphData {
+                    current_branch: "main".into(),
+                    commits: vec![GitCommit {
+                        id: "abcdef12".into(),
+                        summary: "A commit".into(),
+                        ..Default::default()
+                    }],
+                    has_more: true,
+                    ..Default::default()
+                },
+                cx,
+            );
+            graph
+        });
+        window.simulate_resize(gpui::size(px(400.), px(600.)));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let received = events.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&graph, move |_, _, event: &GitGraphEvent, _| {
+                received.borrow_mut().push(event.clone())
+            })
+            .detach();
+        });
+        window.run_until_parked();
+        let button = window.debug_bounds("git-load-more").unwrap();
+        window.simulate_click(button.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(*events.borrow(), vec![GitGraphEvent::LoadMore]);
+    }
+    #[gpui::test]
+    fn comparison_tab_requires_a_compare_branch(cx: &mut gpui::TestAppContext) {
+        let (graph, window) = cx.add_window_view(|_, cx| GitGraph::new(cx));
+        window.simulate_resize(gpui::size(px(400.), px(600.)));
+        window.run_until_parked();
+        let tab = window.debug_bounds("git-tab-comparison").unwrap();
+        window.simulate_click(tab.center(), Default::default());
+        window.run_until_parked();
+        graph.read_with(window, |graph, _| assert!(!graph.comparison_tab));
     }
     #[test]
     fn merge_lanes_join_existing_parent_without_duplicate_lanes() {
@@ -870,6 +1467,25 @@ mod tests {
         assert_eq!(layout[0].edges, vec![(0, 0, true), (0, 1, true)]);
         assert_eq!(layout[2].edges, vec![(0, 0, false), (1, 0, true)]);
         assert_eq!(layout[3].width, 1);
+    }
+    #[test]
+    fn reference_chips_split_head_branches_remotes_and_tags() {
+        assert_eq!(
+            reference_chips("HEAD -> main, origin/main, origin/HEAD, tag: v1.2"),
+            vec![
+                ("HEAD".to_owned(), RefKind::Head),
+                ("main".to_owned(), RefKind::Local),
+                ("origin/main".to_owned(), RefKind::Remote),
+                ("origin/HEAD".to_owned(), RefKind::Head),
+                ("v1.2".to_owned(), RefKind::Tag),
+            ]
+        );
+        assert_eq!(
+            reference_chips("feature/x"),
+            vec![("feature/x".to_owned(), RefKind::Remote)]
+        );
+        assert!(reference_chips("").is_empty());
+        assert!(reference_chips(" , ").is_empty());
     }
 
     #[gpui::test]

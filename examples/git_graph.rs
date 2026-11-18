@@ -63,6 +63,7 @@ fn main() {
                     GitGraphEvent::CompareBranch(branch) => graph.set_data(data(branch), cx),
                     GitGraphEvent::SelectCommit(id) => graph.set_details(id, format!("commit {id}\nAuthor: Glint\n\nOffline fixture: the host supplies commit details."), cx),
                     GitGraphEvent::Refresh => graph.set_data(data("master"), cx),
+                    GitGraphEvent::LoadMore => graph.set_data(data("master"), cx),
                     GitGraphEvent::CloseRequested => cx.quit(),
                     GitGraphEvent::OpenFile { .. } => {},
                 });
