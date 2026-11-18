@@ -73,6 +73,29 @@ impl HostMapping {
         Ok(mappings)
     }
 
+    pub(super) fn format_hosts(mappings: impl IntoIterator<Item = Self>) -> Result<String, String> {
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        let mut text = String::new();
+        let mut domains = std::collections::HashSet::new();
+        for (index, mapping) in mappings.into_iter().enumerate() {
+            if mapping.domain.trim().is_empty() && mapping.ip.trim().is_empty() {
+                continue;
+            }
+            let (domain, address) = mapping
+                .address()
+                .map_err(|error| format!("第 {} 条映射：{error}", index + 1))?;
+            if domains.contains(&domain) {
+                return Err(format!("映射表中存在重复域名：{domain}"));
+            }
+            text.push_str(&format!("{}\t{domain}{newline}", address.ip()));
+            domains.insert(domain);
+        }
+        if text.is_empty() {
+            return Err("没有可导出的 Hosts 映射".into());
+        }
+        Ok(text)
+    }
+
     fn address(&self) -> Result<(String, std::net::SocketAddr), String> {
         let domain = self
             .domain

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
@@ -6,8 +7,8 @@ use std::{
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Bounds, Context, Element, ElementId, GlobalElementId, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Render, ScrollHandle,
+    App, Bounds, Context, Element, ElementId, FocusHandle, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, Point, Render, ScrollHandle,
     SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun, Window, div, px,
     rgb,
 };
@@ -215,6 +216,53 @@ pub struct DiffCard {
     /// Line indices belonging to replaced pairs that differ only in whitespace.
     whitespace_pairs: HashSet<usize>,
     hide_whitespace: bool,
+    focus: Option<FocusHandle>,
+    selection: Option<DiffSelection>,
+}
+
+type DiffCursor = (usize, usize); // Display row and source byte offset.
+
+struct DiffSelection {
+    old: bool,
+    anchor: DiffCursor,
+    head: DiffCursor,
+    dragging: bool,
+}
+
+impl DiffSelection {
+    fn span(&self) -> (DiffCursor, DiffCursor) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    fn range(&self, row: usize, len: usize) -> Option<Range<usize>> {
+        let (start, end) = self.span();
+        (start.0..=end.0).contains(&row).then(|| {
+            let start = if row == start.0 { start.1 } else { 0 };
+            let end = if row == end.0 { end.1 } else { len };
+            start..end
+        })
+    }
+}
+
+type DiffTextHits = Rc<RefCell<HashMap<(usize, bool), DiffTextHit>>>;
+
+struct DiffTextHit {
+    bounds: Bounds<Pixels>,
+    origin_x: Pixels,
+    shape: Rc<EditorLine>,
+    display: SharedString,
+    source: SharedString,
+}
+
+fn offset_in(from: &str, to: &str, offset: usize) -> usize {
+    if from == to {
+        offset
+    } else {
+        // Visible whitespace substitutes one glyph for each source character.
+        to.char_indices()
+            .nth(from[..offset].chars().count())
+            .map_or(to.len(), |(offset, _)| offset)
+    }
 }
 
 /// Thread-safe diff preparation result. Build it on a background executor, then
@@ -243,34 +291,7 @@ impl DiffCard {
         old_text: impl Into<SharedString>,
         new_text: impl Into<SharedString>,
     ) -> Self {
-        let mut card = Self {
-            language: language.into(),
-            name: "diff".into(),
-            path: "".into(),
-            lines: Vec::new(),
-            word_tints: Vec::new(),
-            expanded_hunks: HashSet::new(),
-            body_visible: true,
-            header_visible: true,
-            title_clickable: false,
-            side_by_side: false,
-            fill_height: false,
-            theme: ThemePreset::default(),
-            rows: None,
-            row_offsets: Vec::new(),
-            runs: HashMap::new(),
-            scroll: ScrollHandle::new(),
-            horizontal_scroll: ScrollHandle::new(),
-            horizontal_bar: ScrollbarState::default(),
-            vertical_bar: ScrollbarState::default(),
-            viewport_width: px(0.),
-            max_columns: 0,
-            measured_width: Default::default(),
-            rendered_rows: 0..0,
-            totals: (0, 0),
-            whitespace_pairs: HashSet::new(),
-            hide_whitespace: false,
-        };
+        let mut card = Self::with_lines(language.into(), Vec::new());
         card.set_diff(old_text, new_text, cx);
         card
     }
@@ -316,6 +337,8 @@ impl DiffCard {
             totals: (0, 0),
             whitespace_pairs: HashSet::new(),
             hide_whitespace: false,
+            focus: None,
+            selection: None,
         }
     }
 
@@ -388,6 +411,7 @@ impl DiffCard {
     pub fn side_by_side(mut self, enabled: bool) -> Self {
         if self.side_by_side != enabled {
             self.rows = None;
+            self.selection = None;
         }
         self.side_by_side = enabled;
         self
@@ -397,6 +421,7 @@ impl DiffCard {
         if self.side_by_side != enabled {
             self.side_by_side = enabled;
             self.rows = None;
+            self.selection = None;
             cx.notify();
         }
     }
@@ -433,6 +458,7 @@ impl DiffCard {
         if self.hide_whitespace != enabled {
             self.hide_whitespace = enabled;
             self.rows = None;
+            self.selection = None;
             self.runs.clear();
             cx.notify();
         }
@@ -480,6 +506,7 @@ impl DiffCard {
         self.expanded_hunks.clear();
         self.expanded_hunks = (0..self.hunk_count()).collect();
         self.rows = None;
+        self.selection = None;
         cx.notify();
     }
 
@@ -499,6 +526,7 @@ impl DiffCard {
     }
 
     fn recompute_word_tints(&mut self) {
+        self.selection = None;
         self.measured_width.set(px(0.));
         // A cheap upper bound avoids shaping every line just to size a rail.
         self.max_columns = self
@@ -816,14 +844,77 @@ fn split_rows(rows: Vec<Row>, lines: &[DiffLine]) -> Vec<Row> {
 }
 
 impl DiffCard {
+    fn finish_selection(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            selection.dragging = false;
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        if selection.anchor == selection.head {
+            return None;
+        }
+        let rows = self.rows.as_ref()?;
+        let (start, end) = selection.span();
+        let mut text = String::new();
+        for (row_index, row) in (start.0..=end.0).zip(&rows[start.0..=end.0]) {
+            let index = match row {
+                Row::Line(index) | Row::Whitespace(_, index) => Some(*index),
+                Row::Pair(old, new) => {
+                    if selection.old {
+                        *old
+                    } else {
+                        *new
+                    }
+                }
+                Row::Hunk { .. } => None,
+            };
+            if let Some(index) = index {
+                let source = &self.lines[index].text;
+                let range = selection.range(row_index, source.len())?;
+                if row_index != start.0 {
+                    text.push('\n');
+                }
+                text.push_str(&source[range]);
+            }
+        }
+        Some(text)
+    }
+
+    fn line_selection(
+        &self,
+        hits: &DiffTextHits,
+        row: usize,
+        old: bool,
+        index: usize,
+        colors: CodeColors,
+    ) -> Option<DiffLineSelection> {
+        let source = self.lines[index].text.clone();
+        let range = self
+            .selection
+            .as_ref()
+            .filter(|selection| selection.old == old && selection.anchor != selection.head)
+            .and_then(|selection| selection.range(row, source.len()));
+        Some(DiffLineSelection {
+            hits: hits.clone(),
+            key: (row, old),
+            source,
+            range,
+            color: colors.selection,
+        })
+    }
+
     fn split_cell(
         &mut self,
         index: Option<usize>,
-        old: bool,
+        location: (usize, bool),
+        hits: &DiffTextHits,
         colors: CodeColors,
         palette: DiffColors,
         owner: gpui::EntityId,
     ) -> gpui::Div {
+        let (row_index, old) = location;
         let mut cell = div()
             .flex_1()
             .min_w_0()
@@ -900,9 +991,11 @@ impl DiffCard {
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
+                .cursor(gpui::CursorStyle::IBeam)
                 .line_height(px(LINE_HEIGHT))
                 .child(DiffLineElement {
                     runs,
+                    selection: self.line_selection(hits, row_index, old, index, colors),
                     text: display_text,
                     horizontal: Some(self.horizontal_scroll.clone()),
                     measurement: Some((self.measured_width.clone(), owner)),
@@ -913,6 +1006,7 @@ impl DiffCard {
 
 impl Render for DiffCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selection_focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
         let theme = self.theme;
         let p = theme.palette();
         let dark = theme.is_dark();
@@ -1103,9 +1197,63 @@ impl Render for DiffCard {
                 px(0.),
             ));
             let (rows, visible) = self.visible_rows();
+            let hits = DiffTextHits::default();
+            let down_hits = hits.clone();
+            let move_hits = hits.clone();
+            let body = div()
+                .track_focus(&selection_focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    let key = &event.keystroke;
+                    if key.key == "c"
+                        && (key.modifiers.control || key.modifiers.platform)
+                        && !key.modifiers.alt
+                        && !key.modifiers.shift
+                        && let Some(text) = this.selected_text()
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        this.selection =
+                            hit_diff_text(&down_hits, event.position, None).map(|(old, cursor)| {
+                                selection_focus.focus(window, cx);
+                                DiffSelection {
+                                    old,
+                                    anchor: cursor,
+                                    head: cursor,
+                                    dragging: true,
+                                }
+                            });
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(
+                    cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if let Some(selection) = &mut this.selection
+                            && selection.dragging
+                            && let Some((_, cursor)) =
+                                hit_diff_text(&move_hits, event.position, Some(selection.old))
+                            && selection.head != cursor
+                        {
+                            selection.head = cursor;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.finish_selection()),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.finish_selection()),
+                );
             let paint_offset = self.scroll.offset();
             let card = cx.entity();
-            let mut body = div()
+            let mut body = body
                 .on_children_prepainted(move |_, _, cx| {
                     card.update(cx, |this, cx| {
                         let width = this.scroll.bounds().size.width;
@@ -1174,12 +1322,25 @@ impl Render for DiffCard {
                     })
                 });
             }
-            for row in rows[visible.clone()].iter().cloned() {
+            for (row_index, row) in (visible.clone()).zip(rows[visible.clone()].iter().cloned()) {
                 match row {
                     Row::Pair(left, right) => {
-                        let left = self.split_cell(left, true, colors, diff_colors, cx.entity_id());
-                        let right =
-                            self.split_cell(right, false, colors, diff_colors, cx.entity_id());
+                        let left = self.split_cell(
+                            left,
+                            (row_index, true),
+                            &hits,
+                            colors,
+                            diff_colors,
+                            cx.entity_id(),
+                        );
+                        let right = self.split_cell(
+                            right,
+                            (row_index, false),
+                            &hits,
+                            colors,
+                            diff_colors,
+                            cx.entity_id(),
+                        );
                         content = content.child(
                             div()
                                 .w_full()
@@ -1298,9 +1459,12 @@ impl Render for DiffCard {
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
+                                .cursor(gpui::CursorStyle::IBeam)
                                 .line_height(px(LINE_HEIGHT))
                                 .child(DiffLineElement {
                                     runs,
+                                    selection: self
+                                        .line_selection(&hits, row_index, false, index, colors),
                                     text: display_text,
                                     horizontal: Some(self.horizontal_scroll.clone()),
                                     measurement: Some((
@@ -1338,6 +1502,7 @@ impl Render for DiffCard {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.expanded_hunks.insert(id);
                                     this.rows = None;
+                                    this.selection = None;
                                     let _ = first;
                                     cx.notify();
                                 }))
@@ -1495,8 +1660,36 @@ fn window_font() -> gpui::Font {
     gpui::font(".SystemUIFont")
 }
 
+fn hit_diff_text(
+    hits: &DiffTextHits,
+    position: Point<Pixels>,
+    old_column: Option<bool>,
+) -> Option<(bool, DiffCursor)> {
+    let hits = hits.borrow();
+    let (&(row, old), hit) = hits
+        .iter()
+        .filter(|((_, old), hit)| {
+            old_column.map_or_else(|| hit.bounds.contains(&position), |column| *old == column)
+        })
+        .min_by(|(_, first), (_, second)| {
+            let distance = |hit: &DiffTextHit| f32::from(position.y - hit.bounds.center().y).abs();
+            distance(first).total_cmp(&distance(second))
+        })?;
+    let offset = hit.shape.closest_index_for_x(position.x - hit.origin_x);
+    Some((old, (row, offset_in(&hit.display, &hit.source, offset))))
+}
+
+struct DiffLineSelection {
+    hits: DiffTextHits,
+    key: (usize, bool),
+    source: SharedString,
+    range: Option<Range<usize>>,
+    color: u32,
+}
+
 /// Paints one highlighted code line, including per-run background tints.
 struct DiffLineElement {
+    selection: Option<DiffLineSelection>,
     text: SharedString,
     runs: Vec<TextRun>,
     horizontal: Option<ScrollHandle>,
@@ -1504,7 +1697,7 @@ struct DiffLineElement {
 }
 
 struct DiffLinePrepaint {
-    line: Option<EditorLine>,
+    line: Option<Rc<EditorLine>>,
 }
 
 impl IntoElement for DiffLineElement {
@@ -1569,7 +1762,9 @@ impl Element for DiffLineElement {
                 cx.defer(move |cx| cx.notify(owner));
             }
         }
-        DiffLinePrepaint { line: Some(line) }
+        DiffLinePrepaint {
+            line: Some(Rc::new(line)),
+        }
     }
 
     fn paint(
@@ -1592,6 +1787,33 @@ impl Element for DiffLineElement {
                 bounds.origin.y,
             );
             line.paint_background(origin, px(LINE_HEIGHT), window, cx);
+            if let Some(selection) = &self.selection {
+                selection.hits.borrow_mut().insert(
+                    selection.key,
+                    DiffTextHit {
+                        bounds,
+                        origin_x: origin.x,
+                        shape: line.clone(),
+                        display: self.text.clone(),
+                        source: selection.source.clone(),
+                    },
+                );
+                if let Some(range) = &selection.range {
+                    let x_for =
+                        |offset| line.x_for_index(offset_in(&selection.source, &self.text, offset));
+                    let left = x_for(range.start);
+                    let right = x_for(range.end);
+                    if right > left {
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                gpui::point(origin.x + left, origin.y),
+                                gpui::size(right - left, px(LINE_HEIGHT)),
+                            ),
+                            rgb(selection.color),
+                        ));
+                    }
+                }
+            }
             line.paint(origin, px(LINE_HEIGHT), window, cx);
         }
     }
@@ -1601,6 +1823,42 @@ impl Element for DiffLineElement {
 mod tests {
     use super::*;
     use gpui::AppContext;
+
+    #[gpui::test]
+    fn drag_copies_original_text_in_unified_and_split_diffs(cx: &mut gpui::TestAppContext) {
+        let (card, window) = cx.add_window_view(|_, cx| {
+            DiffCard::new(cx, "text", "旧  value\nnext\n", "旧 value\nnext\n")
+        });
+        window.simulate_resize(gpui::size(px(600.), px(400.)));
+        window.run_until_parked();
+        let drag = |window: &mut gpui::VisualTestContext, from_x: Pixels, to_x: Pixels| {
+            let body = window.debug_bounds("glass-diff-card-body").unwrap();
+            let start = gpui::point(from_x, body.top() + px(LINE_HEIGHT / 2.));
+            let end = gpui::point(to_x, start.y + px(LINE_HEIGHT));
+            window.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+            window.simulate_mouse_move(end, gpui::MouseButton::Left, Default::default());
+            window.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+            window.run_until_parked();
+        };
+
+        let body = window.debug_bounds("glass-diff-card-body").unwrap();
+        drag(window, body.left() + px(94.), body.left() + px(250.));
+        window.simulate_keystrokes("ctrl-c");
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "旧 value\nnext"
+        );
+
+        card.update(window, |card, cx| card.set_side_by_side(true, cx));
+        window.run_until_parked();
+        let body = window.debug_bounds("glass-diff-card-body").unwrap();
+        drag(window, body.left() + px(50.), body.right() - px(20.));
+        window.simulate_keystrokes("cmd-c");
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "旧  value\nnext"
+        );
+    }
 
     #[gpui::test]
     fn background_preparation_installs_cached_rows_and_keeps_virtual_rendering(
@@ -1781,12 +2039,14 @@ mod tests {
         window.update(|window, cx| {
             let text: SharedString = "\t \t中文 return".into();
             let mut element = DiffLineElement {
+                selection: None,
                 runs: dim_runs(&text, 0x555555),
                 text: text.clone(),
                 horizontal: None,
                 measurement: None,
             };
             let mut spaces = DiffLineElement {
+                selection: None,
                 runs: dim_runs("        中文 return", 0x555555),
                 text: "        中文 return".into(),
                 horizontal: None,

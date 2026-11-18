@@ -54,8 +54,10 @@ impl MenuItem {
                 row.cursor_pointer()
                     .hover(move |s| s.bg(rgb(p.accent_tint)))
             })
-            .when_some(self.icon, |row, icon| row.child(icon.render(14.)))
-            .child(self.label)
+            .when_some(self.icon, |row, icon| {
+                row.child(icon.render(14.).flex_shrink_0())
+            })
+            .child(div().min_w_0().truncate().child(self.label))
     }
 }
 

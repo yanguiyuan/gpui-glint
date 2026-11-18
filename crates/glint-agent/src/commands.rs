@@ -64,7 +64,10 @@ impl AgentWorkspace {
                 .icon(Icon::GitBranch)
                 .group("项目")
                 .keywords("git graph 分支 提交 历史 对比 差异")
-                .disabled(session.project.is_none()),
+                .disabled(
+                    session.project.is_none()
+                        && !(self.page == crate::Page::Projects && self.browser_project.is_some()),
+                ),
             CommandItem::new("workspace-diff", "打开 Git 工作区 Diff 侧栏")
                 .icon(Icon::GitBranch)
                 .shortcut(crate::shortcuts::ProjectAction::Diff.label(&self.history))

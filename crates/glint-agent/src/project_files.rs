@@ -1,18 +1,51 @@
 //! Project-page layout owns a persistent explorer and independently loaded documents.
 use super::*;
 use crate::file_preview::{Loaded, Target};
-use gpui_glint::components::{FilePreview, FilePreviewEvent};
+use crate::git_ui::CommitDiff;
+use crate::go_definition::{GoDefinitions, ProcessState};
+use crate::shortcuts::DefinitionModifier;
+use gpui_glint::components::{FilePreview, FilePreviewEvent, GitGraph, GitGraphEvent, Skeleton};
+use std::{ops::Range, path::Path, time::Duration};
 
 struct Document {
     id: u64,
     path: String,
+    view: DocumentView,
+    _task: Option<Task<()>>,
+}
+
+enum DocumentView {
+    File(Entity<FilePreview>),
+    Diff(CommitDiff),
+}
+
+struct GoSymbol {
     view: Entity<FilePreview>,
+    path: String,
+    source: SharedString,
+    range: Range<usize>,
+}
+
+struct DefinitionHover {
+    view: Entity<FilePreview>,
+    range: Range<usize>,
+    target: Option<(String, usize)>,
     _task: Task<()>,
 }
 
 pub(super) struct ProjectFiles {
     root: Option<PathBuf>,
     tree: Entity<FilePreview>,
+    graph: Option<Entity<GitGraph>>,
+    showing_graph: bool,
+    compare_branch: String,
+    graph_task: Option<Task<()>>,
+    commit_task: Option<Task<()>>,
+    go_definitions: Option<GoDefinitions>,
+    definition_modifier: DefinitionModifier,
+    definition_hover: Option<DefinitionHover>,
+    definition_task: Option<Task<()>>,
+    definition_error: Option<String>,
     documents: Vec<Document>,
     active: Option<usize>,
     task: Option<Task<()>>,
@@ -33,8 +66,22 @@ async fn read(target: Target) -> Result<(String, Option<String>, Loaded), String
 }
 
 impl ProjectFiles {
+    pub(super) fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    pub(super) fn go_process(&self) -> Option<(&Path, ProcessState)> {
+        Some((self.root()?, self.go_definitions.as_ref()?.process_state()))
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let tree = cx.new(FilePreview::new);
+        let tree = cx.new(|cx| {
+            let mut view = FilePreview::new(cx);
+            view.set_standalone(true, cx);
+            view.set_expanded(true, cx);
+            view.set_content_only(true, cx);
+            view
+        });
         cx.subscribe(&tree, |this, _, event: &FilePreviewEvent, cx| match event {
             FilePreviewEvent::OpenRequested(path) => this.open(path.clone(), cx),
             FilePreviewEvent::DirectoryRequested { path, request } => {
@@ -46,6 +93,16 @@ impl ProjectFiles {
         Self {
             root: None,
             tree,
+            graph: None,
+            showing_graph: false,
+            compare_branch: "master".into(),
+            graph_task: None,
+            commit_task: None,
+            go_definitions: None,
+            definition_modifier: Default::default(),
+            definition_hover: None,
+            definition_task: None,
+            definition_error: None,
             documents: vec![],
             active: None,
             task: None,
@@ -61,15 +118,155 @@ impl ProjectFiles {
             return;
         }
         self.root = Some(root);
+        self.graph = None;
+        self.graph_task = None;
+        self.commit_task = None;
+        self.definition_task = None;
+        self.definition_error = None;
+        self.compare_branch = "master".into();
+        for document in &self.documents {
+            if let DocumentView::File(view) = &document.view {
+                view.update(cx, |view, cx| view.set_active(false, cx));
+            }
+        }
         self.documents.clear();
         self.active = None;
         self.refresh(cx);
+        if self.showing_graph {
+            self.show_git_graph(cx);
+        }
+    }
+
+    pub(super) fn show_git_graph(&mut self, cx: &mut Context<Self>) {
+        self.showing_graph = true;
+        if self.graph.is_none() {
+            let graph = cx.new(|cx| {
+                let mut graph = GitGraph::new(cx).header_visible(false);
+                graph.set_theme(self.theme, cx);
+                graph
+            });
+            cx.subscribe(&graph, |this, _, event: &GitGraphEvent, cx| match event {
+                GitGraphEvent::CompareBranch(branch) => {
+                    this.compare_branch = branch.clone();
+                    this.refresh_graph(cx);
+                }
+                GitGraphEvent::SelectCommit(id) => this.load_commit(id.clone(), cx),
+                GitGraphEvent::OpenFile { commit, path } => {
+                    this.open_diff(commit.clone(), path.clone(), cx)
+                }
+                GitGraphEvent::Refresh => this.refresh_graph(cx),
+                GitGraphEvent::CloseRequested => {
+                    this.showing_graph = false;
+                    cx.notify();
+                }
+            })
+            .detach();
+            self.graph = Some(graph);
+            self.refresh_graph(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn refresh_graph(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(graph)) = (self.root.clone(), self.graph.clone()) else {
+            return;
+        };
+        self.graph_task = None;
+        self.commit_task = None;
+        let branch = self.compare_branch.clone();
+        graph.update(cx, |graph, cx| graph.set_loading(cx));
+        let job = match provider::Job::start(async move { git_project::graph(&root, branch).await })
+        {
+            Ok(job) => job,
+            Err(error) => {
+                graph.update(cx, |graph, cx| graph.set_error(error, cx));
+                return;
+            }
+        };
+        let graph = graph.downgrade();
+        self.graph_task = Some(cx.spawn(async move |_, cx| {
+            let result = job.result().await;
+            let _ = graph.update(cx, |graph, cx| match result {
+                Ok(data) => graph.set_data(data, cx),
+                Err(error) => graph.set_error(error, cx),
+            });
+        }));
+    }
+
+    fn load_commit(&mut self, id: String, cx: &mut Context<Self>) {
+        let (Some(root), Some(graph)) = (self.root.clone(), self.graph.as_ref()) else {
+            return;
+        };
+        let commit = id.clone();
+        let job =
+            match provider::Job::start(async move { git_project::details(&root, &commit).await }) {
+                Ok(job) => job,
+                Err(error) => {
+                    graph.update(cx, |graph, cx| graph.set_details(&id, error, cx));
+                    return;
+                }
+            };
+        let graph = graph.downgrade();
+        self.commit_task = Some(cx.spawn(async move |_, cx| {
+            let result = job.result().await;
+            let _ = graph.update(cx, |graph, cx| match result {
+                Ok(details) => graph.set_commit_details(details, cx),
+                Err(error) => graph.set_details(&id, error, cx),
+            });
+        }));
+    }
+
+    fn open_diff(&mut self, commit: String, path: String, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if let Some(index) = self.documents.iter().position(|document| {
+            matches!(&document.view, DocumentView::Diff(diff) if diff.commit == commit && diff.path == path)
+        }) {
+            self.activate(index, cx);
+            return;
+        }
+        let mut diff = CommitDiff::new(commit, path.clone());
+        self.next_document_id += 1;
+        let id = self.next_document_id;
+        let task = match diff.load(root) {
+            Ok(job) => Some(cx.spawn(async move |weak, cx| {
+                let result = job.result().await;
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(document) =
+                        this.documents.iter_mut().find(|document| document.id == id)
+                    else {
+                        return;
+                    };
+                    if let DocumentView::Diff(diff) = &mut document.view {
+                        diff.set_result(result, this.theme, true, cx);
+                        cx.notify();
+                    }
+                });
+            })),
+            Err(error) => {
+                diff.error = Some(error);
+                None
+            }
+        };
+        self.documents.push(Document {
+            id,
+            path,
+            view: DocumentView::Diff(diff),
+            _task: task,
+        });
+        self.activate(self.documents.len() - 1, cx);
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else {
             return;
         };
+        self.definition_task = None;
+        self.clear_definition_hover(cx);
+        self.definition_error = None;
+        self.go_definitions = None;
+        self.warm_go_definitions();
         self.directories.clear();
         let path = if ssh_project::is_remote(&root) {
             match ssh_project::Remote::from_path(&root) {
@@ -106,7 +303,10 @@ impl ProjectFiles {
                     Err(error) => view.set_error(error, cx),
                     _ => view.set_error("项目目录不可用".into(), cx),
                 });
-                if let Some(index) = this.active {
+                if let Some(index) = this
+                    .active
+                    .filter(|index| matches!(this.documents[*index].view, DocumentView::File(_)))
+                {
                     this.tree.update(cx, |view, cx| {
                         view.set_selected_path(this.documents[index].path.clone(), cx)
                     });
@@ -145,6 +345,186 @@ impl ProjectFiles {
         self.open_at(path, None, cx);
     }
 
+    fn go_definitions(&mut self, first_file: PathBuf) -> Result<&GoDefinitions, String> {
+        if self.go_definitions.is_none() {
+            let root = self.root.clone().ok_or("项目目录不可用")?;
+            self.go_definitions = Some(GoDefinitions::start(root, first_file)?);
+        }
+        Ok(self.go_definitions.as_ref().unwrap())
+    }
+
+    fn warm_go_definitions(&mut self) {
+        if self
+            .root
+            .as_deref()
+            .is_some_and(|root| !ssh_project::is_remote(root))
+            && let Some(index) = self.active
+            && let document = &self.documents[index]
+            && matches!(document.view, DocumentView::File(_))
+            && Path::new(&document.path)
+                .extension()
+                .is_some_and(|ext| ext == "go")
+        {
+            let _ = self.go_definitions(PathBuf::from(&document.path));
+        }
+    }
+
+    fn go_symbol_at(&self, position: gpui::Point<gpui::Pixels>, cx: &App) -> Option<GoSymbol> {
+        if self.root.as_deref().is_none_or(ssh_project::is_remote) {
+            return None;
+        }
+        let DocumentView::File(view) = &self.documents[self.active?].view else {
+            return None;
+        };
+        let (path, source, offset) = view.read(cx).go_source_at(position, cx)?;
+        let identifier = |ch: char| ch == '_' || ch.is_alphanumeric();
+        let start = source[..offset]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| identifier(*ch))
+            .last()
+            .map_or(offset, |(index, _)| index);
+        let end = offset
+            + source[offset..]
+                .find(|ch| !identifier(ch))
+                .unwrap_or(source.len() - offset);
+        Some(GoSymbol {
+            view: view.clone(),
+            path,
+            source,
+            range: start..end,
+        })
+    }
+
+    pub(super) fn set_definition_modifier(
+        &mut self,
+        modifier: DefinitionModifier,
+        cx: &mut Context<Self>,
+    ) {
+        if self.definition_modifier != modifier {
+            self.definition_modifier = modifier;
+            self.clear_definition_hover(cx);
+        }
+    }
+
+    fn clear_definition_hover(&mut self, cx: &mut Context<Self>) {
+        if let Some(hover) = self.definition_hover.take() {
+            hover
+                .view
+                .update(cx, |view, cx| view.set_source_underline(None, cx));
+        }
+    }
+
+    pub(super) fn update_definition_hover(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.definition_modifier.matches(modifiers) {
+            self.clear_definition_hover(cx);
+            return;
+        }
+        let Some(symbol) = self.go_symbol_at(position, cx) else {
+            self.clear_definition_hover(cx);
+            return;
+        };
+        if self
+            .definition_hover
+            .as_ref()
+            .is_some_and(|hover| hover.view == symbol.view && hover.range == symbol.range)
+        {
+            return;
+        };
+        self.clear_definition_hover(cx);
+        let GoSymbol {
+            view,
+            path,
+            source,
+            range,
+        } = symbol;
+        let offset = range.start;
+        let task = cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(75))
+                .await;
+            let job = weak.update(cx, |this, _| {
+                this.go_definitions(PathBuf::from(&path))
+                    .and_then(|session| session.lookup(path, source, offset))
+            });
+            let Ok(Ok(job)) = job else { return };
+            if let Ok(target) = job.result().await {
+                let _ = weak.update(cx, |this, cx| {
+                    if let Some(hover) = &mut this.definition_hover {
+                        hover.target = Some(target);
+                        let range = hover.range.clone();
+                        hover
+                            .view
+                            .update(cx, |view, cx| view.set_source_underline(Some(range), cx));
+                    }
+                });
+            }
+        });
+        self.definition_hover = Some(DefinitionHover {
+            view,
+            range,
+            target: None,
+            _task: task,
+        });
+    }
+
+    fn jump_to_go_definition(&mut self, event: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        if !self.definition_modifier.matches(event.modifiers)
+            || event.button != gpui::MouseButton::Left
+        {
+            return;
+        }
+        let Some(symbol) = self.go_symbol_at(event.position, cx) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.definition_task = None;
+        self.definition_error = None;
+        let target = self
+            .definition_hover
+            .as_ref()
+            .filter(|hover| hover.view == symbol.view && hover.range == symbol.range)
+            .and_then(|hover| hover.target.clone());
+        self.clear_definition_hover(cx);
+        if let Some((path, line)) = target {
+            self.open_at(path, Some(line), cx);
+            return;
+        }
+        let GoSymbol {
+            path,
+            source,
+            range,
+            ..
+        } = symbol;
+        match self
+            .go_definitions(PathBuf::from(&path))
+            .and_then(|session| session.lookup(path, source, range.start))
+        {
+            Ok(job) => {
+                self.definition_task = Some(cx.spawn(async move |weak, cx| {
+                    let result = job.result().await;
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(task) = this.definition_task.take() {
+                            task.detach();
+                        }
+                        match result {
+                            Ok((path, line)) => this.open_at(path, Some(line), cx),
+                            Err(error) => this.definition_error = Some(error),
+                        }
+                        cx.notify();
+                    });
+                }));
+            }
+            Err(error) => self.definition_error = Some(error),
+        }
+        cx.notify();
+    }
+
     pub(super) fn open_search_result(
         &mut self,
         path: String,
@@ -153,24 +533,22 @@ impl ProjectFiles {
         cx: &mut Context<Self>,
     ) {
         self.open_at(path, line, cx);
-        if let Some(index) = self.active {
-            self.documents[index]
-                .view
-                .update(cx, |view, cx| view.set_document_search(query, line, cx));
+        if let Some(index) = self.active
+            && let DocumentView::File(view) = &self.documents[index].view
+        {
+            view.update(cx, |view, cx| view.set_document_search(query, line, cx));
         }
     }
 
     pub(super) fn open_at(&mut self, path: String, line: Option<usize>, cx: &mut Context<Self>) {
-        if let Some(index) = self
-            .documents
-            .iter()
-            .position(|document| document.path == path)
-        {
+        if let Some(index) = self.documents.iter().position(|document| {
+            document.path == path && matches!(document.view, DocumentView::File(_))
+        }) {
             self.activate(index, cx);
-            if let Some(line) = line {
-                self.documents[index]
-                    .view
-                    .update(cx, |view, cx| view.reveal_line(line, cx));
+            if let Some(line) = line
+                && let DocumentView::File(view) = &self.documents[index].view
+            {
+                view.update(cx, |view, cx| view.reveal_line(line, cx));
             }
             return;
         }
@@ -182,6 +560,9 @@ impl ProjectFiles {
             view.set_standalone(true, cx);
             view.set_content_only(true, cx);
             view.set_expanded(true, cx);
+            if let Some(line) = line {
+                view.reveal_line(line, cx);
+            }
         });
         let target = Target {
             root: self.root.clone(),
@@ -200,9 +581,6 @@ impl ProjectFiles {
                         .unwrap_or("text")
                         .to_owned();
                     view.set_file(path, parent, language, content, cx);
-                    if let Some(line) = line {
-                        view.reveal_line(line, cx);
-                    }
                 }
                 Ok((path, parent, Loaded::Image(bytes))) => view.set_image(
                     path,
@@ -218,29 +596,32 @@ impl ProjectFiles {
         self.documents.push(Document {
             id: self.next_document_id,
             path,
-            view,
-            _task: task,
+            view: DocumentView::File(view),
+            _task: Some(task),
         });
         self.activate(self.documents.len() - 1, cx);
     }
 
     fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.clear_definition_hover(cx);
+        self.definition_task = None;
+        self.definition_error = None;
         self.active = Some(index);
-        self.tree.update(cx, |view, cx| {
-            view.set_selected_path(self.documents[index].path.clone(), cx)
-        });
-        for (i, document) in self.documents.iter().enumerate() {
-            document.view.update(cx, |view, cx| {
-                view.set_active(self.visible && i == index, cx)
+        self.warm_go_definitions();
+        if matches!(self.documents[index].view, DocumentView::File(_)) {
+            self.tree.update(cx, |view, cx| {
+                view.set_selected_path(self.documents[index].path.clone(), cx)
             });
         }
+        self.update_active_previews(cx);
         cx.notify();
     }
 
     fn close(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.documents[index]
-            .view
-            .update(cx, |view, cx| view.set_active(false, cx));
+        self.clear_definition_hover(cx);
+        if let DocumentView::File(view) = &self.documents[index].view {
+            view.update(cx, |view, cx| view.set_active(false, cx));
+        }
         self.documents.remove(index);
         self.active = self.active.and_then(|active| {
             if self.documents.is_empty() {
@@ -262,10 +643,21 @@ impl ProjectFiles {
             return;
         }
         self.visible = visible;
+        if !visible {
+            self.clear_definition_hover(cx);
+            self.definition_task = None;
+            self.definition_error = None;
+        }
+        self.update_active_previews(cx);
+    }
+
+    fn update_active_previews(&self, cx: &mut Context<Self>) {
         for (index, document) in self.documents.iter().enumerate() {
-            document.view.update(cx, |view, cx| {
-                view.set_active(visible && self.active == Some(index), cx)
-            });
+            if let DocumentView::File(view) = &document.view {
+                view.update(cx, |view, cx| {
+                    view.set_active(self.visible && self.active == Some(index), cx)
+                });
+            }
         }
     }
 
@@ -275,10 +667,18 @@ impl ProjectFiles {
         }
         self.theme = theme;
         self.tree.update(cx, |view, cx| view.set_theme(theme, cx));
+        if let Some(graph) = &self.graph {
+            graph.update(cx, |graph, cx| graph.set_theme(theme, cx));
+        }
         for document in &self.documents {
-            document
-                .view
-                .update(cx, |view, cx| view.set_theme(theme, cx));
+            match &document.view {
+                DocumentView::File(view) => view.update(cx, |view, cx| view.set_theme(theme, cx)),
+                DocumentView::Diff(diff) => {
+                    if let Some(card) = &diff.card {
+                        card.update(cx, |card, cx| card.set_theme(theme, cx));
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -287,10 +687,6 @@ impl ProjectFiles {
 impl Render for ProjectFiles {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
-        self.tree.update(cx, |view, cx| {
-            view.set_standalone(true, cx);
-            view.set_expanded(true, cx);
-        });
         let weak_select = cx.entity().downgrade();
         let weak_close = cx.entity().downgrade();
         let tabs =
@@ -300,7 +696,17 @@ impl Render for ProjectFiles {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                gpui_glint::components::ClosableTab::new(document.id, label).icon(Icon::Text)
+                let (label, icon) = match &document.view {
+                    DocumentView::File(_) => (label, Icon::Text),
+                    DocumentView::Diff(diff) => (
+                        format!(
+                            "{label} · {}",
+                            diff.commit.chars().take(7).collect::<String>()
+                        ),
+                        Icon::GitBranch,
+                    ),
+                };
+                gpui_glint::components::ClosableTab::new(document.id, label).icon(icon)
             }))
             .selected(self.active.map(|index| self.documents[index].id))
             .theme(self.theme)
@@ -326,12 +732,108 @@ impl Render for ProjectFiles {
             });
         let document_pane = if let Some(index) = self.active {
             let document = &self.documents[index];
-            let controls = document
-                .view
-                .update(cx, |view, cx| view.document_controls(cx));
-            tabs.trailing(controls)
-                .content(document.id, document.view.clone())
-                .render()
+            match &document.view {
+                DocumentView::File(view) => {
+                    let controls = view.update(cx, |view, cx| view.document_controls(cx));
+                    let status = self
+                        .definition_error
+                        .as_deref()
+                        .or(self.definition_task.as_ref().map(|_| "正在查找 Go 定义…"));
+                    tabs.trailing(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when_some(status, |row, status| {
+                                row.child(
+                                    gpui_glint::components::Tooltip::new(
+                                        div()
+                                            .max_w(px(240.))
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(status.to_owned()),
+                                        status.to_owned(),
+                                    )
+                                    .theme(self.theme)
+                                    .render(cx),
+                                )
+                            })
+                            .child(controls),
+                    )
+                    .content(
+                        document.id,
+                        div()
+                            .size_full()
+                            .min_h_0()
+                            .id("project-file-preview")
+                            .debug_selector(|| "project-file-preview".into())
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    if event.dragging() {
+                                        this.clear_definition_hover(cx);
+                                    } else {
+                                        this.update_definition_hover(
+                                            event.position,
+                                            event.modifiers,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            ))
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                if !hovered {
+                                    this.clear_definition_hover(cx);
+                                }
+                            }))
+                            .on_scroll_wheel(
+                                cx.listener(|this, _, _, cx| this.clear_definition_hover(cx)),
+                            )
+                            .capture_any_mouse_down(cx.listener(|this, event, _, cx| {
+                                this.jump_to_go_definition(event, cx);
+                            }))
+                            .child(view.clone()),
+                    )
+                    .render()
+                }
+                DocumentView::Diff(diff) => {
+                    let content = div()
+                        .size_full()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_3()
+                                .py_2()
+                                .text_size(px(12.))
+                                .text_color(rgb(p.text_muted))
+                                .truncate()
+                                .child(format!(
+                                    "{} · {}",
+                                    gpui_glint::paths::display_path(&diff.path),
+                                    diff.commit.chars().take(12).collect::<String>()
+                                )),
+                        )
+                        .when_some(diff.card.clone(), |body, card| body.child(card))
+                        .when_some(diff.error.clone(), |body, error| {
+                            body.child(div().p_3().child(error))
+                        })
+                        .when(diff.card.is_none() && diff.error.is_none(), |body| {
+                            body.child(
+                                div().p_4().child(
+                                    Skeleton::new("project-commit-diff-loading")
+                                        .lines(12)
+                                        .height(12.)
+                                        .gap(14.)
+                                        .theme(self.theme),
+                                ),
+                            )
+                        });
+                    tabs.content(document.id, content).render()
+                }
+            }
         } else {
             div()
                 .size_full()
@@ -339,7 +841,34 @@ impl Render for ProjectFiles {
                 .items_center()
                 .justify_center()
                 .text_color(rgb(p.text_muted))
-                .child("从左侧目录树打开文件")
+                .child(if self.showing_graph {
+                    "选择提交中的文件以查看差异"
+                } else {
+                    "从左侧目录树打开文件"
+                })
+        };
+        let weak = cx.entity().downgrade();
+        let segments = SegmentedControl::new([
+            SegmentOption::new("文件目录").debug_selector("project-directory-segment"),
+            SegmentOption::new("Git Graph").debug_selector("project-git-graph-segment"),
+        ])
+        .id("project-explorer-mode")
+        .selected(usize::from(self.showing_graph))
+        .theme(self.theme)
+        .on_change(move |index, _, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if index == 1 {
+                    this.show_git_graph(cx);
+                } else {
+                    this.showing_graph = false;
+                    cx.notify();
+                }
+            });
+        });
+        let navigation = if self.showing_graph {
+            self.graph.clone().map(IntoElement::into_any_element)
+        } else {
+            Some(self.tree.clone().into_any_element())
         };
         div()
             .size_full()
@@ -350,10 +879,36 @@ impl Render for ProjectFiles {
                 div()
                     .w(px(260.))
                     .h_full()
+                    .min_h_0()
                     .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(p.panel))
                     .border_r_1()
                     .border_color(rgb(p.border))
-                    .child(self.tree.clone()),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(p.border))
+                            .child(segments)
+                            .when(self.showing_graph, |header| {
+                                header.child(
+                                    IconButton::new(Icon::Refresh, "刷新 Git")
+                                        .theme(self.theme)
+                                        .render()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.refresh_graph(cx)),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(div().flex_1().min_h_0().children(navigation)),
             )
             .child(div().flex_1().min_w_0().h_full().child(document_pane))
     }
@@ -362,6 +917,279 @@ impl Render for ProjectFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    #[ignore = "requires Go and gopls on PATH"]
+    fn go_definition_shortcut_resolves_hover_and_jumps(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let router = root.join("router.go");
+        let handler = root.join("handler.go");
+        let name = "handleItem";
+        // Unicode and a tab before the click exercise mapping from shaped text to byte offsets.
+        let call = format!(
+            "package fixture\nfunc route(h *Handler) {{\n\t_ = \"中文\"; _ = h.{name}\n}}\n"
+        );
+        let definition = format!(
+            "package fixture\ntype Handler struct{{}}\n{}func (*Handler) {name}() {{}}\n{}",
+            "\n".repeat(100),
+            "\n".repeat(60)
+        );
+        std::fs::write(root.join("go.mod"), "module example.com/fixture\ngo 1.21\n").unwrap();
+        std::fs::write(&router, &call).unwrap();
+        std::fs::write(&handler, &definition).unwrap();
+
+        let history_path = root.join("sessions.json");
+        std::fs::write(
+            root.join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (workspace, window) =
+            cx.add_window_view(|_, cx| AgentWorkspace::with_path(history_path.clone(), cx));
+        window.simulate_resize(gpui::size(px(1440.), px(1100.)));
+        let files = workspace.read_with(window, |workspace, _| workspace.project_files.clone());
+        workspace.update_in(window, |workspace, window, cx| {
+            workspace.navigate(crate::Page::Projects, window, cx);
+            workspace.choose_project(root.clone(), cx);
+            files.update(cx, |files, cx| {
+                files.open(router.to_string_lossy().into_owned(), cx)
+            });
+        });
+
+        let find_symbol = |path: &Path, source: &str, window: &mut gpui::VisualTestContext| {
+            let start = source.find(name).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(65);
+            loop {
+                window.run_until_parked();
+                let bounds = window.debug_bounds("project-file-preview").unwrap();
+                let target = files.read_with(window, |files, cx| {
+                    assert!(
+                        files.definition_error.is_none(),
+                        "{:?}",
+                        files.definition_error
+                    );
+                    let document = &files.documents[files.active?];
+                    let DocumentView::File(view) = &document.view else {
+                        return None;
+                    };
+                    if Path::new(&document.path) != path {
+                        return None;
+                    }
+                    for y in (2..100).step_by(4) {
+                        for x in (25..420).step_by(4) {
+                            let position = gpui::point(
+                                bounds.left() + px(x as f32),
+                                bounds.top() + px(y as f32),
+                            );
+                            if view.read(cx).go_source_at(position, cx).is_some_and(
+                                |(_, _, offset)| (start..start + name.len()).contains(&offset),
+                            ) {
+                                return Some(position);
+                            }
+                        }
+                    }
+                    None
+                });
+                if let Some(position) = target {
+                    return position;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "symbol not visible in {path:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let position = find_symbol(&router, &call, window);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        window.simulate_click(position, shift);
+        window.run_until_parked();
+        files.read_with(window, |files, _| assert!(files.definition_task.is_none()));
+        window.simulate_click(
+            position,
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        find_symbol(&handler, &definition, window);
+        files.read_with(window, |files, _| assert_eq!(files.documents.len(), 2));
+
+        workspace.update_in(window, |workspace, window, cx| {
+            workspace.navigate(crate::Page::Settings, window, cx);
+            workspace.provider_settings.section = crate::provider_ui::Section::Shortcuts;
+            cx.notify();
+        });
+        window.run_until_parked();
+        let option = window.debug_bounds("go-definition-modifier-Shift").unwrap();
+        window.simulate_click(option.center(), Default::default());
+        workspace.update_in(window, |workspace, window, cx| {
+            assert_eq!(
+                workspace.history.definition_modifier,
+                DefinitionModifier::Shift
+            );
+            workspace.history.save(&history_path).unwrap();
+            assert_eq!(
+                History::load(&history_path).unwrap().definition_modifier,
+                DefinitionModifier::Shift
+            );
+            workspace.navigate(crate::Page::Projects, window, cx);
+            files.update(cx, |files, cx| files.activate(0, cx));
+        });
+        let position = find_symbol(&router, &call, window);
+        window.simulate_mouse_move(position, None, Default::default());
+        let symbol_start = call.find(name).unwrap();
+        let symbol_range = symbol_start..symbol_start + name.len();
+        let resolve_hover = |window: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            window.simulate_modifiers_change(shift);
+            window.executor().advance_clock(Duration::from_millis(100));
+            loop {
+                window.run_until_parked();
+                if files.read_with(window, |files, _| {
+                    files
+                        .definition_hover
+                        .as_ref()
+                        .is_some_and(|hover| hover.range == symbol_range && hover.target.is_some())
+                }) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hover definition did not resolve"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        resolve_hover(window);
+        window.simulate_modifiers_change(Default::default());
+        files.read_with(window, |files, _| assert!(files.definition_hover.is_none()));
+        resolve_hover(window);
+        window.simulate_click(position, shift);
+        files.read_with(window, |files, _| {
+            assert_eq!(files.active, Some(1));
+            assert!(
+                files.definition_task.is_none(),
+                "click should reuse the hovered target"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn project_graph_opens_commit_files_in_reusable_diff_tabs(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=disabled-hooks",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(root.join("main.rs"), "fn first() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-qm", "First"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        std::fs::write(root.join("main.rs"), "fn second() {}\n").unwrap();
+        git(&["add", "main.rs"]);
+        git(&["commit", "-qm", "Second"]);
+        let second = git(&["rev-parse", "HEAD"]);
+        std::fs::write(root.join("main.rs"), "fn working_copy() {}\n").unwrap();
+
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(gpui::size(px(900.), px(720.)));
+        files.update(window, |files, cx| {
+            files.set_root(root.clone(), cx);
+            files.open(root.join("main.rs").to_string_lossy().into_owned(), cx);
+        });
+        let click = |selector: &'static str, window: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                if let Some(bounds) = window.debug_bounds(selector) {
+                    window.simulate_click(bounds.center(), Default::default());
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {selector}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        click("project-git-graph-segment", window);
+        window.run_until_parked();
+        assert!(window.debug_bounds("git-graph").is_some());
+        click(
+            Box::leak(format!("git-commit:{second}").into_boxed_str()),
+            window,
+        );
+        click("git-file:main.rs", window);
+        click("git-file:main.rs", window);
+        files.read_with(window, |files, _| {
+            assert_eq!(files.documents.len(), 2);
+            assert_eq!(files.active, Some(1));
+        });
+        click("project-directory-segment", window);
+        click("project-git-graph-segment", window);
+        click("git-file:main.rs", window);
+        click(
+            Box::leak(format!("git-commit:{first}").into_boxed_str()),
+            window,
+        );
+        click("git-file:main.rs", window);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            window.run_until_parked();
+            let loaded = files.read_with(window, |files, cx| {
+                assert_eq!(files.documents.len(), 3);
+                assert_eq!(files.active, Some(2));
+                files.documents[1..]
+                    .iter()
+                    .zip([(&second, (1, 1)), (&first, (1, 0))])
+                    .all(|(document, (commit, stats))| {
+                        let DocumentView::Diff(diff) = &document.view else {
+                            panic!("expected diff tab")
+                        };
+                        assert_eq!(&diff.commit, commit);
+                        assert!(diff.error.is_none(), "{:?}", diff.error);
+                        diff.card.as_ref().is_some_and(|card| {
+                            assert_eq!(card.read(cx).stats(), stats);
+                            true
+                        })
+                    })
+            });
+            if loaded {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "diffs failed to load");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(window.debug_bounds("git-graph").is_some());
+        assert!(window.debug_bounds("glass-diff-card-body").is_some());
+    }
 
     #[gpui::test]
     fn tabs_reuse_document_views_close_neighbors_and_keep_explorer(cx: &mut gpui::TestAppContext) {
@@ -377,13 +1205,19 @@ mod tests {
         files.update(window, |files, cx| {
             let tree = files.tree.entity_id();
             files.open(first.clone(), cx);
-            let first_view = files.documents[0].view.entity_id();
+            let DocumentView::File(first_view) = &files.documents[0].view else {
+                panic!("expected file")
+            };
+            let first_view = first_view.entity_id();
             files.open(second.clone(), cx);
             assert_eq!(files.active, Some(1));
             files.open(first.clone(), cx);
             assert_eq!(files.documents.len(), 2);
             assert_eq!(files.active, Some(0));
-            assert_eq!(files.documents[0].view.entity_id(), first_view);
+            let DocumentView::File(view) = &files.documents[0].view else {
+                panic!("expected file")
+            };
+            assert_eq!(view.entity_id(), first_view);
             files.close(0, cx);
             assert_eq!(files.active, Some(0));
             assert_eq!(files.documents[0].path, second);

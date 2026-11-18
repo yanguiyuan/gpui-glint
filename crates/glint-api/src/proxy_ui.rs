@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::*;
 
 pub(super) struct ProxyInput {
@@ -9,6 +11,7 @@ pub(super) struct ProxyInput {
     pub(super) table: Entity<DataTable>,
     delete_mapping: Option<u64>,
     delete_profile: bool,
+    hosts_menu_open: bool,
     pub(super) search: Entity<TextEntry>,
     _search_subscription: Subscription,
     _table_subscription: Subscription,
@@ -22,6 +25,15 @@ pub(super) struct MappingInput {
     pub(super) name: Entity<TextEntry>,
     pub(super) value: Entity<TextEntry>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl MappingInput {
+    fn draft(&self, cx: &App) -> environment::HostMapping {
+        environment::HostMapping {
+            domain: self.name.read(cx).value().trim().into(),
+            ip: self.value.read(cx).value().trim().into(),
+        }
+    }
 }
 
 impl Workbench {
@@ -81,6 +93,111 @@ impl Workbench {
         }
         cx.notify();
     }
+    fn export_hosts(&mut self, cx: &mut Context<Self>) {
+        let mappings = self.profile_inputs[self.editing_proxy]
+            .mappings
+            .iter()
+            .map(|row| row.draft(cx));
+        let text = match environment::HostMapping::format_hosts(mappings) {
+            Ok(text) => text,
+            Err(error) => {
+                self.variable_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let directory = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let picker = cx.prompt_for_new_path(&directory, Some("hosts"));
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let path = picker
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                let Some(path) = path else { return Ok(None) };
+                let output = path.clone();
+                cx.background_executor()
+                    .spawn(async move { std::fs::write(output, text) })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(Some(path))
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(path)) => {
+                        this.variable_error = None;
+                        this.notice =
+                            format!("Hosts 已导出至 {}", gpui_glint::paths::display_path(&path));
+                        this.toasts.update(cx, |host, cx| {
+                            host.push(Toast::new("Hosts 导出成功").kind(ToastKind::Success), cx)
+                        });
+                    }
+                    Ok(None) => return,
+                    Err(error) => this.variable_error = Some(format!("导出 Hosts 失败：{error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn proxy_hosts_menu(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let index = self.editing_proxy;
+        let owner = cx.entity().downgrade();
+        let content = div()
+            .flex()
+            .flex_col()
+            .child(
+                MenuItem::new("proxy-hosts-import-item", "从剪贴板导入")
+                    .icon(Icon::Upload)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "proxy-hosts-import".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.profile_inputs[index].hosts_menu_open = false;
+                        this.import_hosts_from_clipboard(cx);
+                    })),
+            )
+            .child(
+                MenuItem::new("proxy-hosts-export-item", "导出 Hosts 文件…")
+                    .icon(Icon::Download)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "proxy-hosts-export".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.profile_inputs[index].hosts_menu_open = false;
+                        this.export_hosts(cx);
+                        cx.notify();
+                    })),
+            );
+        DropdownMenu::new(
+            "proxy-hosts-menu",
+            Button::new("Hosts")
+                .icon(Icon::ChevronDown)
+                .kind(ButtonKind::Plain)
+                .size(ButtonSize::Mini)
+                .theme(self.theme)
+                .render()
+                .debug_selector(|| "proxy-hosts-menu".into()),
+            content,
+        )
+        .theme(self.theme)
+        .open(self.profile_inputs[index].hosts_menu_open)
+        .on_open_change(move |open, _, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                if let Some(input) = this.profile_inputs.get_mut(index) {
+                    input.hosts_menu_open = open;
+                    cx.notify();
+                }
+            });
+        })
+        .render()
+    }
+
     fn mapping_input(&mut self, domain: &str, ip: &str, cx: &mut Context<Self>) -> MappingInput {
         let id = self.next_variable_row;
         self.next_variable_row += 1;
@@ -202,6 +319,7 @@ impl Workbench {
             table,
             delete_mapping: None,
             delete_profile: false,
+            hosts_menu_open: false,
             search,
             _search_subscription: search_subscription,
             _table_subscription: table_subscription,
@@ -373,14 +491,7 @@ impl Workbench {
             built_in: input.built_in,
             url: input.url.read(cx).value().trim().into(),
             skip_tls_verification: input.skip_tls_verification,
-            mappings: input
-                .mappings
-                .iter()
-                .map(|row| environment::HostMapping {
-                    domain: row.name.read(cx).value().trim().into(),
-                    ip: row.value.read(cx).value().trim().into(),
-                })
-                .collect(),
+            mappings: input.mappings.iter().map(|row| row.draft(cx)).collect(),
         })
     }
     pub(super) fn proxy_drafts(&self, cx: &App) -> Result<Vec<environment::ProxyProfile>, String> {
@@ -909,18 +1020,7 @@ impl Workbench {
                                         ),
                                 )
                                 .child(div().flex_1())
-                                .child(
-                                    Button::new("导入 Hosts")
-                                        .icon(Icon::Upload)
-                                        .kind(ButtonKind::Plain)
-                                        .size(ButtonSize::Mini)
-                                        .theme(self.theme)
-                                        .render()
-                                        .debug_selector(|| "proxy-hosts-import".into())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.import_hosts_from_clipboard(cx)
-                                        })),
-                                ),
+                                .child(self.proxy_hosts_menu(cx)),
                         )
                         .child(table)
                         .child(
@@ -1322,8 +1422,15 @@ mod tests {
         });
         host.update(window, |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(
             "# copied hosts\n127.0.0.1 api.test alias.test\n::1 ipv6.test # local\n10.0.0.3 API.test".into())));
-        let bounds = window.debug_bounds("proxy-hosts-import").unwrap();
-        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        let click_hosts = |window: &mut gpui::VisualTestContext, item| {
+            let bounds = window.debug_bounds("proxy-hosts-menu").unwrap();
+            window.simulate_click(bounds.center(), gpui::Modifiers::default());
+            window.run_until_parked();
+            let bounds = window.debug_bounds(item).unwrap();
+            window.simulate_click(bounds.center(), gpui::Modifiers::default());
+            window.run_until_parked();
+        };
+        click_hosts(window, "proxy-hosts-import");
         let draft = host.update(window, |host, cx| {
             let draft = host.profile_draft(0, cx).unwrap();
             assert_eq!(draft.mappings.len(), 4);
@@ -1353,8 +1460,29 @@ mod tests {
                     .is_some()
             );
         }
-        let bounds = window.debug_bounds("proxy-hosts-import").unwrap();
-        window.simulate_click(bounds.center(), gpui::Modifiers::default());
+        let output = dir.path().join("hosts");
+        host.update(window, |host, cx| {
+            host.profile_inputs[0]
+                .search
+                .update(cx, |search, cx| search.set_value("ipv6", cx));
+        });
+        click_hosts(window, "proxy-hosts-export");
+        assert!(window.did_prompt_for_new_path());
+        window.simulate_new_path_selection(|_| Some(output.clone()));
+        window.run_until_parked();
+        let text = std::fs::read_to_string(output).unwrap();
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert_eq!(
+            text,
+            format!(
+                "10.0.0.3\tapi.test{newline}10.0.0.2\tkeep.test{newline}127.0.0.1\talias.test{newline}::1\tipv6.test{newline}"
+            )
+        );
+        assert_eq!(
+            environment::HostMapping::parse_hosts(&text).unwrap(),
+            draft.mappings
+        );
+        click_hosts(window, "proxy-hosts-import");
         host.update(window, |host, cx| {
             assert!(host.variable_error.as_ref().unwrap().contains("第 2 行"));
             assert_eq!(host.profile_draft(0, cx).unwrap(), draft);

@@ -1,6 +1,6 @@
 //! Project browsing shares the persisted catalog with chat, but never selects a session.
 use super::*;
-use gpui_glint::components::{MenuItem, Select, SelectEvent, SelectOption};
+use gpui_glint::components::{MenuItem, Select, SelectEvent, SelectOption, Tooltip};
 
 #[derive(Default)]
 pub(super) struct Repositories {
@@ -10,6 +10,9 @@ pub(super) struct Repositories {
     select: Option<Entity<Select>>,
     task: Option<Task<()>>,
     error: Option<String>,
+    head_root: Option<PathBuf>,
+    head: Option<String>,
+    head_task: Option<Task<()>>,
 }
 
 impl Repositories {
@@ -20,6 +23,9 @@ impl Repositories {
 
 impl AgentWorkspace {
     pub(super) fn open_browser_project(&mut self, cx: &mut Context<Self>) {
+        self.project_files.update(cx, |files, cx| {
+            files.set_definition_modifier(self.history.definition_modifier, cx);
+        });
         let root = self
             .browser_project
             .clone()
@@ -138,8 +144,57 @@ impl AgentWorkspace {
 
     fn open_browser_directory(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.project_files
-            .update(cx, |files, cx| files.set_root(root, cx));
+            .update(cx, |files, cx| files.set_root(root.clone(), cx));
+        self.refresh_browser_head(root, cx);
         cx.notify();
+    }
+
+    pub(super) fn focus_go_server_project(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate(crate::Page::Projects, window, cx);
+        if self.project_files.read(cx).root() == Some(root.as_path()) {
+            return;
+        }
+        if self
+            .browser_repositories
+            .options
+            .iter()
+            .any(|(_, path)| path == &root)
+        {
+            self.browser_repositories.selected = Some(root.clone());
+            if let Some(select) = &self.browser_repositories.select {
+                select.update(cx, |select, cx| {
+                    select.set_selected(Some(root.to_string_lossy().into_owned().into()), cx);
+                });
+            }
+            self.open_browser_directory(root, cx);
+        } else {
+            self.choose_project(root, cx);
+        }
+    }
+
+    fn refresh_browser_head(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let repositories = &mut self.browser_repositories;
+        if repositories.head_root.as_ref() != Some(&root) {
+            repositories.head_root = Some(root.clone());
+            repositories.head = None;
+        }
+        repositories.head_task = None;
+        let Ok(job) = provider::Job::start(async move { git_project::current_head(&root).await })
+        else {
+            return;
+        };
+        repositories.head_task = Some(cx.spawn(async move |weak, cx| {
+            let head = job.result().await.ok().flatten();
+            let _ = weak.update(cx, |this, cx| {
+                this.browser_repositories.head = head;
+                cx.notify();
+            });
+        }));
     }
 
     pub(super) fn projects_topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -237,6 +292,36 @@ impl AgentWorkspace {
                             .child(select),
                     )
             })
+            .when_some(
+                self.browser_project
+                    .as_ref()
+                    .and(self.browser_repositories.head.clone()),
+                |bar, head| {
+                    bar.child(
+                        Tooltip::new(
+                            div()
+                                .flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_1()
+                                .text_color(rgb(p.text_muted))
+                                .debug_selector(|| "project-topbar-git-branch".into())
+                                .child(div().flex_shrink_0().child(Icon::GitBranch.render(14.)))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .max_w(px(200.))
+                                        .truncate()
+                                        .child(head.clone()),
+                                ),
+                            head,
+                        )
+                        .theme(self.theme)
+                        .render(cx)
+                        .min_w_0(),
+                    )
+                },
+            )
             .when_some(self.browser_repositories.error.clone(), |bar, error| {
                 bar.child(div().truncate().text_color(rgb(p.text_muted)).child(error))
             })
@@ -277,14 +362,20 @@ impl AgentWorkspace {
                     .on_click(cx.listener(|this, _, window, cx| this.open_commands(window, cx))),
             )
             .child(
-                IconButton::new(Icon::Refresh, "刷新项目文件")
+                IconButton::new(Icon::Refresh, "刷新项目")
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_browser_project(cx);
-                        this.project_files.update(cx, |files, cx| files.refresh(cx));
+                        this.project_files.update(cx, |files, cx| {
+                            files.refresh(cx);
+                            files.refresh_graph(cx);
+                        });
                     })),
             )
+            .when(!self.host_background_tasks, |bar| {
+                bar.child(self.background_tasks_menu(cx))
+            })
     }
 
     pub(super) fn projects_page(&self, cx: &mut Context<Self>) -> gpui::Div {

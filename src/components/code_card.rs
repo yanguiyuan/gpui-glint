@@ -267,6 +267,7 @@ pub struct CodeCard {
     is_selecting: bool,
     document_selection: Option<Range<usize>>,
     source_highlight: Option<Range<usize>>,
+    source_underline: Option<Range<usize>>,
     reveal_cursor: bool,
 }
 
@@ -614,6 +615,7 @@ impl CodeCard {
             is_selecting: false,
             document_selection: None,
             source_highlight: None,
+            source_underline: None,
             reveal_cursor: false,
         }
     }
@@ -997,10 +999,37 @@ impl CodeCard {
         self.mouse_text_hit(position)
             .and_then(|(distance, offset)| (distance == 0.).then_some(offset))
     }
+    pub(super) fn identifier_source_at(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<(SharedString, usize)> {
+        let (start, line, bounds) = self.last_lines.iter().find(|(_, line, bounds)| {
+            bounds.contains(&position) && position.x - bounds.left() < line.width
+        })?;
+        let x = position.x - bounds.left();
+        let index = line.closest_index_for_x(x);
+        let mut offset = start + index;
+        // Caret hit testing rounds to the nearest boundary. Use the character under the pointer.
+        if index > 0 && x < line.x_for_index(index) {
+            offset = start + self.content[*start..offset].char_indices().next_back()?.0;
+        }
+        let ch = self.content[offset..].chars().next()?;
+        (ch == '_' || ch.is_alphanumeric()).then(|| (self.content.clone(), offset))
+    }
     /// Temporary source decoration without changing selection, content or search results.
     pub fn set_source_highlight(&mut self, range: Option<Range<usize>>, cx: &mut Context<Self>) {
         if self.source_highlight != range {
             self.source_highlight = range;
+            cx.notify();
+        }
+    }
+    pub(super) fn set_source_underline(
+        &mut self,
+        range: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source_underline != range {
+            self.source_underline = range;
             cx.notify();
         }
     }
@@ -2445,7 +2474,7 @@ impl EditorLine {
     pub(super) fn x_for_index(&self, index: usize) -> Pixels {
         gpui::LineLayout::x_for_index(self, Self::display_index(&self.tabs, index))
     }
-    fn closest_index_for_x(&self, x: Pixels) -> usize {
+    pub(super) fn closest_index_for_x(&self, x: Pixels) -> usize {
         let index = gpui::LineLayout::closest_index_for_x(self, x);
         let previous = self
             .tabs
@@ -2510,6 +2539,7 @@ struct LinePaint {
     search_highlights: Vec<gpui::PaintQuad>,
     cursor: Option<gpui::PaintQuad>,
     selection: Option<gpui::PaintQuad>,
+    underline: Option<gpui::PaintQuad>,
 }
 
 impl IntoElement for CodeLine {
@@ -2667,11 +2697,27 @@ impl Element for CodeLine {
                 )
             })
             .collect();
+        let underline = input.source_underline.as_ref().and_then(|range| {
+            let start = range.start.max(self.start);
+            let end = range.end.min(end);
+            (start < end).then(|| {
+                let left = bounds.left() + self.line.x_for_index(start - self.start);
+                let right = bounds.left() + self.line.x_for_index(end - self.start);
+                fill(
+                    Bounds::new(
+                        point(left, bounds.bottom() - px(2.)),
+                        size(right - left, px(1.)),
+                    ),
+                    rgb(colors.text),
+                )
+            })
+        });
         LinePaint {
             inline_code_backgrounds,
             cursor,
             selection,
             search_highlights,
+            underline,
         }
     }
 
@@ -2707,6 +2753,9 @@ impl Element for CodeLine {
             window.paint_quad(selection);
         }
         self.line.paint(bounds.origin, self.line_height, window, cx);
+        if let Some(underline) = paint.underline.take() {
+            window.paint_quad(underline);
+        }
         if let Some(cursor) = paint.cursor.take() {
             window.paint_quad(cursor);
         }

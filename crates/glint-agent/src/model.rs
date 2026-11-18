@@ -232,6 +232,8 @@ pub struct History {
     #[serde(default = "crate::shortcuts::default_preview_shortcut")]
     pub preview_shortcut: String,
     #[serde(default)]
+    pub definition_modifier: crate::shortcuts::DefinitionModifier,
+    #[serde(default)]
     pub terminal_default_position: crate::terminal_ui::Position,
     #[serde(default)]
     pub quick_replies_enabled: bool,
@@ -266,6 +268,7 @@ impl Default for History {
             terminal_shortcut: crate::shortcuts::default_terminal_shortcut(),
             diff_shortcut: crate::shortcuts::default_diff_shortcut(),
             preview_shortcut: crate::shortcuts::default_preview_shortcut(),
+            definition_modifier: Default::default(),
             terminal_default_position: Default::default(),
             workspace_display: Default::default(),
             removed_projects: Default::default(),

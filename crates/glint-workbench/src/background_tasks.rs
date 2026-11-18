@@ -79,13 +79,12 @@ impl Render for Tasks {
                             .update(cx, |api, cx| api.focus_background_task(id, window, cx));
                         this.route = Route::Api(this.api.read(cx).page());
                     } else if let Some(id) = id.strip_prefix("agent/") {
-                        this.dispatch(
-                            Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
-                            window,
-                            cx,
-                        );
+                        if matches!(this.route, Route::Api(_)) {
+                            this.api.update(cx, |api, cx| api.deactivate(window, cx));
+                        }
                         this.agent
                             .update(cx, |agent, cx| agent.focus_background_task(id, window, cx));
+                        this.route = Route::Agent(this.agent.read(cx).page());
                     }
                     this.sync_navigation(cx);
                     cx.notify();

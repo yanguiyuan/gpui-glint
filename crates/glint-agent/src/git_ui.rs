@@ -38,12 +38,68 @@ pub enum WorktreeDialog {
         tree: git_project::Worktree,
     },
 }
-struct CommitDiff {
-    commit: String,
-    path: String,
-    card: Option<Entity<DiffCard>>,
-    error: Option<String>,
+pub(super) struct CommitDiff {
+    pub(super) commit: String,
+    pub(super) path: String,
+    pub(super) card: Option<Entity<DiffCard>>,
+    pub(super) error: Option<String>,
 }
+
+impl CommitDiff {
+    pub(super) fn new(commit: String, path: String) -> Self {
+        Self {
+            commit,
+            path,
+            card: None,
+            error: None,
+        }
+    }
+
+    pub(super) fn load(
+        &self,
+        root: PathBuf,
+    ) -> Result<provider::Job<Vec<gpui_glint::components::DiffLine>>, String> {
+        let commit = self.commit.clone();
+        let path = self.path.clone();
+        provider::Job::start(async move { git_project::file_diff(&root, &commit, &path).await })
+    }
+
+    pub(super) fn set_result(
+        &mut self,
+        result: Result<Vec<gpui_glint::components::DiffLine>, String>,
+        theme: ThemePreset,
+        fill_height: bool,
+        cx: &mut App,
+    ) {
+        match result {
+            Ok(lines) => {
+                let language = match std::path::Path::new(&self.path)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                {
+                    Some("rs") => "rust",
+                    Some("go") => "go",
+                    Some("js" | "jsx") => "javascript",
+                    Some("ts" | "tsx") => "typescript",
+                    Some("py") => "python",
+                    Some("json") => "json",
+                    Some("html") => "html",
+                    Some("css") => "css",
+                    _ => "text",
+                };
+                self.card = Some(cx.new(|cx| {
+                    DiffCard::from_lines(cx, language, lines)
+                        .path(self.path.clone())
+                        .header_visible(false)
+                        .fill_height(fill_height)
+                        .theme(theme)
+                }));
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+}
+
 impl State {
     pub fn new(theme: ThemePreset, cx: &mut Context<AgentWorkspace>) -> Self {
         let graph = cx.new(GitGraph::new);
@@ -869,6 +925,11 @@ impl AgentWorkspace {
         self.refresh_git_repository(true, cx);
     }
     pub(crate) fn open_git_graph(&mut self, cx: &mut Context<Self>) {
+        if self.page == crate::Page::Projects && self.browser_project.is_some() {
+            self.project_files
+                .update(cx, |files, cx| files.show_git_graph(cx));
+            return;
+        }
         self.terminal_ui.open = false;
         self.back_from_git_diff(cx);
         self.page = crate::Page::Chat;
@@ -965,15 +1026,10 @@ impl AgentWorkspace {
         };
         self.git_ui.diff_revision += 1;
         let revision = self.git_ui.diff_revision;
-        self.git_ui.diff = Some(CommitDiff {
-            commit: commit.clone(),
-            path: path.clone(),
-            card: None,
-            error: None,
-        });
-        let job = match provider::Job::start(async move {
-            git_project::file_diff(&root, &commit, &path).await
-        }) {
+        let diff = CommitDiff::new(commit, path);
+        let job = diff.load(root);
+        self.git_ui.diff = Some(diff);
+        let job = match job {
             Ok(job) => job,
             Err(error) => {
                 self.git_ui.diff.as_mut().unwrap().error = Some(error);
@@ -990,31 +1046,7 @@ impl AgentWorkspace {
                 let Some(diff) = &mut this.git_ui.diff else {
                     return;
                 };
-                match result {
-                    Ok(lines) => {
-                        let language = match std::path::Path::new(&diff.path)
-                            .extension()
-                            .and_then(|s| s.to_str())
-                        {
-                            Some("rs") => "rust",
-                            Some("go") => "go",
-                            Some("js" | "jsx") => "javascript",
-                            Some("ts" | "tsx") => "typescript",
-                            Some("py") => "python",
-                            Some("json") => "json",
-                            Some("html") => "html",
-                            Some("css") => "css",
-                            _ => "text",
-                        };
-                        diff.card = Some(cx.new(|cx| {
-                            DiffCard::from_lines(cx, language, lines)
-                                .path(diff.path.clone())
-                                .header_visible(false)
-                                .theme(this.theme)
-                        }));
-                    }
-                    Err(error) => diff.error = Some(error),
-                }
+                diff.set_result(result, this.theme, false, cx);
                 cx.notify();
             });
         })

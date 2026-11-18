@@ -1,6 +1,54 @@
 //! Workspace-local shortcuts take effect immediately without app-global rebinding.
 use super::*;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionModifier {
+    #[default]
+    Control,
+    Shift,
+    Alt,
+    Platform,
+}
+
+impl DefinitionModifier {
+    pub const ALL: [Self; 4] = [Self::Control, Self::Shift, Self::Alt, Self::Platform];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Control => "Ctrl",
+            Self::Shift => "Shift",
+            Self::Alt => "Alt",
+            Self::Platform if cfg!(target_os = "macos") => "⌘",
+            Self::Platform => "Win",
+        }
+    }
+
+    pub(super) fn matches(self, modifiers: gpui::Modifiers) -> bool {
+        modifiers.number_of_modifiers() == 1
+            && match self {
+                Self::Control => modifiers.control,
+                Self::Shift => modifiers.shift,
+                Self::Alt => modifiers.alt,
+                Self::Platform => modifiers.platform,
+            }
+    }
+}
+
+impl AgentWorkspace {
+    pub(super) fn set_definition_modifier(
+        &mut self,
+        modifier: DefinitionModifier,
+        cx: &mut Context<Self>,
+    ) {
+        self.history.definition_modifier = modifier;
+        self.project_files
+            .update(cx, |files, cx| files.set_definition_modifier(modifier, cx));
+        self.save(cx);
+        cx.notify();
+    }
+}
+
 pub fn default_terminal_shortcut() -> String {
     "ctrl-`".into()
 }
@@ -272,10 +320,12 @@ mod tests {
         value.as_object_mut().unwrap().remove("terminal_shortcut");
         value.as_object_mut().unwrap().remove("diff_shortcut");
         value.as_object_mut().unwrap().remove("preview_shortcut");
+        value.as_object_mut().unwrap().remove("definition_modifier");
         let history: model::History = serde_json::from_value(value).unwrap();
         assert_eq!(history.terminal_shortcut, default_terminal_shortcut());
         assert_eq!(history.diff_shortcut, default_diff_shortcut());
         assert_eq!(history.preview_shortcut, default_preview_shortcut());
+        assert_eq!(history.definition_modifier, DefinitionModifier::Control);
         let mut conflicting = history.clone();
         conflicting.terminal_shortcut = default_diff_shortcut();
         repair_project_shortcut_conflicts(&mut conflicting);

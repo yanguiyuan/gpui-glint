@@ -1,9 +1,76 @@
 use super::*;
+use crate::go_definition::ProcessState;
 use gpui_glint::components::{BackgroundTask, BackgroundTaskState as State, BackgroundTasksMenu};
+
+const GO_TASK_PREFIX: &str = "language-server:go:";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    #[ignore = "requires Go and gopls on PATH"]
+    fn go_background_task_reopens_the_project_and_keeps_the_process(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("go-project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.com/fixture\ngo 1.21\n").unwrap();
+        let file = root.join("main.go");
+        std::fs::write(&file, "package fixture\n").unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (agent, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        let id = format!("{GO_TASK_PREFIX}{}", root.to_string_lossy());
+        agent.update_in(window, |agent, window, cx| {
+            agent.navigate(crate::Page::Projects, window, cx);
+            agent.choose_project(root.clone(), cx);
+            agent.project_files.update(cx, |files, cx| {
+                files.open_at(file.to_string_lossy().into_owned(), None, cx);
+            });
+            agent.navigate(crate::Page::Chat, window, cx);
+        });
+        let task = |window: &mut gpui::VisualTestContext| {
+            agent.read_with(window, |agent, cx| {
+                agent
+                    .background_tasks(cx)
+                    .into_iter()
+                    .find(|task| task.id == id)
+                    .unwrap()
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let detail = loop {
+            window.run_until_parked();
+            let current = task(window);
+            assert_eq!(current.state, State::Running, "{}", current.detail);
+            if current.detail.starts_with("PID ") {
+                break current.detail;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gopls did not initialize"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let trigger = window.debug_bounds("background-tasks-trigger").unwrap();
+        window.simulate_click(trigger.center(), Default::default());
+        let selector = Box::leak(format!("background-task-{id}").into_boxed_str());
+        let row = window.debug_bounds(selector).unwrap();
+        window.simulate_click(row.center(), Default::default());
+        agent.read_with(window, |agent, cx| {
+            assert_eq!(agent.page(), crate::Page::Projects);
+            assert_eq!(agent.project_files.read(cx).root(), Some(root.as_path()));
+        });
+        assert_eq!(task(window).detail, detail);
+        assert!(window.debug_bounds("background-tasks-trigger").is_some());
+    }
 
     #[gpui::test]
     fn background_tasks_switch_running_sessions_and_preserve_drafts(cx: &mut gpui::TestAppContext) {
@@ -98,7 +165,7 @@ impl AgentWorkspace {
                     let current: Vec<_> = this
                         .background_tasks(cx)
                         .into_iter()
-                        .map(|task| (task.id, task.state))
+                        .map(|task| (task.id, task.state, task.detail))
                         .collect();
                     if current != previous {
                         previous = current;
@@ -176,6 +243,22 @@ impl AgentWorkspace {
                     state: run.state,
                 }),
         );
+        if let Some((root, process)) = self.project_files.read(cx).go_process() {
+            let (state, status) = match process {
+                ProcessState::Starting => (State::Running, "启动中".into()),
+                ProcessState::Running(pid) => (State::Running, format!("PID {pid}")),
+                ProcessState::Failed(error) => (State::Failed, error),
+                ProcessState::Finished => (State::Finished, "进程已退出".into()),
+            };
+            tasks.push(BackgroundTask {
+                id: format!("{GO_TASK_PREFIX}{}", root.to_string_lossy()),
+                label: "Go 语言服务器 (gopls)".into(),
+                detail: format!("{status} · {}", gpui_glint::paths::display_path(root)),
+                group: "语言服务器".into(),
+                icon: Icon::Code,
+                state,
+            });
+        }
         self.background_task_inbox
             .borrow_mut()
             .update(tasks, |task| self.background_task_outcome(&task.id, cx))
@@ -249,9 +332,16 @@ impl AgentWorkspace {
         cx: &mut Context<Self>,
     ) -> bool {
         self.background_tasks(cx);
+        let go_root = id.strip_prefix(GO_TASK_PREFIX);
+        if self.host_background_tasks && go_root.is_none() {
+            self.navigate(crate::Page::Chat, window, cx);
+        }
         let mut opened = false;
         self.show_background_tasks = false;
-        if let Some(id) = id.strip_prefix("session:") {
+        if let Some(root) = go_root {
+            self.focus_go_server_project(PathBuf::from(root), window, cx);
+            opened = true;
+        } else if let Some(id) = id.strip_prefix("session:") {
             if let Ok(id) = Uuid::parse_str(id) {
                 if self.history.sessions.iter().any(|s| s.id == id) {
                     self.switch(id, cx);

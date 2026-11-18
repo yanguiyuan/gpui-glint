@@ -13,9 +13,13 @@ use gpui::{
     img, px, rgb,
 };
 use image::{Frame, RgbaImage};
+use mermaid_rs_renderer::layout::{FlowchartQualityMetrics, flowchart_quality_metrics};
 use mermaid_rs_renderer::{
-    RenderOptions, compute_layout, measure_svg_dimensions, parse_mermaid_strict, render_svg,
+    DiagramKind, Graph, Layout, LayoutConfig, RenderOptions, Theme, compute_layout,
+    measure_svg_dimensions, parse_mermaid_strict, render_svg,
 };
+
+mod flowchart;
 
 /// Offline SVG output suitable for export. Syntax coverage follows mermaid-rs-renderer.
 #[derive(Clone, Debug)]
@@ -51,7 +55,7 @@ pub fn render_mermaid(source: &str, theme: ThemePreset) -> Result<MermaidSvg, St
     options.theme.cluster_border = color(p.border);
     options.theme.sequence_actor_fill = color(p.accent_tint);
     options.theme.sequence_actor_border = color(p.accent);
-    let layout = compute_layout(&parsed.graph, &options.theme, &options.layout);
+    let layout = layout_mermaid(&parsed.graph, &options.theme, &mut options.layout);
     let size = measure_svg_dimensions(&layout, &options.layout, None);
     if !size.width.is_finite() || !size.height.is_finite() || size.width <= 0. || size.height <= 0.
     {
@@ -67,6 +71,94 @@ pub fn render_mermaid(source: &str, theme: ThemePreset) -> Result<MermaidSvg, St
         width: size.width,
         height: size.height,
     })
+}
+
+fn layout_mermaid(graph: &Graph, theme: &Theme, config: &mut LayoutConfig) -> Layout {
+    let mut layout = choose_mermaid_layout(graph, theme, config);
+    if layout.kind == DiagramKind::Flowchart && layout.edges.len() <= 96 && layout.nodes.len() <= 96
+    {
+        flowchart::polish(&mut layout);
+        flowchart::compact_ranks(&mut layout, graph.direction, config.rank_spacing);
+    }
+    layout
+}
+
+fn choose_mermaid_layout(graph: &Graph, theme: &Theme, config: &mut LayoutConfig) -> Layout {
+    let baseline = compute_layout(graph, theme, config);
+    // A second layout and pairwise edge comparisons are reserved for bounded flowcharts.
+    if graph.kind != DiagramKind::Flowchart
+        || !(5..=96).contains(&baseline.edges.len())
+        || baseline.nodes.len() > 96
+    {
+        return baseline;
+    }
+    let Some(original) = flowchart_quality_metrics(&baseline) else {
+        return baseline;
+    };
+    let original_overlap = overlapping_edge_length(&baseline);
+    if original.geometry_debt_count() == 0 && original.crossings == 0 && original_overlap == 0. {
+        return baseline;
+    }
+
+    // Give long parallel routes more room and spend extra sweeps on ordering each rank.
+    let mut alternate_config = config.clone();
+    alternate_config.node_spacing = alternate_config.node_spacing.max(88.);
+    alternate_config.rank_spacing = alternate_config.rank_spacing.max(60.);
+    alternate_config.flowchart.auto_spacing.enabled = false;
+    alternate_config.flowchart.order_passes = alternate_config.flowchart.order_passes.max(8);
+    alternate_config.flowchart.routing.occupancy_weight = 4.;
+    alternate_config.flowchart.routing.turn_penalty = 1.2;
+    let alternate = compute_layout(graph, theme, &alternate_config);
+    let Some(candidate) = flowchart_quality_metrics(&alternate) else {
+        return baseline;
+    };
+    if candidate.hard_violation_count() <= original.hard_violation_count()
+        && candidate.geometry_debt_count() <= original.geometry_debt_count()
+        && route_cost(candidate, overlapping_edge_length(&alternate))
+            < route_cost(original, original_overlap)
+    {
+        *config = alternate_config;
+        alternate
+    } else {
+        baseline
+    }
+}
+
+fn route_cost(metrics: FlowchartQualityMetrics, overlap: f32) -> f32 {
+    // Charge for retraced segments and absolute length as well as the renderer's
+    // crossing, bend, and detour penalties.
+    metrics.quality_score + overlap + 0.05 * metrics.path_length
+}
+
+fn overlapping_edge_length(layout: &Layout) -> f32 {
+    let mut length = 0.;
+    for (index, edge) in layout.edges.iter().enumerate() {
+        for other in &layout.edges[index + 1..] {
+            for &[(ax, ay), (bx, by)] in edge.points.array_windows() {
+                for &[(cx, cy), (dx, dy)] in other.points.array_windows() {
+                    length += shared_segment_length((ax, bx), (cx, dx), (ay, by), (cy, dy));
+                    length += shared_segment_length((ay, by), (cy, dy), (ax, bx), (cx, dx));
+                }
+            }
+        }
+    }
+    length
+}
+
+fn shared_segment_length(
+    (a, b): (f32, f32),
+    (c, d): (f32, f32),
+    (fixed_a, fixed_b): (f32, f32),
+    (fixed_c, fixed_d): (f32, f32),
+) -> f32 {
+    const EPSILON: f32 = 0.1;
+    if (fixed_a - fixed_b).abs() > EPSILON
+        || (fixed_c - fixed_d).abs() > EPSILON
+        || (fixed_a - fixed_c).abs() > EPSILON
+    {
+        return 0.;
+    }
+    (a.max(b).min(c.max(d)) - a.min(b).max(c.min(d))).max(0.)
 }
 
 struct DiagramImage {
@@ -507,6 +599,7 @@ mod tests {
             assert!(rendered.width > 0. && rendered.height > 0.);
         }
     }
+
     #[test]
     fn dark_presets_render_dark_surfaces_and_light_labels() {
         for theme in ThemePreset::ALL.into_iter().filter(|theme| theme.is_dark()) {

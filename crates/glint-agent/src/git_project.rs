@@ -130,6 +130,24 @@ fn text(output: Output) -> Result<String, String> {
     }
 }
 
+pub(super) async fn current_head(root: &Path) -> Result<Option<String>, String> {
+    let symbolic = run(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    match symbolic.status.code() {
+        Some(0) => {
+            let reference = text(symbolic)?;
+            Ok(reference.strip_prefix("refs/heads/").map(str::to_owned))
+        }
+        Some(1) => detached_head(root).await.map(Some),
+        Some(128) => Ok(None),
+        _ => text(symbolic).map(Some),
+    }
+}
+
+async fn detached_head(root: &Path) -> Result<String, String> {
+    let commit = text(run(root, &["rev-parse", "--short", "HEAD"]).await?)?;
+    Ok(format!("分离 HEAD · {commit}"))
+}
+
 pub async fn repository(root: &Path) -> Result<Option<Repository>, String> {
     let probe = run(root, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim() != "true" {
@@ -156,10 +174,7 @@ pub async fn repository(root: &Path) -> Result<Option<Repository>, String> {
     let current = if symbolic.status.success() {
         text(symbolic)?
     } else {
-        format!(
-            "分离 HEAD · {}",
-            text(run(root, &["rev-parse", "--short", "HEAD"]).await?)?
-        )
+        detached_head(root).await?
     };
     let branches = text(branches)?.lines().map(str::to_owned).collect();
     let worktree = git_path(root, &text(top)?)?;
@@ -790,6 +805,39 @@ mod tests {
         git(root, &["add", "file.txt"]);
         git(root, &["commit", "-m", value]);
     }
+
+    #[tokio::test]
+    async fn current_head_reads_branch_of_each_worktree() {
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(current_head(plain.path()).await.unwrap(), None);
+        let repo = init();
+        let root = repo.path();
+        assert_eq!(current_head(root).await.unwrap().as_deref(), Some("master"));
+        commit(root, "initial");
+        let worktree = plain.path().join("feature");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/ui",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            current_head(&worktree).await.unwrap().as_deref(),
+            Some("feature/ui")
+        );
+        assert_eq!(current_head(root).await.unwrap().as_deref(), Some("master"));
+        git(&worktree, &["switch", "--detach"]);
+        let short = git(&worktree, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(
+            current_head(&worktree).await.unwrap(),
+            Some(format!("分离 HEAD · {short}"))
+        );
+    }
+
     #[tokio::test]
     async fn structured_files_and_historical_diff_handle_root_rename_delete_and_binary() {
         use gpui_glint::components::DiffLineKind;

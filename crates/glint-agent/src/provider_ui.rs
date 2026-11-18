@@ -2034,6 +2034,72 @@ impl AgentWorkspace {
                             ),
                     );
                 }
+                use crate::shortcuts::DefinitionModifier;
+                let modifier = self.history.definition_modifier;
+                let owner = cx.entity().downgrade();
+                let project = project.child(
+                    div()
+                        .py_4()
+                        .border_t_1()
+                        .border_color(rgb(p.border))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(180.))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_size(px(13.)).child("跳转到 Go 定义"))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child("按住修饰键悬停查看可跳转符号，左键打开定义"),
+                                ),
+                        )
+                        .child(
+                            SegmentedControl::new(DefinitionModifier::ALL.map(|modifier| {
+                                SegmentOption::new(modifier.label()).debug_selector(format!(
+                                    "go-definition-modifier-{}",
+                                    modifier.label()
+                                ))
+                            }))
+                            .id("go-definition-modifier")
+                            .theme(self.theme)
+                            .selected(
+                                DefinitionModifier::ALL
+                                    .iter()
+                                    .position(|key| *key == modifier)
+                                    .unwrap_or_default(),
+                            )
+                            .on_change(move |index, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.set_definition_modifier(
+                                        DefinitionModifier::ALL[index],
+                                        cx,
+                                    );
+                                });
+                            })
+                            .render(),
+                        )
+                        .child(keycaps("左键".into()))
+                        .child(
+                            Button::new("恢复默认")
+                                .kind(ButtonKind::Plain)
+                                .size(ButtonSize::Small)
+                                .theme(self.theme)
+                                .render()
+                                .id("reset-go-definition-shortcut")
+                                .debug_selector(|| "reset-go-definition-shortcut".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_definition_modifier(DefinitionModifier::default(), cx);
+                                })),
+                        ),
+                );
                 let recording = self.provider_settings.shortcut_recording.is_some();
                 let project = project
                     .child(

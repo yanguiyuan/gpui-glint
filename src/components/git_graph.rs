@@ -122,6 +122,7 @@ pub struct GitGraph {
     error: Option<String>,
     loading: bool,
     comparison_tab: bool,
+    header_visible: bool,
     scroll: ScrollHandle,
     _subscription: gpui::Subscription,
 }
@@ -145,10 +146,16 @@ impl GitGraph {
             error: None,
             loading: false,
             comparison_tab: false,
+            header_visible: true,
             scroll: ScrollHandle::new(),
             _subscription: subscription,
         }
     }
+    pub fn header_visible(mut self, visible: bool) -> Self {
+        self.header_visible = visible;
+        self
+    }
+
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
@@ -657,32 +664,36 @@ impl Render for GitGraph {
             .text_size(px(12.))
             .text_color(rgb(p.text))
             .bg(rgb(p.surface))
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap_2()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(rgb(p.border))
-                    .child(Icon::GitBranch.render(16.))
-                    .child(div().flex_1().child("GitGraph"))
-                    .child(
-                        IconButton::new(Icon::Refresh, "刷新 Git")
-                            .theme(self.theme)
-                            .render()
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::Refresh))),
-                    )
-                    .child(
-                        IconButton::new(Icon::Close, "关闭 GitGraph")
-                            .theme(self.theme)
-                            .render()
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::CloseRequested)),
-                            ),
-                    ),
-            )
+            .when(self.header_visible, |graph| {
+                graph.child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        .p_3()
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .child(Icon::GitBranch.render(16.))
+                        .child(div().flex_1().child("GitGraph"))
+                        .child(
+                            IconButton::new(Icon::Refresh, "刷新 Git")
+                                .theme(self.theme)
+                                .render()
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(GitGraphEvent::Refresh)),
+                                ),
+                        )
+                        .child(
+                            IconButton::new(Icon::Close, "关闭 GitGraph")
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(GitGraphEvent::CloseRequested)
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
                     .px_3()

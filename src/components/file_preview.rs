@@ -70,6 +70,7 @@ pub struct FilePreview {
     search_match: Option<(usize, usize)>,
     search_open: bool,
     pending_search: Option<(String, Option<usize>)>,
+    pending_line: Option<usize>,
     _search_subscription: gpui::Subscription,
     subscriptions: Vec<gpui::Subscription>,
 }
@@ -116,6 +117,7 @@ impl FilePreview {
             search_match: None,
             search_open: false,
             pending_search: None,
+            pending_line: None,
             _search_subscription: search_subscription,
             subscriptions: Vec::new(),
         }
@@ -204,6 +206,7 @@ impl FilePreview {
         }
     }
     pub fn set_loading(&mut self, path: String, cx: &mut Context<Self>) {
+        self.pending_line = None;
         if self
             .navigation
             .as_ref()
@@ -310,6 +313,9 @@ impl FilePreview {
         self.search.update(cx, |entry, cx| entry.set_value("", cx));
         if let Some((query, line)) = self.pending_search.clone() {
             self.set_document_search(query, line, cx);
+        }
+        if let Some(line) = self.pending_line.take() {
+            self.reveal_line(line, cx);
         }
         cx.notify();
     }
@@ -472,6 +478,35 @@ impl FilePreview {
             self.markdown_preview = false;
             editor.update(cx, |editor, cx| editor.reveal_line(line, cx));
             cx.notify();
+        } else if matches!(self.page, Page::Loading) {
+            self.pending_line = Some(line);
+        }
+    }
+
+    /// Source snapshot and byte offset of a Go identifier under the pointer.
+    pub fn go_source_at(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &gpui::App,
+    ) -> Option<(String, SharedString, usize)> {
+        let Page::File(editor) = &self.page else {
+            return None;
+        };
+        if std::path::Path::new(&self.path).extension()?.to_str()? != "go" {
+            return None;
+        }
+        let (source, offset) = editor.read(cx).identifier_source_at(position)?;
+        Some((self.path.clone(), source, offset))
+    }
+
+    /// Decorate a source range without changing the selection or search results.
+    pub fn set_source_underline(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Page::File(editor) = &self.page {
+            editor.update(cx, |editor, cx| editor.set_source_underline(range, cx));
         }
     }
     fn directory_list(

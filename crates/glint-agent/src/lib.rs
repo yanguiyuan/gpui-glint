@@ -34,6 +34,7 @@ mod file_preview;
 mod generation;
 mod git_project;
 mod git_ui;
+mod go_definition;
 mod images;
 mod mcp;
 mod mcp_ui;
@@ -51,11 +52,11 @@ mod partner_ui;
 mod partners;
 mod project_actions;
 mod project_context;
+mod project_files;
 mod project_grouping;
+mod project_search;
 mod project_ui;
 mod projects_page;
-mod project_files;
-mod project_search;
 mod provider;
 mod provider_catalog;
 mod provider_ui;
@@ -2821,6 +2822,19 @@ impl Render for AgentWorkspace {
             .size_full()
             .key_context("AgentWorkspace")
             .track_focus(&self.focus)
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    if this.page == crate::Page::Projects {
+                        this.project_files.update(cx, |files, cx| {
+                            files.update_definition_hover(
+                                window.mouse_position(),
+                                event.modifiers,
+                                cx,
+                            );
+                        });
+                    }
+                },
+            ))
             .on_mouse_move(
                 cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
                     if let Some((start, width)) = this.edits_ui.navigation_resize {
