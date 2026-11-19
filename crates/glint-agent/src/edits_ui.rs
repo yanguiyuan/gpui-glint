@@ -1113,14 +1113,9 @@ impl AgentWorkspace {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(p.surface_subtle)))
                             .child(
-                                if *collapsed {
-                                    Icon::ChevronRight
-                                } else {
-                                    Icon::ChevronDown
-                                }
-                                .render(13.)
-                                .flex_shrink_0()
-                                .text_color(rgb(p.text_muted)),
+                                Icon::disclosure(13., !*collapsed)
+                                    .flex_shrink_0()
+                                    .text_color(rgb(p.text_muted)),
                             )
                             .child(
                                 Icon::Folder
@@ -3787,14 +3782,7 @@ impl Render for ConflictView {
                     .items_center()
                     .gap_2()
                     .cursor_pointer()
-                    .child(
-                        if self.expanded {
-                            Icon::ChevronDown
-                        } else {
-                            Icon::ChevronRight
-                        }
-                        .render(13.),
-                    )
+                    .child(Icon::disclosure(13., self.expanded))
                     .child(
                         div()
                             .flex_1()
@@ -4262,13 +4250,7 @@ impl Render for FileDiff {
                     .hover(|style| style.bg(rgb(p.surface_subtle)))
                     .when(!self.detail, |header| {
                         header.child(
-                            if self.expanded {
-                                Icon::ChevronDown
-                            } else {
-                                Icon::ChevronRight
-                            }
-                            .render(13.)
-                            .text_color(rgb(p.text_muted)),
+                            Icon::disclosure(13., self.expanded).text_color(rgb(p.text_muted)),
                         )
                     })
                     .child(

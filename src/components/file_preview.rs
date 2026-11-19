@@ -719,7 +719,7 @@ impl FilePreview {
                                 this.folders.get(&path).is_some_and(|node| node.expanded);
 
                             div()
-                                .id(("tree-entry", index))
+                                .id(SharedString::from(format!("tree-entry:{path}")))
                                 .debug_selector(move || format!("preview-entry:{path}"))
                                 .h(px(26.))
                                 .w_full()
@@ -735,19 +735,14 @@ impl FilePreview {
                                 } else {
                                     p.text_muted
                                 }))
-                                .child(div().w(px(14.)).flex_shrink_0().when(
-                                    entry.directory,
-                                    |row| {
-                                        row.child(
-                                            if expanded {
-                                                Icon::ChevronDown
-                                            } else {
-                                                Icon::ChevronRight
-                                            }
-                                            .render(12.),
-                                        )
-                                    },
-                                ))
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_shrink_0()
+                                        .when(entry.directory, |row| {
+                                            row.child(Icon::disclosure(12., expanded))
+                                        }),
+                                )
                                 .child(
                                     if entry.directory {
                                         Icon::Folder

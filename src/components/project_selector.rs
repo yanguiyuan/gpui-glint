@@ -20,6 +20,7 @@ pub struct ProjectSelector {
     trigger_selector: &'static str,
     label: String,
     icon: Icon,
+    open: bool,
     projects: Vec<ProjectOption>,
     theme: ThemePreset,
 }
@@ -38,9 +39,15 @@ impl ProjectSelector {
             trigger_selector,
             label,
             icon,
+            open: false,
             projects,
             theme,
         }
+    }
+
+    pub fn open(mut self, open: bool) -> Self {
+        self.open = open;
+        self
     }
 
     pub fn popover(
@@ -61,7 +68,7 @@ impl ProjectSelector {
             .hover(|style| style.bg(rgb(p.surface_subtle)))
             .child(self.icon.render(15.).text_color(rgb(p.text_muted)))
             .child(div().max_w(px(168.)).truncate().child(self.label))
-            .child(Icon::ChevronDown.render(12.).text_color(rgb(p.text_muted)));
+            .child(Icon::disclosure(12., self.open).text_color(rgb(p.text_muted)));
         let on_select = Rc::new(on_select);
         let list = div()
             .id("project-picker-list")
@@ -152,6 +159,7 @@ impl ProjectSelector {
             .child(div().h(px(1.)).mx_2().my_1().bg(rgb(p.border)))
             .child(actions);
         Popover::new(self.id, trigger, content)
+            .open(self.open)
             .trigger_height(28.)
             .width(316.)
             .padding(6.)

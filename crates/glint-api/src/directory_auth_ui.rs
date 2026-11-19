@@ -614,14 +614,7 @@ impl DirectorySettings {
                                 .items_center()
                                 .gap_2()
                                 .cursor_pointer()
-                                .child(
-                                    if profile.expanded {
-                                        Icon::ChevronDown
-                                    } else {
-                                        Icon::ChevronRight
-                                    }
-                                    .render(14.),
-                                )
+                                .child(Icon::disclosure(14., profile.expanded))
                                 .child(
                                     div()
                                         .min_w_0()
@@ -797,11 +790,7 @@ impl DirectorySettings {
                             .gap_3()
                             .child(
                                 Button::new("高级设置")
-                                    .icon(if profile.advanced {
-                                        Icon::ChevronDown
-                                    } else {
-                                        Icon::ChevronRight
-                                    })
+                                    .disclosure(profile.advanced)
                                     .kind(ButtonKind::Plain)
                                     .size(ButtonSize::Mini)
                                     .theme(self.theme)

@@ -189,37 +189,35 @@ impl Render for CollapsePanel {
                 .into_any_element()
         };
 
-        let trigger =
-            div()
-                .id("glass-collapse-panel-trigger")
-                .debug_selector(|| "glass-collapse-panel-trigger".into())
-                .w_full()
-                .h(px(30.))
-                .flex_shrink_0()
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .rounded(px(7.))
-                .cursor_pointer()
-                .hover(move |style| style.bg(hover_bg))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)))
-                .when_some(self.icon, |row, icon| {
-                    row.child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(rgb(p.text_muted))
-                            .child(icon.render(15.)),
-                    )
-                })
-                .child(summary)
-                .child(div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
-                    if self.expanded {
-                        Icon::ChevronDown.render(12.)
-                    } else {
-                        Icon::ChevronRight.render(12.)
-                    },
-                ));
+        let trigger = div()
+            .id("glass-collapse-panel-trigger")
+            .debug_selector(|| "glass-collapse-panel-trigger".into())
+            .w_full()
+            .h(px(30.))
+            .flex_shrink_0()
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)))
+            .when_some(self.icon, |row, icon| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(p.text_muted))
+                        .child(icon.render(15.)),
+                )
+            })
+            .child(summary)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(p.text_muted))
+                    .child(Icon::disclosure(12., self.expanded)),
+            );
 
         let mut root = div()
             .id("glass-collapse-panel")

@@ -189,14 +189,9 @@ impl AgentWorkspace {
                             pinned || entry.kind == "goal_running",
                         ))
                         .child(
-                            div().text_color(rgb(p.text_muted)).child(
-                                if expanded {
-                                    Icon::ChevronDown
-                                } else {
-                                    Icon::ChevronRight
-                                }
-                                .render(14.),
-                            ),
+                            div()
+                                .text_color(rgb(p.text_muted))
+                                .child(Icon::disclosure(14., expanded)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.partners_ui.expanded = if this.partners_ui.expanded == Some(mid) {

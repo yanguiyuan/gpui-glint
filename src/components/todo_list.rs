@@ -80,15 +80,7 @@ impl TodoList {
                     .child(format!("{completed}/{}", self.items.len())),
             )
             .when(toggle.is_some(), |header| {
-                header.child(
-                    if self.expanded {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronRight
-                    }
-                    .render(12.)
-                    .text_color(rgb(p.text_muted)),
-                )
+                header.child(Icon::disclosure(12., self.expanded).text_color(rgb(p.text_muted)))
             })
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();

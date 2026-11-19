@@ -207,7 +207,7 @@ impl AgentWorkspace {
             .hover(|style| style.bg(rgb(p.surface_subtle)))
             .child(Icon::Workflow.render(15.))
             .child(label)
-            .child(Icon::ChevronDown.render(12.));
+            .child(Icon::disclosure(12., self.subagent_ui.picker_open));
         let mut menu = div()
             .id("subagent-menu-list")
             .max_h(px(360.))

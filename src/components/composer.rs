@@ -1435,7 +1435,11 @@ impl Render for Composer {
                 chip_element = chip_element.child(div().min_w_0().text_ellipsis().child(label));
             }
             if chip.chevron {
-                chip_element = chip_element.child(Icon::ChevronDown.render(11.).flex_shrink_0());
+                chip_element = chip_element.child(Icon::disclosure(
+                    11.,
+                    is_menu_open
+                        || (self.context_open && self.context_trigger.as_ref() == Some(&chip.id)),
+                ));
             }
             if is_menu_open {
                 chip_element = chip_element.child(self.chip_menu(chip, selection, window, cx));

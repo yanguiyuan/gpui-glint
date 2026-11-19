@@ -344,7 +344,11 @@ impl Render for Select {
                     .text_ellipsis()
                     .child(label),
             )
-            .child(div().flex_shrink_0().child(Icon::ChevronDown.render(12.)));
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(Icon::disclosure(12., self.open)),
+            );
         if self.embedded {
             trigger = trigger
                 .border_0()

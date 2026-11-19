@@ -1118,13 +1118,12 @@ impl Render for DiffCard {
                     .text_color(rgb(diff_colors.deleted_marker))
                     .child(format!("-{dels}")),
             )
-            .child(div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
-                if self.body_visible {
-                    Icon::ChevronDown.render(13.)
-                } else {
-                    Icon::ChevronDown.render(13.)
-                },
-            ));
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(p.text_muted))
+                    .child(Icon::disclosure(13., self.body_visible)),
+            );
 
         let mut root = div()
             .id("glass-diff-card")

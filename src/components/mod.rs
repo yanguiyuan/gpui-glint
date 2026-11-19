@@ -61,7 +61,7 @@ pub use button::{Button, ButtonKind, ButtonSize};
 pub use closable_tabs::{ClosableTab, ClosableTabs};
 pub use dialog::{Dialog, DialogDismiss};
 pub use dropdown::{DropdownGroup, DropdownItem, GroupedDropdown};
-pub use icon::{GlintAssets, Icon, IconButton, IconSvg};
+pub use icon::{DisclosureChevron, GlintAssets, Icon, IconButton, IconSvg};
 pub use inputs::{
     Checkbox, InputField, RadioOption, SearchInput, SegmentOption, SegmentedControl, Slider,
     Stepper, Switch, TokenInput, checkbox_control, checkbox_control_themed,

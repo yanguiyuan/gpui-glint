@@ -1,3 +1,4 @@
+use super::Icon;
 use crate::theme::ThemePreset;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -264,12 +265,7 @@ impl Render for ThemeSelector {
                     .text_color(rgb(p.text))
                     .child(selected.name()),
             )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(p.text_muted))
-                    .child("⌄"),
-            );
+            .child(Icon::disclosure(12., self.open).text_color(rgb(p.text_muted)));
 
         if disabled {
             trigger = trigger.opacity(0.55);

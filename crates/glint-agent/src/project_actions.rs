@@ -408,7 +408,7 @@ impl AgentWorkspace {
                     }),
             )
             .child(if busy { "运行中" } else { "项目操作" })
-            .child(Icon::ChevronDown.render(12.));
+            .child(Icon::disclosure(12., self.project_actions.open));
         let mut content = div().flex().flex_col().min_w_0();
         if let Some(root) = root {
             content = content.child(

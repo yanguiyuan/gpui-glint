@@ -206,7 +206,7 @@ impl Render for GroupedDropdown {
         };
         trigger = trigger
             .child(trigger_label)
-            .child(Icon::ChevronDown.render(13.));
+            .child(Icon::disclosure(13., self.is_open));
 
         let mut root = div().relative().flex().child(trigger);
 

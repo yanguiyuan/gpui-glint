@@ -177,7 +177,7 @@ impl Workbench {
         DropdownMenu::new(
             "proxy-hosts-menu",
             Button::new("Hosts")
-                .icon(Icon::ChevronDown)
+                .disclosure(self.profile_inputs[index].hosts_menu_open)
                 .kind(ButtonKind::Plain)
                 .size(ButtonSize::Mini)
                 .theme(self.theme)

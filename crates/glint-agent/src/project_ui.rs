@@ -325,6 +325,7 @@ impl AgentWorkspace {
         }
         let weak = cx.entity().downgrade();
         let popover = ProjectSelector::new(id, trigger_selector, label, icon, projects, self.theme)
+            .open(self.workspace_picker == Some(picker))
             .popover(content, move |path, _, cx| {
                 let _ = weak.update(cx, |this, cx| {
                     if picker == WorkspacePicker::ChatProject {
@@ -366,6 +367,7 @@ impl AgentWorkspace {
     pub(super) fn session_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
         let active = self.history.active();
+        let open = self.workspace_picker == Some(WorkspacePicker::ChatSession);
         let trigger = div()
             .debug_selector(|| "agent-topbar-session".into())
             .h(px(28.))
@@ -376,9 +378,9 @@ impl AgentWorkspace {
             .rounded(px(6.))
             .hover(|style| style.bg(rgb(p.surface_subtle)))
             .child(div().max_w(px(200.)).truncate().child(active.title.clone()))
-            .child(Icon::ChevronDown.render(12.).text_color(rgb(p.text_muted)));
+            .child(Icon::disclosure(12., open).text_color(rgb(p.text_muted)));
         let mut sessions = Vec::new();
-        if self.workspace_picker == Some(WorkspacePicker::ChatSession) {
+        if open {
             sessions.extend(
                 self.history
                     .sessions
@@ -416,6 +418,7 @@ impl AgentWorkspace {
                     }))
             }));
         let popover = Popover::new("chat-session-selector", trigger, content)
+            .open(open)
             .trigger_height(28.)
             .width(316.)
             .padding(6.)
@@ -430,19 +433,17 @@ impl AgentWorkspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        let popover = popover
-            .open(self.workspace_picker == Some(picker))
-            .on_open_change(move |open, _, cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    if open {
-                        this.workspace_picker = Some(picker);
-                        this.git_ui.picker_open = false;
-                    } else if this.workspace_picker == Some(picker) {
-                        this.workspace_picker = None;
-                    }
-                    cx.notify();
-                });
+        let popover = popover.on_open_change(move |open, _, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if open {
+                    this.workspace_picker = Some(picker);
+                    this.git_ui.picker_open = false;
+                } else if this.workspace_picker == Some(picker) {
+                    this.workspace_picker = None;
+                }
+                cx.notify();
             });
+        });
         if picker == WorkspacePicker::ComposerProject {
             popover.above_trigger()
         } else {

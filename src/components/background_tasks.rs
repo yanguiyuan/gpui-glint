@@ -294,6 +294,7 @@ impl BackgroundTasksMenu {
         DropdownMenu::new(
             "background-tasks-menu",
             Button::new(format!("后台任务 · {count}"))
+                .disclosure(self.open)
                 .kind(ButtonKind::Plain)
                 .size(ButtonSize::Mini)
                 .theme(self.theme)

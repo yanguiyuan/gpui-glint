@@ -420,7 +420,8 @@ impl Workbench {
         let owner = cx.entity().downgrade();
         DropdownMenu::new(
             "websocket-actions-menu",
-            Button::new("操作 ▾")
+            Button::new("操作")
+                .disclosure(open)
                 .kind(ButtonKind::Plain)
                 .size(ButtonSize::Mini)
                 .theme(self.theme)

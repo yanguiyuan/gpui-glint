@@ -190,7 +190,7 @@ impl Workbench {
         DropdownMenu::new(
             "proxy-open-application-menu",
             Button::new("打开应用")
-                .icon(Icon::ChevronDown)
+                .disclosure(self.proxy_app_menu)
                 .kind(ButtonKind::Gray)
                 .size(ButtonSize::Small)
                 .theme(self.theme)

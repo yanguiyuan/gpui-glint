@@ -32,6 +32,7 @@ pub struct Button {
     theme: ThemePreset,
     label: SharedString,
     icon: Option<Icon>,
+    disclosure: Option<bool>,
     kind: ButtonKind,
     size: ButtonSize,
     pill: bool,
@@ -50,6 +51,7 @@ impl Button {
             theme: ThemePreset::default(),
             label: label.into(),
             icon: None,
+            disclosure: None,
             kind: ButtonKind::Primary,
             size: ButtonSize::Regular,
             pill: false,
@@ -63,6 +65,12 @@ impl Button {
         self.icon = Some(icon);
         self
     }
+    /// Add a trailing chevron that follows the panel’s expanded state.
+    pub fn disclosure(mut self, expanded: bool) -> Self {
+        self.disclosure = Some(expanded);
+        self
+    }
+
     pub fn kind(mut self, kind: ButtonKind) -> Self {
         self.kind = kind;
         self
@@ -171,6 +179,10 @@ impl Button {
         } else {
             button.child(self.label)
         };
+        button = button.children(
+            self.disclosure
+                .map(|expanded| Icon::disclosure(font_size, expanded)),
+        );
         if self.disabled {
             button = button.opacity(0.45);
         } else {

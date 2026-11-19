@@ -434,14 +434,7 @@ impl ChangeNavigation {
             .cursor_pointer()
             .text_size(px(12.))
             .hover(|style| style.bg(rgb(p.surface_subtle)))
-            .child(
-                if collapsed {
-                    Icon::ChevronRight
-                } else {
-                    Icon::ChevronDown
-                }
-                .render(12.),
-            )
+            .child(Icon::disclosure(12., !collapsed))
             .child(Icon::Folder.render(14.))
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(

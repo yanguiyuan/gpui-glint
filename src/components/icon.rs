@@ -2,11 +2,13 @@ use crate::theme::ThemePreset;
 use std::{
     borrow::Cow,
     hash::{Hash, Hasher},
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    AssetSource, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px, rgb, svg,
+    AnyElement, App, AssetSource, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, Transformation, Window, div, px, radians, rgb, svg,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +249,130 @@ impl Icon {
                 )))
                 .size(px(size)),
         )
+    }
+
+    /// A right-pointing chevron that rotates down when its panel expands.
+    /// Place it under a stable element ID for the trigger.
+    pub fn disclosure(size: f32, expanded: bool) -> DisclosureChevron {
+        DisclosureChevron {
+            icon: Some(Self::ChevronRight.render(size).flex_shrink_0()),
+            expanded,
+        }
+    }
+}
+
+pub struct DisclosureChevron {
+    icon: Option<IconSvg>,
+    expanded: bool,
+}
+
+struct ChevronTransition {
+    from: f32,
+    target: f32,
+    started: Instant,
+}
+
+impl ChevronTransition {
+    const DURATION: Duration = Duration::from_millis(150);
+
+    fn angle(&self, now: Instant) -> f32 {
+        let elapsed = now.duration_since(self.started).as_secs_f32();
+        let progress = (elapsed / Self::DURATION.as_secs_f32()).min(1.);
+        self.from + (self.target - self.from) * gpui::ease_in_out(progress)
+    }
+}
+
+impl Styled for DisclosureChevron {
+    fn style(&mut self) -> &mut gpui::StyleRefinement {
+        self.icon.as_mut().unwrap().style()
+    }
+}
+
+impl IntoElement for DisclosureChevron {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for DisclosureChevron {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some("disclosure-chevron".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, AnyElement) {
+        let target = if self.expanded {
+            std::f32::consts::FRAC_PI_2
+        } else {
+            0.
+        };
+        let now = cx.background_executor().now();
+        let reduce_motion = cx.reduce_motion();
+        let angle = window.with_element_state(
+            id.unwrap(),
+            |previous: Option<ChevronTransition>, window| {
+                let transition = match previous.filter(|_| !reduce_motion) {
+                    Some(previous) if previous.target == target => previous,
+                    previous => ChevronTransition {
+                        from: previous.map_or(target, |previous| previous.angle(now)),
+                        target,
+                        started: now,
+                    },
+                };
+                if transition.from != target
+                    && now.duration_since(transition.started) < ChevronTransition::DURATION
+                {
+                    window.request_animation_frame();
+                }
+                (transition.angle(now), transition)
+            },
+        );
+        let mut icon = self
+            .icon
+            .take()
+            .unwrap()
+            .with_transformation(Transformation::rotate(radians(angle)))
+            .into_any_element();
+        (icon.request_layout(window, cx), icon)
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        icon: &mut AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        icon.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        icon: &mut AnyElement,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        icon.paint(window, cx);
     }
 }
 
@@ -732,6 +858,52 @@ fn icon_svg(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ChevronPreview(bool);
+
+    impl gpui::Render for ChevronPreview {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div().id("trigger").child(Icon::disclosure(12., self.0))
+        }
+    }
+
+    #[gpui::test]
+    fn disclosure_animates_on_state_changes(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(100.), px(100.)), |_, _| ChevronPreview(false));
+        let next_frame = |cx: &mut gpui::TestAppContext| {
+            let count = window
+                .update(cx, |_, window, cx| window.simulate_next_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+            count
+        };
+        let toggle = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |view, _, cx| {
+                    view.0 = !view.0;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        cx.run_until_parked();
+        assert_eq!(next_frame(cx), 0);
+
+        toggle(cx);
+        cx.executor().advance_clock(ChevronTransition::DURATION);
+        assert_eq!(next_frame(cx), 1);
+        assert_eq!(next_frame(cx), 0);
+
+        toggle(cx);
+        cx.executor().advance_clock(ChevronTransition::DURATION);
+        assert_eq!(next_frame(cx), 1);
+        assert_eq!(next_frame(cx), 0);
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        toggle(cx);
+        assert_eq!(next_frame(cx), 0);
+    }
+
     #[test]
     fn settings_gear_has_a_continuous_outline_at_toolbar_sizes() {
         let svg = GlintAssets

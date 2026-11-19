@@ -423,7 +423,7 @@ impl AgentWorkspace {
                     .text_size(px(12.))
                     .text_color(rgb(p.text_muted))
                     .cursor_pointer()
-                    .child(if state.advanced { "⌄" } else { "›" })
+                    .child(Icon::disclosure(12., state.advanced))
                     .child("参数与环境变量")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.mcp_ui.advanced = !this.mcp_ui.advanced;
@@ -678,11 +678,11 @@ impl AgentWorkspace {
                                 .text_size(px(11.))
                                 .text_color(rgb(p.text_muted))
                                 .cursor_pointer()
-                                .child(if state.show_path {
-                                    "⌄ 配置文件位置"
-                                } else {
-                                    "› 配置文件位置"
-                                })
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Icon::disclosure(11., state.show_path))
+                                .child("配置文件位置")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.mcp_ui.show_path = !this.mcp_ui.show_path;
                                     cx.notify();

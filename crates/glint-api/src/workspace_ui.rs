@@ -24,7 +24,7 @@ impl Workbench {
             .cursor_pointer()
             .hover(|s| s.bg(rgb(self.theme.palette().accent_tint)))
             .child(div().min_w_0().truncate().child(self.workspace_label()))
-            .child(Icon::ChevronDown.render(12.).flex_shrink_0())
+            .child(Icon::disclosure(12., self.show_workspaces).flex_shrink_0())
             .on_click(cx.listener(|this, _, window, cx| {
                 match this.workspace.storage.workspaces() {
                     Ok(list) => {

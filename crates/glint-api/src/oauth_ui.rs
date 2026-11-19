@@ -872,7 +872,7 @@ impl Workbench {
             );
         }
         let trigger = Button::new("授权预设")
-            .icon(Icon::ChevronDown)
+            .disclosure(self.oauth.show_presets)
             .kind(ButtonKind::Plain)
             .size(ButtonSize::Mini)
             .theme(self.theme)
@@ -1129,11 +1129,7 @@ impl Workbench {
                 .pt_1()
                 .child(
                     Button::new("高级设置")
-                        .icon(if self.oauth.show_advanced {
-                            Icon::ChevronDown
-                        } else {
-                            Icon::ChevronRight
-                        })
+                        .disclosure(self.oauth.show_advanced)
                         .kind(ButtonKind::Plain)
                         .size(ButtonSize::Mini)
                         .theme(self.theme)

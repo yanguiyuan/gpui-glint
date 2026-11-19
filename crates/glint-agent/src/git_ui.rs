@@ -286,7 +286,7 @@ impl AgentWorkspace {
                 Icon::GitBranch.render(15.).into_any_element()
             })
             .child(div().max_w(px(200.)).truncate().child(repo.current.clone()))
-            .child(Icon::ChevronDown.render(12.));
+            .child(Icon::disclosure(12., self.git_ui.picker_open));
         let project_name = repo
             .worktrees
             .first()
