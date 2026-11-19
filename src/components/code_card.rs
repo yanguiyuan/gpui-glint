@@ -235,7 +235,9 @@ pub struct CodeCard {
     search_cache: Option<(SharedString, SharedString, Rc<Vec<Range<usize>>>)>,
     search_query: SharedString,
     active_search_match: Option<Range<usize>>,
-    pending_search_reveal: Option<Range<usize>>,
+    pending_reveal: Option<Range<usize>>,
+    selected_line: Option<usize>,
+    track_selected_line: bool,
     focus_handle: FocusHandle,
     content: SharedString,
     language: SharedString,
@@ -477,13 +479,19 @@ impl CodeCard {
         &self.search_query
     }
 
-    /// Search decoration only; does not change content, selection, or undo history.
+    /// Search decoration only; does not change content, text selection, or undo history.
     pub fn set_search_query(&mut self, query: impl Into<SharedString>, cx: &mut Context<Self>) {
         let query = query.into();
         if self.search_query != query {
             self.search_query = query;
             self.active_search_match = None;
-            self.pending_search_reveal = None;
+            if self
+                .pending_reveal
+                .as_ref()
+                .is_some_and(|hit| !hit.is_empty())
+            {
+                self.pending_reveal = None;
+            }
             cx.notify();
         }
     }
@@ -515,12 +523,7 @@ impl CodeCard {
 
     /// Locate the first match on or after a one-based source line.
     pub fn reveal_search_at_line(&mut self, line: usize, cx: &mut Context<Self>) -> Option<usize> {
-        let offset = self
-            .content
-            .split_inclusive('\n')
-            .take(line.saturating_sub(1))
-            .map(str::len)
-            .sum::<usize>();
+        let offset = self.source_line_start(line);
         let matches = self.cached_search_matches();
         if matches.is_empty() {
             return None;
@@ -537,25 +540,11 @@ impl CodeCard {
         let Some(range) = self.cached_search_matches().get(index).cloned() else {
             return false;
         };
-        if let Some(cache) = &self.viewport_cache
-            && let Some(folds) = &cache.folds
-        {
-            let line = cache
-                .ranges
-                .partition_point(|line| line.start <= range.start)
-                .saturating_sub(1);
-            let before = self.collapsed_json.len();
-            self.collapsed_json.retain(|start| {
-                !folds
-                    .get(start)
-                    .is_some_and(|fold| *start < line && line <= fold.end_line)
-            });
-            if before != self.collapsed_json.len() {
-                self.fold_revision = self.fold_revision.wrapping_add(1);
-            }
+        if self.track_selected_line {
+            self.selected_line = Some(self.source_line_at_offset(range.start));
         }
         self.active_search_match = Some(range.clone());
-        self.pending_search_reveal = Some(range);
+        self.pending_reveal = Some(range);
         cx.notify();
         true
     }
@@ -583,7 +572,9 @@ impl CodeCard {
             search_cache: None,
             search_query: "".into(),
             active_search_match: None,
-            pending_search_reveal: None,
+            pending_reveal: None,
+            selected_line: None,
+            track_selected_line: false,
             focus_handle: cx.focus_handle(),
             content,
             language: language.into(),
@@ -837,16 +828,77 @@ impl CodeCard {
         )
     }
 
+    /// Select the source line under a click or revealed by navigation or search.
+    pub fn track_selected_line(mut self, enabled: bool) -> Self {
+        self.track_selected_line = enabled;
+        self
+    }
+
+    /// The highlighted one-based source line, independent of the text selection.
+    pub fn selected_line(&self) -> Option<usize> {
+        self.selected_line
+    }
+
+    /// Highlight a one-based source line without scrolling or changing focus.
+    /// Pass `None` or an out-of-range number to clear the highlight.
+    pub fn set_selected_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
+        let line = line.filter(|&line| {
+            line != 0
+                && self.source_ranges().map_or_else(
+                    || self.content.split('\n').nth(line - 1).is_some(),
+                    |ranges| line <= ranges.len(),
+                )
+        });
+        if self.selected_line != line {
+            self.selected_line = line;
+            cx.notify();
+        }
+    }
+
+    fn source_ranges(&self) -> Option<&[Range<usize>]> {
+        self.viewport_cache
+            .as_ref()
+            .filter(|cache| cache.key.content == self.content)
+            .map(|cache| cache.ranges.as_slice())
+    }
+
+    fn source_line_at_offset(&self, offset: usize) -> usize {
+        self.source_ranges().map_or_else(
+            || {
+                1 + self.content.as_bytes()[..offset]
+                    .iter()
+                    .filter(|&&byte| byte == b'\n')
+                    .count()
+            },
+            |ranges| ranges.partition_point(|line| line.start <= offset),
+        )
+    }
+
+    fn source_line_start(&self, line: usize) -> usize {
+        let index = line.saturating_sub(1);
+        self.source_ranges().map_or_else(
+            || {
+                self.content
+                    .split_inclusive('\n')
+                    .take(index)
+                    .map(str::len)
+                    .sum()
+            },
+            |ranges| {
+                ranges
+                    .get(index)
+                    .map_or(self.content.len(), |range| range.start)
+            },
+        )
+    }
+
     /// Reveal a one-based source line in the read-only viewport without focus changes.
     pub fn reveal_line(&mut self, line: usize, cx: &mut Context<Self>) {
-        let offset = self
-            .content
-            .split_inclusive('\n')
-            .take(line.saturating_sub(1))
-            .map(str::len)
-            .sum::<usize>()
-            .min(self.content.len());
-        self.pending_search_reveal = Some(offset..offset);
+        let offset = self.source_line_start(line);
+        if self.track_selected_line {
+            self.selected_line = Some(self.source_line_at_offset(offset));
+        }
+        self.pending_reveal = Some(offset..offset);
         cx.notify();
     }
 
@@ -877,7 +929,8 @@ impl CodeCard {
     pub fn sync_content(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = value.into();
         self.active_search_match = None;
-        self.pending_search_reveal = None;
+        self.pending_reveal = None;
+        self.selected_line = None;
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
         self.history.clear();
@@ -1094,7 +1147,8 @@ impl CodeCard {
 
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.active_search_match = None;
-        self.pending_search_reveal = None;
+        self.pending_reveal = None;
+        self.selected_line = None;
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.reveal_cursor = true;
         let value = if let Some(rich) = &mut self.rich {
@@ -1454,6 +1508,23 @@ impl CodeCard {
         self.is_selecting = true;
         window.focus(&self.focus_handle, cx);
         let offset = self.index_for_mouse_position(event.position);
+        if self.track_selected_line
+            && (!self.viewport
+                || !self.read_only
+                || self.prose
+                || self
+                    .viewport_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .bounds()
+                    .contains(&event.position))
+            && let Some((start, _, _)) = self.last_lines.iter().find(|(_, _, bounds)| {
+                event.position.y >= bounds.top() && event.position.y < bounds.bottom()
+            })
+        {
+            self.selected_line = Some(self.source_line_at_offset(*start));
+        }
         if self.document_managed {
             cx.emit(CodeCardEvent::SelectionStarted {
                 editor: cx.entity_id(),
@@ -3108,6 +3179,24 @@ impl CodeCard {
         if folding && cache.folds.is_none() {
             cache.folds = Some(super::json_folding::folds(&self.content));
         }
+        let pending_reveal = self.pending_reveal.take().map(|hit| {
+            let index = cache
+                .ranges
+                .partition_point(|line| line.start <= hit.start)
+                .saturating_sub(1);
+            if folding && let Some(folds) = &cache.folds {
+                let before = self.collapsed_json.len();
+                self.collapsed_json.retain(|start| {
+                    !folds
+                        .get(start)
+                        .is_some_and(|fold| *start < index && index <= fold.end_line)
+                });
+                if before != self.collapsed_json.len() {
+                    self.fold_revision = self.fold_revision.wrapping_add(1);
+                }
+            }
+            (hit, index)
+        });
         if cache.fold_revision != self.fold_revision {
             cache.visible = if folding {
                 super::json_folding::visible_lines(
@@ -3125,12 +3214,8 @@ impl CodeCard {
         let gutter_width =
             viewport_gutter_width(source_count) + if folding { px(16.) } else { px(0.) };
         let search_matches = self.cached_search_matches();
-        if let Some(hit) = self.pending_search_reveal.take() {
+        if let Some((hit, index)) = pending_reveal {
             let cache = self.viewport_cache.as_mut().unwrap();
-            let index = cache
-                .ranges
-                .partition_point(|line| line.start <= hit.start)
-                .saturating_sub(1);
             let range = cache.ranges[index].clone();
             let text: SharedString = self.content[range.clone()].to_owned().into();
             let runs = [TextRun {
@@ -3191,6 +3276,7 @@ impl CodeCard {
                 indexes
                     .map(|visible_index| {
                         let index = cache.visible[visible_index];
+                        let selected = this.selected_line == Some(index + 1);
                         let fold = if folding {
                             cache.folds.as_ref().and_then(|folds| folds.get(&index))
                         } else {
@@ -3255,6 +3341,7 @@ impl CodeCard {
                             .w_full()
                             .h(px(LINE_HEIGHT))
                             .flex()
+                            .when(selected, |row| row.bg(rgb(colors.selection).opacity(0.65)))
                             .child(
                                 div()
                                     .w(gutter_width)
@@ -3267,6 +3354,11 @@ impl CodeCard {
                                     .pr(px(if folding { 5. } else { 9. }))
                                     .border_r_1()
                                     .border_color(rgb(colors.border))
+                                    .when(selected, |gutter| {
+                                        gutter
+                                            .border_color(rgb(colors.key))
+                                            .text_color(rgb(colors.key))
+                                    })
                                     .child(
                                         div().flex_1().text_right().child((index + 1).to_string()),
                                     )
@@ -3725,7 +3817,12 @@ impl Render for CodeCard {
             }))
             .flex()
             .flex_col();
+        let mut source_line = 1;
         for (index, (start, line)) in shaped.iter().cloned().enumerate() {
+            if start > 0 && self.content.as_bytes()[start - 1] == b'\n' {
+                source_line += 1;
+            }
+            let selected = self.selected_line == Some(source_line);
             let current = focused
                 && self.selected_range.is_empty()
                 && self.document_selection.is_none()
@@ -3745,8 +3842,11 @@ impl Render for CodeCard {
                 colors.surface
             };
             // Keep the caret row subtler than a text selection in both themes.
-            let background =
-                rgb(background).opacity(if current && !self.prose { 0.35 } else { 1. });
+            let background = if selected {
+                rgb(colors.selection).opacity(0.65)
+            } else {
+                rgb(background).opacity(if current && !self.prose { 0.35 } else { 1. })
+            };
             gutter = gutter.child(
                 div()
                     .h(px(LINE_HEIGHT))
@@ -3755,6 +3855,11 @@ impl Render for CodeCard {
                     .border_r_1()
                     .border_color(rgb(colors.border))
                     .bg(background)
+                    .when(selected, |gutter| {
+                        gutter
+                            .border_color(rgb(colors.key))
+                            .text_color(rgb(colors.key))
+                    })
                     .child((index + self.inline_preview.map_or(1, |(first, _)| first)).to_string()),
             );
             let mut row = div()
@@ -3763,7 +3868,7 @@ impl Render for CodeCard {
                 .h(line_height)
                 .pl(px(if rich_mode { 0. } else { 8. }))
                 .pr(px(if rich_mode { 0. } else { 18. }));
-            if !rich_mode {
+            if !rich_mode || selected {
                 row = row.bg(background);
             }
             let reference_tooltips = Self::reference_tooltips(

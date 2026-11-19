@@ -563,7 +563,7 @@ impl Workbench {
                     )),
             )
             .child(
-                IconButton::new(Icon::ArrowUp, "上一处（Shift+Enter）")
+                IconButton::new(Icon::ChevronUp, "上一处（Shift+Enter）")
                     .plain()
                     .theme(self.theme)
                     .render()

@@ -298,6 +298,7 @@ impl FilePreview {
             CodeCard::new(cx, language, text)
                 .read_only(true)
                 .quote_context(true)
+                .track_selected_line(true)
                 .show_header(false)
                 .viewport()
                 .theme(self.theme)
@@ -311,11 +312,11 @@ impl FilePreview {
         self.page = Page::File(editor);
         self.search_match = None;
         self.search.update(cx, |entry, cx| entry.set_value("", cx));
-        if let Some((query, line)) = self.pending_search.clone() {
-            self.set_document_search(query, line, cx);
-        }
         if let Some(line) = self.pending_line.take() {
             self.reveal_line(line, cx);
+        }
+        if let Some((query, line)) = self.pending_search.take() {
+            self.set_document_search(query, line, cx);
         }
         cx.notify();
     }
@@ -340,7 +341,6 @@ impl FilePreview {
         line: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        self.pending_search = Some((query.clone(), line));
         self.search_open = !query.is_empty();
         self.search
             .update(cx, |search, cx| search.set_value(query.clone(), cx));
@@ -351,6 +351,8 @@ impl FilePreview {
                 let active = editor.reveal_search_at_line(line.unwrap_or(1), cx);
                 active.map(|index| (index, count))
             });
+        } else {
+            self.pending_search = Some((query, line));
         }
         cx.notify();
     }
@@ -443,7 +445,7 @@ impl FilePreview {
             .when(self.search_match.is_some(), |row| {
                 row.children(
                     [
-                        (Icon::ArrowUp, "上一个匹配", true),
+                        (Icon::ChevronUp, "上一个匹配", true),
                         (Icon::ChevronDown, "下一个匹配", false),
                     ]
                     .map(|(icon, label, previous)| {
