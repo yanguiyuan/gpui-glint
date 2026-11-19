@@ -340,28 +340,58 @@ impl AgentWorkspace {
 
     fn switch_chat_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.workspace_picker = None;
-        if self.history.active().project.as_ref() == Some(&path) {
-            cx.notify();
+        if self.resume_project_chat(&path, cx) {
             return;
+        }
+        if self.history.active().project.is_none() {
+            self.choose_project(path, cx);
+        } else {
+            self.create_project_chat(path, cx);
+        }
+    }
+
+    fn resume_project_chat(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        if self.history.active().project.as_deref() == Some(path) {
+            cx.notify();
+            return true;
         }
         let session = self
             .history
             .sessions
             .iter()
-            .filter(|session| session.project.as_ref() == Some(&path))
+            .filter(|session| session.project.as_deref() == Some(path))
             .max_by_key(|session| session.updated)
             .map(|session| session.id);
         if let Some(session) = session {
             self.switch(session, cx);
-        } else if self.history.active().project.is_none() {
-            self.choose_project(path, cx);
+            true
         } else {
-            let previous = self.history.active;
-            self.history.new_session_for(Some(path));
-            let session = std::mem::replace(&mut self.history.active, previous);
-            self.switch(session, cx);
-            self.save(cx);
+            false
         }
+    }
+
+    fn create_project_chat(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let previous = self.history.active;
+        self.history.new_session_for(Some(path));
+        let session = std::mem::replace(&mut self.history.active, previous);
+        self.switch(session, cx);
+        self.save(cx);
+    }
+
+    pub(super) fn quote_project_excerpt(
+        &mut self,
+        excerpt: &project_files::ProjectExcerpt,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != crate::Page::Projects {
+            return;
+        }
+        if !self.resume_project_chat(&excerpt.project, cx) {
+            self.create_project_chat(excerpt.project.clone(), cx);
+        }
+        self.set_page(crate::Page::Chat, cx);
+        let path = file_preview::reference_path(Some(&excerpt.project), &excerpt.path);
+        self.quote_file_excerpt(&path, &excerpt.selection, cx);
     }
 
     pub(super) fn session_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {

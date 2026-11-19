@@ -11,6 +11,16 @@ fn is_png(path: &Path) -> bool {
 }
 const LIMIT: u64 = 2 * 1024 * 1024;
 
+pub(super) fn reference_path(root: Option<&Path>, path: &str) -> String {
+    if let Some(root) = root.filter(|root| ssh_project::is_remote(root))
+        && let Ok(mut remote) = ssh_project::Remote::from_path(root)
+    {
+        remote.directory = path.to_owned();
+        return remote.uri().to_string_lossy().into_owned();
+    }
+    path.to_owned()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub root: Option<PathBuf>,
@@ -401,19 +411,12 @@ impl State {
                     this.quote_reference(reference, cx);
                     return;
                 }
-                let path = if let Some(root) = this
+                let root = this
                     .file_preview
                     .target
                     .as_ref()
-                    .and_then(|t| t.root.as_deref())
-                    .filter(|p| ssh_project::is_remote(p))
-                {
-                    let mut remote = ssh_project::Remote::from_path(root).unwrap();
-                    remote.directory = path.clone();
-                    remote.uri().to_string_lossy().into_owned()
-                } else {
-                    path.clone()
-                };
+                    .and_then(|target| target.root.as_deref());
+                let path = reference_path(root, path);
                 this.quote_file_excerpt(&path, selection, cx);
             }
             FilePreviewEvent::DirectoryRequested { path, request } => {
@@ -520,7 +523,7 @@ impl AgentWorkspace {
             });
         }));
     }
-    fn quote_file_excerpt(
+    pub(super) fn quote_file_excerpt(
         &mut self,
         path: &str,
         selection: &gpui_glint::components::CodeSelection,

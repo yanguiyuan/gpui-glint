@@ -41,20 +41,26 @@ impl AgentWorkspace {
         self.page
     }
 
-    pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.project_files.update(cx, |files, cx| {
             files.set_visible(page == Page::Projects, cx)
         });
         self.page = page;
         self.workspace_picker = None;
         self.git_ui.picker_open = false;
+        if page == Page::Chat {
+            self.sync_skill_context(cx);
+        }
+    }
+
+    pub fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_page(page, cx);
         match page {
             Page::Projects => {
                 self.open_browser_project(cx);
                 window.focus(&self.focus, cx);
             }
             Page::Chat => {
-                self.sync_skill_context(cx);
                 window.focus(&self.composer.focus_handle(cx), cx);
             }
             Page::Settings => self.open_settings(window, cx),

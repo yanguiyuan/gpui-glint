@@ -244,6 +244,7 @@ pub struct CodeCard {
     read_only: bool,
     preview_links: bool,
     quote_context: bool,
+    quote_label: SharedString,
     context_menu: Option<(gpui::WindowId, gpui::Point<Pixels>)>,
     hovered_preview_link: bool,
     completions: CompletionState,
@@ -581,6 +582,7 @@ impl CodeCard {
             read_only: false,
             preview_links: false,
             quote_context: false,
+            quote_label: "引用选中内容".into(),
             context_menu: None,
             hovered_preview_link: false,
             completions: CompletionState::default(),
@@ -735,6 +737,12 @@ impl CodeCard {
         self
     }
 
+    /// Set the menu label for the host's quote action.
+    pub fn quote_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.quote_label = label.into();
+        self
+    }
+
     fn on_context_menu(
         &mut self,
         event: &MouseDownEvent,
@@ -796,7 +804,7 @@ impl CodeCard {
             )
             .when(self.quote_context && self.read_only, |menu| {
                 menu.child(
-                    super::MenuItem::new("code-card-quote", "引用选中内容")
+                    super::MenuItem::new("code-card-quote", self.quote_label.clone())
                         .theme(theme)
                         .disabled(!selected)
                         .render()

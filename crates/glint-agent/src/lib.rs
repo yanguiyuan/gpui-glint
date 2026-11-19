@@ -793,6 +793,12 @@ impl AgentWorkspace {
             }
         }));
         workspace._subscriptions.push(cx.subscribe(
+            &workspace.project_files,
+            |this, _, excerpt: &project_files::ProjectExcerpt, cx| {
+                this.quote_project_excerpt(excerpt, cx);
+            },
+        ));
+        workspace._subscriptions.push(cx.subscribe(
             &workspace.vault,
             |this, _, _: &glint_vault::VaultEvent, cx| {
                 if !this.host_owns_vault {

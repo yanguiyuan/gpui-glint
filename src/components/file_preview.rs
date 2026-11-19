@@ -48,6 +48,7 @@ struct FolderNode {
 
 pub struct FilePreview {
     header_accessory: Option<gpui::AnyView>,
+    quote_label: Option<SharedString>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
     html: Option<String>,
     #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -99,6 +100,7 @@ impl FilePreview {
             #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
             browser: None,
             header_accessory: None,
+            quote_label: None,
             expanded: false,
             standalone: false,
             content_only: false,
@@ -121,6 +123,12 @@ impl FilePreview {
             _search_subscription: search_subscription,
             subscriptions: Vec::new(),
         }
+    }
+
+    /// Label used for the action that emits a selected source excerpt.
+    pub fn quote_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.quote_label = Some(label.into());
+        self
     }
     fn clear_html(&mut self) {
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -295,13 +303,17 @@ impl FilePreview {
         self.parent = parent;
         self.subscriptions.clear();
         let editor = cx.new(|cx| {
-            CodeCard::new(cx, language, text)
+            let editor = CodeCard::new(cx, language, text)
                 .read_only(true)
                 .quote_context(true)
                 .track_selected_line(true)
                 .show_header(false)
                 .viewport()
-                .theme(self.theme)
+                .theme(self.theme);
+            match &self.quote_label {
+                Some(label) => editor.quote_label(label.clone()),
+                None => editor,
+            }
         });
         self.subscriptions
             .push(cx.subscribe(&editor, |this, _, event: &CodeCardEvent, cx| {

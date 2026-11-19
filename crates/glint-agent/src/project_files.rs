@@ -6,10 +6,10 @@ use crate::git_ui::CommitDiff;
 use crate::go_definition::{GoDefinitions, ProcessState};
 use crate::project_changes::{ChangeSnapshot, ProjectChanges, StageSelection};
 use crate::shortcuts::DefinitionModifier;
-use gpui::{Animation, AnimationExt};
+use gpui::{Animation, AnimationExt, EventEmitter};
 use gpui_glint::components::{
-    ChangeNavigation, ChangeNavigationEvent, FilePreview, FilePreviewEvent, GitGraph,
-    GitGraphEvent, MenuItem, PromptEditor, Skeleton, Tooltip,
+    ChangeNavigation, ChangeNavigationEvent, CodeSelection, FilePreview, FilePreviewEvent,
+    GitGraph, GitGraphEvent, MenuItem, PromptEditor, Skeleton, Tooltip,
 };
 use std::{ops::Range, path::Path, time::Duration};
 
@@ -17,6 +17,12 @@ const EXPLORER_MIN_WIDTH: f32 = 240.;
 const EXPLORER_MAX_WIDTH: f32 = 720.;
 const DOCUMENT_MIN_WIDTH: f32 = 320.;
 const EXPLORER_DIVIDER_WIDTH: f32 = 5.;
+
+pub(super) struct ProjectExcerpt {
+    pub project: PathBuf,
+    pub path: String,
+    pub selection: CodeSelection,
+}
 
 struct Document {
     id: u64,
@@ -124,6 +130,8 @@ pub(super) struct ProjectFiles {
     visible: bool,
     next_document_id: u64,
 }
+
+impl EventEmitter<ProjectExcerpt> for ProjectFiles {}
 
 async fn read(target: Target) -> Result<(String, Option<String>, Loaded), String> {
     if target.root.as_deref().is_some_and(ssh_project::is_remote) {
@@ -1177,8 +1185,22 @@ impl ProjectFiles {
             }
             return;
         }
-        let view = cx.new(FilePreview::new);
+        let view = cx.new(|cx| FilePreview::new(cx).quote_label("交给 Agent"));
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&view, |this, preview, event: &FilePreviewEvent, cx| {
+            if let FilePreviewEvent::QuoteRequested { path, selection } = event
+                && let Some(project) = &this.root
+                && let Some(index) = this.active
+                && matches!(&this.documents[index].view, DocumentView::File(view) if *view == preview)
+            {
+                cx.emit(ProjectExcerpt {
+                    project: project.clone(),
+                    path: path.clone(),
+                    selection: selection.clone(),
+                });
+            }
+        })
+        .detach();
         view.update(cx, |view, cx| {
             view.set_theme(self.theme, cx);
             view.set_loading(path.clone(), cx);
