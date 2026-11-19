@@ -27,7 +27,7 @@ impl State {
 }
 impl AgentWorkspace {
     pub(crate) fn open_ssh_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         self.ssh_ui.open = true;
         self.ssh_ui.error = None;
         self.ssh_ui.set_theme(self.theme, cx);

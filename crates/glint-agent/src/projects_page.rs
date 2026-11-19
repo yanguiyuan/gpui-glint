@@ -1,6 +1,6 @@
 //! Project browsing shares the persisted catalog with chat, but never selects a session.
 use super::*;
-use gpui_glint::components::{MenuItem, Select, SelectEvent, SelectOption, Tooltip};
+use gpui_glint::components::{Select, SelectEvent, SelectOption, Tooltip};
 
 #[derive(Default)]
 pub(super) struct Repositories {
@@ -199,67 +199,6 @@ impl AgentWorkspace {
 
     pub(super) fn projects_topbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
-        let label = self
-            .browser_project
-            .as_ref()
-            .map(|path| project_grouping::project_label(&self.history, path))
-            .unwrap_or_else(|| "选择项目".into());
-        let trigger = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded(px(6.))
-            .hover(|s| s.bg(rgb(p.border)))
-            .child(Icon::FolderOpen.render(15.))
-            .child(div().max_w(px(260.)).truncate().child(label))
-            .child(Icon::ChevronDown.render(12.));
-        let mut content = div().flex().flex_col().child(
-            div()
-                .id("browser-project-list")
-                .max_h(px(320.))
-                .overflow_y_scroll()
-                .children(self.history.projects.iter().map(|path| {
-                    let project = path.clone();
-                    MenuItem::new(
-                        SharedString::from(format!("browse-project:{}", path.display())),
-                        project_grouping::project_label(&self.history, path),
-                    )
-                    .icon(if self.browser_project.as_ref() == Some(path) {
-                        Icon::CheckCircle
-                    } else {
-                        Icon::Folder
-                    })
-                    .theme(self.theme)
-                    .render()
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.choose_project(project.clone(), cx)),
-                    )
-                })),
-        );
-        content = content
-            .child(
-                MenuItem::new("browser-open-project", "打开项目目录…")
-                    .icon(Icon::FolderOpen)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.project_picker_open = false;
-                        this.open_project(cx);
-                    })),
-            )
-            .child(
-                MenuItem::new("browser-open-ssh", "连接 SSH 项目…")
-                    .icon(Icon::Globe)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.project_picker_open = false;
-                        this.open_ssh_project(window, cx);
-                    })),
-            );
-        let weak = cx.entity().downgrade();
         div()
             .size_full()
             .flex()
@@ -267,20 +206,7 @@ impl AgentWorkspace {
             .gap_3()
             .px_3()
             .debug_selector(|| "projects-topbar".into())
-            .child(
-                Popover::new("browser-project-selector", trigger, content)
-                    .open(self.project_picker_open)
-                    .trigger_height(28.)
-                    .width(320.)
-                    .padding(6.)
-                    .theme(self.theme)
-                    .on_open_change(move |open, _, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.project_picker_open = open;
-                            cx.notify();
-                        });
-                    }),
-            )
+            .child(self.project_selector_at(project_ui::WorkspacePicker::BrowserProject, cx))
             .when_some(self.browser_repositories.select.clone(), |bar, select| {
                 if select.read(cx).theme_preset() != self.theme {
                     select.update(cx, |select, cx| select.set_theme(self.theme, cx));

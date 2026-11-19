@@ -7,6 +7,7 @@ use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, ListAlignment, ListOffset, ListState,
     MouseButton, Render, SharedString, Window, div, prelude::*, px, rgb,
 };
+use std::collections::{HashMap, HashSet};
 
 const ROW_HEIGHT: f32 = 34.;
 const SKELETON_ROWS: usize = 5;
@@ -58,14 +59,14 @@ pub enum ChangeRow {
         depth: usize,
         count: usize,
         collapsed: bool,
-        /// Which group this directory belongs to, so the host can key collapse state.
-        staged: bool,
+        /// Staging layer, if this directory belongs to a staging group.
+        staged: Option<bool>,
     },
     File {
         path: String,
         label: String,
         depth: usize,
-        status: ChangeStatus,
+        status: Option<ChangeStatus>,
         /// Layer the row belongs to; it also drives the staging checkbox.
         staged: bool,
         /// Counts from `git diff --numstat`. `None` only means this layer has no
@@ -87,7 +88,7 @@ pub enum ChangeNavigationEvent {
     },
     ToggleDirectory {
         path: String,
-        staged: bool,
+        staged: Option<bool>,
     },
     /// Stage or unstage these files; the host resolves them against its own sources.
     Stage {
@@ -95,6 +96,7 @@ pub enum ChangeNavigationEvent {
         staged: bool,
     },
     StageGroup {
+        layer: bool,
         staged: bool,
     },
     Menu {
@@ -109,7 +111,11 @@ pub struct ChangeNavigation {
     selected: Option<(String, bool)>,
     /// Staging is only offered where the host can actually move files between layers.
     stage_controls: bool,
+    blocked_files: HashSet<String>,
+    stage_intents: HashMap<String, bool>,
+    available_groups: [bool; 2],
     background_visible: bool,
+    empty_label: &'static str,
     error: Option<String>,
     loading: bool,
     focus: FocusHandle,
@@ -126,7 +132,11 @@ impl ChangeNavigation {
             theme: ThemePreset::default(),
             selected: None,
             stage_controls: false,
+            blocked_files: HashSet::new(),
+            stage_intents: HashMap::new(),
+            available_groups: [true; 2],
             background_visible: true,
+            empty_label: "工作区没有未提交的变更",
             error: None,
             loading: false,
             focus: cx.focus_handle(),
@@ -153,6 +163,56 @@ impl ChangeNavigation {
         self
     }
 
+    pub fn empty_label(mut self, label: &'static str) -> Self {
+        self.empty_label = label;
+        self
+    }
+
+    pub fn has_conflicts(&self) -> bool {
+        self.rows.iter().any(|row| {
+            matches!(
+                row,
+                ChangeRow::File {
+                    status: Some(ChangeStatus::Conflict),
+                    ..
+                }
+            )
+        })
+    }
+
+    pub fn conflict_label(&self, path: &str) -> Option<&str> {
+        self.rows.iter().find_map(|row| match row {
+            ChangeRow::File {
+                path: row_path,
+                label,
+                status: Some(ChangeStatus::Conflict),
+                ..
+            } if row_path == path => Some(label.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Group availability also accounts for files in collapsed directories.
+    pub fn set_stage_availability(
+        &mut self,
+        blocked_files: HashSet<String>,
+        available_groups: [bool; 2],
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked_files != blocked_files || self.available_groups != available_groups {
+            self.blocked_files = blocked_files;
+            self.available_groups = available_groups;
+            cx.notify();
+        }
+    }
+
+    pub fn set_stage_intents(&mut self, intents: HashMap<String, bool>, cx: &mut Context<Self>) {
+        if self.stage_intents != intents {
+            self.stage_intents = intents;
+            cx.notify();
+        }
+    }
+
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
@@ -163,6 +223,9 @@ impl ChangeNavigation {
     /// Replace the rows. Common prefixes and suffixes reuse their list items so
     /// a background refresh does not jump the viewport.
     pub fn set_rows(&mut self, rows: Vec<ChangeRow>, cx: &mut Context<Self>) {
+        if self.rows == rows && !self.loading && self.error.is_none() {
+            return;
+        }
         let old_count = self.rows.len();
         let new_count = rows.len();
         if old_count != new_count {
@@ -236,10 +299,19 @@ impl ChangeNavigation {
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.rows.clear();
+        self.stage_intents.clear();
         self.selected = None;
         self.error = None;
         self.loading = true;
         self.state = ListState::new(0, ListAlignment::Top, px(ROW_HEIGHT));
+        cx.notify();
+    }
+
+    pub fn scroll_to_row(&self, index: usize, cx: &mut Context<Self>) {
+        self.state.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(0.),
+        });
         cx.notify();
     }
 
@@ -267,25 +339,16 @@ impl ChangeNavigation {
             (None, _) => 0,
         };
         let (index, row) = files[next];
-        if let Some(key) = row_key(row) {
-            self.selected = Some(key);
-            self.state.scroll_to(ListOffset {
-                item_ix: index,
-                offset_in_item: px(0.),
-            });
+        if let Some((path, staged)) = row_key(row) {
+            self.selected = Some((path.clone(), staged));
+            self.state.scroll_to_reveal_item(index);
+            cx.emit(ChangeNavigationEvent::Select { path, staged });
+            cx.notify();
         }
-        cx.notify();
     }
 
-    fn group_row(
-        &self,
-        title: String,
-        count: usize,
-        staged: Option<bool>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let p = self.theme.palette();
-        let mut row = div()
+    pub fn group_element(title: &str, count: usize, conflict: bool) -> gpui::Div {
+        div()
             .h(px(ROW_HEIGHT))
             .flex_shrink_0()
             .w_full()
@@ -295,54 +358,68 @@ impl ChangeNavigation {
             .gap_2()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_size(px(12.))
-            .child(format!("{title} · {count}"));
+            .when(conflict, |row| row.child(Icon::GitConflict.render(13.)))
+            .child(format!("{title} · {count}"))
+    }
+
+    fn group_row(
+        &self,
+        title: String,
+        count: usize,
+        staged: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut row = Self::group_element(&title, count, title == "待解决冲突");
         if self.stage_controls
             && let Some(staged) = staged
         {
-            let weak = cx.entity().downgrade();
-            row = row.child(div().flex_1()).child(
-                div()
-                    .flex_shrink_0()
-                    .p_1()
-                    .id(SharedString::from(format!("stage-group:{staged}")))
-                    .debug_selector(move || format!("stage-group:{staged}"))
-                    .child(
-                        Checkbox::new("")
-                            .checked(staged)
-                            .theme(self.theme)
-                            .on_change(move |staged, _, cx| {
-                                cx.stop_propagation();
-                                let _ = weak.update(cx, |_, cx| {
-                                    cx.emit(ChangeNavigationEvent::StageGroup { staged })
-                                });
-                            })
-                            .render(),
-                    )
-                    .on_click(|_, _, cx| cx.stop_propagation()),
-            );
-        } else {
-            row = row.child(div().flex_1()).child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(rgb(p.text_muted))
-                    .child(count.to_string()),
-            );
+            let checked = if self.stage_intents.is_empty() {
+                staged
+            } else {
+                let mut files = self
+                    .rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        ChangeRow::File {
+                            path,
+                            staged: layer,
+                            status: Some(status),
+                            ..
+                        } if *layer == staged && *status != ChangeStatus::Conflict => {
+                            Some(self.stage_intents.get(path).copied().unwrap_or(staged))
+                        }
+                        _ => None,
+                    })
+                    .peekable();
+                if files.peek().is_some() {
+                    files.all(|checked| checked)
+                } else {
+                    staged
+                }
+            };
+            row = row.child(div().flex_1()).child(self.stage_checkbox(
+                format!("stage-group:{staged}"),
+                checked,
+                self.available_groups[usize::from(staged)],
+                ChangeNavigationEvent::StageGroup {
+                    layer: staged,
+                    staged: !checked,
+                },
+                cx,
+            ));
         }
         row
     }
 
-    fn directory_row(
-        &self,
-        path: String,
+    pub fn directory_element(
+        selector: String,
         label: String,
         depth: usize,
         count: usize,
         collapsed: bool,
-        staged: bool,
-        cx: &mut Context<Self>,
+        theme: ThemePreset,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = self.theme.palette();
-        let selector = format!("change-directory:{path}:{staged}");
+        let p = theme.palette();
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
@@ -373,12 +450,30 @@ impl ChangeNavigation {
                     .text_color(rgb(p.text_muted))
                     .child(count.to_string()),
             )
-            .on_click(cx.listener(move |_, _, _, cx| {
+    }
+
+    fn directory_row(
+        &self,
+        path: String,
+        label: String,
+        depth: usize,
+        count: usize,
+        collapsed: bool,
+        staged: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selector = match staged {
+            Some(layer) => format!("change-directory:{path}:{layer}"),
+            None => format!("change-directory:{path}"),
+        };
+        Self::directory_element(selector, label, depth, count, collapsed, self.theme).on_click(
+            cx.listener(move |_, _, _, cx| {
                 cx.emit(ChangeNavigationEvent::ToggleDirectory {
                     path: path.clone(),
                     staged,
                 });
-            }))
+            }),
+        )
     }
 
     fn file_row(
@@ -386,7 +481,7 @@ impl ChangeNavigation {
         path: String,
         label: String,
         depth: usize,
-        status: ChangeStatus,
+        status: Option<ChangeStatus>,
         staged: bool,
         additions: Option<usize>,
         deletions: Option<usize>,
@@ -394,9 +489,15 @@ impl ChangeNavigation {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let p = self.theme.palette();
-        let color = status.color(self.theme);
-        let icon = Icon::for_file_name(&label);
+        let color = status.map_or(p.text, |status| status.color(self.theme));
+        let conflict = status == Some(ChangeStatus::Conflict);
+        let icon = if conflict {
+            Icon::GitConflict
+        } else {
+            Icon::for_file_name(&label)
+        };
         let selector = format!("change-file:{path}:{staged}");
+        let marker = format!("selected-conflict-file:{path}");
         let active = self
             .selected
             .as_ref()
@@ -404,10 +505,11 @@ impl ChangeNavigation {
         let mut row = div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
+            .relative()
             .h(px(ROW_HEIGHT))
             .flex_shrink_0()
             .w_full()
-            .pr_2()
+            .pr_3()
             .pl(px(26. + depth as f32 * 16.))
             .flex()
             .items_center()
@@ -415,6 +517,19 @@ impl ChangeNavigation {
             .cursor_pointer()
             .text_size(px(12.))
             .when(active, |row| row.bg(rgb(p.accent_tint)))
+            .when(active && conflict, |row| {
+                row.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(6.))
+                        .bottom(px(6.))
+                        .w(px(3.))
+                        .rounded(px(2.))
+                        .bg(rgb(p.accent))
+                        .debug_selector(move || marker.clone()),
+                )
+            })
             .hover(|row| row.bg(rgb(p.surface_subtle)))
             .child(icon.render(14.).text_color(rgb(color)))
             .child(
@@ -425,14 +540,16 @@ impl ChangeNavigation {
                     .text_color(rgb(color))
                     .child(label),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(10.))
-                    .text_color(rgb(color))
-                    .child(status.label()),
-            );
-        if binary && status != ChangeStatus::Untracked {
+            .when_some(status, |row, status| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .text_color(rgb(color))
+                        .child(status.label()),
+                )
+            });
+        if binary && !conflict && status != Some(ChangeStatus::Untracked) {
             row = row.child(
                 div()
                     .debug_selector(|| "change-file-binary".into())
@@ -457,40 +574,24 @@ impl ChangeNavigation {
                 );
             }
         }
-        if self.stage_controls {
-            let weak = cx.entity().downgrade();
-            let stage_path = path.clone();
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .p_1()
-                    .id(SharedString::from(format!("stage-file:{path}:{staged}")))
-                    .debug_selector({
-                        let value = format!("stage-file:{path}:{staged}");
-                        move || value.clone()
-                    })
-                    .child(
-                        Checkbox::new("")
-                            .checked(staged)
-                            .theme(self.theme)
-                            .on_change(move |next, _, cx| {
-                                cx.stop_propagation();
-                                let _ = weak.update(cx, |_, cx| {
-                                    cx.emit(ChangeNavigationEvent::Stage {
-                                        paths: vec![stage_path.clone()],
-                                        staged: next,
-                                    })
-                                });
-                            })
-                            .render(),
-                    )
-                    .on_click(|_, _, cx| cx.stop_propagation()),
-            );
+        if self.stage_controls && status.is_some() && !conflict {
+            let checked = self.stage_intents.get(&path).copied().unwrap_or(staged);
+            row = row.child(self.stage_checkbox(
+                format!("stage-file:{path}:{staged}"),
+                checked,
+                !self.blocked_files.contains(&path),
+                ChangeNavigationEvent::Stage {
+                    paths: vec![path.clone()],
+                    staged: !checked,
+                },
+                cx,
+            ));
         }
         let menu_path = path.clone();
         row.on_mouse_down(
             MouseButton::Right,
             cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                cx.stop_propagation();
                 cx.emit(ChangeNavigationEvent::Menu {
                     path: menu_path.clone(),
                     position: event.position,
@@ -506,6 +607,32 @@ impl ChangeNavigation {
             });
             cx.notify();
         }))
+    }
+
+    fn stage_checkbox(
+        &self,
+        selector: String,
+        checked: bool,
+        available: bool,
+        event: ChangeNavigationEvent,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut checkbox = Checkbox::new("").checked(checked).theme(self.theme);
+        if available {
+            let weak = cx.entity().downgrade();
+            checkbox = checkbox.on_change(move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = weak.update(cx, |_, cx| cx.emit(event.clone()));
+            });
+        }
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .flex_shrink_0()
+            .p_1()
+            .when(!available, |row| row.opacity(0.4))
+            .child(checkbox.render())
+            .on_click(|_, _, cx| cx.stop_propagation())
     }
 
     fn row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -544,14 +671,6 @@ impl ChangeNavigation {
                 .into_any_element(),
         }
     }
-
-    fn empty_label(&self) -> &'static str {
-        if self.rows.is_empty() {
-            "工作区没有未提交的变更"
-        } else {
-            "没有匹配的变更"
-        }
-    }
 }
 
 fn row_key(row: &ChangeRow) -> Option<(String, bool)> {
@@ -571,7 +690,7 @@ mod tests {
             path: format!("/repo/{label}"),
             label: label.into(),
             depth: 0,
-            status: ChangeStatus::Modified,
+            status: Some(ChangeStatus::Modified),
             staged,
             additions: Some(3),
             deletions: Some(1),
@@ -672,7 +791,10 @@ mod tests {
         window.run_until_parked();
         assert_eq!(
             *events.borrow(),
-            vec![ChangeNavigationEvent::StageGroup { staged: true }]
+            vec![ChangeNavigationEvent::StageGroup {
+                layer: false,
+                staged: true
+            }]
         );
     }
 
@@ -701,7 +823,7 @@ mod tests {
                     path: "/repo/src/pending.rs".into(),
                     label: "src/pending.rs".into(),
                     depth: 0,
-                    status: ChangeStatus::Modified,
+                    status: Some(ChangeStatus::Modified),
                     staged: false,
                     // Counts were not loaded yet; that must not look like binary.
                     additions: None,
@@ -721,7 +843,7 @@ mod tests {
                     path: "/repo/logo.png".into(),
                     label: "logo.png".into(),
                     depth: 0,
-                    status: ChangeStatus::Modified,
+                    status: Some(ChangeStatus::Modified),
                     staged: false,
                     additions: None,
                     deletions: None,
@@ -783,7 +905,6 @@ impl Render for ChangeNavigation {
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .pr(px(12.))
                     .flex()
                     .flex_col()
                     .children(self.error.as_ref().map(|error| {
@@ -816,7 +937,7 @@ impl Render for ChangeNavigation {
                                     .p_3()
                                     .text_size(px(11.5))
                                     .text_color(rgb(p.text_muted))
-                                    .child(self.empty_label()),
+                                    .child(self.empty_label),
                             )
                         },
                     )

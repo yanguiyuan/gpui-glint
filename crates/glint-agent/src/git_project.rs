@@ -1,6 +1,7 @@
 //! Git I/O shared by the composer branch picker and GitGraph. Never force checkout.
 use gpui_glint::components::{
-    DiffLine, GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraphData, diff_lines,
+    DiffLine, DiffLineKind, GitBranchFiles, GitCommit, GitCommitDetails, GitCommitFile,
+    GitComparison, GitGraphData, diff_lines,
 };
 use std::{
     path::{Path, PathBuf},
@@ -439,6 +440,7 @@ pub async fn graph_window(
         current_count: counts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0),
         current_only: log(root, &format!("{target_id}..{head}"), limit).await?.0,
         target_only: log(root, &format!("{head}..{target_id}"), limit).await?.0,
+        file_changes: Some(branch_files(&repo.worktree, target_id).await),
     });
     Ok(data)
 }
@@ -503,22 +505,6 @@ pub async fn details(root: &Path, id: &str) -> Result<GitCommitDetails, String> 
         )
         .await?
     };
-    if !output.status.success() {
-        return Err(text(output).unwrap_err());
-    }
-    let stats = String::from_utf8(output.stdout).map_err(|_| "改动文件名不是有效的 UTF-8")?;
-    let mut files = Vec::new();
-    for record in stats.split('\0').filter(|s| !s.is_empty()) {
-        let fields = record.splitn(3, '\t').collect::<Vec<_>>();
-        if fields.len() != 3 {
-            return Err("文件改动信息格式无效".into());
-        }
-        files.push(GitCommitFile {
-            path: fields[2].into(),
-            additions: fields[0].parse().ok(),
-            deletions: fields[1].parse().ok(),
-        });
-    }
     Ok(GitCommitDetails {
         id: fields[0].into(),
         parents,
@@ -527,7 +513,92 @@ pub async fn details(root: &Path, id: &str) -> Result<GitCommitDetails, String> 
         committer: fields[4].into(),
         committed_at: fields[5].into(),
         message: fields[6].trim().into(),
-        files,
+        files: diff_stats(output)?,
+    })
+}
+
+fn diff_stats(output: Output) -> Result<Vec<GitCommitFile>, String> {
+    if !output.status.success() {
+        return Err(text(output).unwrap_err());
+    }
+    let stats = String::from_utf8(output.stdout).map_err(|_| "改动文件名不是有效的 UTF-8")?;
+    stats
+        .split_terminator('\0')
+        .map(|record| {
+            let mut fields = record.splitn(3, '\t');
+            let additions = fields.next().and_then(|value| value.parse().ok());
+            let deletions = fields.next().and_then(|value| value.parse().ok());
+            let path = fields.next().ok_or("文件改动信息格式无效")?.to_owned();
+            Ok(GitCommitFile {
+                path,
+                additions,
+                deletions,
+            })
+        })
+        .collect()
+}
+
+async fn branch_files(root: &Path, base: String) -> Result<GitBranchFiles, String> {
+    let diff_args = [
+        "--no-optional-locks",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-relative",
+        "--numstat",
+        "-z",
+        &base,
+        "--",
+    ];
+    let (tracked, others) = tokio::try_join!(
+        run(root, &diff_args),
+        run(root, &["ls-files", "--others", "--exclude-standard", "-z"]),
+    )?;
+    if !others.status.success() {
+        return Err(text(others).unwrap_err());
+    }
+    let mut files: std::collections::BTreeMap<_, _> = diff_stats(tracked)?
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
+    let mut untracked = std::collections::BTreeSet::new();
+    let others = String::from_utf8(others.stdout).map_err(|_| "未跟踪文件名不是有效的 UTF-8")?;
+    for path in others
+        .split_terminator('\0')
+        .filter(|path| !path.ends_with('/'))
+    {
+        let mut file = GitCommitFile {
+            path: path.to_owned(),
+            ..Default::default()
+        };
+        // A file removed from the index can still exist in the working tree.
+        // Replace Git's deletion row with the net content comparison in that case.
+        if files.contains_key(path)
+            && let Ok(lines) = compare_worktree_file(root, &base, path).await
+        {
+            let additions = lines
+                .iter()
+                .filter(|line| line.kind == DiffLineKind::Added)
+                .count();
+            let deletions = lines
+                .iter()
+                .filter(|line| line.kind == DiffLineKind::Deleted)
+                .count();
+            if additions == 0 && deletions == 0 {
+                files.remove(path);
+                continue;
+            }
+            file.additions = Some(additions);
+            file.deletions = Some(deletions);
+        }
+        untracked.insert(path.to_owned());
+        files.insert(path.to_owned(), file);
+    }
+    Ok(GitBranchFiles {
+        base,
+        files: files.into_values().collect(),
+        untracked,
     })
 }
 
@@ -538,7 +609,15 @@ async fn blob(root: &Path, revision: Option<&str>, path: &str) -> Result<String,
     let entry = text(
         run(
             root,
-            &["--literal-pathspecs", "ls-tree", "-z", revision, "--", path],
+            &[
+                "--literal-pathspecs",
+                "ls-tree",
+                "--full-tree",
+                "-z",
+                revision,
+                "--",
+                path,
+            ],
         )
         .await?,
     )?;
@@ -556,6 +635,9 @@ async fn blob(root: &Path, revision: Option<&str>, path: &str) -> Result<String,
     }
     if fields[1] == "commit" {
         return Ok(format!("Subproject commit {}\n", fields[2]));
+    }
+    if fields[1] == "tree" {
+        return Ok(String::new());
     }
     if fields[1] != "blob" {
         return Err("所选改动不是文件".into());
@@ -583,6 +665,56 @@ pub async fn file_diff(root: &Path, id: &str, path: &str) -> Result<Vec<DiffLine
     }
     let old = blob(root, commit.parents.first().map(String::as_str), path).await?;
     let new = blob(root, Some(&commit.id), path).await?;
+    Ok(diff_lines(&old, &new))
+}
+
+pub async fn branch_file_diff(
+    root: &Path,
+    base: &str,
+    path: &str,
+) -> Result<Vec<DiffLine>, String> {
+    if !matches!(base.len(), 40 | 64) || !base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("无效的分支比较快照".into());
+    }
+    let top = text(run(root, &["rev-parse", "--show-toplevel"]).await?)?;
+    compare_worktree_file(&git_path(root, &top)?, base, path).await
+}
+
+async fn compare_worktree_file(
+    root: &Path,
+    base: &str,
+    path: &str,
+) -> Result<Vec<DiffLine>, String> {
+    if path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || !Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("无效的仓库文件路径".into());
+    }
+    let old = blob(root, Some(base), path).await?;
+    let new = if crate::ssh_project::is_remote(root) {
+        let remote = crate::ssh_project::Remote::from_path(root)?;
+        remote
+            .action(
+                "diff_worktree_file",
+                serde_json::json!({"path": path}),
+                false,
+            )
+            .await?
+            .as_str()
+            .ok_or("远程文件响应无效")?
+            .to_owned()
+    } else {
+        let root = root.canonicalize().map_err(|error| error.to_string())?;
+        let file = root.join(path);
+        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
+            String::new()
+        } else {
+            crate::workspace_diff::worktree_text(&root, &file, false)
+                .map_err(|error| error.to_string())?
+        }
+    };
     Ok(diff_lines(&old, &new))
 }
 
@@ -1041,6 +1173,80 @@ mod tests {
                 .unwrap()
                 .comparison_error
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_file_comparison_includes_the_live_worktree_and_keeps_the_base_pinned() {
+        let dir = init();
+        let root = dir.path();
+        let literal = "src [1].txt";
+        std::fs::write(root.join(literal), "base content\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("gone.txt"), "old contents\n").unwrap();
+        std::fs::write(root.join("same.txt"), "same contents\n").unwrap();
+        git(
+            root,
+            &[
+                "--literal-pathspecs",
+                "add",
+                literal,
+                ".gitignore",
+                "gone.txt",
+                "same.txt",
+            ],
+        );
+        commit(root, "base");
+        git(root, &["checkout", "-b", "feature"]);
+        commit(root, "temporary change");
+        std::fs::write(root.join(literal), "head content\n").unwrap();
+        git(root, &["--literal-pathspecs", "add", literal]);
+        commit(root, "base");
+
+        std::fs::write(root.join(literal), "worktree only\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "staged only\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        git(root, &["add", "staged.txt"]);
+        git(root, &["rm", "--cached", "same.txt"]);
+
+        let comparison = graph(root, "master".into())
+            .await
+            .unwrap()
+            .comparison
+            .unwrap();
+        assert_eq!(comparison.current_count, 2);
+        let files = comparison.file_changes.unwrap().unwrap();
+        assert_eq!(
+            files
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["gone.txt", literal, "staged.txt", "untracked.txt"]
+        );
+        assert!(files.untracked.contains("untracked.txt"));
+
+        git(root, &["branch", "-f", "master", "HEAD"]);
+        let text = |lines: Vec<DiffLine>| {
+            lines
+                .into_iter()
+                .map(|line| line.text.to_string())
+                .collect::<Vec<_>>()
+        };
+        let compare = |path: &'static str| branch_file_diff(root, &files.base, path);
+        assert_eq!(
+            text(compare(literal).await.unwrap()),
+            ["base content", "worktree only"]
+        );
+        assert_eq!(text(compare("staged.txt").await.unwrap()), ["staged only"]);
+        assert_eq!(text(compare("untracked.txt").await.unwrap()), ["untracked"]);
+        assert_eq!(text(compare("gone.txt").await.unwrap()), ["old contents"]);
+        std::fs::write(root.join(literal), "updated worktree\n").unwrap();
+        assert_eq!(
+            text(compare(literal).await.unwrap()),
+            ["base content", "updated worktree"]
         );
     }
 }

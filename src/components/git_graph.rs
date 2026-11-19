@@ -1,7 +1,8 @@
 //! Reusable Git history and branch comparison viewer. The host owns all Git I/O.
 use super::{
-    Button, ButtonKind, ButtonSize, Icon, IconButton, SearchInput, SegmentOption, SegmentedControl,
-    Select, SelectEvent, SelectOption, Skeleton, TextEntry, search_highlight,
+    Button, ButtonKind, ButtonSize, ChangeNavigation, ChangeNavigationEvent, ChangeRow, Icon,
+    IconButton, SearchInput, SegmentOption, SegmentedControl, Select, SelectEvent, SelectOption,
+    Skeleton, TextEntry, search_highlight,
 };
 use crate::theme::ThemePreset;
 use gpui::{
@@ -51,6 +52,15 @@ pub struct GitComparison {
     pub target_count: usize,
     pub current_only: Vec<GitCommit>,
     pub target_only: Vec<GitCommit>,
+    pub file_changes: Option<Result<GitBranchFiles, String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitBranchFiles {
+    /// The compared branch as resolved when the graph loaded.
+    pub base: String,
+    pub files: Vec<GitCommitFile>,
+    pub untracked: std::collections::BTreeSet<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitGraphData {
@@ -72,6 +82,11 @@ pub enum GitGraphEvent {
         commit: String,
         path: String,
     },
+    OpenComparedFile {
+        base: String,
+        path: String,
+    },
+    RefreshFiles,
     Refresh,
     /// Request a wider history window from the host.
     LoadMore,
@@ -192,6 +207,13 @@ fn highlighted(text: &str, query: &str, theme: ThemePreset) -> StyledText {
     StyledText::new(SharedString::from(text.to_owned())).with_highlights(highlights)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphTab {
+    History,
+    Comparison,
+    Files,
+}
+
 pub struct GitGraph {
     data: GitGraphData,
     lanes: Vec<LaneRow>,
@@ -209,13 +231,15 @@ pub struct GitGraph {
     copied_commit: Option<String>,
     error: Option<String>,
     loading: bool,
-    comparison_tab: bool,
+    tab: GraphTab,
+    branch_files: Entity<ChangeNavigation>,
     header_visible: bool,
     background_visible: bool,
     focus: FocusHandle,
     scroll: ScrollHandle,
     _search_subscription: gpui::Subscription,
     _subscription: gpui::Subscription,
+    _files_subscription: gpui::Subscription,
 }
 impl EventEmitter<GitGraphEvent> for GitGraph {}
 impl GitGraph {
@@ -233,6 +257,28 @@ impl GitGraph {
                 cx.notify();
             }
         });
+        let branch_files = cx.new(|cx| {
+            ChangeNavigation::new(cx)
+                .background_visible(false)
+                .empty_label("当前工作区与对比分支没有文件内容差异")
+        });
+        let files_subscription = cx.subscribe(
+            &branch_files,
+            |this: &mut Self, _, event: &ChangeNavigationEvent, cx| {
+                if let ChangeNavigationEvent::Select { path, .. } = event
+                    && let Some(Ok(files)) = this
+                        .data
+                        .comparison
+                        .as_ref()
+                        .and_then(|comparison| comparison.file_changes.as_ref())
+                {
+                    cx.emit(GitGraphEvent::OpenComparedFile {
+                        base: files.base.clone(),
+                        path: path.clone(),
+                    });
+                }
+            },
+        );
         Self {
             data: GitGraphData::default(),
             lanes: Vec::new(),
@@ -250,13 +296,15 @@ impl GitGraph {
             copied_commit: None,
             error: None,
             loading: false,
-            comparison_tab: false,
+            tab: GraphTab::History,
+            branch_files,
             header_visible: true,
             background_visible: true,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             _search_subscription: search_subscription,
             _subscription: subscription,
+            _files_subscription: files_subscription,
         }
     }
     pub fn header_visible(mut self, visible: bool) -> Self {
@@ -274,6 +322,8 @@ impl GitGraph {
             self.theme = theme;
             self.compare.update(cx, |s, cx| s.set_theme(theme, cx));
             self.search.update(cx, |s, cx| s.set_theme(theme, cx));
+            self.branch_files
+                .update(cx, |files, cx| files.set_theme(theme, cx));
             cx.notify();
         }
     }
@@ -289,7 +339,35 @@ impl GitGraph {
         });
         self.lanes = lanes(&data.commits);
         if data.compare_branch.is_empty() {
-            self.comparison_tab = false;
+            self.tab = GraphTab::History;
+        }
+        if let Some(Ok(files)) = data
+            .comparison
+            .as_ref()
+            .and_then(|comparison| comparison.file_changes.as_ref())
+        {
+            self.branch_files.update(cx, |navigation, cx| {
+                navigation.set_rows(
+                    files
+                        .files
+                        .iter()
+                        .map(|file| {
+                            let untracked = files.untracked.contains(&file.path);
+                            ChangeRow::File {
+                                path: file.path.clone(),
+                                label: crate::paths::display_path(&file.path),
+                                depth: 0,
+                                status: untracked.then_some(super::ChangeStatus::Untracked),
+                                staged: false,
+                                additions: file.additions,
+                                deletions: file.deletions,
+                                binary: !untracked && file.additions.is_none(),
+                            }
+                        })
+                        .collect(),
+                    cx,
+                );
+            });
         }
         self.data = data;
         self.error = None;
@@ -314,6 +392,7 @@ impl GitGraph {
         self.error = None;
         self.loading = true;
         self.scroll = ScrollHandle::new();
+        self.branch_files.update(cx, |files, cx| files.reset(cx));
         cx.notify();
     }
     pub fn set_loading(&mut self, cx: &mut Context<Self>) {
@@ -898,7 +977,22 @@ impl GitGraph {
 impl Render for GitGraph {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
-        let comparison_tab = self.comparison_tab && self.comparison_available();
+        let tab = if self.comparison_available() {
+            self.tab
+        } else {
+            GraphTab::History
+        };
+        let comparison_tab = tab != GraphTab::History;
+        let show_files = tab == GraphTab::Files;
+        let file_changes = self
+            .data
+            .comparison
+            .as_ref()
+            .and_then(|comparison| comparison.file_changes.as_ref());
+        let file_list_ready = show_files
+            && !self.loading
+            && self.error.is_none()
+            && file_changes.is_some_and(Result::is_ok);
         let mut body = div()
             .id("git-graph-scroll")
             .debug_selector(|| "git-graph-scroll".into())
@@ -1001,7 +1095,20 @@ impl Render for GitGraph {
         } else if self.loading {
             body = body.child(div().text_color(rgb(p.text_muted)).child("正在读取 Git…"));
         }
-        if comparison_tab {
+        if show_files {
+            if !self.loading && self.error.is_none() {
+                let error = file_changes
+                    .and_then(|result| result.as_ref().err())
+                    .or(self.data.comparison_error.as_ref());
+                body = body.child(
+                    div().text_color(rgb(p.text_muted)).child(
+                        error
+                            .cloned()
+                            .unwrap_or_else(|| "没有可比较的提交".to_owned()),
+                    ),
+                );
+            }
+        } else if comparison_tab {
             if let Some(comparison) = &self.data.comparison {
                 for (title, count, commits) in [
                     (
@@ -1107,16 +1214,25 @@ impl Render for GitGraph {
                         ),
                 )
             })
-            .child(self.filter_bar(comparison_tab, cx))
-            .child(body)
-            .when(self.selected.is_some(), |root| {
+            .child(self.filter_bar(tab, cx))
+            .child(if file_list_ready {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.branch_files.clone())
+                    .into_any_element()
+            } else {
+                body.into_any_element()
+            })
+            .when(!show_files && self.selected.is_some(), |root| {
                 root.child(self.details_panel(cx))
             })
     }
 }
 impl GitGraph {
-    fn filter_bar(&self, comparison_tab: bool, cx: &mut Context<Self>) -> gpui::Div {
+    fn filter_bar(&self, tab: GraphTab, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
+        let history = tab == GraphTab::History;
         let weak = cx.entity().downgrade();
         div()
             .px_3()
@@ -1139,7 +1255,7 @@ impl GitGraph {
                             .truncate()
                             .child(format!("当前：{}", self.data.current_branch)),
                     )
-                    .when(self.filter_active(), |row| {
+                    .when(history && self.filter_active(), |row| {
                         row.child(
                             div()
                                 .text_size(px(10.))
@@ -1147,20 +1263,22 @@ impl GitGraph {
                                 .child(format!("{} 条", self.visible_commits().len())),
                         )
                     })
-                    .child(self.filter_chip(
-                        "合并",
-                        self.merge_only,
-                        "git-filter-merges",
-                        |this| this.merge_only = !this.merge_only,
-                        cx,
-                    ))
-                    .child(self.filter_chip(
-                        "有标记",
-                        self.labeled_only,
-                        "git-filter-labeled",
-                        |this| this.labeled_only = !this.labeled_only,
-                        cx,
-                    )),
+                    .when(history, |row| {
+                        row.child(self.filter_chip(
+                            "合并",
+                            self.merge_only,
+                            "git-filter-merges",
+                            |this| this.merge_only = !this.merge_only,
+                            cx,
+                        ))
+                        .child(self.filter_chip(
+                            "有标记",
+                            self.labeled_only,
+                            "git-filter-labeled",
+                            |this| this.labeled_only = !this.labeled_only,
+                            cx,
+                        ))
+                    }),
             )
             .child(
                 div()
@@ -1176,24 +1294,38 @@ impl GitGraph {
                     SegmentOption::new("分支差异")
                         .debug_selector("git-tab-comparison")
                         .disabled(!self.comparison_available()),
+                    SegmentOption::new("文件差异")
+                        .debug_selector("git-tab-files")
+                        .disabled(!self.comparison_available()),
                 ])
                 .id("git-graph-tabs")
                 .theme(self.theme)
-                .selected(usize::from(comparison_tab))
+                .selected(tab as usize)
                 .on_change(move |index, _, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        this.comparison_tab = index == 1;
+                        let tab = match index {
+                            1 => GraphTab::Comparison,
+                            2 => GraphTab::Files,
+                            _ => GraphTab::History,
+                        };
+                        if tab == GraphTab::Files && this.tab != tab && !this.loading {
+                            cx.emit(GitGraphEvent::RefreshFiles);
+                        }
+                        this.tab = tab;
+                        this.scroll = ScrollHandle::new();
                         cx.notify();
                     });
                 }),
             )
-            .child(
-                SearchInput::new("搜索提交、Hash、作者")
-                    .theme(self.theme)
-                    .full_width()
-                    .control(self.search.clone())
-                    .render(),
-            )
+            .when(history, |row| {
+                row.child(
+                    SearchInput::new("搜索提交、Hash、作者")
+                        .theme(self.theme)
+                        .full_width()
+                        .control(self.search.clone())
+                        .render(),
+                )
+            })
     }
 }
 
@@ -1456,7 +1588,71 @@ mod tests {
         let tab = window.debug_bounds("git-tab-comparison").unwrap();
         window.simulate_click(tab.center(), Default::default());
         window.run_until_parked();
-        graph.read_with(window, |graph, _| assert!(!graph.comparison_tab));
+        graph.read_with(window, |graph, _| assert!(graph.tab == GraphTab::History));
+    }
+
+    #[gpui::test]
+    fn branch_files_and_unique_commits_have_separate_tabs(cx: &mut gpui::TestAppContext) {
+        let (graph, window) = cx.add_window_view(|_, cx| {
+            let mut graph = GitGraph::new(cx);
+            graph.set_data(
+                GitGraphData {
+                    current_branch: "feature".into(),
+                    branches: vec!["master".into(), "feature".into()],
+                    compare_branch: "master".into(),
+                    comparison: Some(GitComparison {
+                        current_count: 1,
+                        current_only: vec![GitCommit {
+                            id: "feature-commit".into(),
+                            ..Default::default()
+                        }],
+                        file_changes: Some(Ok(GitBranchFiles {
+                            base: "base".into(),
+                            files: vec![GitCommitFile {
+                                path: "main.rs".into(),
+                                additions: Some(1),
+                                deletions: Some(0),
+                            }],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                cx,
+            );
+            graph
+        });
+        window.simulate_resize(gpui::size(px(400.), px(600.)));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let received = events.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&graph, move |_, _, event: &GitGraphEvent, _| {
+                received.borrow_mut().push(event.clone())
+            })
+            .detach();
+        });
+        let click = |window: &mut gpui::VisualTestContext, selector| {
+            window.run_until_parked();
+            let position = window.debug_bounds(selector).unwrap().center();
+            window.simulate_click(position, Default::default());
+            window.run_until_parked();
+        };
+        click(window, "git-tab-comparison");
+        assert!(window.debug_bounds("git-commit:feature-commit").is_some());
+        click(window, "git-tab-files");
+        assert!(window.debug_bounds("git-commit:feature-commit").is_none());
+        click(window, "change-file:main.rs:false");
+        assert_eq!(
+            *events.borrow(),
+            [
+                GitGraphEvent::RefreshFiles,
+                GitGraphEvent::OpenComparedFile {
+                    base: "base".into(),
+                    path: "main.rs".into(),
+                }
+            ]
+        );
     }
     #[test]
     fn merge_lanes_join_existing_parent_without_duplicate_lanes() {

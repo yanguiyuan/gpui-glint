@@ -111,6 +111,18 @@ pub enum FileStatus {
     Untracked,
 }
 
+impl From<FileStatus> for gpui_glint::components::ChangeStatus {
+    fn from(status: FileStatus) -> Self {
+        match status {
+            FileStatus::Added => Self::Added,
+            FileStatus::Modified => Self::Modified,
+            FileStatus::Deleted => Self::Deleted,
+            FileStatus::Renamed => Self::Renamed,
+            FileStatus::Untracked => Self::Untracked,
+        }
+    }
+}
+
 impl FileStatus {
     fn from_status(status: &[u8]) -> Self {
         if status == b"??" {
@@ -133,7 +145,7 @@ pub struct Inventory {
     pub head: Option<String>,
     pub files: Vec<Change>,
     pub sources: HashMap<PathBuf, Source>,
-    pub has_conflicts: bool,
+    pub conflict_labels: Vec<String>,
     pub conflict_versions: Vec<(Vec<u8>, Option<FileStamp>)>,
     pub stamp: Option<RepositoryStamp>,
 }
@@ -294,7 +306,7 @@ fn parse_inventory(
         head: head.clone(),
         files: Vec::new(),
         sources: HashMap::new(),
-        has_conflicts: false,
+        conflict_labels: Vec::new(),
         conflict_versions: Vec::new(),
         stamp: None,
     };
@@ -347,7 +359,7 @@ fn parse_inventory(
                     None
                 };
                 if field[0] == b'u' {
-                    result.has_conflicts = true;
+                    result.conflict_labels.push(label.into());
                     result
                         .conflict_versions
                         .push((field.to_vec(), file_stamp(&root.join(label))));
@@ -662,13 +674,13 @@ pub fn stage_and_refresh(sources: &[Source], staged: bool) -> Result<StageUpdate
     }
     // Counts are optional; a failed statistic must not hide a successful index update.
     let eager = sources.len() <= EAGER_STATS_LIMIT;
-    let (staged_counts, unstaged_counts) = if eager {
-        scoped_statistics(&first.root, &labels.into_iter().collect::<Vec<_>>()).unwrap_or_default()
-    } else {
-        Default::default()
-    };
+    let counts = eager
+        .then(|| scoped_statistics(&first.root, &labels.into_iter().collect::<Vec<_>>()).ok())
+        .flatten();
+    let stats_ready = counts.is_some();
+    let (staged_counts, unstaged_counts) = counts.unwrap_or_default();
     for source in inventory.sources.values_mut() {
-        source.stats_ready = eager;
+        source.stats_ready = stats_ready;
         source.staged_stats = (source.old_path == source.label)
             .then(|| staged_counts.get(&source.label).copied())
             .flatten();
@@ -773,25 +785,33 @@ fn blob(source: &Source, spec: &str, manual: bool) -> Result<String, LoadError> 
 }
 
 impl Source {
-    pub fn for_layer(&self, staged: bool) -> Self {
-        let mut source = self.clone();
-        source.layer = Some(staged);
-        source.status = if staged {
+    pub fn layer_status(&self, staged: bool) -> FileStatus {
+        if staged {
             self.staged_status
         } else {
             self.unstaged_status
-        };
-        source.stats = if staged {
+        }
+    }
+
+    pub fn layer_stats(&self, staged: bool) -> Option<(usize, usize)> {
+        if staged {
             self.staged_stats
         } else {
             self.unstaged_stats
-        };
+        }
+    }
+
+    pub fn for_layer(&self, staged: bool) -> Self {
+        let mut source = self.clone();
+        source.layer = Some(staged);
+        source.status = self.layer_status(staged);
+        source.stats = self.layer_stats(staged);
         source
     }
 }
 
-fn worktree_text(source: &Source, manual: bool) -> Result<String, LoadError> {
-    let text = match std::fs::symlink_metadata(&source.path) {
+pub(super) fn worktree_text(root: &Path, path: &Path, manual: bool) -> Result<String, LoadError> {
+    let text = match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
             return Err("链接和子模块不支持文本预览".into());
         }
@@ -802,13 +822,20 @@ fn worktree_text(source: &Source, manual: bool) -> Result<String, LoadError> {
             )));
         }
         Ok(_) => {
-            let path = source.path.canonicalize().map_err(|e| e.to_string())?;
-            if !path.starts_with(&source.root) {
+            let path = path.canonicalize().map_err(|e| e.to_string())?;
+            if !path.starts_with(root) {
                 return Err("文件位于仓库外，未读取".into());
             }
             std::fs::read_to_string(&path).map_err(|e| e.to_string())?
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            String::new()
+        }
         Err(e) => return Err(e.to_string().into()),
     };
     if !manual && text.len() > 2 * 1024 * 1024 {
@@ -843,7 +870,7 @@ pub fn load_with_options(source: &Source, manual: bool) -> Result<Change, LoadEr
         let after = if staged {
             blob(source, &format!(":0:{}", source.label), manual)?
         } else {
-            worktree_text(source, manual)?
+            worktree_text(&source.root, &source.path, manual)?
         };
         return Ok(Change::preview(
             source.path.clone(),
@@ -853,7 +880,7 @@ pub fn load_with_options(source: &Source, manual: bool) -> Result<Change, LoadEr
             None,
         ));
     }
-    let after = worktree_text(source, manual)?;
+    let after = worktree_text(&source.root, &source.path, manual)?;
     let before = if source.untracked || source.head.is_none() {
         None
     } else {

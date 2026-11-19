@@ -18,8 +18,8 @@ mod git_graph;
 pub use change_navigation::{ChangeNavigation, ChangeNavigationEvent, ChangeRow, ChangeStatus};
 pub use file_preview::{FilePreview, FilePreviewEntry, FilePreviewEvent};
 pub use git_graph::{
-    GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraph, GitGraphData,
-    GitGraphEvent,
+    GitBranchFiles, GitCommit, GitCommitDetails, GitCommitFile, GitComparison, GitGraph,
+    GitGraphData, GitGraphEvent,
 };
 mod dropdown;
 mod icon;
@@ -31,6 +31,7 @@ pub use calendar::{Calendar, CalendarEvent};
 mod html_reader;
 mod mermaid;
 mod popover;
+mod project_selector;
 mod rich_text;
 pub use html_reader::HtmlReader;
 mod scrollbar;
@@ -72,6 +73,7 @@ pub use plugin_card::{
     plugin_section_title, plugin_setting_card, plugin_settings_section, plugin_summary,
 };
 pub use popover::Popover;
+pub use project_selector::{ProjectOption, ProjectSelector};
 pub use select::{Select, SelectEvent, SelectOption};
 pub use separator::Separator;
 pub use shimmer_text::ShimmerText;

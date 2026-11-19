@@ -1,5 +1,15 @@
 use super::*;
-use gpui_glint::components::{GroupListGroup, GroupListHeader, GroupListItem, MenuItem};
+use gpui_glint::components::{
+    GroupListGroup, GroupListHeader, GroupListItem, MenuItem, ProjectOption, ProjectSelector,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspacePicker {
+    ChatProject,
+    BrowserProject,
+    ComposerProject,
+    ChatSession,
+}
 
 impl AgentWorkspace {
     pub(super) fn remove_project_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -112,7 +122,7 @@ impl AgentWorkspace {
             self.terminal_ui.open = false;
             self.project_actions.panel = false;
         }
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         self.project_grouping.editing = None;
         self.git_ui.toasts.update(cx, |toasts, cx| {
             toasts.push(
@@ -136,7 +146,7 @@ impl AgentWorkspace {
                 self.refresh_project_metadata(vec![path.clone()], cx);
             }
             self.browser_project = Some(path);
-            self.project_picker_open = false;
+            self.workspace_picker = None;
             if added || restored {
                 self.save(cx);
             }
@@ -169,7 +179,7 @@ impl AgentWorkspace {
         }
         self.restore_draft(cx);
         images::release_previews(self.image_views.borrow_mut().clear(), cx);
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         if matches!(self.page, crate::Page::Settings | crate::Page::Calendar) {
             self.page = crate::Page::Chat;
         }
@@ -178,34 +188,51 @@ impl AgentWorkspace {
     }
 
     pub fn project_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.project_selector_at(WorkspacePicker::ComposerProject, cx)
+    }
+
+    pub(super) fn project_selector_at(
+        &self,
+        picker: WorkspacePicker,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = self.theme.palette();
-        let label = self
-            .history
-            .active()
-            .project
-            .as_ref()
-            .map(|path| project_grouping::repository_label(&self.history, path))
+        let selected_project = if picker == WorkspacePicker::BrowserProject {
+            self.browser_project.as_ref()
+        } else {
+            self.history.active().project.as_ref()
+        };
+        let label = selected_project
+            .map(|path| project_grouping::project_label(&self.history, path))
             .unwrap_or_else(|| "选择项目".into());
-        let trigger = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded(px(8.))
-            .text_color(rgb(p.text))
-            .hover(|style| style.bg(rgb(p.border)))
-            .child(
-                self.history
-                    .active()
-                    .project
-                    .as_deref()
-                    .map(|path| project_grouping::project_icon(&self.history, path))
-                    .unwrap_or(Icon::Folder)
-                    .render(16.),
-            )
-            .child(div().max_w(px(220.)).truncate().child(label))
-            .child(Icon::ChevronDown.render(12.));
+        let icon = selected_project
+            .map(|path| project_grouping::project_icon(&self.history, path))
+            .unwrap_or(Icon::Folder);
+        let (id, trigger_selector) = match picker {
+            WorkspacePicker::ChatProject => ("chat-project-selector", "agent-topbar-project"),
+            WorkspacePicker::BrowserProject => {
+                ("browser-project-selector", "browser-topbar-project")
+            }
+            WorkspacePicker::ComposerProject => {
+                ("composer-project-selector", "composer-project-trigger")
+            }
+            WorkspacePicker::ChatSession => unreachable!("session picker uses its own list"),
+        };
+        let projects = if self.workspace_picker == Some(picker) {
+            self.history
+                .projects
+                .iter()
+                .map(|path| ProjectOption {
+                    path: path.clone(),
+                    label: project_grouping::project_label(&self.history, path),
+                    icon: project_grouping::project_icon(&self.history, path),
+                    selected: selected_project == Some(path),
+                    default_space: self.history.agentspace.as_ref() == Some(path),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let section = |label: &str| {
             div()
                 .px_2()
@@ -217,120 +244,17 @@ impl AgentWorkspace {
                 .child(label.to_owned())
         };
         let divider = || div().h(px(1.)).mx_2().my_1().bg(rgb(p.border));
-        let mut projects = div()
-            .id("project-picker-list")
-            .max_h(px(200.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(2.));
-        for path in &self.history.projects {
-            let selected = self.history.active().project.as_ref() == Some(path);
-            let is_space = self.history.agentspace.as_ref() == Some(path);
-            let remote = ssh_project::is_remote(path);
-            let label = if remote {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| ssh_project::label(path))
-            } else if is_space {
-                ssh_project::label(path)
-            } else {
-                project_grouping::project_label(&self.history, path)
-            };
-            let path = path.clone();
-            projects = projects.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "choose-project:{}",
-                        path.display()
-                    )))
-                    .h(px(40.))
-                    .flex_shrink_0()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(5.))
-                    .text_color(rgb(p.text))
-                    .cursor_pointer()
-                    .when(selected, |row| row.bg(rgb(p.accent_tint)))
-                    .hover(|style| style.bg(rgb(p.accent_tint)))
-                    .child(
-                        div().flex_shrink_0().text_color(rgb(p.text_muted)).child(
-                            if is_space {
-                                Icon::Box
-                            } else if remote {
-                                Icon::Globe
-                            } else {
-                                Icon::Folder
-                            }
-                            .render(15.),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(div().text_size(px(12.)).truncate().child(label))
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(p.text_muted))
-                                    .truncate()
-                                    .child(gpui_glint::paths::display_path(&path)),
-                            ),
-                    )
-                    .when(is_space, |row| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(9.))
-                                .text_color(rgb(p.text_muted))
-                                .child("默认空间"),
-                        )
-                    })
-                    .when(selected, |row| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(rgb(p.accent))
-                                .child(Icon::CheckCircle.render(14.)),
-                        )
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.choose_project(path.clone(), cx)),
-                    ),
-            );
-        }
         let mut content = div()
             .flex()
             .flex_col()
-            .text_color(rgb(p.text))
-            .child(section("切换项目"));
-        if self.history.projects.is_empty() {
-            content = content.child(
-                div()
-                    .px_2()
-                    .py_2()
-                    .text_size(px(12.))
-                    .text_color(rgb(p.text_muted))
-                    .child("打开目录，或设置默认空间"),
-            );
-        } else {
-            content = content.child(projects);
-        }
-        content = content
-            .child(divider())
             .child(
-                MenuItem::new("picker-open-project", "打开项目目录…")
+                MenuItem::new("picker-open-project", "打开本地项目…")
                     .icon(Icon::FolderOpen)
                     .theme(self.theme)
                     .render()
+                    .debug_selector(|| "picker-open-project".into())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.project_picker_open = false;
+                        this.workspace_picker = None;
                         this.open_project(cx);
                         cx.notify();
                     })),
@@ -341,20 +265,18 @@ impl AgentWorkspace {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.project_picker_open = false;
+                        this.workspace_picker = None;
                         this.open_ssh_project(window, cx);
                     })),
             );
-        if self.history.active().project.is_some() {
+        if let Some(path) = selected_project.cloned() {
             content = content.child(
                 MenuItem::new("picker-project-group", "项目分组…")
                     .icon(Icon::Folders)
                     .theme(self.theme)
                     .render()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(path) = this.history.active().project.clone() {
-                            this.edit_project_group(path, cx);
-                        }
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_project_group(path.clone(), cx);
                     })),
             );
         }
@@ -367,28 +289,23 @@ impl AgentWorkspace {
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.project_picker_open = false;
+                        this.workspace_picker = None;
                         this.pick_agentspace(cx);
                     })),
             );
-        if self
-            .history
-            .active()
-            .project
-            .as_deref()
-            .is_some_and(|path| {
-                !ssh_project::is_remote(path) && self.history.agentspace.as_deref() != Some(path)
+        if let Some(path) = selected_project
+            .filter(|path| {
+                !ssh_project::is_remote(path) && self.history.agentspace.as_ref() != Some(*path)
             })
+            .cloned()
         {
             content = content.child(
                 MenuItem::new("picker-set-agentspace", "将当前目录设为默认空间")
                     .icon(Icon::Box)
                     .theme(self.theme)
                     .render()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(path) = this.history.active().project.clone() {
-                            this.set_agentspace(path, cx);
-                        }
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_agentspace(path.clone(), cx);
                     })),
             );
         }
@@ -400,29 +317,137 @@ impl AgentWorkspace {
                     .render()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.history.agentspace = None;
-                        this.project_picker_open = false;
+                        this.workspace_picker = None;
                         this.save(cx);
                         cx.notify();
                     })),
             );
         }
         let weak = cx.entity().downgrade();
-        Popover::new("composer-project-selector", trigger, content)
-            .open(self.project_picker_open)
-            .above_trigger()
+        let popover = ProjectSelector::new(id, trigger_selector, label, icon, projects, self.theme)
+            .popover(content, move |path, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if picker == WorkspacePicker::ChatProject {
+                        this.switch_chat_project(path.to_owned(), cx);
+                    } else {
+                        this.choose_project(path.to_owned(), cx);
+                    }
+                });
+            });
+        self.picker_popover(picker, popover, cx)
+    }
+
+    fn switch_chat_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.workspace_picker = None;
+        if self.history.active().project.as_ref() == Some(&path) {
+            cx.notify();
+            return;
+        }
+        let session = self
+            .history
+            .sessions
+            .iter()
+            .filter(|session| session.project.as_ref() == Some(&path))
+            .max_by_key(|session| session.updated)
+            .map(|session| session.id);
+        if let Some(session) = session {
+            self.switch(session, cx);
+        } else if self.history.active().project.is_none() {
+            self.choose_project(path, cx);
+        } else {
+            let previous = self.history.active;
+            self.history.new_session_for(Some(path));
+            let session = std::mem::replace(&mut self.history.active, previous);
+            self.switch(session, cx);
+            self.save(cx);
+        }
+    }
+
+    pub(super) fn session_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.theme.palette();
+        let active = self.history.active();
+        let trigger = div()
+            .debug_selector(|| "agent-topbar-session".into())
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(6.))
+            .hover(|style| style.bg(rgb(p.surface_subtle)))
+            .child(div().max_w(px(200.)).truncate().child(active.title.clone()))
+            .child(Icon::ChevronDown.render(12.).text_color(rgb(p.text_muted)));
+        let mut sessions = Vec::new();
+        if self.workspace_picker == Some(WorkspacePicker::ChatSession) {
+            sessions.extend(
+                self.history
+                    .sessions
+                    .iter()
+                    .filter(|session| session.project == active.project),
+            );
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.updated));
+        }
+        let content = div()
+            .id("session-picker-list")
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .children(sessions.into_iter().map(|session| {
+                let id = session.id;
+                let selector = format!("choose-session:{id}");
+                MenuItem::new(SharedString::from(selector.clone()), session.title.clone())
+                    .icon(if id == active.id {
+                        Icon::CheckCircle
+                    } else {
+                        Icon::MessageCircle
+                    })
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(move || selector.clone())
+                    .when(id == active.id, |row| row.bg(rgb(p.accent_tint)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.history.active != id {
+                            this.switch(id, cx);
+                        } else {
+                            this.workspace_picker = None;
+                            cx.notify();
+                        }
+                    }))
+            }));
+        let popover = Popover::new("chat-session-selector", trigger, content)
             .trigger_height(28.)
-            .width(304.)
+            .width(316.)
             .padding(6.)
-            .theme(self.theme)
+            .theme(self.theme);
+        self.picker_popover(WorkspacePicker::ChatSession, popover, cx)
+    }
+
+    fn picker_popover(
+        &self,
+        picker: WorkspacePicker,
+        popover: Popover,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let popover = popover
+            .open(self.workspace_picker == Some(picker))
             .on_open_change(move |open, _, cx| {
                 let _ = weak.update(cx, |this, cx| {
-                    this.project_picker_open = open;
                     if open {
+                        this.workspace_picker = Some(picker);
                         this.git_ui.picker_open = false;
+                    } else if this.workspace_picker == Some(picker) {
+                        this.workspace_picker = None;
                     }
                     cx.notify();
                 });
-            })
+            });
+        if picker == WorkspacePicker::ComposerProject {
+            popover.above_trigger()
+        } else {
+            popover
+        }
     }
 
     pub fn pick_context(&mut self, directories: bool, cx: &mut Context<Self>) {
@@ -747,6 +772,90 @@ fn partner_session_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn project_selectors_share_a_menu_and_chat_breadcrumb_switches_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(dir.path().join("sessions.json"), cx)
+        });
+        let (first_session, recent_session, older_session) = host.update(window, |host, cx| {
+            host.history.new_session_for(Some(second.clone()));
+            let older = host.history.active;
+            host.history.active_mut().draft = "older draft".into();
+            host.history.active_mut().updated -= chrono::Duration::minutes(1);
+            host.history.new_session_for(Some(second.clone()));
+            let recent = host.history.active;
+            host.history.new_session_for(Some(first.clone()));
+            host.restore_draft(cx);
+            host.composer.update(cx, |composer, cx| {
+                composer.set_draft("first draft", Vec::new(), cx);
+            });
+            cx.notify();
+            (host.history.active, recent, older)
+        });
+        window.simulate_resize(size(px(1440.), px(900.)));
+        let click = |window: &mut gpui::VisualTestContext, selector: &'static str| {
+            window.run_until_parked();
+            let bounds = window
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector}"));
+            window.simulate_click(bounds.center(), Default::default());
+            window.run_until_parked();
+        };
+        let project = |path: &std::path::Path| -> &'static str {
+            Box::leak(format!("choose-project:{}", path.display()).into_boxed_str())
+        };
+        let session =
+            |id| -> &'static str { Box::leak(format!("choose-session:{id}").into_boxed_str()) };
+
+        click(window, "composer-project-trigger");
+        assert!(window.debug_bounds("picker-open-project").is_some());
+        click(window, "agent-topbar-project");
+        assert!(window.debug_bounds("picker-open-project").is_some());
+        click(window, project(&second));
+        host.read_with(window, |host, _| {
+            assert_eq!(host.history.active, recent_session)
+        });
+
+        click(window, "agent-topbar-session");
+        assert!(window.debug_bounds(session(first_session)).is_none());
+        click(window, session(older_session));
+        host.read_with(window, |host, cx| {
+            assert_eq!(host.history.active, older_session);
+            assert_eq!(host.composer.read(cx).value(cx), "older draft");
+            let first = host
+                .history
+                .sessions
+                .iter()
+                .find(|s| s.id == first_session)
+                .unwrap();
+            assert_eq!(first.draft, "first draft");
+        });
+
+        host.update_in(window, |host, window, cx| {
+            host.navigate(crate::Page::Projects, window, cx)
+        });
+        click(window, "browser-topbar-project");
+        assert!(window.debug_bounds("picker-open-project").is_some());
+        click(window, project(&first));
+        host.read_with(window, |host, _| {
+            assert_eq!(host.browser_project.as_ref(), Some(&first));
+            assert_eq!(host.history.active, older_session);
+        });
+    }
 
     #[gpui::test]
     fn agentspace_default_switches_without_moving_existing_sessions(cx: &mut gpui::TestAppContext) {

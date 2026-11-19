@@ -124,6 +124,30 @@ pub(super) struct StatusChanged;
 impl gpui::EventEmitter<StatusChanged> for TerminalView {}
 pub(super) struct WorkspaceActivity;
 impl gpui::EventEmitter<WorkspaceActivity> for TerminalView {}
+/// A resolved terminal output path the host should reveal in its own surfaces.
+pub(super) struct OpenFile {
+    pub path: PathBuf,
+    pub line: Option<usize>,
+}
+
+impl OpenFile {
+    fn preview_target(&self, root: &Path) -> Option<crate::file_preview::Target> {
+        if self
+            .path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        {
+            return None;
+        }
+        Some(crate::file_preview::Target {
+            root: Some(root.to_path_buf()),
+            path: self.path.to_string_lossy().into_owned(),
+            line: self.line,
+        })
+    }
+}
+
+impl gpui::EventEmitter<OpenFile> for TerminalView {}
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         gpui::KeyBinding::new("ctrl-c", CopyOrInterrupt, Some("ProjectTerminal")),
@@ -598,17 +622,22 @@ fn terminal_line_snapshot<T: EventListener>(term: &Term<T>, point: TermPoint) ->
     }
 }
 
-fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
+fn output_path(value: &str, root: &Path) -> Option<(PathBuf, Option<usize>)> {
     let mut value = value;
+    // `path:line:column` carries its numbers outside the file name, so strip
+    // them right-to-left and keep the last one: a drive letter like `C:` never
+    // parses as a number, so native absolute paths survive the strip.
+    let mut line = None;
     for _ in 0..2 {
         if let Some((path, number)) = value.rsplit_once(':') {
             if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
                 value = path;
+                line = number.parse::<usize>().ok();
             }
         }
     }
     if value.starts_with("file://") {
-        return reqwest::Url::parse(value).ok()?.to_file_path().ok();
+        return Some((reqwest::Url::parse(value).ok()?.to_file_path().ok()?, line));
     }
     if value.contains("://") || !value.contains(['/', '\\', '.']) {
         return None;
@@ -617,10 +646,11 @@ fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
         .strip_prefix("~/")
         .or_else(|| value.strip_prefix("~\\"))
     {
-        return Some(
+        return Some((
             PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?)
                 .join(relative),
-        );
+            line,
+        ));
     }
     // Git Bash emits /c/... alongside native C:\... paths.
     #[cfg(windows)]
@@ -629,23 +659,33 @@ fn output_path(value: &str, root: &Path) -> Option<PathBuf> {
         && value.as_bytes()[1].is_ascii_alphabetic()
         && value.as_bytes()[2] == b'/'
     {
-        return Some(PathBuf::from(format!("{}:{}", &value[1..2], &value[2..])));
+        return Some((
+            PathBuf::from(format!("{}:{}", &value[1..2], &value[2..])),
+            line,
+        ));
     }
     let path = PathBuf::from(value);
-    Some(if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    })
+    Some((
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        },
+        line,
+    ))
 }
 
 // Resolve on the background executor. Trying bounded, longest-first spans also
 // handles unquoted paths containing spaces without guessing where the name ends.
-fn resolve_output_path(text: &str, offset: usize, root: &Path) -> Option<PathBuf> {
-    resolve_output_link(text, offset, root).map(|(path, _)| path)
+fn resolve_output_path(text: &str, offset: usize, root: &Path) -> Option<(PathBuf, Option<usize>)> {
+    resolve_output_link(text, offset, root).map(|(path, _, line)| (path, line))
 }
 
-fn resolve_output_link(text: &str, offset: usize, root: &Path) -> Option<(PathBuf, Range<usize>)> {
+fn resolve_output_link(
+    text: &str,
+    offset: usize,
+    root: &Path,
+) -> Option<(PathBuf, Range<usize>, Option<usize>)> {
     if offset >= text.len() || crate::ssh_project::is_remote(root) {
         return None;
     }
@@ -684,9 +724,9 @@ fn resolve_output_link(text: &str, offset: usize, root: &Path) -> Option<(PathBu
             if offset < begin || offset >= begin + value.len() {
                 continue;
             }
-            if let Some(path) = output_path(value, root) {
+            if let Some((path, line)) = output_path(value, root) {
                 if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_dir()) {
-                    return Some((path, begin..begin + value.len()));
+                    return Some((path, begin..begin + value.len(), line));
                 }
             }
         }
@@ -1038,9 +1078,11 @@ impl TerminalView {
         let work = cx
             .background_executor()
             .spawn(async move { resolve_output_path(&text, offset, &root) });
-        cx.spawn(async move |_, cx| {
-            if let Some(path) = work.await {
-                let _ = cx.update(|cx| cx.reveal_path(&path));
+        cx.spawn(async move |weak, cx| {
+            if let Some((path, line)) = work.await {
+                // The host owns the editor surfaces, so the terminal only
+                // reports what it resolved instead of revealing it directly.
+                let _ = weak.update(cx, |_, cx| cx.emit(OpenFile { path, line }));
             }
         })
         .detach();
@@ -1082,7 +1124,7 @@ impl TerminalView {
             let cells = cx
                 .background_executor()
                 .spawn(async move {
-                    let Some((_, range)) =
+                    let Some((_, range, _)) =
                         resolve_output_link(&snapshot.text, snapshot.offset, &root)
                     else {
                         return HashSet::new();
@@ -1334,7 +1376,7 @@ impl Render for TerminalView {
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
-                    if event.modifiers.shift {
+                    if event.modifiers.shift || event.modifiers.control {
                         this.reveal_output_path(event.position, cx);
                         cx.stop_propagation();
                         return;
@@ -1547,7 +1589,7 @@ mod tests {
             let resolved =
                 resolve_output_path(&text, offset, dir.path()).unwrap_or_else(|| panic!("{text}"));
             assert_eq!(
-                resolved.canonicalize().unwrap(),
+                resolved.0.canonicalize().unwrap(),
                 file.canonicalize().unwrap()
             );
         }
@@ -1566,11 +1608,54 @@ mod tests {
             assert_eq!(
                 resolve_output_path(&bash, offset, dir.path())
                     .unwrap()
+                    .0
                     .canonicalize()
                     .unwrap(),
                 file.canonicalize().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn terminal_path_keeps_location_numbers_for_the_reveal_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("defaults.go");
+        std::fs::write(&file, "package editiondefaults\n").unwrap();
+        let text = format!(
+            "{}:11:12: pattern editions_defaults.binpb: no matching files found",
+            file.display()
+        );
+        let offset = text.find("defaults.go").unwrap();
+        let (path, range, line) = resolve_output_link(&text, offset, dir.path()).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(line, Some(11));
+        assert!(text[range].starts_with(&*file.to_string_lossy()));
+        // A bare path still resolves, just without a line to reveal.
+        let plain = format!("Installer: {}", file.display());
+        let offset = plain.find("defaults.go").unwrap();
+        assert_eq!(
+            resolve_output_link(&plain, offset, dir.path()).unwrap().2,
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_output_executables_are_revealed_instead_of_previewed() {
+        let root = Path::new("output");
+        let executable = OpenFile {
+            path: root.join("Setup.EXE"),
+            line: None,
+        };
+        assert!(executable.preview_target(root).is_none());
+
+        let source = OpenFile {
+            path: root.join("main.rs"),
+            line: Some(12),
+        };
+        let preview = source.preview_target(root).unwrap();
+        assert_eq!(preview.root.as_deref(), Some(root));
+        assert_eq!(Path::new(&preview.path), source.path);
+        assert_eq!(preview.line, Some(12));
     }
 
     #[test]
@@ -1598,7 +1683,8 @@ mod tests {
             .point;
         let (line, offset) = terminal_logical_line(&term, point);
         assert_eq!(line.as_bytes()[offset], b'x');
-        let (_, range) = resolve_output_link(&line, offset, dir.path()).unwrap();
+        let (_, range, line_number) = resolve_output_link(&line, offset, dir.path()).unwrap();
+        assert_eq!(line_number, None);
         assert_eq!(&line[range.clone()], file.to_string_lossy());
         let snapshot = terminal_line_snapshot(&term, point);
         let linked: Vec<_> = snapshot
@@ -1622,6 +1708,7 @@ mod tests {
         assert_eq!(
             resolve_output_path(&line, offset, dir.path())
                 .unwrap()
+                .0
                 .canonicalize()
                 .unwrap(),
             file.canonicalize().unwrap()
@@ -2593,6 +2680,18 @@ impl AgentWorkspace {
             terminal.update(cx, |terminal, cx| terminal.set_theme(self.theme, cx));
         }
     }
+    pub(super) fn open_terminal_output(
+        &mut self,
+        root: &Path,
+        event: &OpenFile,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = event.preview_target(root) {
+            self.open_file_preview(target, cx);
+        } else {
+            cx.reveal_path(&event.path);
+        }
+    }
     pub(super) fn open_project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.panel_repository_root(crate::panel_repositories::Panel::Terminal)
         else {
@@ -2622,6 +2721,11 @@ impl AgentWorkspace {
             let project = root.clone();
             cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| {
                 this.workspace_terminal_activity(&project, cx)
+            })
+            .detach();
+            let project = root.clone();
+            cx.subscribe(&terminal, move |this, _, event: &OpenFile, cx| {
+                this.open_terminal_output(&project, event, cx)
             })
             .detach();
             self.terminal_ui.terminals.insert(root.clone(), terminal);
@@ -2711,6 +2815,11 @@ impl AgentWorkspace {
         let project = root.clone();
         cx.subscribe(&terminal, move |this, _, _: &WorkspaceActivity, cx| {
             this.workspace_terminal_activity(&project, cx)
+        })
+        .detach();
+        let project = root.clone();
+        cx.subscribe(&terminal, move |this, _, event: &OpenFile, cx| {
+            this.open_terminal_output(&project, event, cx)
         })
         .detach();
         if self.terminal_ui.terminals.contains_key(&root) {

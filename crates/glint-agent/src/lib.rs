@@ -51,6 +51,7 @@ mod partner_transfer;
 mod partner_ui;
 mod partners;
 mod project_actions;
+mod project_changes;
 mod project_context;
 mod project_files;
 mod project_grouping;
@@ -200,7 +201,7 @@ pub struct AgentWorkspace {
     conversation_layouts: Vec<(Uuid, ScrollHandle, MessageLayout)>,
     show_sessions: bool,
     show_auxiliary_sidebar: bool,
-    project_picker_open: bool,
+    workspace_picker: Option<project_ui::WorkspacePicker>,
     browser_project: Option<PathBuf>,
     browser_repositories: projects_page::Repositories,
     project_grouping: project_grouping::State,
@@ -746,7 +747,7 @@ impl AgentWorkspace {
             conversation_layouts: Vec::new(),
             show_sessions: true,
             show_auxiliary_sidebar: true,
-            project_picker_open: false,
+            workspace_picker: None,
             browser_project: None,
             browser_repositories: Default::default(),
             project_grouping: project_grouping::State::new(cx),
@@ -907,7 +908,7 @@ impl AgentWorkspace {
         self.history.active = id;
         self.trajectory.close_detail();
         self.history.preferred_partner = self.history.active().partner_id;
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         // PreviewCache is already bounded (64 images / 64 MiB); keep it warm across chats.
         self.restore_draft(cx);
         self.open_conversation_at_latest();
@@ -1705,51 +1706,24 @@ impl AgentWorkspace {
                         cx.notify();
                     })),
             )
-            .when(
-                self.page != crate::Page::Settings
-                    && self.page != crate::Page::Calendar
-                    && self.page != crate::Page::Vault
-                    && self.page != crate::Page::Partners
-                    && self.page != crate::Page::Channels,
-                |bar| {
-                    bar.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_color(rgb(p.text_muted))
-                            .child(Icon::Folder.render(14.))
-                            .id("open-project")
-                            .debug_selector(|| "agent-topbar-project".into())
-                            .cursor_pointer()
-                            .child(
-                                self.history
-                                    .active()
-                                    .project
-                                    .as_ref()
-                                    .map(|path| ssh_project::label(path))
-                                    .unwrap_or_else(|| "打开项目".into()),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.open_project(cx)))
-                            .child("›"),
-                    )
-                },
-            )
-            .child(div().min_w_0().max_w(px(260.)).truncate().child(
-                if self.page == crate::Page::Partners {
-                    "伙伴".into()
-                } else if self.page == crate::Page::Channels {
-                    "频道".into()
-                } else if self.page == crate::Page::Vault {
-                    "密码箱".into()
-                } else if self.page == crate::Page::Calendar {
-                    "日程与定时任务".into()
-                } else if self.page == crate::Page::Settings {
-                    format!("设置  ›  {}", self.provider_settings.section.title())
-                } else {
-                    self.history.active().title.clone()
-                },
-            ))
+            .when(self.page == crate::Page::Chat, |bar| {
+                bar.child(self.project_selector_at(project_ui::WorkspacePicker::ChatProject, cx))
+                    .child(Icon::ChevronRight.render(12.).text_color(rgb(p.text_muted)))
+                    .child(self.session_selector(cx))
+            })
+            .when(self.page != crate::Page::Chat, |bar| {
+                let title = match self.page {
+                    crate::Page::Partners => "伙伴".into(),
+                    crate::Page::Channels => "频道".into(),
+                    crate::Page::Vault => "密码箱".into(),
+                    crate::Page::Calendar => "日程与定时任务".into(),
+                    crate::Page::Settings => {
+                        format!("设置  ›  {}", self.provider_settings.section.title())
+                    }
+                    _ => self.history.active().title.clone(),
+                };
+                bar.child(div().min_w_0().max_w(px(260.)).truncate().child(title))
+            })
             .when(
                 !matches!(
                     self.page,
@@ -2918,7 +2892,7 @@ impl Render for AgentWorkspace {
                         && self.edits_ui.open
                         && self.edits_ui.expanded
                     {
-                        let panel = self.edits_sidebar(cx);
+                        let panel = self.edits_sidebar(window, cx);
                         self.expanded_project_panel(panel, cx)
                     } else if self.page == crate::Page::Channels {
                         div().size_full().child(self.channels_page(cx))
@@ -2988,7 +2962,7 @@ impl Render for AgentWorkspace {
                                 body.child(self.file_preview_sidebar(cx))
                             })
                             .when(self.edits_ui.open, |body| {
-                                body.child(self.edits_sidebar(cx))
+                                body.child(self.edits_sidebar(window, cx))
                             })
                             .when(self.terminal_ui.open && !self.terminal_ui.bottom, |body| {
                                 body.child(self.project_terminal_sidebar(cx))

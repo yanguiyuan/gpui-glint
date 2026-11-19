@@ -198,6 +198,7 @@ impl ClosableTabs {
 
             let mut item = div()
                 .id(("glass-closable-tab", tab.id))
+                .debug_selector(move || format!("glass-closable-tab:{}", tab.id))
                 .h(px(40.))
                 // 不再固定宽度：标签多时按比例压缩，标签少时最多 240px。
                 .min_w(px(MIN_TAB_WIDTH))

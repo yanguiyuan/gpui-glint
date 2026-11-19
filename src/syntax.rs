@@ -13,6 +13,17 @@ use std::{
 const GRAMMAR_LIMIT: usize = 512 * 1024;
 const LANGUAGE_LIMIT: usize = 128;
 
+/// Recognize ignore dotfiles and Dockerfile-specific ignore files.
+pub fn is_ignore_file(path: &str) -> bool {
+    let filename = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (filename.starts_with('.') && filename.ends_with("ignore"))
+        || filename.ends_with(".dockerignore")
+}
+
 #[derive(Deserialize)]
 struct Manifest {
     id: String,
@@ -225,7 +236,7 @@ impl LanguageRegistry {
         Ok(())
     }
 
-    /// Explicit file-name associations win over extension associations.
+    /// Explicit pack associations win over built-in file-name associations.
     pub fn language_for_path(&self, path: &str) -> Option<String> {
         let filename = path.rsplit(['/', '\\']).next()?;
         self.filenames
@@ -235,6 +246,7 @@ impl LanguageRegistry {
                 self.extensions.get(&extension.to_ascii_lowercase())
             })
             .cloned()
+            .or_else(|| is_ignore_file(path).then(|| "ignore".to_owned()))
     }
 
     pub(crate) fn tokens(
@@ -469,6 +481,25 @@ mod tests {
                 source
             );
         }
+    }
+
+    #[test]
+    fn ignore_file_names_resolve_without_installed_packs() {
+        let registry = LanguageRegistry::empty();
+        for name in [
+            ".gitignore",
+            r"D:\项目\.DOCKERIGNORE",
+            "docker/build.Dockerfile.dockerignore",
+            ".zcodeignore",
+            ".ignore",
+        ] {
+            assert_eq!(
+                registry.language_for_path(name).as_deref(),
+                Some("ignore"),
+                "{name}"
+            );
+        }
+        assert_eq!(registry.language_for_path(".gitignore.bak"), None);
     }
 
     #[test]

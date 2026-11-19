@@ -1774,6 +1774,12 @@ fn tokens(source: &str, language: &str) -> Vec<(Range<usize>, TokenKind)> {
     if let Some(tokens) = crate::syntax::global().tokens(source, language) {
         return tokens;
     }
+    if ["ignore", "gitignore", "dockerignore"]
+        .iter()
+        .any(|name| language.eq_ignore_ascii_case(name))
+    {
+        return source_syntax::ignore_file(source);
+    }
     if ["md", "markdown"]
         .iter()
         .any(|name| language.eq_ignore_ascii_case(name))

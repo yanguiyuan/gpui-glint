@@ -139,6 +139,23 @@ fn index(root: &Path, label: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
+    load_matching(root, None)
+}
+
+pub fn load_file(root: &Path, label: &str) -> Result<Conflict, String> {
+    let (files, notes) = load_matching(root, Some(label))?;
+    files.into_iter().next().ok_or_else(|| {
+        notes
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "文件已不在冲突列表中，请刷新后重试".into())
+    })
+}
+
+fn load_matching(
+    root: &Path,
+    target: Option<&str>,
+) -> Result<(Vec<Conflict>, Vec<String>), String> {
     let top = git(root, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(
         std::str::from_utf8(&top)
@@ -147,7 +164,11 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
     )
     .canonicalize()
     .map_err(|e| e.to_string())?;
-    let entries = git(&root, &["ls-files", "--unmerged", "-z"])?;
+    let mut args = vec!["--literal-pathspecs", "ls-files", "--unmerged", "-z"];
+    if let Some(label) = target {
+        args.extend(["--", label]);
+    }
+    let entries = git(&root, &args)?;
     // One index snapshot covers every conflict. Keep each complete raw record
     // so save() can still compare it against a fresh path-scoped snapshot.
     let mut indexes = std::collections::BTreeMap::<String, Vec<u8>>::new();
@@ -160,6 +181,9 @@ pub fn load(root: &Path) -> Result<(Vec<Conflict>, Vec<String>), String> {
             .position(|b| *b == b'\t')
             .ok_or("Git 冲突索引格式无效")?;
         let label = std::str::from_utf8(&record[tab + 1..]).map_err(|_| "冲突路径不是 UTF-8")?;
+        if target.is_some_and(|target| target != label) {
+            continue;
+        }
         let snapshot = indexes.entry(label.to_owned()).or_default();
         snapshot.extend_from_slice(record);
         snapshot.push(0);
@@ -454,7 +478,7 @@ pub(crate) mod tests {
         let inventory = crate::workspace_diff::inventory(dir.path()).unwrap();
         let listing_time = started.elapsed();
         assert_eq!(inventory.files.len(), 6926);
-        assert!(inventory.has_conflicts);
+        assert_eq!(inventory.conflict_labels.len(), 161);
         assert!(
             inventory
                 .files

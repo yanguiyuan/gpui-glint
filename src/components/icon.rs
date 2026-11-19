@@ -211,10 +211,14 @@ impl Icon {
             .and_then(|name| name.to_str())
             .unwrap_or(name)
             .to_ascii_lowercase();
+        if file == ".gitignore" {
+            return Self::GitBranch;
+        }
         if file == "dockerfile"
             || file == "containerfile"
             || file.starts_with("dockerfile.")
             || file.ends_with(".dockerfile")
+            || file.ends_with(".dockerignore")
         {
             return Self::Docker;
         }
@@ -866,7 +870,9 @@ mod tests {
             ("script.sh", Icon::Shell),
             ("notes.txt", Icon::Text),
             ("LICENSE", Icon::Text),
-            (".gitignore", Icon::Text),
+            (".gitignore", Icon::GitBranch),
+            (".dockerignore", Icon::Docker),
+            ("build.Dockerfile.dockerignore", Icon::Docker),
             ("archive.unknown", Icon::Text),
         ] {
             assert_eq!(Icon::for_file_name(name), expected, "{name}");

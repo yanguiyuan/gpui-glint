@@ -345,7 +345,7 @@ impl AgentWorkspace {
             field.set_value(name, cx);
         });
         self.project_grouping.editing = Some(path);
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         cx.notify();
     }
 

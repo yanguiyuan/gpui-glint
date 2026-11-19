@@ -41,7 +41,7 @@ def run(q):
     def read(path, missing=False):
         try:
             metadata = os.stat(path)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             if missing: return None
             raise
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > LIMIT:
@@ -50,6 +50,15 @@ def run(q):
             content = f.read(LIMIT + 1)
         if len(content.encode('utf-8')) > LIMIT:
             raise ValueError('文件超过 2MB')
+        return content
+
+    if op == 'diff_worktree_file':
+        if os.path.islink(os.path.join(root, relative)):
+            raise ValueError('链接不支持文本 Diff')
+        if os.path.isdir(path):
+            return ''
+        content = read(path, missing=True) or ''
+        if '\x00' in content: raise ValueError('二进制文件不支持文本 Diff')
         return content
 
     if op == 'preview_excerpt':

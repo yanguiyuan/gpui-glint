@@ -1,15 +1,22 @@
 //! Project-page layout owns a persistent explorer and independently loaded documents.
 use super::*;
+use crate::edits_ui::{ConflictResolved, ConflictView};
 use crate::file_preview::{Loaded, Target};
 use crate::git_ui::CommitDiff;
 use crate::go_definition::{GoDefinitions, ProcessState};
+use crate::project_changes::{ChangeSnapshot, ProjectChanges, StageSelection};
 use crate::shortcuts::DefinitionModifier;
 use gpui::{Animation, AnimationExt};
 use gpui_glint::components::{
-    ChangeNavigation, ChangeNavigationEvent, ChangeRow, ChangeStatus, FilePreview,
-    FilePreviewEvent, GitGraph, GitGraphEvent, PromptEditor, Skeleton, Tooltip,
+    ChangeNavigation, ChangeNavigationEvent, FilePreview, FilePreviewEvent, GitGraph,
+    GitGraphEvent, MenuItem, PromptEditor, Skeleton, Tooltip,
 };
 use std::{ops::Range, path::Path, time::Duration};
+
+const EXPLORER_MIN_WIDTH: f32 = 240.;
+const EXPLORER_MAX_WIDTH: f32 = 720.;
+const DOCUMENT_MIN_WIDTH: f32 = 320.;
+const EXPLORER_DIVIDER_WIDTH: f32 = 5.;
 
 struct Document {
     id: u64,
@@ -21,6 +28,25 @@ struct Document {
 enum DocumentView {
     File(Entity<FilePreview>),
     Diff(CommitDiff),
+    Conflict {
+        editor: Option<Entity<ConflictView>>,
+        error: Option<String>,
+        scroll: ScrollHandle,
+    },
+}
+
+struct DocumentTabMenu {
+    tab: u64,
+    window: gpui::WindowId,
+    position: gpui::Point<gpui::Pixels>,
+    focus: gpui::FocusHandle,
+}
+
+#[derive(Clone, Copy)]
+enum CloseTabs {
+    Others,
+    Left,
+    Right,
 }
 
 struct GoSymbol {
@@ -73,8 +99,12 @@ pub(super) struct ProjectFiles {
     history_limit: usize,
     graph_task: Option<Task<()>>,
     changes_task: Option<Task<()>>,
-    stage_task: Option<Task<()>>,
+    changes_by_root: std::collections::HashMap<PathBuf, ProjectChanges>,
     commit_task: Option<Task<()>>,
+    /// Git Graph commit-details loads. Kept apart from `commit_task` so a
+    /// details request cannot make the commit button look busy, and so a graph
+    /// refresh cannot drop (and thereby cancel) a real commit in flight.
+    details_task: Option<Task<()>>,
     commit_entry: Option<Entity<PromptEditor>>,
     commit_notice: Option<String>,
     go_definitions: Option<GoDefinitions>,
@@ -84,6 +114,10 @@ pub(super) struct ProjectFiles {
     definition_error: Option<String>,
     documents: Vec<Document>,
     active: Option<usize>,
+    tab_menu: Option<DocumentTabMenu>,
+    explorer_width: f32,
+    explorer_maximum: std::cell::Cell<f32>,
+    explorer_resize: Option<(gpui::Pixels, f32)>,
     task: Option<Task<()>>,
     directories: std::collections::HashMap<u64, Task<()>>,
     theme: ThemePreset,
@@ -98,99 +132,6 @@ async fn read(target: Target) -> Result<(String, Option<String>, Loaded), String
             .await
     } else {
         file_preview::load(target).await
-    }
-}
-
-/// One Git status snapshot, grouped into the same rows the diff sidebar renders.
-fn change_rows(root: &Path) -> Result<Vec<ChangeRow>, String> {
-    let inventory = workspace_diff::inventory(root)?;
-    // The inventory never carries numstat counts, so read them for the whole list
-    // once. Without them every row would look like a binary change.
-    let labels: Vec<String> = inventory
-        .sources
-        .values()
-        .flat_map(|source| {
-            let mut paths = vec![source.label.clone()];
-            if source.old_path != source.label {
-                paths.push(source.old_path.clone());
-            }
-            paths
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let counts = workspace_diff::scoped_statistics(root, &labels);
-    let known = counts.is_ok();
-    let (staged_counts, unstaged_counts) = counts.unwrap_or_default();
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
-    let mut untracked = Vec::new();
-    for source in inventory.sources.values() {
-        let path = source.path.to_string_lossy().into_owned();
-        if source.staged {
-            let layer = source.for_layer(true);
-            staged.push((
-                source.label.clone(),
-                path.clone(),
-                layer.status,
-                staged_counts.get(&source.label).copied(),
-            ));
-        }
-        if source.unstaged {
-            let layer = source.for_layer(false);
-            let entry = (
-                source.label.clone(),
-                path,
-                layer.status,
-                unstaged_counts.get(&source.label).copied(),
-            );
-            if layer.status == workspace_diff::FileStatus::Untracked {
-                untracked.push(entry);
-            } else {
-                unstaged.push(entry);
-            }
-        }
-    }
-    let groups = [
-        ("已暂存", Some(true), staged),
-        ("未暂存", Some(false), unstaged),
-        ("未跟踪", None, untracked),
-    ];
-    let mut rows = Vec::new();
-    for (title, layer, mut entries) in groups {
-        if entries.is_empty() {
-            continue;
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.push(ChangeRow::Group {
-            title: title.to_owned(),
-            count: entries.len(),
-            staged: layer,
-        });
-        rows.extend(entries.into_iter().map(|(label, path, status, stats)| {
-            ChangeRow::File {
-                path,
-                label,
-                depth: 0,
-                status: change_status(status),
-                staged: layer.unwrap_or(false),
-                additions: stats.map(|(added, _)| added),
-                deletions: stats.map(|(_, removed)| removed),
-                // Only trust "no numstat row" once the counts were actually read.
-                binary: known && layer.is_some() && stats.is_none(),
-            }
-        }));
-    }
-    Ok(rows)
-}
-
-fn change_status(status: workspace_diff::FileStatus) -> ChangeStatus {
-    match status {
-        workspace_diff::FileStatus::Added => ChangeStatus::Added,
-        workspace_diff::FileStatus::Deleted => ChangeStatus::Deleted,
-        workspace_diff::FileStatus::Renamed => ChangeStatus::Renamed,
-        workspace_diff::FileStatus::Untracked => ChangeStatus::Untracked,
-        workspace_diff::FileStatus::Modified => ChangeStatus::Modified,
     }
 }
 
@@ -229,8 +170,9 @@ impl ProjectFiles {
             history_limit: git_project::DEFAULT_HISTORY_LIMIT,
             graph_task: None,
             changes_task: None,
-            stage_task: None,
+            changes_by_root: Default::default(),
             commit_task: None,
+            details_task: None,
             commit_entry: None,
             commit_notice: None,
             go_definitions: None,
@@ -240,6 +182,10 @@ impl ProjectFiles {
             definition_error: None,
             documents: vec![],
             active: None,
+            tab_menu: None,
+            explorer_width: 260.,
+            explorer_maximum: std::cell::Cell::new(EXPLORER_MAX_WIDTH),
+            explorer_resize: None,
             task: None,
             directories: Default::default(),
             theme: ThemePreset::Moonstone,
@@ -257,8 +203,8 @@ impl ProjectFiles {
         self.changes = None;
         self.graph_task = None;
         self.changes_task = None;
-        self.stage_task = None;
         self.commit_task = None;
+        self.details_task = None;
         self.commit_entry = None;
         self.commit_notice = None;
         self.definition_task = None;
@@ -272,6 +218,7 @@ impl ProjectFiles {
         }
         self.documents.clear();
         self.active = None;
+        self.tab_menu = None;
         self.refresh(cx);
         match self.mode {
             ExplorerMode::Graph => self.show_git_graph(cx),
@@ -297,8 +244,12 @@ impl ProjectFiles {
                 }
                 GitGraphEvent::SelectCommit(id) => this.load_commit(id.clone(), cx),
                 GitGraphEvent::OpenFile { commit, path } => {
-                    this.open_diff(commit.clone(), path.clone(), cx)
+                    this.open_diff(CommitDiff::new(commit.clone(), path.clone()), cx)
                 }
+                GitGraphEvent::OpenComparedFile { base, path } => {
+                    this.open_diff(CommitDiff::against_worktree(base.clone(), path.clone()), cx)
+                }
+                GitGraphEvent::RefreshFiles => this.load_graph(false, cx),
                 GitGraphEvent::Refresh => this.refresh_graph(cx),
                 GitGraphEvent::LoadMore => {
                     this.history_limit += git_project::DEFAULT_HISTORY_LIMIT;
@@ -311,8 +262,8 @@ impl ProjectFiles {
             })
             .detach();
             self.graph = Some(graph);
-            self.refresh_graph(cx);
         }
+        self.refresh_graph(cx);
         cx.notify();
     }
 
@@ -326,7 +277,6 @@ impl ProjectFiles {
             return;
         };
         self.graph_task = None;
-        self.commit_task = None;
         let branch = self.compare_branch.clone();
         let limit = self.history_limit;
         if show_loading {
@@ -363,15 +313,19 @@ impl ProjectFiles {
             });
             cx.subscribe(
                 &changes,
-                |this, _, event: &ChangeNavigationEvent, cx| match event {
+                |this, changes, event: &ChangeNavigationEvent, cx| match event {
                     ChangeNavigationEvent::Select { path, staged } => {
-                        this.open_worktree_diff(path.clone(), *staged, cx)
+                        if let Some(label) = changes.read(cx).conflict_label(path) {
+                            this.open_conflict(path.clone(), label.to_owned(), cx);
+                        } else {
+                            this.open_worktree_diff(path.clone(), *staged, cx);
+                        }
                     }
                     ChangeNavigationEvent::Stage { paths, staged } => {
-                        this.stage_changes(Some(paths.clone()), *staged, cx)
+                        this.queue_staging(StageSelection::Files(paths), *staged, cx)
                     }
-                    ChangeNavigationEvent::StageGroup { staged } => {
-                        this.stage_changes(None, *staged, cx)
+                    ChangeNavigationEvent::StageGroup { layer, staged } => {
+                        this.queue_staging(StageSelection::Group(*layer), *staged, cx)
                     }
                     ChangeNavigationEvent::ToggleDirectory { .. }
                     | ChangeNavigationEvent::Menu { .. } => {}
@@ -386,6 +340,9 @@ impl ProjectFiles {
             cx.observe(&entry, |_, _, cx| cx.notify()).detach();
             self.commit_entry = Some(entry);
             self.changes = Some(changes);
+            if let Some(root) = self.root.clone() {
+                self.publish_changes(&root, true, cx);
+            }
         }
         // Re-read on every switch: the worktree changes while the page stays open.
         self.refresh_changes(cx);
@@ -396,7 +353,6 @@ impl ProjectFiles {
         let (Some(root), Some(changes)) = (self.root.clone(), self.changes.clone()) else {
             return;
         };
-        self.changes_task = None;
         if ssh_project::is_remote(&root) {
             changes.update(cx, |changes, cx| {
                 changes.set_error(
@@ -406,77 +362,126 @@ impl ProjectFiles {
             });
             return;
         }
+        let state = self.changes_by_root.entry(root.clone()).or_default();
+        if state.busy() {
+            state.refresh_pending = true;
+            return;
+        }
+        state.refresh_pending = false;
         changes.update(cx, |changes, cx| changes.set_loading(cx));
-        let job = match provider::Job::start(async move { change_rows(&root) }) {
-            Ok(job) => job,
-            Err(error) => {
-                changes.update(cx, |changes, cx| changes.set_error(error, cx));
-                return;
-            }
-        };
-        let changes = changes.downgrade();
-        self.changes_task = Some(cx.spawn(async move |_, cx| {
-            let result = job.result().await;
-            let _ = changes.update(cx, |changes, cx| match result {
-                Ok(rows) => changes.set_rows(rows, cx),
-                Err(error) => changes.set_error(error, cx),
+        let work_root = root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { ChangeSnapshot::read(&work_root) });
+        self.changes_task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(task) = this.changes_task.take() {
+                    task.detach();
+                }
+                match result {
+                    Ok(snapshot) => {
+                        this.changes_by_root
+                            .entry(root.clone())
+                            .or_default()
+                            .snapshot = Some(snapshot);
+                        this.publish_changes(&root, true, cx);
+                    }
+                    Err(error) => changes.update(cx, |changes, cx| changes.set_error(error, cx)),
+                }
+                cx.notify();
             });
         }));
     }
 
-    /// Move one layer between the index and the worktree, then re-read every row.
-    fn stage_changes(&mut self, paths: Option<Vec<String>>, staged: bool, cx: &mut Context<Self>) {
-        let (Some(root), Some(changes)) = (self.root.clone(), self.changes.clone()) else {
-            return;
-        };
-        if self.stage_task.is_some() {
+    fn publish_changes(&self, root: &Path, rows_changed: bool, cx: &mut Context<Self>) {
+        if self.root.as_deref() != Some(root) {
             return;
         }
-        changes.update(cx, |changes, cx| changes.set_loading(cx));
-        let job = provider::Job::start(async move {
-            let inventory = workspace_diff::inventory(&root)?;
-            let sources: Vec<_> = inventory
-                .sources
-                .values()
-                .filter(|source| {
-                    if staged {
-                        source.unstaged
-                    } else {
-                        source.staged
-                    }
-                })
-                .filter(|source| {
-                    paths.as_ref().is_none_or(|paths| {
-                        let path = source.path.to_string_lossy();
-                        paths.iter().any(|candidate| *candidate == path)
-                    })
-                })
-                .cloned()
-                .collect();
-            if sources.is_empty() {
-                return Err("文件已不在变更列表中，请刷新后重试".to_owned());
-            }
-            workspace_diff::stage_and_refresh(&sources, staged).map(|_| ())
-        });
-        let job = match job {
-            Ok(job) => job,
-            Err(error) => {
-                changes.update(cx, |changes, cx| changes.set_error(error, cx));
-                return;
-            }
+        let (Some(changes), Some(state)) = (self.changes.as_ref(), self.changes_by_root.get(root))
+        else {
+            return;
         };
-        let panel = changes.downgrade();
-        let weak = cx.entity().downgrade();
-        self.stage_task = Some(cx.spawn(async move |_, cx| {
-            let result = job.result().await;
+        changes.update(cx, |changes, cx| {
+            if rows_changed && let Some(snapshot) = &state.snapshot {
+                changes.set_rows(snapshot.rows(), cx);
+            }
+            changes.set_stage_intents(state.intents(), cx);
+        });
+    }
+
+    fn queue_staging(
+        &mut self,
+        selection: StageSelection<'_>,
+        staged: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_task.is_some() {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let Some(state) = self.changes_by_root.get_mut(&root) else {
+            return;
+        };
+        state.enqueue(selection, staged);
+        if state.busy() {
+            state.error = None;
+            state.refresh_pending |= self.changes_task.take().is_some();
+            if state.debounce.is_none() && state.task.is_none() {
+                let timer = cx.background_executor().timer(Duration::from_millis(80));
+                let queued_root = root.clone();
+                state.debounce = Some(cx.spawn(async move |weak, cx| {
+                    timer.await;
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(task) = this
+                            .changes_by_root
+                            .get_mut(&queued_root)
+                            .and_then(|state| state.debounce.take())
+                        {
+                            task.detach();
+                        }
+                        this.start_stage_batch(queued_root, cx);
+                    });
+                }));
+            }
+        } else if state.refresh_pending {
+            self.refresh_changes(cx);
+        }
+        self.publish_changes(&root, false, cx);
+        cx.notify();
+    }
+
+    fn start_stage_batch(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let Some(state) = self.changes_by_root.get_mut(&root) else {
+            return;
+        };
+        let Some((staged, sources)) = state.take_batch() else {
+            if state.refresh_pending && self.root.as_ref() == Some(&root) {
+                self.refresh_changes(cx);
+            }
+            self.publish_changes(&root, false, cx);
+            cx.notify();
+            return;
+        };
+        let work = cx
+            .background_executor()
+            .spawn(async move { workspace_diff::stage_and_refresh(&sources, staged) });
+        state.task = Some(cx.spawn(async move |weak, cx| {
+            let result = work.await;
             let _ = weak.update(cx, |this, cx| {
-                this.stage_task = None;
-                match result {
-                    Ok(()) => this.refresh_changes(cx),
-                    Err(error) => {
-                        let _ = panel.update(cx, |panel, cx| panel.set_error(error, cx));
-                    }
+                let state = this
+                    .changes_by_root
+                    .get_mut(&root)
+                    .expect("staging project state");
+                if let Some(task) = state.task.take() {
+                    task.detach();
                 }
+                state.complete(result);
+                this.publish_changes(&root, true, cx);
+                this.start_stage_batch(root, cx);
+                cx.notify();
             });
         }));
     }
@@ -487,12 +492,16 @@ impl ProjectFiles {
         };
         self.mode == ExplorerMode::Changes
             && !ssh_project::is_remote(root)
-            && self.stage_task.is_none()
+            && !self
+                .changes_by_root
+                .get(root)
+                .is_some_and(ProjectChanges::busy)
             && self.commit_task.is_none()
-            && self
-                .changes
-                .as_ref()
-                .is_some_and(|changes| changes.read(cx).staged_count() > 0)
+            && self.changes_task.is_none()
+            && self.changes.as_ref().is_some_and(|changes| {
+                let changes = changes.read(cx);
+                changes.staged_count() > 0 && !changes.has_conflicts()
+            })
             && self.commit_entry.as_ref().is_some_and(|entry| {
                 let entry = entry.read(cx);
                 !entry.is_composing() && !entry.value().trim().is_empty()
@@ -545,10 +554,18 @@ impl ProjectFiles {
         let entry = self.commit_entry.clone()?;
         entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
         let p = self.theme.palette();
-        let staged = self
-            .changes
-            .as_ref()
-            .map_or(0, |changes| changes.read(cx).staged_count());
+        let (staged, has_conflicts) = self.changes.as_ref().map_or((0, false), |changes| {
+            let changes = changes.read(cx);
+            (changes.staged_count(), changes.has_conflicts())
+        });
+        let stage_state = self.changes_by_root.get(&root);
+        let sync_notice = stage_state.and_then(|state| {
+            if state.busy() {
+                Some("正在同步暂存区…".to_owned())
+            } else {
+                state.error.clone()
+            }
+        });
         let disabled = !self.can_commit_changes(cx);
         let submitting = self.commit_task.is_some();
         let submit = div()
@@ -623,12 +640,24 @@ impl ProjectFiles {
                             ),
                         ),
                 )
-                .when(staged > 0 && !submitting, |footer| {
+                .when(has_conflicts || (staged > 0 && !submitting), |footer| {
                     footer.child(
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child(format!("提交 {staged} 个已暂存文件")),
+                            .child(if has_conflicts {
+                                "请先解决所有合并冲突".to_owned()
+                            } else {
+                                format!("提交 {staged} 个已暂存文件")
+                            }),
+                    )
+                })
+                .when_some(sync_notice, |footer, notice| {
+                    footer.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child(notice),
                     )
                 })
                 .when_some(self.commit_notice.clone(), |footer, notice| {
@@ -656,7 +685,7 @@ impl ProjectFiles {
                 }
             };
         let graph = graph.downgrade();
-        self.commit_task = Some(cx.spawn(async move |_, cx| {
+        self.details_task = Some(cx.spawn(async move |_, cx| {
             let result = job.result().await;
             let _ = graph.update(cx, |graph, cx| match result {
                 Ok(details) => graph.set_commit_details(details, cx),
@@ -665,19 +694,27 @@ impl ProjectFiles {
         }));
     }
 
-    fn open_diff(&mut self, commit: String, path: String, cx: &mut Context<Self>) {
+    fn open_diff(&mut self, mut diff: CommitDiff, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else {
             return;
         };
-        if let Some(index) = self.documents.iter().position(|document| {
-            matches!(&document.view, DocumentView::Diff(diff) if diff.commit == commit && diff.path == path)
-        }) {
+        let existing = self.documents.iter().position(|document| {
+            matches!(&document.view, DocumentView::Diff(open) if open.commit == diff.commit && open.base == diff.base && open.path == diff.path)
+        });
+        if let Some(index) = existing
+            && diff.base.is_none()
+        {
             self.activate(index, cx);
             return;
         }
-        let mut diff = CommitDiff::new(commit, path.clone());
-        self.next_document_id += 1;
-        let id = self.next_document_id;
+        let path = diff.path.clone();
+        let id = existing.map_or_else(
+            || {
+                self.next_document_id += 1;
+                self.next_document_id
+            },
+            |index| self.documents[index].id,
+        );
         let task = match diff.load(root) {
             Ok(job) => Some(cx.spawn(async move |weak, cx| {
                 let result = job.result().await;
@@ -698,13 +735,19 @@ impl ProjectFiles {
                 None
             }
         };
-        self.documents.push(Document {
+        let document = Document {
             id,
             path,
             view: DocumentView::Diff(diff),
             _task: task,
-        });
-        self.activate(self.documents.len() - 1, cx);
+        };
+        if let Some(index) = existing {
+            self.documents[index] = document;
+            self.activate(index, cx);
+        } else {
+            self.documents.push(document);
+            self.activate(self.documents.len() - 1, cx);
+        }
     }
 
     /// Open one worktree layer of a changed file without leaving the explorer.
@@ -762,6 +805,80 @@ impl ProjectFiles {
             path,
             view: DocumentView::Diff(diff),
             _task: task,
+        });
+        self.activate(self.documents.len() - 1, cx);
+    }
+
+    fn open_conflict(&mut self, path: String, label: String, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if let Some(index) = self.documents.iter().position(|document| {
+            document.path == path && matches!(document.view, DocumentView::Conflict { .. })
+        }) {
+            if matches!(
+                self.documents[index].view,
+                DocumentView::Conflict { error: None, .. }
+            ) {
+                self.activate(index, cx);
+                return;
+            }
+            self.close(index, cx);
+        }
+
+        self.next_document_id += 1;
+        let id = self.next_document_id;
+        let scroll = ScrollHandle::new();
+        let work_root = root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::merge_conflicts::load_file(&work_root, &label) });
+        let task = cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                let Some(document) = this.documents.iter_mut().find(|document| document.id == id)
+                else {
+                    return;
+                };
+                let DocumentView::Conflict {
+                    editor,
+                    error,
+                    scroll,
+                } = &mut document.view
+                else {
+                    return;
+                };
+                match result {
+                    Ok(file) => {
+                        let view = cx.new(|cx| {
+                            let mut view = ConflictView::new(file, root, None, this.theme, cx);
+                            view.reveal(scroll.clone(), 0, cx);
+                            view
+                        });
+                        cx.subscribe(&view, move |this, _, _: &ConflictResolved, cx| {
+                            if let Some(index) = this.documents.iter().position(|doc| doc.id == id)
+                            {
+                                this.close(index, cx);
+                            }
+                            this.refresh_changes(cx);
+                        })
+                        .detach();
+                        *editor = Some(view);
+                    }
+                    Err(reason) => *error = Some(reason),
+                }
+                cx.notify();
+            });
+        });
+        self.documents.push(Document {
+            id,
+            path,
+            view: DocumentView::Conflict {
+                editor: None,
+                error: None,
+                scroll,
+            },
+            _task: Some(task),
         });
         self.activate(self.documents.len() - 1, cx);
     }
@@ -1111,6 +1228,7 @@ impl ProjectFiles {
     }
 
     fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tab_menu = None;
         self.clear_definition_hover(cx);
         self.definition_task = None;
         self.definition_error = None;
@@ -1126,24 +1244,147 @@ impl ProjectFiles {
     }
 
     fn close(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.close_documents(|candidate| candidate == index, index, cx);
+    }
+
+    fn close_documents(
+        &mut self,
+        mut should_close: impl FnMut(usize) -> bool,
+        fallback: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_menu = None;
         self.clear_definition_hover(cx);
-        if let DocumentView::File(view) = &self.documents[index].view {
-            view.update(cx, |view, cx| view.set_active(false, cx));
-        }
-        self.documents.remove(index);
-        self.active = self.active.and_then(|active| {
-            if self.documents.is_empty() {
-                None
-            } else if active > index {
-                Some(active - 1)
-            } else {
-                Some(active.min(self.documents.len() - 1))
+        let selected_id = self.active.map(|index| self.documents[index].id);
+        let mut index = 0;
+        self.documents.retain(|document| {
+            let close = should_close(index);
+            index += 1;
+            if close && let DocumentView::File(view) = &document.view {
+                view.update(cx, |view, cx| view.set_active(false, cx));
             }
+            !close
+        });
+        self.active = selected_id.and_then(|id| {
+            let last = self.documents.len().checked_sub(1)?;
+            Some(
+                self.documents
+                    .iter()
+                    .position(|doc| doc.id == id)
+                    .unwrap_or(fallback.min(last)),
+            )
         });
         if let Some(index) = self.active {
             self.activate(index, cx);
         }
         cx.notify();
+    }
+
+    fn close_tabs_around(&mut self, tab: u64, mode: CloseTabs, cx: &mut Context<Self>) {
+        let Some(anchor) = self
+            .documents
+            .iter()
+            .position(|document| document.id == tab)
+        else {
+            return;
+        };
+        let fallback = match mode {
+            CloseTabs::Others | CloseTabs::Left => 0,
+            CloseTabs::Right => anchor,
+        };
+        self.close_documents(
+            |index| match mode {
+                CloseTabs::Others => index != anchor,
+                CloseTabs::Left => index < anchor,
+                CloseTabs::Right => index > anchor,
+            },
+            fallback,
+            cx,
+        );
+    }
+
+    fn tab_context_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let state = self.tab_menu.as_ref()?;
+        if state.window != window.window_handle().window_id() {
+            return None;
+        }
+        let tab = state.tab;
+        let anchor = self
+            .documents
+            .iter()
+            .position(|document| document.id == tab)?;
+        let p = self.theme.palette();
+        let menu = div()
+            .id("project-document-tab-menu")
+            .track_focus(&state.focus)
+            .w(px(192.))
+            .p_1()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface))
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.tab_menu = None;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.tab_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .children(
+                [
+                    (
+                        "project-tab-close-others",
+                        "关闭其他标签页",
+                        CloseTabs::Others,
+                        self.documents.len() > 1,
+                    ),
+                    (
+                        "project-tab-close-left",
+                        "关闭左侧标签页",
+                        CloseTabs::Left,
+                        anchor > 0,
+                    ),
+                    (
+                        "project-tab-close-right",
+                        "关闭右侧标签页",
+                        CloseTabs::Right,
+                        anchor + 1 < self.documents.len(),
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, label, mode, enabled)| {
+                    MenuItem::new(id, label)
+                        .theme(self.theme)
+                        .disabled(!enabled)
+                        .render()
+                        .debug_selector(move || id.into())
+                        .when(enabled, |item| {
+                            item.on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_tabs_around(tab, mode, cx);
+                            }))
+                        })
+                }),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(state.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .with_priority(80)
+            .into_any_element(),
+        )
     }
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -1152,6 +1393,8 @@ impl ProjectFiles {
         }
         self.visible = visible;
         if !visible {
+            self.tab_menu = None;
+            self.explorer_resize = None;
             self.clear_definition_hover(cx);
             self.definition_task = None;
             self.definition_error = None;
@@ -1178,12 +1421,20 @@ impl ProjectFiles {
         if let Some(graph) = &self.graph {
             graph.update(cx, |graph, cx| graph.set_theme(theme, cx));
         }
+        if let Some(changes) = &self.changes {
+            changes.update(cx, |changes, cx| changes.set_theme(theme, cx));
+        }
         for document in &self.documents {
             match &document.view {
                 DocumentView::File(view) => view.update(cx, |view, cx| view.set_theme(theme, cx)),
                 DocumentView::Diff(diff) => {
                     if let Some(card) = &diff.card {
                         card.update(cx, |card, cx| card.set_theme(theme, cx));
+                    }
+                }
+                DocumentView::Conflict { editor, .. } => {
+                    if let Some(editor) = editor {
+                        editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
                     }
                 }
             }
@@ -1193,10 +1444,11 @@ impl ProjectFiles {
 }
 
 impl Render for ProjectFiles {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
         let weak_select = cx.entity().downgrade();
         let weak_close = cx.entity().downgrade();
+        let weak_context = cx.entity().downgrade();
         let tabs =
             gpui_glint::components::ClosableTabs::new(self.documents.iter().map(|document| {
                 let label = std::path::Path::new(&document.path)
@@ -1204,14 +1456,20 @@ impl Render for ProjectFiles {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
+                let file_icon = Icon::for_file_name(&label);
                 let (label, icon) = match &document.view {
-                    DocumentView::File(_) => (label, Icon::Text),
+                    DocumentView::File(_) => (label, file_icon),
+                    DocumentView::Conflict { .. } => (label, Icon::GitConflict),
                     DocumentView::Diff(diff) => (
-                        format!(
-                            "{label} · {}",
-                            diff.commit.chars().take(7).collect::<String>()
-                        ),
-                        Icon::GitBranch,
+                        if diff.base.is_some() {
+                            format!("{label} · 分支差异")
+                        } else {
+                            format!(
+                                "{label} · {}",
+                                diff.commit.chars().take(7).collect::<String>()
+                            )
+                        },
+                        file_icon,
                     ),
                 };
                 gpui_glint::components::ClosableTab::new(document.id, label).icon(icon)
@@ -1236,6 +1494,19 @@ impl Render for ProjectFiles {
                     {
                         this.close(index, cx);
                     }
+                });
+            })
+            .on_context(move |tab, position, window, cx| {
+                let _ = weak_context.update(cx, |this, cx| {
+                    let focus = cx.focus_handle();
+                    window.focus(&focus, cx);
+                    this.tab_menu = Some(DocumentTabMenu {
+                        tab,
+                        window: window.window_handle().window_id(),
+                        position,
+                        focus,
+                    });
+                    cx.notify();
                 });
             });
         let document_pane = if let Some(index) = self.active {
@@ -1304,6 +1575,32 @@ impl Render for ProjectFiles {
                     )
                     .render()
                 }
+                DocumentView::Conflict {
+                    editor,
+                    error,
+                    scroll,
+                } => {
+                    let content = div()
+                        .id("project-conflict-editor")
+                        .size_full()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(scroll)
+                        .children(editor.clone())
+                        .when_some(error.clone(), |body, error| {
+                            body.child(div().p_3().child(error))
+                        })
+                        .when(editor.is_none() && error.is_none(), |body| {
+                            body.child(
+                                div().p_4().child(
+                                    Skeleton::new("project-conflict-loading")
+                                        .lines(5)
+                                        .theme(self.theme),
+                                ),
+                            )
+                        });
+                    tabs.content(document.id, content).render()
+                }
                 DocumentView::Diff(diff) => {
                     let content = div()
                         .size_full()
@@ -1366,22 +1663,58 @@ impl Render for ProjectFiles {
             ExplorerMode::Changes => self.changes.clone().map(IntoElement::into_any_element),
             ExplorerMode::Tree => Some(self.tree.clone().into_any_element()),
         };
+        let weak = cx.entity().downgrade();
+        let explorer_width = self
+            .explorer_width
+            .clamp(EXPLORER_MIN_WIDTH, self.explorer_maximum.get());
         div()
             .size_full()
             .flex()
             .min_h_0()
             .min_w_0()
+            .on_children_prepainted(move |bounds, _, cx| {
+                let available: f32 = bounds
+                    .iter()
+                    .take(3)
+                    .map(|bounds| f32::from(bounds.size.width))
+                    .sum();
+                let maximum = (available - DOCUMENT_MIN_WIDTH - EXPLORER_DIVIDER_WIDTH)
+                    .clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH);
+                let _ = weak.update(cx, |this, cx| {
+                    if this.explorer_maximum.replace(maximum) != maximum {
+                        let id = cx.entity_id();
+                        cx.defer(move |cx| cx.notify(id));
+                    }
+                });
+            })
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some((start, width)) = this.explorer_resize {
+                    if event.dragging() {
+                        this.explorer_width = (width + f32::from(event.position.x - start))
+                            .clamp(EXPLORER_MIN_WIDTH, this.explorer_maximum.get());
+                    } else {
+                        this.explorer_resize = None;
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.explorer_resize = None;
+                }),
+            )
             .child(
                 div()
-                    .w(px(260.))
+                    .debug_selector(|| "project-explorer-sidebar".into())
+                    .w(px(explorer_width))
                     .h_full()
                     .min_h_0()
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
                     .bg(rgb(p.panel))
-                    .border_r_1()
-                    .border_color(rgb(p.border))
                     .child(
                         div()
                             .flex()
@@ -1411,13 +1744,184 @@ impl Render for ProjectFiles {
                         column.children(self.commit_footer(cx))
                     }),
             )
+            .child(
+                div()
+                    .id("project-explorer-resize")
+                    .debug_selector(|| "project-explorer-resize".into())
+                    .w(px(EXPLORER_DIVIDER_WIDTH))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor(gpui::CursorStyle::ResizeLeftRight)
+                    .bg(rgb(p.border))
+                    .hover(|style| style.bg(rgb(p.accent)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.explorer_resize = Some((event.position.x, explorer_width));
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
             .child(div().flex_1().min_w_0().h_full().child(document_pane))
+            .children(self.tab_context_menu(window, cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn project_changes_checkboxes_update_before_git_and_cancel_a_queued_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let repo = workspace_diff::tests::many_files(2);
+        let root = repo.path().canonicalize().unwrap();
+        let path = root.join("vendor/0000.rs").to_string_lossy().into_owned();
+        let checkbox = Box::leak(format!("stage-file:{path}:false").into_boxed_str());
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(size(px(1100.), px(720.)));
+        files.update(window, |files, cx| {
+            files.set_root(root.clone(), cx);
+            files.show_changes(cx);
+        });
+        let until = |window: &mut gpui::VisualTestContext,
+                     done: &dyn Fn(&mut gpui::VisualTestContext) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                if done(window) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until(window, &|window| window.debug_bounds(checkbox).is_some());
+        let click = |window: &mut gpui::VisualTestContext, selector| {
+            let bounds = window.debug_bounds(selector).unwrap();
+            window.simulate_click(bounds.center(), Default::default());
+            window.run_until_parked();
+        };
+        click(window, checkbox);
+        files.read_with(window, |files, cx| {
+            let changes = &files.changes_by_root[&root];
+            assert_eq!(changes.intents().get(&path), Some(&true));
+            assert!(changes.task.is_none());
+            assert_eq!(files.changes.as_ref().unwrap().read(cx).staged_count(), 0);
+        });
+        click(window, checkbox);
+        files.read_with(window, |files, _| {
+            assert!(!files.changes_by_root[&root].busy())
+        });
+        window.executor().advance_clock(Duration::from_millis(100));
+        window.run_until_parked();
+        assert!(
+            workspace_diff::inventory(&root)
+                .unwrap()
+                .sources
+                .values()
+                .all(|file| !file.staged)
+        );
+
+        click(window, "stage-group:false");
+        files.read_with(window, |files, _| {
+            assert_eq!(files.changes_by_root[&root].intents().len(), 2)
+        });
+        window.executor().advance_clock(Duration::from_millis(100));
+        until(window, &|window| {
+            files.read_with(window, |files, cx| {
+                !files.changes_by_root[&root].busy()
+                    && files.changes.as_ref().unwrap().read(cx).staged_count() == 2
+            })
+        });
+        assert!(
+            workspace_diff::inventory(&root)
+                .unwrap()
+                .sources
+                .values()
+                .all(|file| file.staged)
+        );
+    }
+
+    #[gpui::test]
+    fn document_tab_context_closes_around_the_clicked_tab(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let paths = ["first.rs", "keep.toml", "third.go", "fourth.txt"].map(|name| {
+            let path = root.join(name);
+            std::fs::write(&path, "content").unwrap();
+            path.to_string_lossy().into_owned()
+        });
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(size(px(1200.), px(720.)));
+        files.update(window, |files, cx| {
+            files.set_root(root.to_owned(), cx);
+            for path in &paths {
+                files.open(path.clone(), cx);
+            }
+        });
+        let tab = files.read_with(window, |files, _| files.documents[1].id);
+        let tab_selector: &'static str =
+            Box::leak(format!("glass-closable-tab:{tab}").into_boxed_str());
+        let action = |window: &mut gpui::VisualTestContext, selector| {
+            window.run_until_parked();
+            let position = window.debug_bounds(tab_selector).unwrap().center();
+            window.simulate_mouse_down(position, gpui::MouseButton::Right, Default::default());
+            window.run_until_parked();
+            let menu = window.debug_bounds(selector).unwrap();
+            window.simulate_click(menu.center(), Default::default());
+            window.run_until_parked();
+        };
+        action(window, "project-tab-close-right");
+        files.read_with(window, |files, _| {
+            assert_eq!(files.documents.len(), 2);
+            assert_eq!(files.documents[files.active.unwrap()].id, tab);
+        });
+        files.update(window, |files, cx| files.open(paths[2].clone(), cx));
+        action(window, "project-tab-close-left");
+        files.read_with(window, |files, _| {
+            assert_eq!(files.documents.len(), 2);
+            assert_eq!(files.documents[0].id, tab);
+            assert_eq!(files.documents[files.active.unwrap()].path, paths[2]);
+        });
+        action(window, "project-tab-close-others");
+        files.read_with(window, |files, _| {
+            assert_eq!(files.documents.len(), 1);
+            assert_eq!(files.documents[files.active.unwrap()].id, tab);
+        });
+    }
+
+    #[gpui::test]
+    fn project_explorer_divider_resizes_the_sidebar(cx: &mut gpui::TestAppContext) {
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(size(px(1100.), px(720.)));
+        window.run_until_parked();
+        let width = |window: &mut gpui::VisualTestContext| {
+            window
+                .debug_bounds("project-explorer-sidebar")
+                .unwrap()
+                .size
+                .width
+        };
+        let before = width(window);
+        let start = window
+            .debug_bounds("project-explorer-resize")
+            .unwrap()
+            .center();
+        let end = gpui::point(start.x + px(150.), start.y);
+        window.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+        window.simulate_mouse_move(end, gpui::MouseButton::Left, Default::default());
+        window.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+        window.run_until_parked();
+        assert_eq!(width(window), before + px(150.));
+        files.read_with(window, |files, _| assert!(files.explorer_resize.is_none()));
+        window.simulate_resize(size(px(650.), px(720.)));
+        window.run_until_parked();
+        assert!(width(window) <= px(650. - DOCUMENT_MIN_WIDTH - EXPLORER_DIVIDER_WIDTH));
+    }
 
     #[gpui::test]
     #[ignore = "requires Go and gopls on PATH"]
@@ -1827,6 +2331,66 @@ mod tests {
     }
 
     #[gpui::test]
+    fn project_changes_opens_and_resolves_one_conflict(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let repo = crate::merge_conflicts::tests::vendor_update(1, 2);
+        let root = repo.path().canonicalize().unwrap();
+        let path = root.join("冲突 [1].txt");
+        let path = path.to_string_lossy();
+        let git = workspace_diff::tests::git_ok;
+        git(&root, &["add", "vendor/tracked/0.go"]);
+
+        let (files, window) = cx.add_window_view(|_, cx| ProjectFiles::new(cx));
+        window.simulate_resize(gpui::size(px(1100.), px(900.)));
+        files.update(window, |files, cx| {
+            files.set_root(root.clone(), cx);
+            files.show_changes(cx);
+        });
+        let wait_for = |window: &mut gpui::VisualTestContext, selector: &'static str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                if let Some(bounds) = window.debug_bounds(selector) {
+                    return bounds.center();
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {selector}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let selector = Box::leak(format!("change-file:{path}:false").into_boxed_str());
+        let row = wait_for(window, selector);
+        let checkbox = Box::leak(format!("stage-file:{path}:false").into_boxed_str());
+        assert!(window.debug_bounds(checkbox).is_none());
+        files.update(window, |files, cx| {
+            files
+                .commit_entry
+                .as_ref()
+                .unwrap()
+                .update(cx, |entry, cx| {
+                    entry.set_value("Resolve merge", cx);
+                });
+            assert!(!files.can_commit_changes(cx));
+        });
+        window.simulate_click(row, Default::default());
+        let theirs = wait_for(window, "merge-choice:0:1");
+        window.simulate_click(theirs, Default::default());
+        let save = wait_for(window, "save-merge-conflict");
+        window.simulate_click(save, Default::default());
+
+        wait_for(
+            window,
+            Box::leak(format!("change-file:{path}:true").into_boxed_str()),
+        );
+        assert!(window.debug_bounds(selector).is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("冲突 [1].txt")).unwrap(),
+            "theirs\n"
+        );
+        let inventory = workspace_diff::inventory(&root).unwrap();
+        assert_eq!(inventory.conflict_labels, ["vendor/group_1/conflict-1.go"]);
+    }
+
+    #[gpui::test]
     fn project_changes_tab_commits_the_index(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
@@ -1967,10 +2531,10 @@ mod tests {
         std::fs::write(root.join("logo.png"), [0u8, 1, 2, 3]).unwrap();
         git(&["add", "logo.png"]);
 
-        let rows = change_rows(&root).unwrap();
+        let rows = ChangeSnapshot::read(&root).unwrap().rows();
         let find = |label: &str| {
             rows.iter().find_map(|row| match row {
-                ChangeRow::File {
+                gpui_glint::components::ChangeRow::File {
                     label: row_label,
                     additions,
                     deletions,

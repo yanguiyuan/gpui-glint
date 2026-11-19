@@ -576,13 +576,16 @@ pub fn aggregate_records_excluding(
 }
 
 pub fn language(path: &Path) -> &'static str {
+    if gpui_glint::syntax::is_ignore_file(&path.to_string_lossy()) {
+        return "ignore";
+    }
     match path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
     {
         "rs" => "rust",
-        "js" => "javascript",
+        "js" | "jsx" => "javascript",
         "ts" | "tsx" => "typescript",
         "html" => "html",
         "css" => "css",

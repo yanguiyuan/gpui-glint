@@ -296,6 +296,14 @@ impl AgentWorkspace {
             },
         )
         .detach();
+        let project = root.clone();
+        cx.subscribe(
+            &terminal,
+            move |this, _, event: &terminal_ui::OpenFile, cx| {
+                this.open_terminal_output(&project, event, cx)
+            },
+        )
+        .detach();
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         self.select_terminal_tab(root.clone(), terminal.entity_id());
         self.project_actions

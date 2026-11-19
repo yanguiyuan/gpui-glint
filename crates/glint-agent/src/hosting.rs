@@ -46,7 +46,7 @@ impl AgentWorkspace {
             files.set_visible(page == Page::Projects, cx)
         });
         self.page = page;
-        self.project_picker_open = false;
+        self.workspace_picker = None;
         self.git_ui.picker_open = false;
         match page {
             Page::Projects => {
@@ -166,11 +166,15 @@ mod tests {
                 page == Page::Chat
             );
             assert_eq!(
+                window.debug_bounds("agent-topbar-session").is_some(),
+                page == Page::Chat
+            );
+            assert_eq!(
                 window.debug_bounds("agent-topbar-search").is_some(),
                 matches!(page, Page::Chat | Page::Settings)
             );
             assert_eq!(
-                window.debug_bounds("agent-topbar-provider").is_some(),
+                window.debug_bounds("chat-partner").is_some(),
                 page == Page::Chat
             );
         }

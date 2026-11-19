@@ -41,6 +41,7 @@ pub enum WorktreeDialog {
 }
 pub(super) struct CommitDiff {
     pub(super) commit: String,
+    pub(super) base: Option<String>,
     pub(super) path: String,
     pub(super) card: Option<Entity<DiffCard>>,
     pub(super) error: Option<String>,
@@ -50,9 +51,17 @@ impl CommitDiff {
     pub(super) fn new(commit: String, path: String) -> Self {
         Self {
             commit,
+            base: None,
             path,
             card: None,
             error: None,
+        }
+    }
+
+    pub(super) fn against_worktree(base: String, path: String) -> Self {
+        Self {
+            base: Some(base),
+            ..Self::new("工作区".into(), path)
         }
     }
 
@@ -61,8 +70,14 @@ impl CommitDiff {
         root: PathBuf,
     ) -> Result<provider::Job<Vec<gpui_glint::components::DiffLine>>, String> {
         let commit = self.commit.clone();
+        let base = self.base.clone();
         let path = self.path.clone();
-        provider::Job::start(async move { git_project::file_diff(&root, &commit, &path).await })
+        provider::Job::start(async move {
+            match base {
+                Some(base) => git_project::branch_file_diff(&root, &base, &path).await,
+                None => git_project::file_diff(&root, &commit, &path).await,
+            }
+        })
     }
 
     pub(super) fn set_result(
@@ -74,20 +89,7 @@ impl CommitDiff {
     ) {
         match result {
             Ok(lines) => {
-                let language = match std::path::Path::new(&self.path)
-                    .extension()
-                    .and_then(|s| s.to_str())
-                {
-                    Some("rs") => "rust",
-                    Some("go") => "go",
-                    Some("js" | "jsx") => "javascript",
-                    Some("ts" | "tsx") => "typescript",
-                    Some("py") => "python",
-                    Some("json") => "json",
-                    Some("html") => "html",
-                    Some("css") => "css",
-                    _ => "text",
-                };
+                let language = crate::edits::language(std::path::Path::new(&self.path));
                 self.card = Some(cx.new(|cx| {
                     DiffCard::from_lines(cx, language, lines)
                         .path(self.path.clone())
@@ -116,8 +118,12 @@ impl State {
                 }
                 GitGraphEvent::SelectCommit(id) => this.load_git_commit(id.clone(), cx),
                 GitGraphEvent::OpenFile { commit, path } => {
-                    this.open_git_file(commit.clone(), path.clone(), cx)
+                    this.open_git_file(CommitDiff::new(commit.clone(), path.clone()), cx)
                 }
+                GitGraphEvent::OpenComparedFile { base, path } => {
+                    this.open_git_file(CommitDiff::against_worktree(base.clone(), path.clone()), cx)
+                }
+                GitGraphEvent::RefreshFiles => this.load_git_graph(false, cx),
                 GitGraphEvent::Refresh => {
                     this.refresh_git_repository(true, cx);
                     this.refresh_git_graph(cx);
@@ -603,7 +609,7 @@ impl AgentWorkspace {
                         this.git_ui.picker_open = open;
                         this.git_ui.worktree_actions = None;
                         if open {
-                            this.project_picker_open = false;
+                            this.workspace_picker = None;
                             this.refresh_git_repository(true, cx);
                         }
                         cx.notify();
@@ -1034,13 +1040,12 @@ impl AgentWorkspace {
         self.git_ui.diff_revision += 1;
         cx.notify();
     }
-    fn open_git_file(&mut self, commit: String, path: String, cx: &mut Context<Self>) {
+    fn open_git_file(&mut self, diff: CommitDiff, cx: &mut Context<Self>) {
         let Some(root) = self.history.active().project.clone() else {
             return;
         };
         self.git_ui.diff_revision += 1;
         let revision = self.git_ui.diff_revision;
-        let diff = CommitDiff::new(commit, path);
         let job = diff.load(root);
         self.git_ui.diff = Some(diff);
         let job = match job {
@@ -1117,10 +1122,14 @@ impl AgentWorkspace {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(rgb(p.text_muted))
-                                    .child(format!(
-                                        "{} · 提交改动",
-                                        diff.commit.chars().take(12).collect::<String>()
-                                    )),
+                                    .child(if diff.base.is_some() {
+                                        "工作区文件差异".to_owned()
+                                    } else {
+                                        format!(
+                                            "{} · 提交改动",
+                                            diff.commit.chars().take(12).collect::<String>()
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -1380,6 +1389,7 @@ mod tests {
             });
             host.git_ui.diff = Some(CommitDiff {
                 commit: "abcdef1234".into(),
+                base: None,
                 path: "src/main.rs".into(),
                 card: None,
                 error: Some("binary preview unavailable".into()),

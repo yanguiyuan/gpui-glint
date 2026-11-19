@@ -2,6 +2,43 @@
 use super::{TokenKind, tokens};
 use std::{collections::BTreeMap, ops::Range};
 
+pub(super) fn ignore_file(source: &str) -> Vec<(Range<usize>, TokenKind)> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    let mut plain_start = 0;
+    for line in source.split_inclusive('\n') {
+        let pattern = line.trim_end_matches(['\r', '\n']);
+        if pattern.starts_with('#') {
+            if plain_start < offset {
+                tokens.push((plain_start..offset, TokenKind::Plain));
+            }
+            plain_start = offset + pattern.len();
+            tokens.push((offset..plain_start, TokenKind::Comment));
+        } else {
+            let mut chars = pattern.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                let kind = match ch {
+                    '!' if index == 0 => TokenKind::Key,
+                    '*' | '?' | '[' | ']' => TokenKind::Type,
+                    '\\' if chars.next().is_some() => TokenKind::String,
+                    _ => continue,
+                };
+                let start = offset + index;
+                if plain_start < start {
+                    tokens.push((plain_start..start, TokenKind::Plain));
+                }
+                plain_start = offset + chars.peek().map_or(pattern.len(), |(index, _)| *index);
+                tokens.push((start..plain_start, kind));
+            }
+        }
+        offset += line.len();
+    }
+    if plain_start < source.len() {
+        tokens.push((plain_start..source.len(), TokenKind::Plain));
+    }
+    tokens
+}
+
 pub(super) fn markdown(source: &str) -> Vec<(Range<usize>, TokenKind)> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
     let mut spans = Vec::new();
@@ -1140,6 +1177,33 @@ mod tests {
             offset = range.end;
         }
         assert_eq!(offset, source.len());
+    }
+
+    #[test]
+    fn ignore_files_highlight_pattern_operators_without_losing_source_bytes() {
+        let source =
+            "# 注释\r\n!src/**/文件?.[ch]\n\\#literal\n\\!literal\npath#literal\n\\*literal";
+        let ranges = tokens(source, "ignore");
+        check(source, &ranges);
+        for (part, kind) in [
+            ("# 注释", TokenKind::Comment),
+            ("!", TokenKind::Key),
+            ("?", TokenKind::Type),
+            ("[", TokenKind::Type),
+            ("\\#", TokenKind::String),
+            ("\\!", TokenKind::String),
+            ("\\*", TokenKind::String),
+        ] {
+            assert!(
+                ranges
+                    .iter()
+                    .any(|(range, token)| &source[range.clone()] == part && *token == kind),
+                "{part}"
+            );
+        }
+        assert!(ranges.iter().any(|(range, token)| {
+            source[range.clone()].contains("path#literal") && *token == TokenKind::Plain
+        }));
     }
     #[test]
     fn makefile_highlights_rules_assignments_functions_and_recipes() {

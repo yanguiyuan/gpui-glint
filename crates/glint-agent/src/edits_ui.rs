@@ -1,9 +1,11 @@
 use super::*;
 use crate::edits::Change;
 use gpui::{Animation, AnimationExt};
+use gpui_glint::components::ChangeNavigationEvent;
 use gpui_glint::components::{
-    ChainScroll, CodeCard, CodeCardEvent, Dialog, DiffCard, DiffCardEvent, DiffColors, MenuItem,
-    PromptEditor, Scrollbar, ScrollbarState, Skeleton, Tooltip,
+    ChainScroll, ChangeNavigation, ChangeRow, ChangeStatus, CodeCard, CodeCardEvent, Dialog,
+    DiffCard, DiffCardEvent, DiffColors, MenuItem, PromptEditor, Scrollbar, ScrollbarState,
+    Skeleton, Tooltip,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -13,6 +15,35 @@ use std::{
 };
 
 type ListLink = Rc<RefCell<Option<(gpui::ListState, usize)>>>;
+
+fn change_file_label(label: &str, tree: bool) -> String {
+    if tree {
+        label.rsplit('/').next().unwrap_or(label).to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+fn change_directory(row: &crate::workspace_tree::Row, staged: Option<bool>) -> ChangeRow {
+    let crate::workspace_tree::Row::Directory {
+        path,
+        label,
+        depth,
+        count,
+        collapsed,
+    } = row
+    else {
+        unreachable!("expected a change directory")
+    };
+    ChangeRow::Directory {
+        path: path.clone(),
+        label: label.clone(),
+        depth: *depth,
+        count: *count,
+        collapsed: *collapsed,
+        staged,
+    }
+}
 
 fn file_status_style(
     status: crate::workspace_diff::FileStatus,
@@ -180,7 +211,7 @@ pub struct State {
     file_action_task: Option<Task<()>>,
     detail_scrolls: RefCell<HashMap<String, ScrollHandle>>,
     detail_scrollbars: RefCell<HashMap<String, ScrollbarState>>,
-    navigation_scroll: gpui::UniformListScrollHandle,
+    navigation: RefCell<Option<(String, Entity<ChangeNavigation>)>>,
     pub(super) navigation_width: Option<f32>,
     pub(super) navigation_resize: Option<(gpui::Pixels, f32)>,
     pub(super) navigation_maximum: Cell<f32>,
@@ -516,59 +547,30 @@ impl AgentWorkspace {
         else {
             unreachable!()
         };
-        let p = self.theme.palette();
         let path = path.clone();
         let scope = scope.to_owned();
-        let selector = format!("conflict-directory:{path}");
-        div()
-            .id(SharedString::from(format!("{scope}:{path}")))
-            .debug_selector(move || selector.clone())
-            .w_full()
-            .h(px(34.))
-            .pr_3()
-            .pl(px(12. + *depth as f32 * 16.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(p.surface_subtle)))
-            .child(
-                if *collapsed {
-                    Icon::ChevronRight
-                } else {
-                    Icon::ChevronDown
-                }
-                .render(12.),
-            )
-            .child(Icon::Folder.render(14.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.))
-                    .child(label.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(rgb(p.text_muted))
-                    .child(count.to_string()),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let collapsed = this
-                    .edits_ui
-                    .collapsed_directories
-                    .entry(scope.clone())
-                    .or_default();
-                if !collapsed.remove(&path) {
-                    collapsed.insert(path.clone());
-                }
-                this.edits_ui.conflict_tree_cache.borrow_mut().take();
-                this.edits_ui.grouped_list.borrow_mut().take();
-                cx.notify();
-            }))
-            .into_any_element()
+        ChangeNavigation::directory_element(
+            format!("conflict-directory:{path}"),
+            label.clone(),
+            *depth,
+            *count,
+            *collapsed,
+            self.theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let collapsed = this
+                .edits_ui
+                .collapsed_directories
+                .entry(scope.clone())
+                .or_default();
+            if !collapsed.remove(&path) {
+                collapsed.insert(path.clone());
+            }
+            this.edits_ui.conflict_tree_cache.borrow_mut().take();
+            this.edits_ui.grouped_list.borrow_mut().take();
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     pub(super) fn open_workspace_diff(&mut self, cx: &mut Context<Self>) {
@@ -1218,7 +1220,7 @@ impl AgentWorkspace {
             .child(list)
     }
 
-    pub fn edits_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub fn edits_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let workspace_mode = self.edits_ui.workspace_mode;
         let root_matches = self.edits_ui.workspace_root == self.diff_repository_root();
@@ -1337,7 +1339,7 @@ impl AgentWorkspace {
             }
         }
         if grouped && !self.edits_ui.expanded {
-            list = self.grouped_workspace_files(files.clone(), scope.clone(), cx);
+            list = self.compact_workspace_files(files.clone(), scope.clone(), cx);
         }
         let workspace_status = if !workspace_mode {
             None
@@ -1583,7 +1585,7 @@ impl AgentWorkspace {
             && self.edits_ui.conflicts.is_empty()
             && self.edits_ui.workspace_task.is_some();
         if self.edits_ui.expanded && !loading_files {
-            list = self.expanded_edit_files(files, scope, can_undo, root_matches, cx);
+            list = self.expanded_edit_files(files, scope, can_undo, root_matches, window, cx);
         }
         if loading_files {
             list = list.child(
@@ -1624,57 +1626,128 @@ impl AgentWorkspace {
         scope: String,
         can_undo: bool,
         root_matches: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.edits_ui.workspace_mode
-            && root_matches
-            && !self.edits_ui.workspace_sources.is_empty()
-        {
-            return self.grouped_workspace_files(files, scope, cx);
-        }
         use crate::workspace_tree::Row;
         let p = self.theme.palette();
         let tree = self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree;
-        let rows = if tree {
-            let mut cache = self.edits_ui.tree_cache.borrow_mut();
-            if cache
-                .as_ref()
-                .is_none_or(|(key, cached, _)| key != &scope || !Rc::ptr_eq(cached, &files))
+        let grouped = self.edits_ui.workspace_mode
+            && root_matches
+            && (!self.edits_ui.workspace_sources.is_empty() || !self.edits_ui.conflicts.is_empty());
+        let conflicts = if grouped {
+            self.edits_ui.conflicts.as_slice()
+        } else {
+            &[]
+        };
+        let mut rows = Vec::new();
+        if !conflicts.is_empty() {
+            rows.push(ChangeRow::Group {
+                title: "待解决冲突".into(),
+                count: conflicts.len(),
+                staged: None,
+            });
+            for row in self
+                .conflict_rows(conflicts, &format!("{scope}:conflicts"), cx)
+                .iter()
             {
-                let empty = Default::default();
-                let collapsed = self
-                    .edits_ui
-                    .collapsed_directories
-                    .get(&scope)
-                    .unwrap_or(&empty);
-                *cache = Some((
-                    scope.clone(),
-                    files.clone(),
-                    Rc::new(crate::workspace_tree::rows(&files, collapsed)),
-                ));
+                match row {
+                    Row::File { index, depth } => {
+                        let file = &conflicts[*index].read(cx).file;
+                        rows.push(ChangeRow::File {
+                            path: file.path.to_string_lossy().into_owned(),
+                            label: change_file_label(&file.label, tree),
+                            depth: *depth,
+                            status: Some(ChangeStatus::Conflict),
+                            staged: false,
+                            additions: None,
+                            deletions: None,
+                            binary: false,
+                        });
+                    }
+                    directory => rows.push(change_directory(directory, None)),
+                }
             }
-            cache.as_ref().unwrap().2.clone()
+        }
+        if grouped {
+            for row in self.git_group_rows(files.clone(), &scope).iter() {
+                rows.push(match row {
+                    GitRow::Group(staged, count) => ChangeRow::Group {
+                        title: if *staged { "已暂存" } else { "未暂存" }.into(),
+                        count: *count,
+                        staged: Some(*staged),
+                    },
+                    GitRow::Directory(staged, row) => change_directory(row, Some(*staged)),
+                    GitRow::File(staged, index, depth) => {
+                        let file = &files[*index];
+                        let source = &self.edits_ui.workspace_sources[&file.path];
+                        let stats = source.layer_stats(*staged);
+                        ChangeRow::File {
+                            path: file.path.to_string_lossy().into_owned(),
+                            label: change_file_label(&file.label, tree),
+                            depth: *depth,
+                            status: Some(source.layer_status(*staged).into()),
+                            staged: *staged,
+                            additions: stats.map(|(added, _)| added),
+                            deletions: stats.map(|(_, removed)| removed),
+                            binary: source.stats_ready && stats.is_none(),
+                        }
+                    }
+                });
+            }
         } else {
-            Rc::new(
-                (0..files.len())
-                    .map(|index| Row::File { index, depth: 0 })
-                    .collect(),
-            )
-        };
-        let conflicts = if self.edits_ui.workspace_mode && root_matches {
-            self.edits_ui.conflicts.clone()
-        } else {
-            Vec::new()
-        };
+            let tree_rows = if tree {
+                let mut cache = self.edits_ui.tree_cache.borrow_mut();
+                if cache
+                    .as_ref()
+                    .is_none_or(|(key, cached, _)| key != &scope || !Rc::ptr_eq(cached, &files))
+                {
+                    let empty = Default::default();
+                    let collapsed = self
+                        .edits_ui
+                        .collapsed_directories
+                        .get(&scope)
+                        .unwrap_or(&empty);
+                    *cache = Some((
+                        scope.clone(),
+                        files.clone(),
+                        Rc::new(crate::workspace_tree::rows(&files, collapsed)),
+                    ));
+                }
+                cache.as_ref().unwrap().2.clone()
+            } else {
+                Rc::new(
+                    (0..files.len())
+                        .map(|index| Row::File { index, depth: 0 })
+                        .collect(),
+                )
+            };
+            rows.extend(tree_rows.iter().map(|row| match row {
+                Row::File { index, depth } => {
+                    let file = &files[*index];
+                    ChangeRow::File {
+                        path: file.path.to_string_lossy().into_owned(),
+                        label: change_file_label(&file.label, tree),
+                        depth: *depth,
+                        status: None,
+                        staged: false,
+                        additions: Some(file.added),
+                        deletions: Some(file.removed),
+                        binary: false,
+                    }
+                }
+                directory => change_directory(directory, None),
+            }));
+        }
         let selected = self
             .edits_ui
             .selected
             .as_ref()
             .filter(|path| {
-                files.iter().any(|file| &file.path == *path)
-                    || conflicts
-                        .iter()
-                        .any(|view| &view.read(cx).file.path == *path)
+                conflicts
+                    .iter()
+                    .any(|view| &view.read(cx).file.path == *path)
+                    || files.iter().any(|file| &file.path == *path)
             })
             .cloned()
             .or_else(|| {
@@ -1683,6 +1756,27 @@ impl AgentWorkspace {
                     .map(|view| view.read(cx).file.path.clone())
             })
             .or_else(|| files.first().map(|file| file.path.clone()));
+        let selected_layer = selected
+            .as_ref()
+            .filter(|_| grouped)
+            .and_then(|path| self.edits_ui.workspace_sources.get(path))
+            .is_some_and(|source| {
+                if self.edits_ui.selected_staged {
+                    source.staged
+                } else {
+                    !source.unstaged
+                }
+            });
+        let navigation = self.expanded_change_navigation(
+            &scope,
+            rows,
+            selected
+                .as_ref()
+                .map(|path| (path.to_string_lossy().into_owned(), selected_layer)),
+            grouped,
+            window,
+            cx,
+        );
         let mut detail_bar = None;
         let mut conflict_header = None;
         let mut detail = div()
@@ -1692,64 +1786,69 @@ impl AgentWorkspace {
             .min_w_0()
             .min_h_0()
             .overflow_y_scroll();
-        if let Some(path) = &selected {
-            let scroll_key = format!("{scope}:{}", path.display());
-            let scroll = self
-                .edits_ui
-                .detail_scrolls
-                .borrow_mut()
-                .entry(scroll_key.clone())
-                .or_default()
-                .clone();
-            let state = self
-                .edits_ui
-                .detail_scrollbars
-                .borrow_mut()
-                .entry(scroll_key)
-                .or_default()
-                .clone();
-            detail_bar = Some(
-                Scrollbar::vertical(&scroll, &state)
-                    .theme(self.theme)
-                    .render()
-                    .debug_selector(|| "diff-detail-vertical-scrollbar".into())
-                    .absolute()
-                    .right_0()
-                    .top_0(),
-            );
-            detail = detail.track_scroll(&scroll).pr(px(12.));
+        if let Some(path) = selected.as_ref() {
             if let Some(view) = conflicts
                 .iter()
                 .find(|view| &view.read(cx).file.path == path)
             {
+                let scroll_key = format!("{scope}:{}", path.display());
+                let scroll = self
+                    .edits_ui
+                    .detail_scrolls
+                    .borrow_mut()
+                    .entry(scroll_key.clone())
+                    .or_default()
+                    .clone();
+                let state = self
+                    .edits_ui
+                    .detail_scrollbars
+                    .borrow_mut()
+                    .entry(scroll_key)
+                    .or_default()
+                    .clone();
+                detail_bar = Some(
+                    Scrollbar::vertical(&scroll, &state)
+                        .theme(self.theme)
+                        .render()
+                        .debug_selector(|| "diff-detail-vertical-scrollbar".into())
+                        .absolute()
+                        .right_0()
+                        .top_0(),
+                );
+                detail = detail.track_scroll(&scroll).pr(px(12.));
                 view.update(cx, |view, cx| {
                     view.reveal(scroll.clone(), self.edits_ui.reveal_revision, cx);
-                    if view.tree_depth.take().is_some() {
+                    if view.tree_depth.take().is_some()
+                        || !view.expanded
+                        || view.theme != self.theme
+                    {
                         cx.notify();
                     }
                     view.list_link.borrow_mut().take();
-                    if !view.expanded {
-                        view.expanded = true;
-                        cx.notify();
-                    }
-                    if view.theme != self.theme {
-                        view.theme = self.theme;
-                        view.editor
-                            .update(cx, |editor, cx| editor.set_theme(self.theme, cx));
-                    }
+                    view.expanded = true;
+                    view.theme = self.theme;
+                    view.editor
+                        .update(cx, |editor, cx| editor.set_theme(self.theme, cx));
                 });
                 conflict_header = Some(view.read(cx).file_header());
                 detail = detail.child(view.clone());
             } else if let Some(file) = files.iter().find(|file| &file.path == path) {
-                detail_bar = None;
+                let group_scope = if grouped {
+                    format!(
+                        "{scope}:{}",
+                        if selected_layer { "staged" } else { "unstaged" }
+                    )
+                } else {
+                    scope.clone()
+                };
                 detail = detail
                     .overflow_hidden()
-                    .pr_0()
                     .flex()
                     .flex_col()
-                    .child(self.file_row(file, &scope, None, None, can_undo, false, cx));
+                    .child(self.file_row(file, &group_scope, None, None, can_undo, false, cx));
             }
-        } else {
+        }
+        if selected.is_none() {
             detail = detail.child(
                 div()
                     .p_4()
@@ -1758,281 +1857,13 @@ impl AgentWorkspace {
             );
         }
         if self.edits_ui.workspace_mode {
-            detail = detail.children(self.edits_ui.workspace_notes.iter().map(|note| {
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_size(px(11.))
-                    .text_color(rgb(p.text_muted))
-                    .child(note.clone())
-            }));
+            detail = detail.children(
+                self.edits_ui
+                    .workspace_notes
+                    .iter()
+                    .map(|note| div().px_3().text_size(px(11.)).child(note.clone())),
+            );
         }
-        let conflict_scope = format!("{scope}:conflicts");
-        let conflict_rows = self.conflict_rows(&conflicts, &conflict_scope, cx);
-        let prefix = if conflicts.is_empty() {
-            0
-        } else {
-            conflict_rows.len() + 1
-        };
-        let tracked_header = usize::from(prefix > 0 && !rows.is_empty());
-        let count = prefix + tracked_header + rows.len();
-        let navigation_files = files.clone();
-        let navigation = gpui::uniform_list(
-            "expanded-diff-files",
-            count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                range
-                    .map(|index| {
-                        if prefix > 0 && index == 0 {
-                            return div()
-                                .w_full()
-                                .h(px(34.))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(Icon::GitConflict.render(13.))
-                                .child(format!("冲突 · {}", conflicts.len()))
-                                .into_any_element();
-                        }
-                        if tracked_header > 0 && index == prefix {
-                            return div()
-                                .w_full()
-                                .h(px(34.))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("文件变更 · {}", navigation_files.len()))
-                                .into_any_element();
-                        }
-                        let (path, label, depth, icon, counts) = if index < prefix {
-                            let (file_index, depth) = match &conflict_rows[index - 1] {
-                                Row::Directory { .. } => {
-                                    return this.conflict_directory_row(
-                                        &conflict_rows[index - 1],
-                                        &conflict_scope,
-                                        cx,
-                                    );
-                                }
-                                Row::File { index, depth } => (*index, *depth),
-                            };
-                            let file = &conflicts[file_index].read(cx).file;
-                            let label = if tree {
-                                file.label
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(&file.label)
-                                    .to_owned()
-                            } else {
-                                file.label.clone()
-                            };
-                            (
-                                file.path.clone(),
-                                label,
-                                depth,
-                                Icon::GitConflict,
-                                conflict_status_style(file.kind(), this.theme).0.to_owned(),
-                            )
-                        } else {
-                            match &rows[index - prefix - tracked_header] {
-                                Row::Directory {
-                                    path,
-                                    label,
-                                    depth,
-                                    count,
-                                    collapsed,
-                                } => {
-                                    let path = path.clone();
-                                    let directory_scope = scope.clone();
-                                    let selector = format!("diff-navigation-directory:{path}");
-                                    return div()
-                                        .id(SharedString::from(format!(
-                                            "diff-directory:{scope}:{path}"
-                                        )))
-                                        .debug_selector(move || selector.clone())
-                                        .w_full()
-                                        .h(px(34.))
-                                        .pr_3()
-                                        .pl(px(10. + *depth as f32 * 16.))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgb(p.surface_subtle)))
-                                        .child(
-                                            if *collapsed {
-                                                Icon::ChevronRight
-                                            } else {
-                                                Icon::ChevronDown
-                                            }
-                                            .render(12.),
-                                        )
-                                        .child(Icon::Folder.render(14.))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(12.))
-                                                .child(label.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .text_color(rgb(p.text_muted))
-                                                .child(count.to_string()),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let collapsed = this
-                                                .edits_ui
-                                                .collapsed_directories
-                                                .entry(directory_scope.clone())
-                                                .or_default();
-                                            if !collapsed.remove(&path) {
-                                                collapsed.insert(path.clone());
-                                            }
-                                            this.edits_ui.tree_cache.borrow_mut().take();
-                                            cx.notify();
-                                        }))
-                                        .into_any_element();
-                                }
-                                Row::File { index, depth } => {
-                                    let file = &navigation_files[*index];
-                                    let label = if tree {
-                                        file.label
-                                            .rsplit('/')
-                                            .next()
-                                            .unwrap_or(&file.label)
-                                            .to_owned()
-                                    } else {
-                                        file.label.clone()
-                                    };
-                                    (
-                                        file.path.clone(),
-                                        label,
-                                        *depth,
-                                        Icon::for_language(edits::language(&file.path)),
-                                        format!("+{} −{}", file.added, file.removed),
-                                    )
-                                }
-                            }
-                        };
-                        let menu_path = path.clone();
-                        let menu_label = navigation_files
-                            .iter()
-                            .find(|file| file.path == path)
-                            .map(|file| file.label.clone())
-                            .or_else(|| {
-                                conflicts.iter().find_map(|view| {
-                                    let file = &view.read(cx).file;
-                                    (file.path == path).then(|| file.label.clone())
-                                })
-                            })
-                            .unwrap_or_else(|| label.clone());
-                        let selector = format!("diff-navigation-file:{}", path.display());
-                        let active = selected.as_ref() == Some(&path);
-                        let status = if index < prefix {
-                            let Row::File { index, .. } = &conflict_rows[index - 1] else {
-                                unreachable!()
-                            };
-                            Some(conflict_status_style(
-                                conflicts[*index].read(cx).file.kind(),
-                                this.theme,
-                            ))
-                        } else {
-                            this.edits_ui
-                                .workspace_sources
-                                .get(&path)
-                                .map(|source| file_status_style(source.status, this.theme))
-                        };
-                        let color = status.map_or(p.text_muted, |(_, color)| color);
-                        let marker = format!("selected-conflict-file:{}", path.display());
-                        div()
-                            .relative()
-                            .id(SharedString::from(selector.clone()))
-                            .debug_selector(move || selector.clone())
-                            .w_full()
-                            .h(px(34.))
-                            .pr_3()
-                            .pl(px(26. + depth as f32 * 16.))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .when(active, |row| {
-                                row.bg(rgb(p.accent_tint))
-                                    .text_color(rgb(p.accent))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .when(index < prefix, |row| {
-                                        row.child(
-                                            div()
-                                                .absolute()
-                                                .left_0()
-                                                .top(px(6.))
-                                                .bottom(px(6.))
-                                                .w(px(3.))
-                                                .rounded(px(2.))
-                                                .bg(rgb(p.accent))
-                                                .debug_selector(move || marker.clone()),
-                                        )
-                                    })
-                            })
-                            .when(!active, |row| {
-                                row.hover(|style| style.bg(rgb(p.surface_subtle)))
-                            })
-                            .child(
-                                icon.render(14.)
-                                    .flex_shrink_0()
-                                    .when(status.is_some(), |icon| icon.text_color(rgb(color))),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .when(status.is_some(), |label| label.text_color(rgb(color)))
-                                    .child(label),
-                            )
-                            .when_some(status.filter(|_| index >= prefix), |row, (label, _)| {
-                                row.child(
-                                    div().text_size(px(10.)).text_color(rgb(color)).child(label),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(color))
-                                    .child(counts),
-                            )
-                            .on_mouse_down(
-                                gpui::MouseButton::Right,
-                                cx.listener(
-                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                        this.open_diff_file_menu(
-                                            menu_path.clone(),
-                                            menu_label.clone(),
-                                            event.position,
-                                            window,
-                                            cx,
-                                        );
-                                    },
-                                ),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edits_ui.selected = Some(path.clone());
-                                this.edits_ui.reveal_revision += 1;
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .size_full()
-        .track_scroll(&self.edits_ui.navigation_scroll);
         let weak = cx.entity().downgrade();
         div()
             .on_children_prepainted(move |bounds, _, cx| {
@@ -2099,8 +1930,161 @@ impl AgentWorkspace {
                     ),
             )
     }
+    fn expanded_change_navigation(
+        &self,
+        scope: &str,
+        rows: Vec<ChangeRow>,
+        selected: Option<(String, bool)>,
+        grouped: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChangeNavigation> {
+        let mut cached = self.edits_ui.navigation.borrow_mut();
+        let navigation = match cached.as_ref() {
+            Some((key, navigation)) if key == scope => navigation.clone(),
+            _ => {
+                let navigation = cx.new(|cx| {
+                    ChangeNavigation::new(cx)
+                        .stage_controls(true)
+                        .background_visible(false)
+                });
+                let scope = scope.to_owned();
+                let event_scope = scope.clone();
+                cx.subscribe_in(&navigation, window, move |this, _, event, window, cx| {
+                    this.handle_change_navigation(event, &event_scope, window, cx);
+                })
+                .detach();
+                *cached = Some((scope, navigation.clone()));
+                navigation
+            }
+        };
+        let mut blocked = std::collections::HashSet::new();
+        let mut available = [false; 2];
+        if grouped {
+            let busy = self.workspace_stage_busy();
+            for source in self.edits_ui.workspace_sources.values() {
+                if busy || source.overlaps(&self.edits_ui.stage_pending) {
+                    blocked.insert(source.path.to_string_lossy().into_owned());
+                } else {
+                    available[0] |= source.unstaged;
+                    available[1] |= source.staged;
+                }
+            }
+        }
+        navigation.update(cx, |navigation, cx| {
+            navigation.set_theme(self.theme, cx);
+            navigation.set_rows(rows, cx);
+            navigation.set_selected(selected, cx);
+            navigation.set_stage_availability(blocked, available, cx);
+        });
+        navigation
+    }
 
-    fn diff_navigation(&self, navigation: impl IntoElement, cx: &mut Context<Self>) -> gpui::Div {
+    fn handle_change_navigation(
+        &mut self,
+        event: &ChangeNavigationEvent,
+        scope: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ChangeNavigationEvent::Select { path, staged } => {
+                self.edits_ui.selected = Some(PathBuf::from(path));
+                self.edits_ui.selected_staged = *staged;
+                self.edits_ui.reveal_revision += 1;
+                cx.notify();
+            }
+            ChangeNavigationEvent::ToggleDirectory { path, staged } => {
+                let group_scope = match staged {
+                    Some(true) => format!("{scope}:staged"),
+                    Some(false) => format!("{scope}:unstaged"),
+                    None if self.edits_ui.workspace_mode && !self.edits_ui.conflicts.is_empty() => {
+                        format!("{scope}:conflicts")
+                    }
+                    None => scope.to_owned(),
+                };
+                let collapsed = self
+                    .edits_ui
+                    .collapsed_directories
+                    .entry(group_scope)
+                    .or_default();
+                if !collapsed.remove(path) {
+                    collapsed.insert(path.clone());
+                }
+                self.edits_ui.tree_cache.borrow_mut().take();
+                self.edits_ui.grouped_rows.borrow_mut().take();
+                self.edits_ui.conflict_tree_cache.borrow_mut().take();
+                self.edits_ui.grouped_list.borrow_mut().take();
+                cx.notify();
+            }
+            ChangeNavigationEvent::Stage { paths, staged } => {
+                if self.edits_ui.workspace_root != self.diff_repository_root() {
+                    return;
+                }
+                let sources = paths
+                    .iter()
+                    .filter_map(|path| {
+                        self.edits_ui
+                            .workspace_sources
+                            .get(std::path::Path::new(path))
+                    })
+                    .cloned()
+                    .collect();
+                self.stage_workspace_files(sources, *staged, cx);
+            }
+            ChangeNavigationEvent::StageGroup { staged, .. } => {
+                if self.edits_ui.workspace_root != self.diff_repository_root() {
+                    return;
+                }
+                let sources = self
+                    .edits_ui
+                    .workspace_sources
+                    .values()
+                    .filter(|source| {
+                        if *staged {
+                            source.unstaged
+                        } else {
+                            source.staged
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                self.stage_workspace_files(sources, *staged, cx);
+            }
+            ChangeNavigationEvent::Menu { path, position } => {
+                let path = PathBuf::from(path);
+                let label = if self.edits_ui.workspace_mode {
+                    self.edits_ui
+                        .conflicts
+                        .iter()
+                        .find_map(|view| {
+                            let file = &view.read(cx).file;
+                            (file.path == path).then(|| file.label.clone())
+                        })
+                        .or_else(|| {
+                            self.edits_ui
+                                .workspace_files
+                                .iter()
+                                .find(|file| file.path == path)
+                                .map(|file| file.label.clone())
+                        })
+                } else {
+                    self.session_edits()
+                        .iter()
+                        .find(|file| file.path == path)
+                        .map(|file| file.label.clone())
+                }
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                self.open_diff_file_menu(path, label, *position, window, cx);
+            }
+        }
+    }
+
+    fn diff_navigation(
+        &self,
+        navigation: Entity<ChangeNavigation>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         div()
             .debug_selector(|| "expanded-diff-navigation".into())
             .w(px(self.edits_ui.navigation_width.unwrap_or(260.)))
@@ -2114,21 +2098,7 @@ impl AgentWorkspace {
                     .debug_selector(|| "diff-navigation-tree".into())
                     .flex_1()
                     .min_h_0()
-                    .relative()
-                    .pr(px(12.))
-                    .child(navigation)
-                    .child(
-                        Scrollbar::vertical(
-                            &self.edits_ui.navigation_scroll.0.borrow().base_handle,
-                            &self.edits_ui.navigation_bar,
-                        )
-                        .theme(self.theme)
-                        .render()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .debug_selector(|| "diff-navigation-scrollbar".into()),
-                    ),
+                    .child(navigation),
             )
             .when(self.edits_ui.workspace_mode, |column| {
                 column.children(self.git_commit_footer(cx))
@@ -2355,13 +2325,10 @@ impl AgentWorkspace {
         staged: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.edits_ui.commit_task.is_some() {
+        if self.workspace_stage_busy() {
             return;
         }
         if self.edits_ui.workspace_task.is_some() {
-            if !self.edits_ui.workspace_background_refresh {
-                return;
-            }
             self.edits_ui.workspace_task = None;
             self.edits_ui.workspace_revision += 1;
             self.edits_ui.workspace_background_refresh = false;
@@ -2485,6 +2452,12 @@ impl AgentWorkspace {
         self.stage_control(StageTarget::Files(sources), checked, selector, cx)
     }
 
+    fn workspace_stage_busy(&self) -> bool {
+        self.edits_ui.commit_task.is_some()
+            || self.edits_ui.file_action_task.is_some()
+            || self.edits_ui.workspace_task.is_some() && !self.edits_ui.workspace_background_refresh
+    }
+
     fn stage_control(
         &self,
         target: StageTarget,
@@ -2505,11 +2478,7 @@ impl AgentWorkspace {
                 }) && available(source)
             }),
         };
-        let busy = self.edits_ui.commit_task.is_some()
-            || self.edits_ui.file_action_task.is_some()
-            || !any_available
-            || self.edits_ui.workspace_task.is_some()
-                && !self.edits_ui.workspace_background_refresh;
+        let busy = self.workspace_stage_busy() || !any_available;
         let mut checkbox = gpui_glint::components::Checkbox::new("")
             .checked(checked)
             .theme(self.theme);
@@ -2579,6 +2548,9 @@ impl AgentWorkspace {
                         .map(|_| i)
                 })
                 .collect();
+            if indices.is_empty() && self.edits_ui.workspace_sources.is_empty() {
+                continue;
+            }
             result.push(GitRow::Group(staged, indices.len()));
             if tree {
                 let group_scope = format!("{scope}:{}", if staged { "staged" } else { "unstaged" });
@@ -2616,28 +2588,20 @@ impl AgentWorkspace {
         link: Option<(gpui::ListState, usize)>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let p = self.theme.palette();
         match row {
-            GitRow::Group(staged, count) => div()
-                .w_full()
-                .h(px(34.))
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(format!(
-                    "{} · {count}",
-                    if *staged { "已暂存" } else { "未暂存" }
-                ))
-                .child(div().flex_1())
-                .child(self.stage_control(
-                    StageTarget::Group(*staged),
-                    *staged,
-                    format!("stage-group:{staged}"),
-                    cx,
-                ))
-                .into_any_element(),
+            GitRow::Group(staged, count) => ChangeNavigation::group_element(
+                if *staged { "已暂存" } else { "未暂存" },
+                *count,
+                false,
+            )
+            .child(div().flex_1())
+            .child(self.stage_control(
+                StageTarget::Group(*staged),
+                *staged,
+                format!("stage-group:{staged}"),
+                cx,
+            ))
+            .into_any_element(),
             GitRow::Directory(staged, row) => {
                 let crate::workspace_tree::Row::Directory {
                     path,
@@ -2652,171 +2616,53 @@ impl AgentWorkspace {
                 let path = path.clone();
                 let group_scope =
                     format!("{scope}:{}", if *staged { "staged" } else { "unstaged" });
-                div()
-                    .id(SharedString::from(format!(
-                        "git-directory:{group_scope}:{path}"
-                    )))
-                    .w_full()
-                    .h(px(34.))
-                    .pr_3()
-                    .pl(px(12. + *depth as f32 * 16.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(
-                        if *collapsed {
-                            Icon::ChevronRight
-                        } else {
-                            Icon::ChevronDown
-                        }
-                        .render(12.),
-                    )
-                    .child(Icon::Folder.render(14.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.))
-                            .child(label.clone()),
-                    )
-                    .child(div().text_size(px(10.)).child(count.to_string()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let collapsed = this
-                            .edits_ui
-                            .collapsed_directories
-                            .entry(group_scope.clone())
-                            .or_default();
-                        if !collapsed.remove(&path) {
-                            collapsed.insert(path.clone());
-                        }
-                        this.edits_ui.grouped_rows.borrow_mut().take();
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                ChangeNavigation::directory_element(
+                    format!("git-directory:{group_scope}:{path}"),
+                    label.clone(),
+                    *depth,
+                    *count,
+                    *collapsed,
+                    self.theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let collapsed = this
+                        .edits_ui
+                        .collapsed_directories
+                        .entry(group_scope.clone())
+                        .or_default();
+                    if !collapsed.remove(&path) {
+                        collapsed.insert(path.clone());
+                    }
+                    this.edits_ui.grouped_rows.borrow_mut().take();
+                    cx.notify();
+                }))
+                .into_any_element()
             }
             GitRow::File(staged, index, depth) => {
                 let file = &files[*index];
-                let source = self.edits_ui.workspace_sources[&file.path].for_layer(*staged);
                 let group_scope =
                     format!("{scope}:{}", if *staged { "staged" } else { "unstaged" });
-                if !self.edits_ui.expanded {
-                    return self
-                        .file_row(
-                            file,
-                            &group_scope,
-                            link,
-                            (self.history.workspace_display
-                                == crate::workspace_tree::DisplayMode::Tree)
-                                .then_some(*depth),
-                            false,
-                            false,
-                            cx,
-                        )
-                        .into_any_element();
-                }
-                let (status, color) = file_status_style(source.status, self.theme);
-                let path = file.path.clone();
-                let menu_path = path.clone();
-                let menu_label = file.label.clone();
-                let staged = *staged;
-                let label =
-                    if self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree {
-                        file.label.rsplit('/').next().unwrap_or(&file.label)
-                    } else {
-                        &file.label
-                    };
-                let selected = self
-                    .edits_ui
-                    .selected
-                    .as_ref()
-                    .filter(|path| self.edits_ui.workspace_sources.contains_key(*path))
-                    .or_else(|| {
-                        if self.edits_ui.conflicts.is_empty() {
-                            files.first().map(|file| &file.path)
-                        } else {
-                            None
-                        }
-                    });
-                let original_source = &self.edits_ui.workspace_sources[&path];
-                let selected_layer = if self.edits_ui.selected_staged {
-                    original_source.staged
-                } else {
-                    !original_source.unstaged
-                };
-                let active = selected == Some(&path) && selected_layer == staged;
-                let selector = format!("diff-navigation-file:{}:{staged}", path.display());
-                div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .w_full()
-                    .h(px(34.))
-                    .pr_2()
-                    .pl(px(26. + *depth as f32 * 16.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .when(active, |row| row.bg(rgb(p.accent_tint)))
-                    .hover(|row| row.bg(rgb(p.surface_subtle)))
-                    .child(
-                        Icon::for_language(edits::language(&path))
-                            .render(14.)
-                            .text_color(rgb(color)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(rgb(color))
-                            .child(label.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(color))
-                            .child(status),
-                    )
-                    .when_some(source.stats, |row, (a, r)| row.child(counts(a, r)))
-                    .child(self.stage_checkbox(
-                        vec![source],
-                        staged,
-                        format!("stage-file:{}:{staged}", path.display()),
-                        cx,
-                    ))
-                    .on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            this.open_diff_file_menu(
-                                menu_path.clone(),
-                                menu_label.clone(),
-                                event.position,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.edits_ui.selected = Some(path.clone());
-                        this.edits_ui.selected_staged = staged;
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                self.file_row(
+                    file,
+                    &group_scope,
+                    link,
+                    (self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree)
+                        .then_some(*depth),
+                    false,
+                    false,
+                    cx,
+                )
+                .into_any_element()
             }
         }
     }
 
-    fn grouped_workspace_files(
+    fn compact_workspace_files(
         &self,
         files: Rc<Vec<Change>>,
         scope: String,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let p = self.theme.palette();
         let rows = self.git_group_rows(files.clone(), &scope);
         let conflicts = self.edits_ui.conflicts.clone();
         let conflict_scope = format!("{scope}:conflicts");
@@ -2827,23 +2673,6 @@ impl AgentWorkspace {
             conflict_rows.len() + 1
         };
         let count = prefix + rows.len();
-        let selected = self
-            .edits_ui
-            .selected
-            .clone()
-            .filter(|path| {
-                files.iter().any(|file| &file.path == path)
-                    || conflicts
-                        .iter()
-                        .any(|view| &view.read(cx).file.path == path)
-            })
-            .or_else(|| {
-                conflicts
-                    .first()
-                    .map(|view| view.read(cx).file.path.clone())
-            })
-            .or_else(|| files.first().map(|file| file.path.clone()));
-        let navigation_selected = selected.clone();
         let render_row = {
             let files = files.clone();
             let scope = scope.clone();
@@ -2854,16 +2683,7 @@ impl AgentWorkspace {
                   link: Option<(gpui::ListState, usize)>,
                   cx: &mut Context<AgentWorkspace>| {
                 if prefix > 0 && index == 0 {
-                    return div()
-                        .w_full()
-                        .h(px(34.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(Icon::GitConflict.render(13.))
-                        .child(format!("待解决冲突 · {}", conflicts.len()))
+                    return ChangeNavigation::group_element("待解决冲突", conflicts.len(), true)
                         .into_any_element();
                 }
                 if index < prefix {
@@ -2878,353 +2698,118 @@ impl AgentWorkspace {
                         crate::workspace_tree::Row::File { index, depth } => (*index, *depth),
                     };
                     let view = &conflicts[i];
-                    if !this.edits_ui.expanded {
-                        view.update(cx, |view, cx| {
-                            *view.list_link.borrow_mut() = link;
-                            let depth = (this.history.workspace_display
-                                == crate::workspace_tree::DisplayMode::Tree)
-                                .then_some(depth);
-                            if view.tree_depth != depth {
-                                view.tree_depth = depth;
-                                cx.notify();
-                            }
-                            if view.theme != this.theme {
-                                view.theme = this.theme;
-                                view.editor
-                                    .update(cx, |editor, cx| editor.set_theme(this.theme, cx));
-                                cx.notify();
-                            }
-                        });
-                        return view.clone().into_any_element();
-                    }
-                    let file = &view.read(cx).file;
-                    let path = file.path.clone();
-                    let label = if this.history.workspace_display
-                        == crate::workspace_tree::DisplayMode::Tree
-                    {
-                        file.label.rsplit('/').next().unwrap_or(&file.label)
-                    } else {
-                        &file.label
-                    };
-                    let selector = format!("diff-navigation-file:{}", path.display());
-                    let menu_path = path.clone();
-                    let menu_label = file.label.clone();
-                    let active = navigation_selected.as_ref() == Some(&path);
-                    let marker = format!("selected-conflict-file:{}", path.display());
-                    return div()
-                        .relative()
-                        .id(SharedString::from(selector.clone()))
-                        .debug_selector(move || selector.clone())
-                        .w_full()
-                        .h(px(34.))
-                        .pr_3()
-                        .pl(px(26. + depth as f32 * 16.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .cursor_pointer()
-                        .when(active, |row| {
-                            row.bg(rgb(p.accent_tint))
-                                .text_color(rgb(p.accent))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left_0()
-                                        .top(px(6.))
-                                        .bottom(px(6.))
-                                        .w(px(3.))
-                                        .rounded(px(2.))
-                                        .bg(rgb(p.accent))
-                                        .debug_selector(move || marker.clone()),
-                                )
-                        })
-                        .when(!active, |row| {
-                            row.hover(|style| style.bg(rgb(p.surface_subtle)))
-                        })
-                        .child(Icon::GitConflict.render(14.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.))
-                                .child(label.to_owned()),
-                        )
-                        .on_mouse_down(
-                            gpui::MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                this.open_diff_file_menu(
-                                    menu_path.clone(),
-                                    menu_label.clone(),
-                                    event.position,
-                                    window,
-                                    cx,
-                                );
-                            }),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.edits_ui.selected = Some(path.clone());
-                            this.edits_ui.reveal_revision += 1;
+                    view.update(cx, |view, cx| {
+                        *view.list_link.borrow_mut() = link;
+                        let depth = (this.history.workspace_display
+                            == crate::workspace_tree::DisplayMode::Tree)
+                            .then_some(depth);
+                        if view.tree_depth != depth {
+                            view.tree_depth = depth;
                             cx.notify();
-                        }))
-                        .into_any_element();
+                        }
+                        if view.theme != this.theme {
+                            view.theme = this.theme;
+                            view.editor
+                                .update(cx, |editor, cx| editor.set_theme(this.theme, cx));
+                            cx.notify();
+                        }
+                    });
+                    return view.clone().into_any_element();
                 }
                 this.git_group_row(&rows[index - prefix], &files, &scope, link, cx)
             }
         };
-        if !self.edits_ui.expanded {
-            let ids = conflicts
-                .iter()
-                .map(|view| view.entity_id())
-                .collect::<Vec<_>>();
-            let mut cache = self.edits_ui.grouped_list.borrow_mut();
-            if cache.as_ref().is_none_or(|(_, cached_ids, state, _)| {
-                *cached_ids != ids || state.item_count() < prefix
-            }) {
-                let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
-                state.reset_with_uniform_height(count, px(49.));
-                self.edits_ui.grouped_width.set(px(0.));
-                *cache = Some((rows.clone(), ids, state, files.clone()));
-            } else if let Some((old_rows, _, state, old_files)) = cache.as_mut() {
-                if !Rc::ptr_eq(old_rows, &rows) {
-                    let old_keys: Vec<_> = old_rows.iter().map(|row| row.key(old_files)).collect();
-                    let new_keys: Vec<_> = rows.iter().map(|row| row.key(&files)).collect();
-                    let common = old_keys
-                        .iter()
-                        .zip(&new_keys)
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    let suffix = old_keys[common..]
-                        .iter()
-                        .rev()
-                        .zip(new_keys[common..].iter().rev())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    if common + suffix < old_keys.len() || common + suffix < new_keys.len() {
-                        let top = state.logical_scroll_top();
-                        let anchor = top
-                            .item_ix
-                            .checked_sub(prefix)
-                            .and_then(|index| old_keys.get(index))
-                            .and_then(|key| new_keys.iter().position(|candidate| candidate == key));
-                        state.splice(
-                            prefix + common..prefix + old_keys.len() - suffix,
-                            new_keys.len() - common - suffix,
-                        );
-                        state.clone().with_uniform_item_height(px(49.));
-                        if let Some(index) = anchor {
-                            state.scroll_to(gpui::ListOffset {
-                                item_ix: prefix + index,
-                                offset_in_item: top.offset_in_item,
-                            });
-                        }
+        let ids = conflicts
+            .iter()
+            .map(|view| view.entity_id())
+            .collect::<Vec<_>>();
+        let mut cache = self.edits_ui.grouped_list.borrow_mut();
+        if cache.as_ref().is_none_or(|(_, cached_ids, state, _)| {
+            *cached_ids != ids || state.item_count() < prefix
+        }) {
+            let state = gpui::ListState::new(count, gpui::ListAlignment::Top, px(96.));
+            state.reset_with_uniform_height(count, px(49.));
+            self.edits_ui.grouped_width.set(px(0.));
+            *cache = Some((rows.clone(), ids, state, files.clone()));
+        } else if let Some((old_rows, _, state, old_files)) = cache.as_mut() {
+            if !Rc::ptr_eq(old_rows, &rows) {
+                let old_keys: Vec<_> = old_rows.iter().map(|row| row.key(old_files)).collect();
+                let new_keys: Vec<_> = rows.iter().map(|row| row.key(&files)).collect();
+                let common = old_keys
+                    .iter()
+                    .zip(&new_keys)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let suffix = old_keys[common..]
+                    .iter()
+                    .rev()
+                    .zip(new_keys[common..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if common + suffix < old_keys.len() || common + suffix < new_keys.len() {
+                    let top = state.logical_scroll_top();
+                    let anchor = top
+                        .item_ix
+                        .checked_sub(prefix)
+                        .and_then(|index| old_keys.get(index))
+                        .and_then(|key| new_keys.iter().position(|candidate| candidate == key));
+                    state.splice(
+                        prefix + common..prefix + old_keys.len() - suffix,
+                        new_keys.len() - common - suffix,
+                    );
+                    state.clone().with_uniform_item_height(px(49.));
+                    if let Some(index) = anchor {
+                        state.scroll_to(gpui::ListOffset {
+                            item_ix: prefix + index,
+                            offset_in_item: top.offset_in_item,
+                        });
                     }
-                    *old_rows = rows.clone();
                 }
-                *old_files = files.clone();
+                *old_rows = rows.clone();
             }
-            let state = cache.as_ref().unwrap().2.clone();
-            let link = state.clone();
-            let weak = cx.entity().downgrade();
-            let list = gpui::list(state.clone(), move |index, _, cx| {
-                weak.update(cx, |this, cx| {
-                    render_row(this, index, Some((link.clone(), index)), cx)
-                })
-                .unwrap_or_else(|_| div().into_any_element())
+            *old_files = files.clone();
+        }
+        let state = cache.as_ref().unwrap().2.clone();
+        let link = state.clone();
+        let weak = cx.entity().downgrade();
+        let list = gpui::list(state.clone(), move |index, _, cx| {
+            weak.update(cx, |this, cx| {
+                render_row(this, index, Some((link.clone(), index)), cx)
             })
-            .flex_1()
-            .min_h_0()
-            .w_full();
-            let weak = cx.entity().downgrade();
-            return div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .on_children_prepainted(move |_, _, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        if let Some((_, _, state, _)) = &*this.edits_ui.grouped_list.borrow() {
-                            let width = state.viewport_bounds().size.width;
-                            if width > px(0.) && this.edits_ui.grouped_width.replace(width) != width
-                            {
-                                state.clone().with_uniform_item_height(px(49.));
-                                let id = cx.entity_id();
-                                cx.defer(move |cx| cx.notify(id));
-                            }
-                        }
-                    });
-                })
-                .id("grouped-workspace-files")
-                .relative()
-                .pr(px(12.))
-                .child(list)
-                .child(
-                    Scrollbar::vertical_list(&state, &self.edits_ui.navigation_bar)
-                        .theme(self.theme)
-                        .render()
-                        .absolute()
-                        .right_0()
-                        .top_0(),
-                );
-        }
-        let mut detail_bar = None;
-        let mut conflict_header = None;
-        let mut detail = div()
-            .id("expanded-diff-content")
-            .debug_selector(|| "expanded-diff-content".into())
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .overflow_y_scroll();
-        if let Some(path) = selected {
-            let scroll_key = format!(
-                "{scope}:{}:{}",
-                path.display(),
-                self.edits_ui.selected_staged
-            );
-            let scroll = self
-                .edits_ui
-                .detail_scrolls
-                .borrow_mut()
-                .entry(scroll_key.clone())
-                .or_default()
-                .clone();
-            let state = self
-                .edits_ui
-                .detail_scrollbars
-                .borrow_mut()
-                .entry(scroll_key)
-                .or_default()
-                .clone();
-            detail_bar = Some(
-                Scrollbar::vertical(&scroll, &state)
-                    .theme(self.theme)
-                    .render()
-                    .debug_selector(|| "diff-detail-vertical-scrollbar".into())
-                    .absolute()
-                    .right_0()
-                    .top_0(),
-            );
-            detail = detail.track_scroll(&scroll).pr(px(12.));
-            if let Some(view) = conflicts
-                .iter()
-                .find(|view| view.read(cx).file.path == path)
-            {
-                view.update(cx, |view, cx| {
-                    view.reveal(scroll.clone(), self.edits_ui.reveal_revision, cx);
-                    if view.tree_depth.take().is_some()
-                        || !view.expanded
-                        || view.theme != self.theme
-                    {
-                        cx.notify();
-                    }
-                    view.list_link.borrow_mut().take();
-                    view.expanded = true;
-                    view.theme = self.theme;
-                    view.editor
-                        .update(cx, |editor, cx| editor.set_theme(self.theme, cx));
-                });
-                conflict_header = Some(view.read(cx).file_header());
-                detail = detail.child(view.clone());
-            } else if let Some(file) = files.iter().find(|file| file.path == path) {
-                let source = &self.edits_ui.workspace_sources[&file.path];
-                let staged = if self.edits_ui.selected_staged {
-                    source.staged
-                } else {
-                    !source.unstaged
-                };
-                let group_scope = format!("{scope}:{}", if staged { "staged" } else { "unstaged" });
-                detail_bar = None;
-                detail = detail
-                    .overflow_hidden()
-                    .pr_0()
-                    .flex()
-                    .flex_col()
-                    .child(self.file_row(file, &group_scope, None, None, false, false, cx));
-            }
-        }
-        detail = detail.children(
-            self.edits_ui
-                .workspace_notes
-                .iter()
-                .map(|note| div().px_3().text_size(px(11.)).child(note.clone())),
-        );
-        let navigation = gpui::uniform_list(
-            "expanded-diff-files",
-            count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                range
-                    .map(|index| render_row(this, index, None, cx))
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .size_full()
-        .track_scroll(&self.edits_ui.navigation_scroll);
+            .unwrap_or_else(|_| div().into_any_element())
+        })
+        .flex_1()
+        .min_h_0()
+        .w_full();
         let weak = cx.entity().downgrade();
         div()
-            .on_children_prepainted(move |bounds, _, cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    let width: f32 = bounds
-                        .iter()
-                        .map(|bounds| f32::from(bounds.size.width))
-                        .sum();
-                    let maximum = (width - 320.).clamp(180., 800.);
-                    this.edits_ui.navigation_maximum.set(maximum);
-                    if this.edits_ui.navigation_width.unwrap_or(260.) > maximum {
-                        this.edits_ui.navigation_width = Some(maximum);
-                        let id = cx.entity_id();
-                        cx.defer(move |cx| cx.notify(id));
-                    }
-                });
-            })
-            .id("expanded-diff-layout")
-            .debug_selector(|| "expanded-diff-layout".into())
             .flex_1()
             .min_h_0()
             .flex()
-            .child(self.diff_navigation(navigation, cx))
+            .flex_col()
+            .on_children_prepainted(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if let Some((_, _, state, _)) = &*this.edits_ui.grouped_list.borrow() {
+                        let width = state.viewport_bounds().size.width;
+                        if width > px(0.) && this.edits_ui.grouped_width.replace(width) != width {
+                            state.clone().with_uniform_item_height(px(49.));
+                            let id = cx.entity_id();
+                            cx.defer(move |cx| cx.notify(id));
+                        }
+                    }
+                });
+            })
+            .id("grouped-workspace-files")
+            .relative()
+            .pr(px(12.))
+            .child(list)
             .child(
-                div()
-                    .id("diff-navigation-resize")
-                    .debug_selector(|| "diff-navigation-resize".into())
-                    .w(px(5.))
-                    .h_full()
-                    .flex_shrink_0()
-                    .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .bg(rgb(p.border))
-                    .hover(|style| style.bg(rgb(p.accent)))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                            this.edits_ui.navigation_resize = Some((
-                                event.position.x,
-                                this.edits_ui.navigation_width.unwrap_or(260.),
-                            ));
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .children(conflict_header)
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .flex()
-                            .child(detail)
-                            .children(detail_bar),
-                    ),
+                Scrollbar::vertical_list(&state, &self.edits_ui.navigation_bar)
+                    .theme(self.theme)
+                    .render()
+                    .absolute()
+                    .right_0()
+                    .top_0(),
             )
     }
     fn workspace_watch_active(&self) -> bool {
@@ -3428,7 +3013,7 @@ impl AgentWorkspace {
                         inventory.branch,
                         inventory.root,
                         inventory.head,
-                        inventory.has_conflicts,
+                        !inventory.conflict_labels.is_empty(),
                         inventory.conflict_versions,
                         inventory.stamp,
                     )),
@@ -3581,7 +3166,7 @@ impl AgentWorkspace {
                                             ConflictView::new(
                                                 file,
                                                 root.clone(),
-                                                workspace.clone(),
+                                                Some(workspace.clone()),
                                                 this.theme,
                                                 cx,
                                             )
@@ -3683,12 +3268,12 @@ impl AgentWorkspace {
 }
 
 /// Drafts save and stage automatically once all conflict markers are removed.
-struct ConflictView {
+pub(super) struct ConflictView {
     tree_depth: Option<usize>,
     list_link: ListLink,
     file: crate::merge_conflicts::Conflict,
     project: PathBuf,
-    workspace: gpui::WeakEntity<AgentWorkspace>,
+    workspace: Option<gpui::WeakEntity<AgentWorkspace>>,
     theme: ThemePreset,
     language: &'static str,
     expanded: bool,
@@ -3708,6 +3293,10 @@ struct ConflictView {
     notice: Option<String>,
     task: Option<Task<()>>,
 }
+
+pub(super) struct ConflictResolved;
+
+impl gpui::EventEmitter<ConflictResolved> for ConflictView {}
 
 /// Build the conflict request: instruction text plus the file snapshot as a
 /// separate reference attachment, so history shows a compact highlighted diff
@@ -3766,6 +3355,9 @@ impl ConflictView {
     }
 
     fn ask_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_ref() else {
+            return;
+        };
         if self.task.is_some() {
             return;
         }
@@ -3777,39 +3369,37 @@ impl ConflictView {
             return;
         }
         let submission = conflict_submission(&self.file);
-        let result = self
-            .workspace
-            .update(cx, |workspace, cx| -> Result<(), String> {
-                if workspace.diff_repository_root().as_ref() != Some(&self.project) {
-                    return Err("项目已切换，请回到原项目后重试".into());
-                }
-                if workspace.any_run_busy()
-                    || workspace.edits_ui.undo_task.is_some()
-                    || !workspace.queued_requests.is_empty()
-                {
-                    return Err("Agent 正在处理任务，请完成当前任务后重试".into());
-                }
-                if !workspace.active_model_enabled() {
-                    return Err("请先连接并启用一个 Agent 模型".into());
-                }
-                workspace.send_to(
-                    workspace.history.active,
-                    submission,
-                    workspace.provider.clone(),
-                    false,
-                    cx,
-                );
-                if !workspace.session_busy(workspace.history.active) {
-                    return Err(workspace
-                        .provider_error
-                        .clone()
-                        .unwrap_or_else(|| "Agent 请求未启动，请检查当前模型配置".into()));
-                }
-                workspace.page = crate::Page::Chat;
-                workspace.edits_ui.expanded = false;
-                cx.notify();
-                Ok(())
-            });
+        let result = workspace.update(cx, |workspace, cx| -> Result<(), String> {
+            if workspace.diff_repository_root().as_ref() != Some(&self.project) {
+                return Err("项目已切换，请回到原项目后重试".into());
+            }
+            if workspace.any_run_busy()
+                || workspace.edits_ui.undo_task.is_some()
+                || !workspace.queued_requests.is_empty()
+            {
+                return Err("Agent 正在处理任务，请完成当前任务后重试".into());
+            }
+            if !workspace.active_model_enabled() {
+                return Err("请先连接并启用一个 Agent 模型".into());
+            }
+            workspace.send_to(
+                workspace.history.active,
+                submission,
+                workspace.provider.clone(),
+                false,
+                cx,
+            );
+            if !workspace.session_busy(workspace.history.active) {
+                return Err(workspace
+                    .provider_error
+                    .clone()
+                    .unwrap_or_else(|| "Agent 请求未启动，请检查当前模型配置".into()));
+            }
+            workspace.page = crate::Page::Chat;
+            workspace.edits_ui.expanded = false;
+            cx.notify();
+            Ok(())
+        });
         self.notice = Some(match result {
             Ok(Ok(())) => "已请求 Agent 解决此文件；完成后刷新工作区审阅。".into(),
             Ok(Err(error)) => error,
@@ -3819,10 +3409,10 @@ impl ConflictView {
         cx.notify();
     }
 
-    fn new(
+    pub(super) fn new(
         file: crate::merge_conflicts::Conflict,
         project: PathBuf,
-        workspace: gpui::WeakEntity<AgentWorkspace>,
+        workspace: Option<gpui::WeakEntity<AgentWorkspace>>,
         theme: ThemePreset,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -3865,7 +3455,21 @@ impl ConflictView {
         }
     }
 
-    fn reveal(&mut self, scroll: gpui::ScrollHandle, revision: u64, cx: &mut Context<Self>) {
+    pub(super) fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.editor
+                .update(cx, |editor, cx| editor.set_theme(theme, cx));
+            cx.notify();
+        }
+    }
+
+    pub(super) fn reveal(
+        &mut self,
+        scroll: gpui::ScrollHandle,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
         self.detail_scroll = Some(scroll);
         if self.reveal_revision != Some(revision) {
             self.reveal_revision = Some(revision);
@@ -3935,17 +3539,20 @@ impl ConflictView {
                 match result {
                     Ok(()) => {
                         this.notice = Some("已保存并暂存，冲突已解决".into());
-                        let _ = this.workspace.update(cx, |workspace, cx| {
-                            if workspace.diff_repository_root().as_ref() == Some(&this.project)
-                                && workspace
-                                    .edits_ui
-                                    .conflicts
-                                    .iter()
-                                    .any(|view| view.entity_id() == weak.entity_id())
-                            {
-                                workspace.refresh_workspace_edits(cx);
-                            }
-                        });
+                        cx.emit(ConflictResolved);
+                        if let Some(workspace) = &this.workspace {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                if workspace.diff_repository_root().as_ref() == Some(&this.project)
+                                    && workspace
+                                        .edits_ui
+                                        .conflicts
+                                        .iter()
+                                        .any(|view| view.entity_id() == weak.entity_id())
+                                {
+                                    workspace.refresh_workspace_edits(cx);
+                                }
+                            });
+                        }
                     }
                     Err(error) => this.notice = Some(error),
                 }
@@ -4219,17 +3826,19 @@ impl Render for ConflictView {
                             .child(Icon::GitConflict.render(11.))
                             .child(badge),
                     )
-                    .child(
-                        IconButton::new(Icon::Sparkles, "让 Agent 解决此文件冲突")
-                            .plain()
-                            .theme(self.theme)
-                            .render()
-                            .debug_selector(|| "agent-resolve-conflict".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.ask_agent(cx);
-                            })),
-                    )
+                    .when(self.workspace.is_some(), |row| {
+                        row.child(
+                            IconButton::new(Icon::Sparkles, "让 Agent 解决此文件冲突")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "agent-resolve-conflict".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.ask_agent(cx);
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.expanded = !this.expanded;
                         cx.notify();
@@ -5234,15 +4843,18 @@ mod tests {
                 host.edits_ui.tree_cache.borrow().as_ref().unwrap().2.len(),
                 5001
             );
-            host.edits_ui.navigation_scroll.clone()
+            host.edits_ui
+                .navigation
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .1
+                .clone()
         });
-        host.update(window, |_, cx| {
-            list.scroll_to_item(4001, gpui::ScrollStrategy::Top);
-            cx.notify();
-        });
+        list.update(window, |list, cx| list.scroll_to_row(4001, cx));
         window.run_until_parked();
         let file = window
-            .debug_bounds("diff-navigation-file:vendor/4000.rs")
+            .debug_bounds("change-file:vendor/4000.rs:false")
             .unwrap();
         window.simulate_click(file.center(), Default::default());
         window.run_until_parked();
@@ -5422,7 +5034,9 @@ mod tests {
             host.edits_ui.conflicts = conflicts
                 .into_iter()
                 .map(|file| {
-                    cx.new(|cx| ConflictView::new(file, root.clone(), weak.clone(), host.theme, cx))
+                    cx.new(|cx| {
+                        ConflictView::new(file, root.clone(), Some(weak.clone()), host.theme, cx)
+                    })
                 })
                 .collect();
             host
@@ -5439,8 +5053,7 @@ mod tests {
             "default file must be highlighted without a click"
         );
         let path = root.join("vendor/group_1/conflict-1.go");
-        let selector =
-            Box::leak(format!("diff-navigation-file:{}", path.display()).into_boxed_str());
+        let selector = Box::leak(format!("change-file:{}:false", path.display()).into_boxed_str());
         let row = window.debug_bounds(selector).unwrap();
         let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
         assert_eq!(
@@ -5491,6 +5104,14 @@ mod tests {
             editor.sync_content("draft survives folder collapse", cx)
         });
         for expanded in [true, false] {
+            let (folder_selector, child_selector) = if expanded {
+                ("change-directory:vendor", "change-directory:vendor/group_1")
+            } else {
+                (
+                    "conflict-directory:vendor",
+                    "conflict-directory:vendor/group_1",
+                )
+            };
             host.update(window, |host, cx| {
                 host.edits_ui.expanded = expanded;
                 if !expanded {
@@ -5504,25 +5125,17 @@ mod tests {
                 cx.notify();
             });
             window.run_until_parked();
-            let folder = window.debug_bounds("conflict-directory:vendor").unwrap();
+            let folder = window.debug_bounds(folder_selector).unwrap();
             window.simulate_click(folder.center(), Default::default());
             window.run_until_parked();
-            assert!(
-                window
-                    .debug_bounds("conflict-directory:vendor/group_1")
-                    .is_none()
-            );
+            assert!(window.debug_bounds(child_selector).is_none());
             draft.read_with(window, |editor, _| {
                 assert_eq!(editor.content(), "draft survives folder collapse")
             });
-            let folder = window.debug_bounds("conflict-directory:vendor").unwrap();
+            let folder = window.debug_bounds(folder_selector).unwrap();
             window.simulate_click(folder.center(), Default::default());
             window.run_until_parked();
-            assert!(
-                window
-                    .debug_bounds("conflict-directory:vendor/group_1")
-                    .is_some()
-            );
+            assert!(window.debug_bounds(child_selector).is_some());
         }
     }
 
@@ -5552,6 +5165,7 @@ mod tests {
         window.run_until_parked();
         let navigation = window.debug_bounds("expanded-diff-navigation").unwrap();
         let detail = window.debug_bounds("expanded-diff-content").unwrap();
+        assert!(window.debug_bounds("change-navigation").is_some());
         assert!(navigation.right() <= detail.left());
         assert!(detail.size.width > navigation.size.width);
         let resize = window.debug_bounds("diff-navigation-resize").unwrap();
@@ -5583,20 +5197,36 @@ mod tests {
             )
         });
         let second = window
-            .debug_bounds("diff-navigation-file:src/second.rs")
+            .debug_bounds("change-file:src/second.rs:false")
             .unwrap();
         window.simulate_click(second.center(), Default::default());
         window.run_until_parked();
         assert!(window.debug_bounds("edit-file:src/first.rs").is_none());
         assert!(window.debug_bounds("edit-file:src/second.rs").is_some());
-        let directory = window
-            .debug_bounds("diff-navigation-directory:src")
-            .unwrap();
+        window.simulate_keystrokes("up");
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:src/first.rs").is_some());
+        window.simulate_keystrokes("down");
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:src/second.rs").is_some());
+        window.simulate_mouse_down(
+            second.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        window.run_until_parked();
+        host.read_with(window, |host, _| {
+            let (_, label, _, _) = host.edits_ui.file_menu.as_ref().unwrap();
+            assert_eq!(label, "src/second.rs");
+        });
+        window.simulate_keystrokes("escape");
+        window.run_until_parked();
+        let directory = window.debug_bounds("change-directory:src").unwrap();
         window.simulate_click(directory.center(), Default::default());
         window.run_until_parked();
         assert!(
             window
-                .debug_bounds("diff-navigation-file:src/second.rs")
+                .debug_bounds("change-file:src/second.rs:false")
                 .is_none()
         );
         assert!(
@@ -5763,7 +5393,7 @@ mod tests {
             ConflictView::new(
                 file,
                 repo.path().into(),
-                host.downgrade(),
+                Some(host.downgrade()),
                 ThemePreset::default(),
                 cx,
             )
@@ -6191,8 +5821,7 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("stage-group:false").is_some());
         assert!(window.debug_bounds("stage-group:true").is_some());
-        let selector =
-            Box::leak(format!("diff-navigation-file:{}:true", path.display()).into_boxed_str());
+        let selector = Box::leak(format!("change-file:{}:true", path.display()).into_boxed_str());
         let staged_row = window.debug_bounds(selector).unwrap();
         window.simulate_click(staged_row.center(), Default::default());
         window.run_until_parked();
@@ -6248,7 +5877,7 @@ mod tests {
             ConflictView::new(
                 file,
                 repo.path().into(),
-                host.downgrade(),
+                Some(host.downgrade()),
                 ThemePreset::default(),
                 cx,
             )
