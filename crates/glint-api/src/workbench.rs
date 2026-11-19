@@ -405,7 +405,9 @@ impl Workbench {
                 .show_header(false)
                 .viewport()
         });
-        let commands = cx.new(|cx| CommandPalette::new(Self::command_items(&requests), cx));
+        let commands = cx.new(|cx| {
+            CommandPalette::with_placeholder(Self::command_items(&requests), "搜索命令或请求…", cx)
+        });
         let file_variable_name = Self::entry("", "文件变量名（默认 upload）", cx);
         let variable_search = Self::entry("", "搜索变量名称…", cx);
         let response_search = Self::entry("", "搜索响应体…", cx);

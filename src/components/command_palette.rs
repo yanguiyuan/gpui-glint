@@ -1,5 +1,5 @@
 use super::{Icon, TextEntry};
-use crate::theme::ThemePreset;
+use crate::theme::{ThemePalette, ThemePreset};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -99,7 +99,15 @@ impl Focusable for CommandPalette {
 }
 impl CommandPalette {
     pub fn new(items: impl IntoIterator<Item = CommandItem>, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextEntry::new(cx, "搜索命令、集合…", "").font_size(16.));
+        Self::with_placeholder(items, "搜索命令…", cx)
+    }
+
+    pub fn with_placeholder(
+        items: impl IntoIterator<Item = CommandItem>,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| TextEntry::new(cx, placeholder, "").font_size(15.));
         let subscription = cx.observe(&search, |this, _, cx| {
             this.active = this
                 .visible(cx)
@@ -335,26 +343,48 @@ enum PaletteRow {
     Heading(SharedString),
     Command(usize),
 }
+
+fn shortcut_keycap(label: impl Into<SharedString>, p: ThemePalette) -> gpui::Div {
+    let label: SharedString = label.into();
+    div()
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(4.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(p.border))
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .child(label)
+}
+
 impl CommandPalette {
     fn row_height(&self) -> f32 {
         if self.items.iter().any(|item| item.description.is_some()) {
-            54.
+            44.
         } else {
-            36.
+            32.
         }
     }
-    fn render_row(&mut self, row: &PaletteRow, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
-        let p = theme.palette();
+    fn render_row(
+        &mut self,
+        row: &PaletteRow,
+        row_height: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = self.theme.palette();
         let PaletteRow::Command(i) = row else {
             let PaletteRow::Heading(label) = row else {
                 unreachable!()
             };
             return div()
-                .h(px(self.row_height()))
+                .h(px(row_height))
                 .px(px(10.))
+                .pb(px(4.))
                 .flex()
-                .items_center()
+                .items_end()
                 .text_size(px(11.))
                 .text_color(rgb(p.text_muted))
                 .child(label.clone())
@@ -367,7 +397,7 @@ impl CommandPalette {
             .id(("command", i))
             .debug_selector(move || format!("palette-command-{i}"))
             .w_full()
-            .h(px(self.row_height()))
+            .h(px(row_height))
             .flex_shrink_0()
             .px(px(10.))
             .flex()
@@ -375,14 +405,8 @@ impl CommandPalette {
             .gap(px(10.))
             .rounded(px(7.))
             .text_size(px(13.))
-            .text_color(rgb(if active {
-                0xffffff
-            } else if item.disabled {
-                p.text_muted
-            } else {
-                p.text
-            }))
-            .when(active, |el| el.bg(rgb(p.accent)))
+            .text_color(rgb(if item.disabled { p.text_muted } else { p.text }))
+            .when(active, |el| el.bg(rgb(p.accent_tint)))
             .when(!item.disabled, |el| el.cursor_pointer())
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
                 if !this.items[i].disabled && this.active != Some(i) {
@@ -395,8 +419,8 @@ impl CommandPalette {
             row = row.child(
                 div()
                     .flex_shrink_0()
-                    .child(icon.render(16.).text_color(rgb(if active {
-                        0xffffff
+                    .child(icon.render(15.).text_color(rgb(if active {
+                        p.accent
                     } else {
                         p.text_muted
                     }))),
@@ -408,34 +432,36 @@ impl CommandPalette {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap(px(1.))
                 .child(div().truncate().child(item.label.clone()))
                 .when_some(item.description.clone(), |column, description| {
                     column.child(
                         div()
                             .truncate()
                             .text_size(px(11.))
-                            .text_color(rgb(if active { 0xffffff } else { p.text_muted }))
+                            .text_color(rgb(p.text_muted))
                             .child(description),
                     )
                 }),
         );
         if let Some(shortcut) = &item.shortcut {
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .px(px(5.))
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(rgb(if active {
-                        theme.color(0x69b0ff)
-                    } else {
-                        p.border
-                    }))
-                    .font_family("Menlo")
-                    .text_size(px(11.))
-                    .child(shortcut.clone()),
-            );
+            let label = if shortcut.contains('⌘') {
+                shortcut
+                    .replace(" + ", " ")
+                    .split_whitespace()
+                    .map(|key| match key {
+                        "Ctrl" => "⌃",
+                        "Alt" => "⌥",
+                        "Shift" => "⇧",
+                        "Enter" | "ENTER" => "↵",
+                        key => key,
+                    })
+                    .collect::<String>()
+                    .into()
+            } else {
+                shortcut.clone()
+            };
+            row = row.child(shortcut_keycap(label, p));
         }
         row.into_any_element()
     }
@@ -495,7 +521,8 @@ impl Render for CommandPalette {
                 .child("没有匹配的结果")
                 .into_any_element()
         } else {
-            let height = px((rows.len() as f32 * self.row_height()).min(320.));
+            let row_height = self.row_height();
+            let height = px((rows.len() as f32 * row_height).min(320.));
             let rows = std::rc::Rc::new(rows);
             div()
                 .p(px(6.))
@@ -505,7 +532,7 @@ impl Render for CommandPalette {
                         rows.len(),
                         cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                             range
-                                .map(|index| this.render_row(&rows[index], cx))
+                                .map(|index| this.render_row(&rows[index], row_height, cx))
                                 .collect::<Vec<_>>()
                         }),
                     )
@@ -596,51 +623,67 @@ impl Render for CommandPalette {
             .child(
                 div()
                     .px(px(16.))
-                    .h(px(50.))
+                    .h(px(44.))
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .border_b_1()
-                    .border_color(rgb(p.border))
+                    .when(self.categories.is_empty(), |search| {
+                        search.border_b_1().border_color(rgb(p.border))
+                    })
                     .text_color(rgb(p.text))
-                    .child(Icon::Search.render(20.))
+                    .child(Icon::Search.render(17.).text_color(rgb(p.text_muted)))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .h(px(24.))
                             .child(self.search.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child("esc"),
                     ),
             )
-            .child(list)
             .when(!self.categories.is_empty(), |root| {
-                root.child(div().flex().items_center().gap_2().px_3().py_2().children(
-                    self.categories.iter().map(|category| {
-                        let value = category.clone();
-                        div()
-                            .id(gpui::ElementId::Name(category.clone()))
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .when(*category == self.category, |tab| tab.bg(rgb(p.accent_tint)))
-                            .child(category.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_category(value.clone(), cx)
-                            }))
-                    }),
-                ))
+                root.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .px(px(12.))
+                        .pb(px(7.))
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .text_size(px(12.))
+                        .children(self.categories.iter().map(|category| {
+                            let value = category.clone();
+                            let selected = *category == self.category;
+                            div()
+                                .id(gpui::ElementId::Name(category.clone()))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .px(px(9.))
+                                .rounded(px(5.))
+                                .text_color(rgb(if selected { p.text } else { p.text_muted }))
+                                .cursor_pointer()
+                                .when(selected, |tab| tab.bg(rgb(p.accent_tint)))
+                                .when(!selected, |tab| {
+                                    tab.hover(|style| style.bg(rgb(p.surface_subtle)))
+                                })
+                                .child(category.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_category(value.clone(), cx)
+                                }))
+                        })),
+                )
             })
+            .child(list)
             .child(
                 div()
                     .px(px(16.))
-                    .py(px(8.))
+                    .py(px(6.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(12.))
                     .border_t_1()
                     .border_color(rgb(p.border))
                     // GPUI overflow masks are rectangular; round the footer itself
@@ -649,11 +692,22 @@ impl Render for CommandPalette {
                     .bg(rgb(p.panel))
                     .text_size(px(11.))
                     .text_color(rgb(p.text_muted))
-                    .child(if self.open {
-                        "↑ ↓ 选择    ↵ 执行    esc 关闭"
-                    } else {
-                        "↑ ↓ 选择    ↵ 执行    esc 清空"
-                    }),
+                    .children(
+                        [
+                            ("↑↓", "选择"),
+                            ("↵", "执行"),
+                            ("Esc", if self.open { "关闭" } else { "清空" }),
+                        ]
+                        .into_iter()
+                        .map(|(key, label)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(shortcut_keycap(key, p))
+                                .child(label)
+                        }),
+                    ),
             )
     }
 }

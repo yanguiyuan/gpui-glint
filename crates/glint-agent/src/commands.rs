@@ -8,7 +8,8 @@ pub struct State {
 }
 impl State {
     pub fn new(cx: &mut Context<AgentWorkspace>) -> Self {
-        let palette = cx.new(|cx| CommandPalette::new([], cx));
+        let palette =
+            cx.new(|cx| CommandPalette::with_placeholder([], "搜索命令、会话、文件或文本…", cx));
         cx.subscribe(&palette, |this, _, event: &CommandPaletteEvent, cx| {
             match event {
                 CommandPaletteEvent::Executed(id) => this.commands.pending = Some(id.clone()),
