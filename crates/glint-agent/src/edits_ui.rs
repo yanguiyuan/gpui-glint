@@ -1,6 +1,6 @@
 use super::*;
 use crate::edits::Change;
-use gpui::{Animation, AnimationExt};
+use gpui::{Animation, AnimationExt, Priority};
 use gpui_glint::components::ChangeNavigationEvent;
 use gpui_glint::components::{
     ChainScroll, ChangeNavigation, ChangeRow, ChangeStatus, CodeCard, CodeCardEvent, Dialog,
@@ -9,12 +9,132 @@ use gpui_glint::components::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
+    time::Duration,
 };
+use tokio::sync::oneshot;
 
 type ListLink = Rc<RefCell<Option<(gpui::ListState, usize)>>>;
+
+const DIFF_PREFETCH_DELAY: Duration = Duration::from_millis(150);
+const DIFF_PREFETCH_CAPACITY: usize = 24;
+const DIFF_ON_DEMAND_DIRECTORIES: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "third_party",
+    "target",
+    "dist",
+    "build",
+    "generated",
+    ".next",
+];
+
+fn diff_on_demand(label: &str) -> bool {
+    let Some((directory, _)) = label.rsplit_once('/') else {
+        return false;
+    };
+    directory.split('/').any(|part| {
+        DIFF_ON_DEMAND_DIRECTORIES
+            .iter()
+            .any(|directory| part.eq_ignore_ascii_case(directory))
+    })
+}
+
+type DiffKey = (Uuid, bool, bool);
+struct DiffPreview {
+    change: Change,
+    prepared: gpui_glint::components::PreparedDiff,
+    cacheable: bool,
+}
+type DiffLoadResult = Result<DiffPreview, crate::workspace_diff::LoadError>;
+
+fn prepare_workspace_diff(
+    source: &crate::workspace_diff::Source,
+    manual: bool,
+    side_by_side: bool,
+) -> DiffLoadResult {
+    let mut change = crate::workspace_diff::load_with_options(source, manual)?;
+    let lines = change.take_lines();
+    let cacheable = lines.len() <= 4_000
+        && change.before.as_deref().map_or(0, str::len) + change.after.len() <= 256 * 1024;
+    let prepared = DiffCard::prepare(lines, side_by_side);
+    Ok(DiffPreview {
+        change,
+        prepared,
+        cacheable,
+    })
+}
+
+#[derive(Default)]
+struct DiffPrefetch {
+    files: Rc<Vec<Change>>,
+    side_by_side: bool,
+    next: usize,
+    attempted: HashSet<DiffKey>,
+    ready: HashMap<DiffKey, DiffPreview>,
+    // A click on this same version can take over the result of the current read.
+    active: Option<(DiffKey, Option<oneshot::Sender<DiffLoadResult>>)>,
+}
+
+impl DiffPrefetch {
+    fn update_inventory(&mut self, files: &Rc<Vec<Change>>, side_by_side: bool) {
+        if self.side_by_side == side_by_side && Rc::ptr_eq(&self.files, files) {
+            return;
+        }
+        let ids: HashSet<_> = files.iter().map(|file| file.id).collect();
+        let valid = |(id, _, layout): &DiffKey| *layout == side_by_side && ids.contains(id);
+        self.ready.retain(|key, _| valid(key));
+        self.attempted.retain(valid);
+        self.files = files.clone();
+        self.side_by_side = side_by_side;
+        self.next = 0;
+    }
+
+    fn has_pending(&self) -> bool {
+        self.next < self.files.len() * 2 && self.ready.len() < DIFF_PREFETCH_CAPACITY
+    }
+
+    fn next_source(
+        &mut self,
+        sources: &HashMap<PathBuf, crate::workspace_diff::Source>,
+    ) -> Option<(DiffKey, crate::workspace_diff::Source)> {
+        while self.has_pending() {
+            let file = &self.files[self.next / 2];
+            let staged = self.next % 2 == 1;
+            self.next += 1;
+            let Some(source) = sources.get(&file.path) else {
+                continue;
+            };
+            let changed = if staged {
+                source.staged
+            } else {
+                source.unstaged
+            };
+            let key = (file.id, staged, self.side_by_side);
+            if changed && !diff_on_demand(&source.label) && self.attempted.insert(key) {
+                self.active = Some((key, None));
+                return Some((key, source.for_layer(staged)));
+            }
+        }
+        None
+    }
+
+    fn finish(&mut self, key: DiffKey, result: DiffLoadResult) {
+        let Some((_, waiter)) = self.active.take() else {
+            return;
+        };
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(result);
+        } else if self.attempted.contains(&key)
+            && let Ok(preview) = result
+            && preview.cacheable
+        {
+            self.ready.insert(key, preview);
+        }
+    }
+}
 
 fn change_file_label(label: &str, tree: bool) -> String {
     if tree {
@@ -87,6 +207,7 @@ enum GitRow {
 enum StageTarget {
     Files(Vec<crate::workspace_diff::Source>),
     Group(bool),
+    Directory(String, bool),
 }
 
 enum FileAction {
@@ -202,6 +323,8 @@ pub struct State {
     workspace_sync_debounce: Option<Task<()>>,
     workspace_conflicts_task: Option<Task<()>>,
     workspace_stats_task: Option<Task<()>>,
+    diff_prefetch: Rc<RefCell<DiffPrefetch>>,
+    diff_prefetch_task: Option<Task<()>>,
     workspace_revision: u64,
     conflicts: Vec<Entity<ConflictView>>,
     file_views: RefCell<HashMap<String, Entity<FileDiff>>>,
@@ -922,6 +1045,11 @@ impl AgentWorkspace {
                 cx.notify();
             }
             view.workspace = Some(workspace);
+            view.prefetch = view
+                .source
+                .as_ref()
+                .filter(|source| source.layer.is_some() && !diff_on_demand(&source.label))
+                .map(|_| self.edits_ui.diff_prefetch.clone());
             if view.undo_visible != !self.edits_ui.workspace_mode || view.undo_enabled != can_undo {
                 view.undo_visible = !self.edits_ui.workspace_mode;
                 view.undo_enabled = can_undo;
@@ -1763,7 +1891,12 @@ impl AgentWorkspace {
                     .first()
                     .map(|view| view.read(cx).file.path.clone())
             })
-            .or_else(|| files.first().map(|file| file.path.clone()));
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|file| !grouped || !diff_on_demand(&file.label))
+                    .map(|file| file.path.clone())
+            });
         let selected_layer = selected
             .as_ref()
             .filter(|_| grouped)
@@ -1966,16 +2099,30 @@ impl AgentWorkspace {
                 navigation
             }
         };
-        let mut blocked = std::collections::HashSet::new();
+        let mut blocked = HashSet::new();
         let mut available = [false; 2];
+        let mut directories = [HashSet::new(), HashSet::new()];
         if grouped {
             let busy = self.workspace_stage_busy();
+            let tree = self.history.workspace_display == crate::workspace_tree::DisplayMode::Tree;
             for source in self.edits_ui.workspace_sources.values() {
                 if busy || source.overlaps(&self.edits_ui.stage_pending) {
                     blocked.insert(source.path.to_string_lossy().into_owned());
                 } else {
                     available[0] |= source.unstaged;
                     available[1] |= source.staged;
+                    if tree {
+                        let mut directory = source.label.as_str();
+                        while let Some((parent, _)) = directory.rsplit_once('/') {
+                            if source.unstaged {
+                                directories[0].insert(parent.to_owned());
+                            }
+                            if source.staged {
+                                directories[1].insert(parent.to_owned());
+                            }
+                            directory = parent;
+                        }
+                    }
                 }
             }
         }
@@ -1984,6 +2131,7 @@ impl AgentWorkspace {
             navigation.set_rows(rows, cx);
             navigation.set_selected(selected, cx);
             navigation.set_stage_availability(blocked, available, cx);
+            navigation.set_stage_directory_availability(directories, cx);
         });
         navigation
     }
@@ -2055,6 +2203,20 @@ impl AgentWorkspace {
                             source.staged
                         }
                     })
+                    .cloned()
+                    .collect();
+                self.stage_workspace_files(sources, *staged, cx);
+            }
+            ChangeNavigationEvent::StageDirectory {
+                path,
+                layer,
+                staged,
+            } => {
+                if self.edits_ui.workspace_root != self.diff_repository_root() {
+                    return;
+                }
+                let sources = self
+                    .workspace_directory_sources(path, *layer)
                     .cloned()
                     .collect();
                 self.stage_workspace_files(sources, *staged, cx);
@@ -2598,6 +2760,26 @@ impl AgentWorkspace {
             || self.edits_ui.workspace_task.is_some() && !self.edits_ui.workspace_background_refresh
     }
 
+    fn workspace_directory_sources<'a>(
+        &'a self,
+        directory: &'a str,
+        layer: bool,
+    ) -> impl Iterator<Item = &'a crate::workspace_diff::Source> {
+        self.edits_ui
+            .workspace_sources
+            .values()
+            .filter(move |source| {
+                (if layer {
+                    source.staged
+                } else {
+                    source.unstaged
+                }) && source
+                    .label
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+
     fn stage_control(
         &self,
         target: StageTarget,
@@ -2610,6 +2792,9 @@ impl AgentWorkspace {
             |source: &crate::workspace_diff::Source| !source.overlaps(&self.edits_ui.stage_pending);
         let any_available = match &target {
             StageTarget::Files(sources) => sources.iter().any(available),
+            StageTarget::Directory(path, layer) => self
+                .workspace_directory_sources(path, *layer)
+                .any(available),
             StageTarget::Group(staged) => self.edits_ui.workspace_sources.values().any(|source| {
                 (if *staged {
                     source.staged
@@ -2628,6 +2813,10 @@ impl AgentWorkspace {
                 let _ = weak.update(cx, |this, cx| {
                     let sources = match &target {
                         StageTarget::Files(sources) => sources.clone(),
+                        StageTarget::Directory(path, layer) => this
+                            .workspace_directory_sources(path, *layer)
+                            .cloned()
+                            .collect(),
                         StageTarget::Group(group) => this
                             .edits_ui
                             .workspace_sources
@@ -2764,6 +2953,12 @@ impl AgentWorkspace {
                     *collapsed,
                     self.theme,
                 )
+                .child(self.stage_control(
+                    StageTarget::Directory(path.clone(), *staged),
+                    *staged,
+                    format!("stage-directory:{path}:{staged}"),
+                    cx,
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let collapsed = this
                         .edits_ui
@@ -2957,6 +3152,81 @@ impl AgentWorkspace {
             && self.edits_ui.workspace_mode
             && self.edits_ui.workspace_root == self.diff_repository_root()
             && self.edits_ui.workspace_watch_root.is_some()
+    }
+
+    fn diff_prefetch_active(&self) -> bool {
+        self.page == crate::Page::Chat
+            && self.edits_ui.open
+            && self.edits_ui.workspace_mode
+            && !self.edits_ui.workspace_sources.is_empty()
+            && self.edits_ui.workspace_root == self.diff_repository_root()
+    }
+
+    pub(super) fn sync_workspace_diff_prefetch(&mut self, cx: &mut Context<Self>) {
+        let mut prefetch = self.edits_ui.diff_prefetch.borrow_mut();
+        prefetch.update_inventory(&self.edits_ui.workspace_files, self.edits_ui.expanded);
+        if !self.diff_prefetch_active() {
+            return;
+        }
+        if self.edits_ui.diff_prefetch_task.is_some() || !prefetch.has_pending() {
+            return;
+        }
+        drop(prefetch);
+        self.edits_ui.diff_prefetch_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(DIFF_PREFETCH_DELAY).await;
+                let Ok(next) = weak.update(cx, |this, cx| {
+                    if !this.diff_prefetch_active() {
+                        return None;
+                    }
+                    let mut prefetch = this.edits_ui.diff_prefetch.borrow_mut();
+                    if !prefetch.has_pending() {
+                        return None;
+                    }
+                    if this.edits_ui.workspace_task.is_some()
+                        || this.edits_ui.stage_task.is_some()
+                        || this.edits_ui.workspace_stats_task.is_some()
+                        || this
+                            .edits_ui
+                            .file_views
+                            .borrow()
+                            .values()
+                            .any(|view| view.read(cx).load_task.is_some())
+                    {
+                        return Some(None);
+                    }
+                    prefetch
+                        .next_source(&this.edits_ui.workspace_sources)
+                        .map(|(key, source)| {
+                            Some((
+                                key,
+                                cx.background_executor()
+                                    .spawn_with_priority(Priority::Low, async move {
+                                        prepare_workspace_diff(&source, false, key.2)
+                                    }),
+                            ))
+                        })
+                }) else {
+                    return;
+                };
+                let Some(next) = next else { break };
+                let Some((key, work)) = next else { continue };
+                let result = work.await;
+                if weak
+                    .update(cx, |this, _| {
+                        this.edits_ui.diff_prefetch.borrow_mut().finish(key, result)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = weak.update(cx, |this, _| {
+                if let Some(task) = this.edits_ui.diff_prefetch_task.take() {
+                    task.detach();
+                }
+            });
+        }));
     }
 
     pub(super) fn sync_workspace_watch(&mut self, cx: &mut Context<Self>) {
@@ -4177,6 +4447,7 @@ struct FileDiff {
     tree_depth: Option<usize>,
     list_link: ListLink,
     source: Option<crate::workspace_diff::Source>,
+    prefetch: Option<Rc<RefCell<DiffPrefetch>>>,
     loaded: Option<Change>,
     load_task: Option<Task<()>>,
     load_error: Option<String>,
@@ -4201,6 +4472,7 @@ impl FileDiff {
             tree_depth: None,
             list_link: Default::default(),
             source: None,
+            prefetch: None,
             loaded: None,
             load_task: None,
             load_error: None,
@@ -4261,13 +4533,50 @@ impl FileDiff {
         let side_by_side = self.side_by_side;
         self.load_error = None;
         self.manual_load_available = false;
-        let work = cx.background_executor().spawn(async move {
-            let mut change = crate::workspace_diff::load_with_options(&source, manual)?;
-            let prepared = DiffCard::prepare(change.take_lines(), side_by_side);
-            Ok::<_, crate::workspace_diff::LoadError>((change, prepared))
-        });
+        let mut pending = None;
+        if !manual
+            && let Some(prefetch) = &self.prefetch
+            && let Some(layer) = source.layer
+        {
+            let key = (id, layer, side_by_side);
+            let mut prefetch = prefetch.borrow_mut();
+            prefetch.attempted.insert(key);
+            if let Some(DiffPreview {
+                change, prepared, ..
+            }) = prefetch.ready.remove(&key)
+            {
+                self.loaded = Some(change);
+                self.prepared = Some(prepared);
+                if let Some(workspace) = self.workspace.clone() {
+                    cx.defer(move |cx| {
+                        let _ =
+                            workspace.update(cx, |this, cx| this.sync_workspace_diff_prefetch(cx));
+                    });
+                }
+                return;
+            }
+            if let Some((active, waiter)) = &mut prefetch.active
+                && *active == key
+            {
+                let (send, receive) = oneshot::channel();
+                *waiter = Some(send);
+                pending = Some(receive);
+            }
+        }
         self.load_task = Some(cx.spawn(async move |weak, cx| {
-            let result = work.await;
+            let result = async {
+                if let Some(pending) = pending
+                    && let Ok(result) = pending.await
+                {
+                    return result;
+                }
+                cx.background_executor()
+                    .spawn_with_priority(Priority::High, async move {
+                        prepare_workspace_diff(&source, manual, side_by_side)
+                    })
+                    .await
+            }
+            .await;
             let _ = weak.update(cx, |this, cx| {
                 if this.file.id != id {
                     return;
@@ -4276,7 +4585,9 @@ impl FileDiff {
                     task.detach();
                 }
                 match result {
-                    Ok((change, prepared)) => {
+                    Ok(DiffPreview {
+                        change, prepared, ..
+                    }) => {
                         if this.side_by_side != side_by_side {
                             this.load_diff(manual, cx);
                             cx.notify();
@@ -5828,6 +6139,174 @@ mod tests {
             "4096 generated vendor files: coalesced metadata sync + visible tree frame={:?}",
             started.elapsed()
         );
+    }
+
+    #[gpui::test]
+    fn workspace_diff_prefetch_yields_to_clicks_and_leaves_vendor_on_demand(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(1);
+        for label in ["first.rs", "second.rs"] {
+            std::fs::write(repo.path().join(label), "// untracked\n").unwrap();
+        }
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.edits_ui.open = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        window.run_until_parked();
+
+        let first = window.debug_bounds("edit-file:first.rs").unwrap();
+        window.simulate_click(first.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.diff_prefetch.borrow().ready.is_empty());
+            assert!(host.edits_ui.file_views.borrow().values().any(|view| {
+                let view = view.read(cx);
+                view.file.label == "first.rs" && view.loaded.is_some()
+            }));
+        });
+        window.simulate_click(first.center(), Default::default());
+
+        for _ in 0..2 {
+            window.executor().advance_clock(DIFF_PREFETCH_DELAY);
+            window.run_until_parked();
+        }
+        host.read_with(window, |host, _| {
+            let prefetch = host.edits_ui.diff_prefetch.borrow();
+            assert_eq!(prefetch.ready.len(), 1);
+            assert_eq!(
+                prefetch.ready.values().next().unwrap().change.label,
+                "second.rs"
+            );
+            assert!(!prefetch.has_pending());
+        });
+
+        let second = window.debug_bounds("edit-file:second.rs").unwrap();
+        window.simulate_click(second.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.diff_prefetch.borrow().ready.is_empty());
+            assert!(host.edits_ui.file_views.borrow().values().any(|view| {
+                let view = view.read(cx);
+                view.file.label == "second.rs" && view.loaded.is_some()
+            }));
+        });
+
+        let vendor = root.join("vendor/0000.rs");
+        host.update(window, |host, cx| {
+            Rc::make_mut(&mut host.edits_ui.workspace_files).retain(|file| file.path == vendor);
+            Rc::make_mut(&mut host.edits_ui.workspace_sources).retain(|path, _| *path == vendor);
+            host.edits_ui.grouped_rows.borrow_mut().take();
+            host.edits_ui.expanded = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-file:vendor/0000.rs").is_none());
+        let selector =
+            Box::leak(format!("change-file:{}:false", vendor.display()).into_boxed_str());
+        let row = window.debug_bounds(selector).unwrap();
+        window.simulate_click(row.center(), Default::default());
+        window.run_until_parked();
+        host.read_with(window, |host, cx| {
+            assert!(host.edits_ui.file_views.borrow().values().any(|view| {
+                let view = view.read(cx);
+                view.file.path == vendor && view.loaded.is_some()
+            }));
+        });
+    }
+
+    #[gpui::test]
+    fn directory_checkbox_stages_collapsed_descendants_in_both_diff_layouts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let repo = crate::workspace_diff::tests::many_files(1);
+        std::fs::create_dir(repo.path().join("vendor/nested")).unwrap();
+        std::fs::create_dir(repo.path().join("vendor-other")).unwrap();
+        for file in ["vendor/nested/new.rs", "vendor-other/unrelated.rs"] {
+            std::fs::write(repo.path().join(file), "// untracked\n").unwrap();
+        }
+        let inventory = crate::workspace_diff::inventory(repo.path()).unwrap();
+        let root = inventory.root.clone();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(data.path().join("sessions.json"), cx);
+            host.history.active_mut().project = Some(root.clone());
+            host.history.workspace_display = crate::workspace_tree::DisplayMode::Tree;
+            host.edits_ui.workspace_root = Some(root.clone());
+            host.edits_ui.open = true;
+            host.edits_ui.workspace_mode = true;
+            host.edits_ui.workspace_files = Rc::new(inventory.files);
+            host.edits_ui.workspace_sources = Rc::new(inventory.sources);
+            host
+        });
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        for expanded in [false, true] {
+            host.update(window, |host, cx| {
+                host.edits_ui.expanded = expanded;
+                cx.notify();
+            });
+            window.run_until_parked();
+            let checkbox = window.debug_bounds("stage-directory:vendor:false").unwrap();
+            if window
+                .debug_bounds("stage-directory:vendor/nested:false")
+                .is_some()
+            {
+                let directory = point(checkbox.left() - px(16.), checkbox.center().y);
+                window.simulate_click(directory, Default::default());
+                window.run_until_parked();
+            }
+            assert!(
+                window
+                    .debug_bounds("stage-directory:vendor/nested:false")
+                    .is_none()
+            );
+            window.simulate_click(checkbox.center(), Default::default());
+            window.run_until_parked();
+            let sources = crate::workspace_diff::inventory(repo.path())
+                .unwrap()
+                .sources;
+            assert!(sources[&root.join("vendor/0000.rs")].staged);
+            assert!(sources[&root.join("vendor/nested/new.rs")].staged);
+            assert!(!sources[&root.join("vendor-other/unrelated.rs")].staged);
+
+            let checkbox = window.debug_bounds("stage-directory:vendor:true").unwrap();
+            window.simulate_click(checkbox.center(), Default::default());
+            window.run_until_parked();
+            assert!(
+                crate::workspace_diff::inventory(repo.path())
+                    .unwrap()
+                    .sources
+                    .values()
+                    .all(|source| !source.staged)
+            );
+            assert!(
+                window
+                    .debug_bounds("stage-directory:vendor/nested:false")
+                    .is_none()
+            );
+        }
     }
 
     #[gpui::test]

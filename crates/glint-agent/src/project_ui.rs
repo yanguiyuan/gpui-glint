@@ -1032,15 +1032,15 @@ mod tests {
     #[test]
     fn worktree_groups_keep_repository_and_session_identity_across_repositories() {
         let mut history = History::default();
-        let idl = PathBuf::from("/worktree/idl/feat/chat-governance-openapi");
-        let kim = PathBuf::from("/worktree/kim/feat/chat-governance-openapi");
-        for (path, name) in [(&idl, "idl"), (&kim, "kim")] {
+        let core = PathBuf::from("/worktree/core/feat/graph-cache");
+        let web = PathBuf::from("/worktree/web/feat/graph-cache");
+        for (path, name) in [(&core, "core"), (&web, "web")] {
             history.new_session_for(Some(path.clone()));
             history.project_metadata.insert(
                 path.clone(),
                 project_grouping::Metadata {
                     repository_name: name.into(),
-                    branch: "feat/chat-governance-openapi".into(),
+                    branch: "feat/graph-cache".into(),
                     linked_worktree: true,
                 },
             );
@@ -1048,13 +1048,10 @@ mod tests {
         let active = history.active;
         let groups = session_groups(&history, "", Some(active));
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].header.label.as_ref(),
-            "feat/chat-governance-openapi"
-        );
+        assert_eq!(groups[0].header.label.as_ref(), "feat/graph-cache");
         assert_eq!(groups[0].children.len(), 2);
-        assert_eq!(groups[0].children[0].header.label.as_ref(), "idl");
-        assert_eq!(groups[0].children[1].header.label.as_ref(), "kim");
+        assert_eq!(groups[0].children[0].header.label.as_ref(), "core");
+        assert_eq!(groups[0].children[1].header.label.as_ref(), "web");
         assert_ne!(
             groups[0].children[0].header.id,
             groups[0].children[1].header.id
@@ -1065,13 +1062,13 @@ mod tests {
         );
         assert_eq!(groups[0].children[1].items[0].icon, Some(Icon::Spinner));
         assert_eq!(
-            session_groups(&history, "idl", None)[0].children[0]
+            session_groups(&history, "core", None)[0].children[0]
                 .items
                 .len(),
             1
         );
         assert_eq!(
-            session_groups(&history, "chat-governance", None)[0]
+            session_groups(&history, "graph", None)[0]
                 .children
                 .iter()
                 .map(|group| group.items.len())
@@ -1080,11 +1077,11 @@ mod tests {
         );
         history
             .project_group_overrides
-            .insert(idl.clone(), "custom".into());
+            .insert(core.clone(), "custom".into());
         assert_eq!(session_groups(&history, "", None).len(), 2);
-        history.project_group_overrides.insert(kim, String::new());
+        history.project_group_overrides.insert(web, String::new());
         let ungrouped = session_groups(&history, "", None);
-        assert!(ungrouped[1].header.label.contains("kim"));
+        assert!(ungrouped[1].header.label.contains("web"));
         assert!(ungrouped[1].children.is_empty());
     }
 

@@ -2854,6 +2854,7 @@ impl Render for AgentWorkspace {
         self.sync_panel_repositories(window, cx);
         self.sync_terminal_theme(cx);
         self.sync_workspace_watch(cx);
+        self.sync_workspace_diff_prefetch(cx);
         self.sync_project_actions(cx);
         self.file_preview.view.update(cx, |view, cx| {
             view.set_active(
