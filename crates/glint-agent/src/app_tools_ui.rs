@@ -1,4 +1,5 @@
 use super::*;
+use gpui_glint::components::ChainScroll;
 use std::hash::{Hash, Hasher};
 
 pub struct MarkdownView {
@@ -15,6 +16,7 @@ pub struct ToolPanel {
     active: bool,
     output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     output_scroll: ScrollHandle,
+    diff_scroll: ScrollHandle,
     signature: String,
     theme: ThemePreset,
     panel: Entity<gpui_glint::components::CollapsePanel>,
@@ -778,6 +780,7 @@ impl AgentWorkspace {
                     active: false,
                     output_panel: None,
                     output_scroll: ScrollHandle::new(),
+                    diff_scroll: ScrollHandle::new(),
                     signature: String::new(),
                     theme,
                     panel,
@@ -792,11 +795,20 @@ impl AgentWorkspace {
             )
             .then(|| crate::command_output::Output::parse(&result, theme));
             let result_scroll = entry.output_scroll.clone();
+            let diff_scroll = entry.diff_scroll.clone();
             if record.result == "执行中…" {
                 scroll_follow::follow_if_at_bottom(&result_scroll);
             }
             let change = record.change.clone();
             let nested = record.nested_tools.clone();
+            // A running call with nothing to show yet renders a skeleton where
+            // the "waiting for the tool" placeholder sentence used to sit.
+            let pending_body = record.result == "执行中…"
+                && record
+                    .live_output
+                    .as_ref()
+                    .is_none_or(|output| output.trim().is_empty());
+            let pending_id = format!("tool-pending:{}", record.call.id);
             let script = if record.call.name == "code_mode" {
                 record.call.arguments["code"].as_str().map(|source| {
                     let text: SharedString = source.to_owned().into();
@@ -811,7 +823,7 @@ impl AgentWorkspace {
             } else {
                 None
             };
-            let output_cards = (record.call.name == "code_mode").then(|| {
+            let output_cards = (record.call.name == "code_mode" && !pending_body).then(|| {
                 code_mode_output_sections(&record.result)
                     .into_iter()
                     .map(|(label, text, language)| {
@@ -861,19 +873,24 @@ impl AgentWorkspace {
             }
             .to_owned();
             let status_animation_id = SharedString::from(format!("tool-status:{}", record.call.id));
-            let (status_icon, status_label) = if record.result == "执行中…" {
-                (Icon::Spinner, "执行中")
+            use gpui_glint::components::StatusTone;
+            let (status_icon, status_label, status_tone) = if record.result == "执行中…" {
+                (Icon::Spinner, "执行中", StatusTone::Accent)
             } else if record.result == "正在生成参数…" {
-                (Icon::Clock, "准备中")
+                (Icon::Clock, "准备中", StatusTone::Accent)
             } else if record.result.starts_with("未执行：") {
-                (Icon::Pause, "未执行")
+                (Icon::Pause, "未执行", StatusTone::Warning)
             } else if record.result.starts_with("调用已中断：") {
-                (Icon::Pause, "已中断")
+                (Icon::Pause, "已中断", StatusTone::Warning)
             } else if tool_succeeded(record) {
-                (Icon::CheckCircle, "成功")
+                (Icon::CheckCircle, "成功", StatusTone::Success)
             } else {
-                (Icon::Close, "失败")
+                (Icon::Close, "失败", StatusTone::Danger)
             };
+            // A tool call is one result block, so its body lines up flush with
+            // the trigger icon and skips the indent guide. That holds for tool
+            // orchestration too: the script and its return value read as one
+            // answer, not as a list to be grouped.
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
                 panel.set_summary(presentation.summary.clone(), cx);
@@ -1025,6 +1042,15 @@ impl AgentWorkspace {
                                                     })
                                                     .child(output_panel.clone())
                                                     .into_any_element()
+                                            } else if pending_body {
+                                                div()
+                                                    .w_full()
+                                                    .py_1()
+                                                    .child(pending_skeleton(
+                                                        pending_id.clone(),
+                                                        theme,
+                                                    ))
+                                                    .into_any_element()
                                             } else {
                                                 div()
                                                     .text_size(px(12.))
@@ -1054,6 +1080,8 @@ impl AgentWorkspace {
                                                     .id("tool-edit-diff")
                                                     .max_h(px(360.))
                                                     .overflow_y_scroll()
+                                                    .track_scroll(&diff_scroll)
+                                                    .chain_scroll_y(&diff_scroll)
                                                     .child(this.edit_diff(&scope, change, cx)),
                                             )
                                             .into_any_element()
@@ -1074,13 +1102,16 @@ impl AgentWorkspace {
                                 .line_height(px(20.))
                                 .font_family("monospace")
                                 .text_color(rgb(p.text_muted))
-                                .child(div().w_full().min_w_0().child(
-                                    if let Some(output) = &command_output {
-                                        output.render().into_any_element()
-                                    } else {
-                                        div().child(result.clone()).into_any_element()
-                                    },
-                                ))
+                                .child(div().w_full().min_w_0().child(if pending_body {
+                                    div()
+                                        .py_1()
+                                        .child(pending_skeleton(pending_id.clone(), theme))
+                                        .into_any_element()
+                                } else if let Some(output) = &command_output {
+                                    output.render().into_any_element()
+                                } else {
+                                    div().child(result.clone()).into_any_element()
+                                }))
                                 .child(crate::command_output::scroll_guard(&result_scroll, 20.))
                                 .into_any_element()
                         })();
@@ -1088,6 +1119,7 @@ impl AgentWorkspace {
                             .theme(theme)
                             .child(body)
                             .status(status_icon, status_label)
+                            .status_tone(status_tone)
                             .status_animation_id(status_animation_id.clone())
                             .render()
                     },
@@ -1294,6 +1326,7 @@ impl AgentWorkspace {
                             active: false,
                             output_panel: None,
                             output_scroll: ScrollHandle::new(),
+                            diff_scroll: ScrollHandle::new(),
                             signature: String::new(),
                             theme,
                             panel: cx
@@ -1746,7 +1779,7 @@ impl AgentWorkspace {
                 .unwrap_or_default();
             panel = panel.w_full().max_w(px(800.)).p_4().flex().flex_col().gap_3().rounded(px(10.)).border_1().border_color(rgb(p.accent)).bg(rgb(p.panel))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{source}确认工具调用：{}", approval.call.name)))
-                .child(div().id("approval-arguments").max_h(px(180.)).overflow_y_scroll().text_size(px(11.)).child(serde_json::to_string_pretty(&approval.call.arguments).unwrap_or_default()))
+                .child(approval_arguments_view(approval, self.theme))
                 .when(approval.call.name == "run_command", |panel| panel.child(div().text_size(px(11.)).text_color(rgb(p.text_muted)).child("命令在项目目录运行，批准前请检查程序和参数；命令自身可以访问项目外部。")))
                 .child(div().flex().gap_3()
                     .child(Button::new("允许本次").theme(self.theme).render().on_click(cx.listener(move |this, _, _, cx| { if let Some(approval) = this.runs.get_mut(&session).and_then(|run| run.approval.take()) { let _=approval.respond.send(true); } cx.notify(); })))
@@ -1754,6 +1787,33 @@ impl AgentWorkspace {
         }
         panel
     }
+}
+
+/// Approval arguments scroll on their own; the dialogue must stay put while the
+/// reader inspects a long call, then take over once the arguments hit an edge.
+fn approval_arguments_view(approval: &Approval, theme: ThemePreset) -> gpui::Stateful<gpui::Div> {
+    let p = theme.palette();
+    use std::cell::RefCell;
+    thread_local! {
+        static HANDLES: RefCell<std::collections::HashMap<String, ScrollHandle>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    let scroll = HANDLES.with(|handles| {
+        handles
+            .borrow_mut()
+            .entry(approval.call.id.clone())
+            .or_default()
+            .clone()
+    });
+    div()
+        .id("approval-arguments")
+        .max_h(px(180.))
+        .overflow_y_scroll()
+        .track_scroll(&scroll)
+        .chain_scroll_y(&scroll)
+        .text_size(px(11.))
+        .text_color(rgb(p.text_muted))
+        .child(serde_json::to_string_pretty(&approval.call.arguments).unwrap_or_default())
 }
 
 type OutputCard = (
@@ -1853,6 +1913,23 @@ fn code_mode_output_sections(raw: &str) -> Vec<(Option<String>, String, &'static
     } else {
         vec![format_value(Some("输出结果".into()), &value)]
     }
+}
+
+/// A running tool call has no result yet; a pulsing placeholder reads as
+/// "content is coming" where a sentence of placeholder copy reads as output.
+fn pending_skeleton(id: String, theme: ThemePreset) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "tool-pending".into())
+        .w_full()
+        .min_w_0()
+        .child(
+            gpui_glint::components::Skeleton::new(id)
+                .lines(2)
+                .height(11.)
+                .gap(10.)
+                .theme(theme),
+        )
+        .into_any_element()
 }
 
 fn thinking_summary(text: &str, active: bool, elapsed_ms: Option<u64>) -> String {

@@ -365,6 +365,18 @@ fn entries<'a>(
     entries
 }
 
+/// Status colors shared with tool activity rows and subagent captions.
+fn status_tone(status: &str) -> gpui_glint::components::StatusTone {
+    use gpui_glint::components::StatusTone;
+    match status {
+        "执行中" | "待执行" => StatusTone::Accent,
+        "成功" => StatusTone::Success,
+        "待批准" | "未执行" | "未完成" => StatusTone::Warning,
+        "失败" => StatusTone::Danger,
+        _ => StatusTone::Neutral,
+    }
+}
+
 #[derive(Clone)]
 struct Row {
     id: String,
@@ -586,6 +598,7 @@ impl AgentWorkspace {
         } else {
             None
         };
+        let theme = self.theme;
         let session_id = session.id;
         let empty = rows.is_empty();
         let count = rows.len();
@@ -644,16 +657,7 @@ impl AgentWorkspace {
                                         div()
                                             .flex_shrink_0()
                                             .text_size(px(10.))
-                                            .text_color(rgb(
-                                                if matches!(
-                                                    row.status,
-                                                    "失败" | "未执行" | "未完成"
-                                                ) {
-                                                    0xd9342b
-                                                } else {
-                                                    p.text_muted
-                                                },
-                                            ))
+                                            .text_color(rgb(status_tone(row.status).color(theme)))
                                             .child(row.status),
                                     )
                                     .child(

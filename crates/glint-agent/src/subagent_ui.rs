@@ -239,7 +239,7 @@ impl AgentWorkspace {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(p.text_muted))
+                            .text_color(rgb(trace.status.tone().color(self.theme)))
                             .child(trace_caption(&trace)),
                     )
                     .on_click(
@@ -358,7 +358,7 @@ impl AgentWorkspace {
             )
             .child(
                 div()
-                    .text_color(rgb(p.text_muted))
+                    .text_color(rgb(trace.status.tone().color(self.theme)))
                     .child(trace_caption(trace)),
             )
             .child(self.subagent_selector(cx));
@@ -525,7 +525,7 @@ impl Render for Summary {
             )
             .child(
                 div()
-                    .text_color(rgb(p.text_muted))
+                    .text_color(rgb(self.trace.status.tone().color(self.theme)))
                     .child(trace_caption(&self.trace)),
             )
             .child(Icon::ChevronRight.render(12.).text_color(rgb(p.text_muted)))

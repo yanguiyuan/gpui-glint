@@ -144,7 +144,7 @@ mod group_list;
 pub use group_list::{GroupList, GroupListEvent, GroupListGroup, GroupListHeader, GroupListItem};
 
 mod operation_panel;
-pub use operation_panel::OperationPanel;
+pub use operation_panel::{OperationPanel, StatusTone};
 mod collapse_panel;
 pub use collapse_panel::{CollapsePanel, CollapsePanelContent, CollapsePanelEvent};
 

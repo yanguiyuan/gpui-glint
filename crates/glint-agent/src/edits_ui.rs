@@ -4581,19 +4581,32 @@ impl Render for Summary {
             );
         }
         if self.files.len() > 3 {
+            // A quiet text toggle sits inside the card like one more row: the
+            // filled button read as a separate action and split the list.
             panel = panel.child(
-                Button::new(if self.expanded {
-                    "收起".into()
-                } else {
-                    format!("再显示 {} 个文件", self.files.len() - 3)
-                })
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .render()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.expanded = !this.expanded;
-                    cx.notify();
-                })),
+                div()
+                    .id("edit-summary-more")
+                    .debug_selector(|| "edit-summary-more".into())
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .rounded_b(px(10.))
+                    .hover(|style| style.bg(rgb(p.surface_subtle)))
+                    .child(div().text_size(px(12.)).text_color(rgb(p.text)).child(
+                        if self.expanded {
+                            "收起".to_owned()
+                        } else {
+                            format!("再显示 {} 个文件", self.files.len() - 3)
+                        },
+                    ))
+                    .child(Icon::disclosure(12., self.expanded))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    })),
             );
         }
         panel

@@ -14,10 +14,22 @@ fn response_timeout_content(
     theme: ThemePreset,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement {
     move |_, _| {
+        let muted = theme.palette().text_muted;
         div().flex().flex_col().gap_2()
             .debug_selector(|| "provider-response-timeout".to_owned())
-            .child(InputField::new("").label("响应空闲超时（秒）").control(entry.clone()).theme(theme).render().w_full())
-            .child(div().text_size(px(11.)).text_color(rgb(theme.palette().text_muted))
+            .child(
+                div().flex().items_center().gap_4()
+                    .child(
+                        div().w(px(128.)).flex_shrink_0().text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM).text_color(rgb(muted))
+                            .child("响应空闲超时（秒）"),
+                    )
+                    .child(
+                        div().flex_1().min_w_0()
+                            .child(InputField::new("").control(entry.clone()).theme(theme).render().w_full()),
+                    ),
+            )
+            .child(div().pl(px(144.)).text_size(px(11.)).text_color(rgb(muted))
                 .child("连续未收到数据时的等待上限，默认 180 秒，可设 1–86400 秒。持续输出时不限制总时长。"))
             .into_any_element()
     }
@@ -199,6 +211,7 @@ impl Settings {
         let more_settings = cx.new(|_| {
             CollapsePanel::new("更多设置")
                 .compact()
+                .guard_line(true)
                 .theme(ThemePreset::Moonstone)
                 .content(response_timeout_content(
                     response_timeout.clone(),
@@ -1111,6 +1124,48 @@ impl AgentWorkspace {
                 .render()
                 .w_full()
         };
+        // Connection form rows: label on the left, value/control right-aligned.
+        let label_col = |label: &str| {
+            div()
+                .w(px(128.))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(p.text_muted))
+                .child(label.to_owned())
+        };
+        let hint_col = |hint: &str| {
+            div()
+                .pl(px(144.))
+                .text_size(px(11.))
+                .text_color(rgb(p.text_muted))
+                .child(hint.to_owned())
+        };
+        let setting_row = |label: &str, control: gpui::Div| {
+            div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .child(label_col(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .child(control),
+                )
+        };
+        let field_row = |label: &str, entry: &Entity<TextEntry>| {
+            let input = InputField::new("")
+                .control(entry.clone())
+                .theme(self.theme)
+                .render()
+                .w_full();
+            setting_row(label, div().w_full().child(input))
+        };
         if settings.tab == ProviderTab::Connection {
             let mut card = div()
                 .p_5()
@@ -1120,13 +1175,15 @@ impl AgentWorkspace {
                 .rounded(px(12.))
                 .border_1()
                 .border_color(rgb(p.border))
-                .child(field("名称", &settings.name));
+                .child(field_row("名称", &settings.name));
             if chatgpt {
                 card = card
-                    .child(
+                    .child(setting_row(
+                        "订阅授权",
                         div()
                             .flex()
                             .flex_wrap()
+                            .justify_end()
                             .gap_3()
                             .child(
                                 Button::new(if settings.auth_task.is_some() {
@@ -1157,134 +1214,134 @@ impl AgentWorkspace {
                                     .render()
                                     .on_click(cx.listener(|this, _, _, cx| this.chatgpt_auth(ChatGptAuth::SignOut, cx))),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child("通过官方 ChatGPT 页面授权订阅；凭据保存在本机，无需 API Key。每个供应商对应一个账号授权。"),
-                    );
+                    ))
+                    .child(hint_col(
+                        "通过官方 ChatGPT 页面授权订阅；凭据保存在本机，无需 API Key。每个供应商对应一个账号授权。",
+                    ));
                 if let Some(account) = &settings.chatgpt_account {
-                    card = card.child(
-                        div()
-                            .text_size(px(12.))
-                            .child(format!("当前账号：{account}")),
-                    );
+                    card = card.child(setting_row(
+                        "当前账号",
+                        div().text_size(px(12.)).child(account.clone()),
+                    ));
                 }
             } else {
                 card = card
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_size(px(12.)).child("协议"))
-                            .child(
-                                SegmentedControl::new([
-                                    SegmentOption::new("Anthropic")
-                                        .debug_selector("provider-protocol-anthropic"),
-                                    SegmentOption::new("OpenAI 兼容")
-                                        .debug_selector("provider-protocol-openai"),
-                                ])
-                                .id("provider-protocol")
-                                .selected(usize::from(
-                                    settings.protocol == provider::Protocol::OpenAi,
-                                ))
-                                .theme(self.theme)
-                                .on_change({
-                                    let weak = cx.entity().downgrade();
-                                    move |index, _, cx| {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            let protocol = if index == 1 {
-                                                provider::Protocol::OpenAi
+                    .child(setting_row(
+                        "协议",
+                        div().flex().items_center().gap_2().child(
+                            SegmentedControl::new([
+                                SegmentOption::new("Anthropic")
+                                    .debug_selector("provider-protocol-anthropic"),
+                                SegmentOption::new("OpenAI 兼容")
+                                    .debug_selector("provider-protocol-openai"),
+                            ])
+                            .id("provider-protocol")
+                            .selected(usize::from(settings.protocol == provider::Protocol::OpenAi))
+                            .theme(self.theme)
+                            .on_change({
+                                let weak = cx.entity().downgrade();
+                                move |index, _, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        let protocol = if index == 1 {
+                                            provider::Protocol::OpenAi
+                                        } else {
+                                            provider::Protocol::Anthropic
+                                        };
+                                        this.provider_settings.protocol = protocol;
+                                        let address = this.provider_settings.url.read(cx).value();
+                                        if matches!(
+                                            address.trim_end_matches('/'),
+                                            "https://api.deepseek.com"
+                                                | "https://api.deepseek.com/v1"
+                                                | "https://api.deepseek.com/anthropic"
+                                        ) {
+                                            let url = if protocol == provider::Protocol::Anthropic {
+                                                "https://api.deepseek.com/anthropic"
                                             } else {
-                                                provider::Protocol::Anthropic
-                                            };
-                                            this.provider_settings.protocol = protocol;
-                                            let address =
-                                                this.provider_settings.url.read(cx).value();
-                                            if matches!(
-                                                address.trim_end_matches('/'),
                                                 "https://api.deepseek.com"
-                                                    | "https://api.deepseek.com/v1"
-                                                    | "https://api.deepseek.com/anthropic"
-                                            ) {
-                                                let url =
-                                                    if protocol == provider::Protocol::Anthropic {
-                                                        "https://api.deepseek.com/anthropic"
-                                                    } else {
-                                                        "https://api.deepseek.com"
-                                                    };
-                                                this.provider_settings
-                                                    .url
-                                                    .update(cx, |entry, cx| {
-                                                        entry.set_value(url, cx)
-                                                    });
-                                                this.provider_settings.original.models_url =
-                                                    Some("https://api.deepseek.com/models".into());
-                                            }
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .render(),
-                            ),
-                    )
-                    .child(field("Base URL", &settings.url))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_size(px(12.)).child("认证方式"))
-                            .child(
-                                SegmentedControl::new([
-                                    SegmentOption::new("环境变量")
-                                        .debug_selector("provider-auth-env"),
-                                    SegmentOption::new("API Key")
-                                        .debug_selector("provider-auth-key"),
-                                ])
-                                .id("provider-auth")
-                                .selected(usize::from(!settings.use_env))
-                                .theme(self.theme)
-                                .on_change({
-                                    let weak = cx.entity().downgrade();
-                                    move |index, _, cx| {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.provider_settings.use_env = index == 0;
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .render(),
-                            ),
-                    )
+                                            };
+                                            this.provider_settings
+                                                .url
+                                                .update(cx, |entry, cx| entry.set_value(url, cx));
+                                            this.provider_settings.original.models_url =
+                                                Some("https://api.deepseek.com/models".into());
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .render(),
+                        ),
+                    ))
+                    .child(field_row("Base URL", &settings.url))
+                    .child(setting_row(
+                        "认证方式",
+                        div().flex().items_center().gap_2().child(
+                            SegmentedControl::new([
+                                SegmentOption::new("环境变量").debug_selector("provider-auth-env"),
+                                SegmentOption::new("API Key").debug_selector("provider-auth-key"),
+                            ])
+                            .id("provider-auth")
+                            .selected(usize::from(!settings.use_env))
+                            .theme(self.theme)
+                            .on_change({
+                                let weak = cx.entity().downgrade();
+                                move |index, _, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.provider_settings.use_env = index == 0;
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .render(),
+                        ),
+                    ))
                     .child(if settings.use_env {
-                        field("环境变量名", &settings.key_env)
+                        field_row("环境变量名", &settings.key_env)
                     } else {
                         div()
                             .flex()
-                            .items_end()
-                            .gap_2()
-                            .child(div().flex_1().child(field(
-                                "API Key（本机 SQLite 明文保存，留空保留）",
-                                &settings.key,
-                            )))
-                            .child(
-                                IconButton::new(Icon::Trash, "清除已保存的密钥")
-                                    .plain()
-                                    .theme(self.theme)
-                                    .render()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.provider_settings.message = Some(
-                                            match this.provider_settings.original.remove_key() {
-                                                Ok(()) => "已清除 SQLite 中保存的密钥。".into(),
-                                                Err(error) => error,
-                                            },
-                                        );
-                                        cx.notify();
-                                    })),
-                            )
+                            .flex_col()
+                            .gap_1()
+                            .child(setting_row(
+                                "API Key",
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().min_w_0().child(
+                                            InputField::new("")
+                                                .control(settings.key.clone())
+                                                .theme(self.theme)
+                                                .render()
+                                                .w_full(),
+                                        ),
+                                    )
+                                    .child(
+                                        IconButton::new(Icon::Trash, "清除已保存的密钥")
+                                            .plain()
+                                            .theme(self.theme)
+                                            .render()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.provider_settings.message = Some(
+                                                    match this
+                                                        .provider_settings
+                                                        .original
+                                                        .remove_key()
+                                                    {
+                                                        Ok(()) => {
+                                                            "已清除 SQLite 中保存的密钥。".into()
+                                                        }
+                                                        Err(error) => error,
+                                                    },
+                                                );
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ))
+                            .child(hint_col("留空保留已保存的密钥；密钥只写在本机 SQLite。"))
                     });
             }
             card = card.child(settings.more_settings.clone());
@@ -1292,25 +1349,23 @@ impl AgentWorkspace {
                 div()
                     .pt_2()
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        Button::new(if settings.testing.is_some() {
-                            "取消测试"
-                        } else {
-                            "测试连接"
-                        })
-                        .kind(ButtonKind::Glass)
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, _, cx| this.test_provider(cx))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child("使用默认模型发送一条简短请求。"),
-                    ),
+                    .flex_col()
+                    .gap_1()
+                    .child(setting_row(
+                        "连接测试",
+                        div().flex().items_center().gap_3().child(
+                            Button::new(if settings.testing.is_some() {
+                                "取消测试"
+                            } else {
+                                "测试连接"
+                            })
+                            .kind(ButtonKind::Glass)
+                            .theme(self.theme)
+                            .render()
+                            .on_click(cx.listener(|this, _, _, cx| this.test_provider(cx))),
+                        ),
+                    ))
+                    .child(hint_col("使用默认模型发送一条简短请求。")),
             );
             page = page.child(card);
         } else {

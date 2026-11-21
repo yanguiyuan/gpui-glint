@@ -1,6 +1,7 @@
 use super::document_markdown::{self as md, Node};
 pub use super::document_markdown::{DocumentBlock, DocumentBlockKind};
 use super::inputs::checkbox_control_themed;
+use super::scroll_chain::ChainScroll;
 use super::{
     CodeCard, CodeCardEvent, DataTable, Icon, MermaidDiagram, MermaidEvent, TableCell, TableColumn,
     TableRow,
@@ -2870,6 +2871,7 @@ impl DocumentEditor {
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    .chain_scroll_y(&self.scroll)
                     .pt(px(if self.scrollable_preview { 8. } else { 32. }))
                     .pb(px(if self.scrollable_preview { 8. } else { 32. }))
             })

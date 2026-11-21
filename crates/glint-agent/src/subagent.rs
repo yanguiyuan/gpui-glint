@@ -43,6 +43,18 @@ impl Status {
             Self::Cancelled => "已取消",
         }
     }
+
+    /// Shared status coloring so subagent captions match tool activity rows.
+    pub fn tone(self) -> gpui_glint::components::StatusTone {
+        use gpui_glint::components::StatusTone;
+        match self {
+            Self::Running => StatusTone::Accent,
+            Self::WaitingApproval | Self::WaitingInput => StatusTone::Warning,
+            Self::Completed => StatusTone::Success,
+            Self::Failed => StatusTone::Danger,
+            Self::Cancelled => StatusTone::Warning,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

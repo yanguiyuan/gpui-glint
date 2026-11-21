@@ -398,6 +398,29 @@ impl From<ComposerSubmission> for QueueEntry {
     }
 }
 
+/// A queued prompt being dragged to a new position in the queue.
+#[derive(Clone)]
+struct QueueDrag {
+    owner: gpui::EntityId,
+    id: u64,
+    label: SharedString,
+    theme: ThemePreset,
+}
+impl Render for QueueDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let p = self.theme.palette();
+        div()
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(10.))
+            .bg(rgb(p.surface))
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(rgb(p.text))
+            .child(self.label.clone())
+    }
+}
+
 pub struct Composer {
     editor: Entity<PromptEditor>,
     theme: ThemePreset,
@@ -1329,6 +1352,25 @@ impl Composer {
             cx.notify();
         }
     }
+
+    /// Moves queued prompt `source` into `target`'s slot. Dispatch is FIFO over this
+    /// vector (see [`Self::submit_next_in_scope`]), so this changes sending order too.
+    fn queue_move(&mut self, source: u64, target: u64, cx: &mut Context<Self>) {
+        if source == target {
+            return;
+        }
+        let Some(from) = self.queue.iter().position(|entry| entry.id == source) else {
+            return;
+        };
+        let Some(to) = self.queue.iter().position(|entry| entry.id == target) else {
+            return;
+        };
+        let entry = self.queue.remove(from);
+        // Removing shifts everything after `from` down, so clamp into the new length.
+        let to = to.min(self.queue.len());
+        self.queue.insert(to, entry);
+        cx.notify();
+    }
 }
 
 impl Render for Composer {
@@ -1745,7 +1787,10 @@ impl Render for Composer {
                 continue;
             }
             has_queue = true;
+            let entry_id = submission.id;
+            let owner = cx.entity_id();
             let row = div()
+                .id(("composer-queue-row", entry_id as usize))
                 .w_full()
                 .flex()
                 .items_center()
@@ -1754,10 +1799,36 @@ impl Render for Composer {
                 .py(px(11.))
                 .rounded(px(14.))
                 .bg(if dark { rgba(0xffffff0a) } else { rgb(p.panel) })
+                .drag_over::<QueueDrag>(move |style, drag, _, _| {
+                    if drag.owner == owner && drag.id != entry_id {
+                        style.bg(rgb(p.accent_tint))
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(cx.listener(move |this, drag: &QueueDrag, _, cx| {
+                    if drag.owner == cx.entity_id() {
+                        this.queue_move(drag.id, entry_id, cx);
+                    }
+                }))
                 .child(
                     div()
+                        .id(("composer-queue-grip", entry_id as usize))
                         .flex_shrink_0()
+                        .p(px(2.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
                         .text_color(rgb(p.text_muted))
+                        .hover(move |style| style.text_color(rgb(p.text)).bg(rgb(p.surface_subtle)))
+                        .on_drag(
+                            QueueDrag {
+                                owner,
+                                id: entry_id,
+                                label: submission.text.chars().take(48).collect::<String>().into(),
+                                theme,
+                            },
+                            |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        )
                         .child(Icon::Grip.render(14.)),
                 )
                 .child(

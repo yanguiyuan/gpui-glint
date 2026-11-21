@@ -1,4 +1,5 @@
 use super::Icon;
+use super::scroll_chain::ChainScroll;
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -17,9 +18,10 @@ pub enum CollapsePanelEvent {
 }
 
 /// An AI-chat style collapsible panel: a trigger row (optional prefix icon,
-/// summary, rotating chevron) over a body of custom content with a left
-/// hairline. Typical bodies are thinking text, code previews, and terminal
-/// output.
+/// summary, rotating chevron) over a body of custom content. By default the
+/// body sits flush with the trigger icon, which suits the common case of one
+/// result block; call [`CollapsePanel::guard_line`] to hang it off a left
+/// hairline instead, which groups multi-row bodies such as a work log.
 pub struct CollapsePanel {
     icon: Option<Icon>,
     summary: SharedString,
@@ -29,6 +31,9 @@ pub struct CollapsePanel {
     content: Option<CollapsePanelContent>,
     expanded: bool,
     compact: bool,
+    /// Draw the left hairline and indent the body under the trigger. Off by
+    /// default, so a single result lines up with the trigger icon.
+    guard_line: bool,
     theme: ThemePreset,
 }
 
@@ -45,6 +50,7 @@ impl CollapsePanel {
             content: None,
             expanded: false,
             compact: false,
+            guard_line: false,
             theme: ThemePreset::default(),
         }
     }
@@ -142,6 +148,24 @@ impl CollapsePanel {
         self.expanded
     }
 
+    /// Draw the left hairline through the body and indent it under the
+    /// trigger. Off by default: one result block reads better flush left, lined
+    /// up with the trigger icon. Turn it on for multi-row bodies such as a work
+    /// log, where the line groups the rows.
+    pub fn guard_line(mut self, show: bool) -> Self {
+        self.guard_line = show;
+        self
+    }
+
+    /// Setter form of [`CollapsePanel::guard_line`], for hosts that keep one
+    /// entity and re-apply their layout choice as content changes.
+    pub fn set_guard_line(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.guard_line != show {
+            self.guard_line = show;
+            cx.notify();
+        }
+    }
+
     pub fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         if self.theme != theme {
             self.theme = theme;
@@ -175,6 +199,7 @@ impl Render for CollapsePanel {
                 .h(px(20.))
                 .overflow_y_scroll()
                 .track_scroll(&self.summary_scroll)
+                .chain_scroll_y(&self.summary_scroll)
                 .child(
                     div()
                         .w_full()
@@ -232,16 +257,20 @@ impl Render for CollapsePanel {
         if self.expanded
             && let Some(content) = &self.content
         {
-            root = root.child(
-                div()
-                    .ml(px(15.))
+            let body = div().py(px(2.)).flex_shrink_0();
+            // The hairline doubles as the indent guide: drop both together so a
+            // lined body stays aligned with the trigger icon above it.
+            let body = if self.guard_line {
+                body.ml(px(15.))
                     .pl(px(18.))
-                    .py(px(2.))
-                    .flex_shrink_0()
                     .border_l_1()
                     .border_color(rgb(p.border))
-                    .child(content(window, cx)),
-            );
+            } else {
+                // No guide: line the body up with the trigger icon instead of
+                // hanging it off a hairline.
+                body.pl(px(10.))
+            };
+            root = root.child(body.child(content(window, cx)));
         }
         root
     }

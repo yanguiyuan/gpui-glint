@@ -5,6 +5,43 @@ use gpui::{
     div, px, rgb,
 };
 
+/// Semantic color for the bottom-right execution status, so running, done,
+/// skipped, and failed reads are distinguishable at a glance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusTone {
+    /// Muted, for idle or skipped work.
+    #[default]
+    Neutral,
+    /// Accent, for work in progress.
+    Accent,
+    /// Green, for a completed operation.
+    Success,
+    /// Amber, for interrupted or incomplete work.
+    Warning,
+    /// Red, for a failed operation.
+    Danger,
+}
+
+impl StatusTone {
+    const fn token(self) -> u32 {
+        match self {
+            Self::Neutral => 0,
+            Self::Accent => 0x007aff,
+            Self::Success => 0x24864c,
+            Self::Warning => 0xb37716,
+            Self::Danger => 0xd9342b,
+        }
+    }
+
+    /// Resolve this tone against a theme preset.
+    pub fn color(self, theme: ThemePreset) -> u32 {
+        match self {
+            Self::Neutral => theme.palette().text_muted,
+            tone => theme.color(tone.token()),
+        }
+    }
+}
+
 /// Neutral result surface for an operation inside a collapsible activity row.
 /// The host owns scrolling, streamed content, and execution status.
 pub struct OperationPanel {
@@ -12,6 +49,7 @@ pub struct OperationPanel {
     theme: ThemePreset,
     body: Vec<AnyElement>,
     status: Option<(Icon, SharedString)>,
+    status_tone: StatusTone,
     status_animation_id: SharedString,
 }
 
@@ -22,6 +60,7 @@ impl OperationPanel {
             theme: ThemePreset::default(),
             body: vec![],
             status: None,
+            status_tone: StatusTone::default(),
             status_animation_id: SharedString::from("operation-panel-status"),
         }
     }
@@ -38,6 +77,12 @@ impl OperationPanel {
 
     pub fn status(mut self, icon: Icon, label: impl Into<SharedString>) -> Self {
         self.status = Some((icon, label.into()));
+        self
+    }
+
+    /// Color the status icon and label by outcome. Defaults to muted neutral.
+    pub fn status_tone(mut self, tone: StatusTone) -> Self {
+        self.status_tone = tone;
         self
     }
 
@@ -91,6 +136,7 @@ impl OperationPanel {
                     .justify_end()
                     .gap_1()
                     .text_size(px(11.))
+                    .text_color(rgb(self.status_tone.color(self.theme)))
                     .child(status_icon)
                     .child(label),
             );

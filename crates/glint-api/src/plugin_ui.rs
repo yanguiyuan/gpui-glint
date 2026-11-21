@@ -146,6 +146,7 @@ pub(super) fn environment_settings_panel<V: 'static>(
     cx.new(|_| {
         gpui_glint::components::CollapsePanel::new("更多设置")
             .compact()
+            .guard_line(true)
             .theme(theme)
             .content(move |_, _| {
                 div()

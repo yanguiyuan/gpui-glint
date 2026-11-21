@@ -3072,12 +3072,14 @@ impl CodeCard {
         });
     }
 
+    /// Returns true when the viewport used the wheel delta itself, so the
+    /// caller can keep the conversation from scrolling at the same time.
     fn viewport_wheel(
         &mut self,
         event: &gpui::ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.activate_window(window, cx);
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
         if event.modifiers.shift {
@@ -3105,18 +3107,22 @@ impl CodeCard {
             };
             let next = (offset.x + horizontal).clamp(-max, px(0.));
             self.scroll.set_offset(point(next, px(0.)));
-            cx.stop_propagation();
             if next != offset.x {
                 cx.notify();
             }
+            // Shift+wheel is horizontal intent for this card; never let it turn
+            // into a vertical conversation scroll.
+            true
         } else {
             let handle = self.viewport_scroll.0.borrow().base_handle.clone();
             let offset = handle.offset();
             let next = (offset.y + delta.y).clamp(-handle.max_offset().y, px(0.));
             if next != offset.y {
                 handle.set_offset(point(offset.x, next));
-                cx.stop_propagation();
                 cx.notify();
+                true
+            } else {
+                false
             }
         }
     }
@@ -3506,9 +3512,16 @@ impl CodeCard {
                                         if phase == gpui::DispatchPhase::Capture
                                             && hitbox.should_handle_scroll(window)
                                         {
-                                            let _ = entity.update(cx, |this, cx| {
-                                                this.viewport_wheel(event, window, cx)
-                                            });
+                                            let consumed = entity
+                                                .update(cx, |this, cx| {
+                                                    this.viewport_wheel(event, window, cx)
+                                                })
+                                                .unwrap_or(false);
+                                            // Once the inner viewport is pinned at the edge
+                                            // the same wheel must reach the conversation.
+                                            if consumed {
+                                                cx.stop_propagation();
+                                            }
                                         }
                                     },
                                 );
