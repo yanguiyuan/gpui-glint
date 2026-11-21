@@ -1,4 +1,4 @@
-// Matches pixeldata's WPS-2 signature action in its default (auto MD5) mode.
+// Matches the official client's WPS-2 signature action in its default (auto MD5) mode.
 glint.on("request.before-send", (request) => {
   const accessKey = glint.host.call("environment.get", "wps_app_id");
   const secretKey = glint.host.call("environment.get", "wps_app_key");

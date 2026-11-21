@@ -536,16 +536,16 @@ mod proxy_tests {
     }
     #[test]
     fn hosts_import_expands_aliases_comments_ipv6_and_last_entry_wins() {
-        let mappings = HostMapping::parse_hosts("\u{feff}# hosts\r\n10.13.34.11 c.kdocs.cn www.kdocs.cn kdocs.cn # aliases\r\n\r\n::1\tLOCAL.test. ipv6.test\n119.3.170.233 www.kdocs.cn\n").unwrap();
+        let mappings = HostMapping::parse_hosts("\u{feff}# hosts\r\n10.0.0.1 host-a.test host-b.test example.test # aliases\r\n\r\n::1\tLOCAL.test. ipv6.test\n10.0.0.9 host-b.test\n").unwrap();
         assert_eq!(mappings.len(), 5);
         assert_eq!(
             mappings[0],
             HostMapping {
-                domain: "c.kdocs.cn".into(),
-                ip: "10.13.34.11".into()
+                domain: "host-a.test".into(),
+                ip: "10.0.0.1".into()
             }
         );
-        assert_eq!(mappings[1].ip, "119.3.170.233");
+        assert_eq!(mappings[1].ip, "10.0.0.9");
         assert_eq!(
             mappings[3],
             HostMapping {

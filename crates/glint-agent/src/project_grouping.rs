@@ -75,7 +75,7 @@ mod tests {
     #[tokio::test]
     async fn arbitrary_worktree_directory_uses_main_repository_name() {
         let directory = tempfile::tempdir().unwrap();
-        let main = directory.path().join("idl");
+        let main = directory.path().join("core");
         let linked = directory.path().join("arbitrary-directory");
         std::fs::create_dir(&main).unwrap();
         git(&main, &["init", "-b", "main"]);
@@ -100,13 +100,13 @@ mod tests {
                 "worktree",
                 "add",
                 "-b",
-                "feat/chat-governance-openapi",
+                "feat/graph-cache",
                 linked.to_str().unwrap(),
             ],
         );
         let meta = metadata(&git_project::repository(&linked).await.unwrap().unwrap());
-        assert_eq!(meta.repository_name, "idl");
-        assert_eq!(meta.branch, "feat/chat-governance-openapi");
+        assert_eq!(meta.repository_name, "core");
+        assert_eq!(meta.branch, "feat/graph-cache");
         assert!(meta.linked_worktree);
         assert!(!metadata(&git_project::repository(&main).await.unwrap().unwrap()).linked_worktree);
     }
@@ -114,28 +114,25 @@ mod tests {
     #[test]
     fn project_group_metadata_and_overrides_survive_reload_and_legacy_history() {
         let mut history = History::default();
-        let path = PathBuf::from("/worktree/idl/feature");
+        let path = PathBuf::from("/worktree/core/feature");
         history.projects.push(path.clone());
         history.project_metadata.insert(
             path.clone(),
             Metadata {
-                repository_name: "idl".into(),
-                branch: "feat/chat-governance-openapi".into(),
+                repository_name: "core".into(),
+                branch: "feat/graph-cache".into(),
                 linked_worktree: true,
             },
         );
         history
             .project_group_overrides
-            .insert(path.clone(), "chat-governance-openapi".into());
+            .insert(path.clone(), "graph-cache".into());
         let directory = tempfile::tempdir().unwrap();
         let anchor = directory.path().join("sessions.json");
         history.save(&anchor).unwrap();
         let restored = History::load(&anchor).unwrap();
-        assert_eq!(
-            group_name(&restored, &path),
-            Some("chat-governance-openapi")
-        );
-        assert_eq!(repository_label(&restored, &path), "idl");
+        assert_eq!(group_name(&restored, &path), Some("graph-cache"));
+        assert_eq!(repository_label(&restored, &path), "core");
         let mut legacy = serde_json::to_value(history).unwrap();
         legacy.as_object_mut().unwrap().remove("project_metadata");
         legacy
@@ -159,35 +156,29 @@ mod tests {
             AgentWorkspace::with_path(directory.path().join("sessions.json"), cx)
         });
         workspace.update(window, |this, cx| {
-            let path = PathBuf::from("/worktree/kim/feature");
+            let path = PathBuf::from("/worktree/web/feature");
             this.history.projects.push(path.clone());
             this.history.project_metadata.insert(
                 path.clone(),
                 Metadata {
-                    repository_name: "kim".into(),
-                    branch: "feat/chat-governance-openapi".into(),
+                    repository_name: "web".into(),
+                    branch: "feat/graph-cache".into(),
                     linked_worktree: true,
                 },
             );
             this.edit_project_group(path.clone(), cx);
             assert_eq!(
                 this.project_grouping.name.read(cx).value(),
-                "feat/chat-governance-openapi"
+                "feat/graph-cache"
             );
-            this.set_project_group(Some(" chat-governance-openapi ".into()), cx);
-            assert_eq!(
-                group_name(&this.history, &path),
-                Some("chat-governance-openapi")
-            );
+            this.set_project_group(Some(" graph-cache ".into()), cx);
+            assert_eq!(group_name(&this.history, &path), Some("graph-cache"));
             this.edit_project_group(path.clone(), cx);
             this.set_project_group(Some(String::new()), cx);
             assert_eq!(group_name(&this.history, &path), None);
             this.edit_project_group(path.clone(), cx);
             this.set_project_group(None, cx);
-            assert_eq!(
-                group_name(&this.history, &path),
-                Some("feat/chat-governance-openapi")
-            );
+            assert_eq!(group_name(&this.history, &path), Some("feat/graph-cache"));
         });
     }
 }
@@ -268,7 +259,7 @@ pub struct State {
 
 impl State {
     pub fn new(cx: &mut Context<AgentWorkspace>) -> Self {
-        let name = cx.new(|cx| TextEntry::new(cx, "例如 chat-governance-openapi", ""));
+        let name = cx.new(|cx| TextEntry::new(cx, "例如 feat/graph-cache", ""));
         let observer = cx.observe(&name, |_, _, cx| cx.notify());
         Self {
             editing: None,
