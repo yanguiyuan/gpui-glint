@@ -4,7 +4,7 @@ use crate::provider::{Config, ModelCatalog, Thinking};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 mod auth;
-pub use auth::{account, finish_login, saved_account_label, sign_out, start_login};
+pub use auth::{account, finish_login, forget, saved_account_label, sign_out, start_login};
 
 fn http_error(status: reqwest::StatusCode) -> String {
     format!(

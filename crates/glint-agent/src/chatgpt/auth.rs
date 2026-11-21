@@ -552,6 +552,17 @@ pub fn saved_account_label(config: &Config) -> Option<String> {
     Some(format!("{} · {}", credentials.email, credentials.client_id))
 }
 
+/// 删除供应商时清掉它在本机保存的授权记录，不做远端注销。
+pub fn forget(config: &Config) -> Result<(), String> {
+    database(config)?
+        .execute(
+            "DELETE FROM chatgpt_auth WHERE provider_id=?1",
+            [config.id.to_string()],
+        )
+        .map_err(|_| "无法清除 ChatGPT 授权记录")?;
+    Ok(())
+}
+
 pub async fn sign_out(config: &Config) -> Result<String, String> {
     let config = config.clone();
     tokio::spawn(async move { sign_out_inner(&config).await })

@@ -121,6 +121,33 @@ impl ProviderCatalog {
         }
     }
 
+    /// 移除供应商。删掉的是当前使用的，就换到另一个启用中的供应商。
+    pub fn remove(&mut self, id: Uuid) -> Option<Config> {
+        let index = self
+            .providers
+            .iter()
+            .position(|provider| provider.id == id)?;
+        let removed = self.providers.remove(index);
+        if self.active == Some(id) {
+            match self
+                .providers
+                .iter()
+                .find(|provider| provider.enabled)
+                .map(|provider| (provider.id, provider.model.clone()))
+            {
+                Some((id, model)) => {
+                    self.active = Some(id);
+                    self.active_model = model;
+                }
+                None => {
+                    self.active = None;
+                    self.active_model.clear();
+                }
+            }
+        }
+        Some(removed)
+    }
+
     pub fn activate(&mut self, id: Uuid, model: String) -> Result<(), String> {
         let provider = self
             .providers

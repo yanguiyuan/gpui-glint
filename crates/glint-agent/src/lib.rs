@@ -60,6 +60,7 @@ mod project_ui;
 mod projects_page;
 mod provider;
 mod provider_catalog;
+mod provider_file;
 mod provider_ui;
 mod quick_replies;
 mod schedule_ui;
@@ -181,6 +182,8 @@ pub struct AgentWorkspace {
     tool_panels: std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ToolPanel>>,
     access: std::sync::Arc<std::sync::Mutex<tools::AccessMode>>,
     catalog: provider_catalog::ProviderCatalog,
+    provider_file_state: provider_file::State,
+    provider_file_task: Option<Task<()>>,
     history: History,
     provider: provider::Config,
     thinking: provider::Thinking,
@@ -299,7 +302,7 @@ impl AgentWorkspace {
             ),
         };
         let discovered = discovery::DiscoveryRegistry::default().discover();
-        let (catalog, provider_error) = match provider_catalog::ProviderCatalog::load(
+        let (mut catalog, provider_error) = match provider_catalog::ProviderCatalog::load(
             &path.with_file_name("providers.json"),
             &discovered,
         ) {
@@ -312,6 +315,16 @@ impl AgentWorkspace {
                 },
                 Some(error),
             ),
+        };
+        let mut provider_file_state = provider_file::State::default();
+        provider_file::ensure_config();
+        provider_file::apply(&path, &mut catalog, &mut provider_file_state);
+        let provider_error = match provider_file_state.error.clone() {
+            Some(error) => Some(match provider_error {
+                Some(previous) => format!("{previous}；{error}"),
+                None => error,
+            }),
+            None => provider_error,
         };
         let provider = catalog.current();
         let editing = catalog
@@ -727,6 +740,8 @@ impl AgentWorkspace {
             access,
             history,
             catalog,
+            provider_file_state,
+            provider_file_task: None,
             provider,
             thinking: provider::Thinking::Default,
             provider_settings,
@@ -815,10 +830,69 @@ impl AgentWorkspace {
         workspace.refresh_calendar(cx);
         workspace.start_scheduler(cx);
         workspace.start_channels(cx);
+        workspace.start_provider_file_watcher(cx);
         workspace.start_partner_worker(cx);
         workspace.sync_context_usage(cx);
         workspace.refresh_context_models(cx);
         workspace
+    }
+
+    fn start_provider_file_watcher(&mut self, cx: &mut Context<Self>) {
+        self.provider_file_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if weak
+                    .update(cx, |this, cx| this.poll_provider_file(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn poll_provider_file(&mut self, cx: &mut Context<Self>) {
+        let anchor = self.path.clone();
+        if !provider_file::apply(&anchor, &mut self.catalog, &mut self.provider_file_state) {
+            return;
+        }
+        self.provider = self.catalog.current();
+        if let Some(selected) = self.provider_settings.selected {
+            let present = self
+                .catalog
+                .providers
+                .iter()
+                .find(|provider| provider.id == selected)
+                .cloned();
+            match present {
+                Some(config) => {
+                    // 配置文件里的供应商变了，设置页跟着刷新。
+                    if self.provider_file_state.is_injected(selected) {
+                        self.provider_settings
+                            .load(config, String::new(), false, cx);
+                    }
+                }
+                None => match self.catalog.providers.first().cloned() {
+                    Some(config) => self
+                        .provider_settings
+                        .load(config, String::new(), false, cx),
+                    None => self.provider_settings.selected = None,
+                },
+            }
+        }
+        if let Some(error) = &self.provider_file_state.error {
+            self.provider_error = Some(error.clone());
+        } else if self
+            .provider_error
+            .as_deref()
+            .is_some_and(|error| error.contains("供应商配置文件"))
+        {
+            self.provider_error = None;
+        }
+        self.provider_settings.message = self.provider_error.clone();
+        cx.notify();
     }
 
     fn capture_draft(&mut self, cx: &App) {
@@ -3031,6 +3105,9 @@ impl Render for AgentWorkspace {
             })
             .when(self.project_grouping.removing.is_some(), |root| {
                 root.child(self.remove_project_dialog(cx))
+            })
+            .when(self.provider_settings.confirming_remove.is_some(), |root| {
+                root.child(self.provider_remove_dialog(cx))
             })
             .child(self.diff_file_overlays(window, cx))
             .children(command_overlay)

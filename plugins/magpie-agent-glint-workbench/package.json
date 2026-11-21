@@ -1,0 +1,16 @@
+{
+  "name": "magpie-agent-glint-workbench",
+  "version": "0.1.0",
+  "description": "Magpie Agent 插件：把 Magpie 网关注入 Glint Workbench 的供应商列表",
+  "type": "module",
+  "keywords": ["magpie", "agent", "glint", "workbench"],
+  "license": "MIT",
+  "magpie": {
+    "agent": "./agent.js",
+    "name": "Glint Workbench",
+    "summary": {
+      "zh": "在 Magpie 中为 Glint Workbench 选择模型，自动注入网关供应商。",
+      "en": "Pick a model in Magpie and inject the gateway as a Glint Workbench provider."
+    }
+  }
+}

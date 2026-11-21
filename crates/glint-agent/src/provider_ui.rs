@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{CollapsePanel, InputField, Skeleton, Switch};
+use gpui_glint::components::{CollapsePanel, InputField, MenuItem, Skeleton, Switch};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -158,6 +158,10 @@ pub struct Settings {
     new_model_window: Entity<TextEntry>,
     pub discovering: Option<Task<()>>,
     pub section: Section,
+    /// Whether the "+" dropdown in the provider list header is open.
+    add_menu_open: bool,
+    /// Provider awaiting confirmation in the remove dialog.
+    pub(crate) confirming_remove: Option<Uuid>,
     tab: ProviderTab,
     pub search: Entity<TextEntry>,
     pub kind: provider::Kind,
@@ -234,6 +238,8 @@ impl Settings {
             new_model_window: entry("例如 1M，留空自动", ""),
             discovering: None,
             section: Section::General,
+            add_menu_open: false,
+            confirming_remove: None,
             tab: ProviderTab::Connection,
             kind: config.kind,
             protocol: config.protocol,
@@ -257,7 +263,7 @@ impl Settings {
         }
     }
 
-    fn load(
+    pub(crate) fn load(
         &mut self,
         config: provider::Config,
         key: String,
@@ -339,6 +345,63 @@ impl Settings {
 }
 
 impl AgentWorkspace {
+    /// The "+" menu above the provider list: an API provider or a ChatGPT subscription.
+    fn add_provider_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let content = div()
+            .flex()
+            .flex_col()
+            .child(
+                MenuItem::new("add-api-provider", "添加 API 供应商")
+                    .icon(Icon::Globe)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "add-api-provider".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.provider_settings.add_menu_open = false;
+                        this.add_provider(provider::Kind::Compatible, window, cx);
+                    })),
+            )
+            .child(
+                MenuItem::new("add-chatgpt-provider", "连接 ChatGPT 订阅")
+                    .icon(Icon::User)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "add-chatgpt-provider".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.provider_settings.add_menu_open = false;
+                        this.add_provider(provider::Kind::ChatGpt, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(p.text_muted))
+                    .child("订阅授权保存在本机，无需 API Key"),
+            );
+        let trigger = IconButton::new(Icon::Plus, "添加供应商")
+            .plain()
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "add-provider-trigger".into());
+        let weak = cx.entity().downgrade();
+        div().flex_shrink_0().child(
+            Popover::new("provider-add-menu", trigger, content)
+                .open(self.provider_settings.add_menu_open)
+                .width(196.)
+                .padding(4.)
+                .theme(self.theme)
+                .on_open_change(move |open, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.provider_settings.add_menu_open = open;
+                        cx.notify();
+                    });
+                }),
+        )
+    }
+
     fn catalog_path(&self) -> PathBuf {
         self.path.with_file_name("providers.json")
     }
@@ -524,6 +587,135 @@ impl AgentWorkspace {
         window.focus(&self.provider_settings.name.focus_handle(cx), cx);
         debug_assert_eq!(self.provider_settings.selected, Some(id));
         cx.notify();
+    }
+
+    /// 侧栏的「移除」先弹确认框，避免误删。
+    fn request_remove_provider(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.provider_settings.confirming_remove = Some(id);
+        cx.notify();
+    }
+
+    fn dismiss_remove_provider(&mut self, cx: &mut Context<Self>) {
+        self.provider_settings.confirming_remove = None;
+        cx.notify();
+    }
+
+    /// 删除供应商：清掉本地密钥和 ChatGPT 授权，正在使用的会自动换到别的供应商。
+    fn remove_provider(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.provider_settings.confirming_remove != Some(id) {
+            return;
+        }
+        self.provider_settings.confirming_remove = None;
+        let mut warning = None;
+        let next = (|| {
+            if self.provider_file_state.is_injected(id) {
+                return Err("这个供应商来自供应商配置文件，请在 Magpie 里移除".to_owned());
+            }
+            if self.catalog.active == Some(id) && self.any_run_busy() {
+                return Err("请先停止当前回复，再移除正在使用的供应商".to_owned());
+            }
+            let mut catalog = self.catalog.clone();
+            let removed = catalog.remove(id).ok_or("供应商不存在")?;
+            if removed.kind == provider::Kind::ChatGpt {
+                warning = chatgpt::forget(&removed).err();
+            }
+            if let Err(error) = removed.remove_key() {
+                warning.get_or_insert(error);
+            }
+            catalog.save(&self.catalog_path())?;
+            Ok::<_, String>(catalog)
+        })();
+        match next {
+            Ok(catalog) => {
+                self.catalog = catalog;
+                self.provider_settings.drafts.remove(&id);
+                self.sync_provider(cx);
+                if self.provider_settings.selected == Some(id) {
+                    match self.catalog.providers.first().cloned() {
+                        Some(config) => {
+                            self.provider_settings
+                                .load(config, String::new(), false, cx)
+                        }
+                        None => {
+                            self.provider_settings.selected = None;
+                            self.provider_settings.kind = provider::Kind::Compatible;
+                        }
+                    }
+                }
+                self.provider_settings.message =
+                    Some(warning.unwrap_or_else(|| "已移除供应商。".into()));
+            }
+            Err(error) => self.provider_settings.message = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn provider_remove_dialog(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(id) = self.provider_settings.confirming_remove else {
+            return gpui::div().into_any_element();
+        };
+        let p = self.theme.palette();
+        let name = self
+            .catalog
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_else(|| "这个供应商".into());
+        let active = self.catalog.active == Some(id);
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("移除“{name}”？")),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .line_height(px(24.))
+                    .text_color(rgb(p.text_muted))
+                    .child(if active {
+                        "将删除这个供应商的配置和已保存的密钥，当前对话会切换到其他可用的供应商。聊天记录会保留。"
+                    } else {
+                        "将删除这个供应商的配置和已保存的密钥。聊天记录会保留。"
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_3()
+                    .child(
+                        Button::new("取消")
+                            .kind(ButtonKind::Plain)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "cancel-remove-provider".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.dismiss_remove_provider(cx))),
+                    )
+                    .child(
+                        Button::new("移除供应商")
+                            .kind(ButtonKind::Danger)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "confirm-remove-provider".into())
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.remove_provider(id, cx)),
+                            ),
+                    ),
+            );
+        let weak = cx.entity().downgrade();
+        gpui_glint::components::Dialog::new("provider-remove-dialog", body)
+            .width(460.)
+            .theme(self.theme)
+            .on_close(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| this.dismiss_remove_provider(cx));
+            })
+            .render()
     }
 
     fn save_provider(&mut self, activate: bool, cx: &mut Context<Self>) {
@@ -852,6 +1044,23 @@ impl AgentWorkspace {
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(|this, _, _, cx| this.save_provider(true, cx))),
+                    )
+                    .when_some(
+                        settings
+                            .selected
+                            .filter(|id| !self.provider_file_state.is_injected(*id)),
+                        |row, id| {
+                            row.child(
+                                IconButton::new(Icon::Trash, "移除供应商")
+                                    .plain()
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "remove-selected-provider".into())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.request_remove_provider(id, cx)
+                                    })),
+                            )
+                        },
                     ),
             )
             .child(
@@ -1435,15 +1644,7 @@ impl AgentWorkspace {
                         .text_color(rgb(p.text_muted))
                         .child("供应商"),
                 )
-                .child(
-                    IconButton::new(Icon::Plus, "添加 API 供应商")
-                        .plain()
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.add_provider(provider::Kind::Compatible, window, cx)
-                        })),
-                ),
+                .child(self.add_provider_menu(cx)),
         );
         for profile in &self.catalog.providers {
             if !query.is_empty()
@@ -1459,6 +1660,7 @@ impl AgentWorkspace {
             navigation = navigation.child(
                 div()
                     .id(gpui::SharedString::from(format!("provider-{id}")))
+                    .group(gpui::SharedString::from(format!("provider-row-{id}")))
                     .px_3()
                     .py_3()
                     .mb_1()
@@ -1492,6 +1694,34 @@ impl AgentWorkspace {
                             )
                             .when(self.catalog.active == Some(id), |row| {
                                 row.child(Icon::CheckCircle.render(13.).text_color(rgb(p.accent)))
+                            })
+                            // 配置文件注入的供应商归文件管，不给移除按钮。
+                            .when(!self.provider_file_state.is_injected(id), |row| {
+                                let group = gpui::SharedString::from(format!("provider-row-{id}"));
+                                row.child(
+                                    div()
+                                        .id(gpui::SharedString::from(format!(
+                                            "remove-provider-{id}"
+                                        )))
+                                        .debug_selector(move || format!("remove-provider-{id}"))
+                                        .size(px(22.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(6.))
+                                        .opacity(0.)
+                                        .group_hover(group, |style| style.opacity(1.))
+                                        .hover(|style| style.bg(rgb(p.border)))
+                                        .cursor_pointer()
+                                        .child(
+                                            Icon::Trash.render(13.).text_color(rgb(p.text_muted)),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.request_remove_provider(id, cx);
+                                        })),
+                                )
                             }),
                     )
                     .child(
@@ -1503,7 +1733,13 @@ impl AgentWorkspace {
                             .child(format!(
                                 "{} 个模型{}",
                                 profile.models.len(),
-                                if detected { " · 自动发现" } else { "" }
+                                if self.provider_file_state.is_injected(profile.id) {
+                                    " · 配置文件"
+                                } else if detected {
+                                    " · 自动发现"
+                                } else {
+                                    ""
+                                }
                             )),
                     )
                     .on_click(
@@ -1514,17 +1750,16 @@ impl AgentWorkspace {
             );
         }
         navigation = navigation.child(
-            div().px_2().pt_3().flex().flex_col().gap_2().child(
-                Button::new("连接 ChatGPT")
-                    .icon(Icon::User)
-                    .kind(ButtonKind::Plain)
-                    .size(ButtonSize::Small)
-                    .theme(self.theme)
-                    .render()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_provider(provider::Kind::ChatGpt, window, cx)
-                    })),
-            ),
+            div()
+                .px_5()
+                .pt_3()
+                .text_size(px(10.))
+                .text_color(rgb(p.text_muted))
+                .child(if self.provider_file_state.connected() {
+                    "已合并供应商配置文件里的供应商，改动 2 秒内自动同步"
+                } else {
+                    "在 Magpie 中选择 Glint Workbench 即可注入供应商"
+                }),
         );
         div()
             .size_full()
