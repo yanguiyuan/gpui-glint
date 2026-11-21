@@ -291,12 +291,20 @@ impl BackgroundTasksMenu {
             }
         }
         let toggle = self.toggle;
+        // 0 tasks stays fully muted; anything running pulls the label to accent.
+        let running = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == BackgroundTaskState::Running)
+            .count();
+        let foreground = if running > 0 { p.accent } else { p.text_muted };
         DropdownMenu::new(
             "background-tasks-menu",
             Button::new(format!("后台任务 · {count}"))
                 .disclosure(self.open)
-                .kind(ButtonKind::Plain)
-                .size(ButtonSize::Mini)
+                .kind(ButtonKind::Ghost)
+                .size(ButtonSize::Compact)
+                .foreground(foreground)
                 .theme(self.theme)
                 .render()
                 .debug_selector(|| "background-tasks-trigger".into()),

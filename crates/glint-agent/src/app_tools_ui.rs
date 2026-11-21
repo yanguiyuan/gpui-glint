@@ -1191,6 +1191,7 @@ impl AgentWorkspace {
             let editor = cx.new(|cx| {
                 let editor = gpui_glint::components::DocumentEditor::new(cx, text)
                     .theme(theme)
+                    .link_root(root.clone())
                     .activate_preview_links(true);
                 if scrollable {
                     editor.scrollable_preview()

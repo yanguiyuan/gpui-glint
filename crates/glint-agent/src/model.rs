@@ -267,6 +267,8 @@ pub struct History {
     #[serde(default)]
     pub compaction_settings: crate::compaction::Settings,
     #[serde(default)]
+    pub commit_message: crate::commit_message::Settings,
+    #[serde(default)]
     pub preferred_partner: Option<Uuid>,
     #[serde(default)]
     pub access_mode: crate::tools::AccessMode,
@@ -300,6 +302,7 @@ impl Default for History {
             partner_models: Default::default(),
             quick_replies_enabled: false,
             compaction_settings: Default::default(),
+            commit_message: Default::default(),
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
             agentspace: None,

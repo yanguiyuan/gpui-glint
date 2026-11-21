@@ -113,6 +113,8 @@ pub(super) struct ProjectFiles {
     details_task: Option<Task<()>>,
     commit_entry: Option<Entity<PromptEditor>>,
     commit_notice: Option<String>,
+    /// The workspace that owns provider and prompt settings for the wand.
+    owner: Option<gpui::WeakEntity<AgentWorkspace>>,
     go_definitions: Option<GoDefinitions>,
     definition_modifier: DefinitionModifier,
     definition_hover: Option<DefinitionHover>,
@@ -183,6 +185,7 @@ impl ProjectFiles {
             details_task: None,
             commit_entry: None,
             commit_notice: None,
+            owner: None,
             go_definitions: None,
             definition_modifier: Default::default(),
             definition_hover: None,
@@ -200,6 +203,17 @@ impl ProjectFiles {
             visible: true,
             next_document_id: 0,
         }
+    }
+
+    /// Points the commit footer at the workspace that owns model and prompt
+    /// preferences. Set once, when the workspace is created. The footer reads
+    /// live workspace state (busy flag, menu, notice), so it must repaint
+    /// whenever that state changes.
+    pub fn set_owner(&mut self, owner: gpui::WeakEntity<AgentWorkspace>, cx: &mut Context<Self>) {
+        if let Some(owner) = owner.upgrade() {
+            cx.observe(&owner, |_, _, cx| cx.notify()).detach();
+        }
+        self.owner = Some(owner);
     }
 
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -554,6 +568,21 @@ impl ProjectFiles {
         cx.notify();
     }
 
+    /// Asks the workspace to fill the footer's draft from the repository diff.
+    fn request_commit_message(&mut self, cx: &mut Context<Self>) {
+        let (Some(owner), Some(root), Some(entry)) = (
+            self.owner.clone(),
+            self.root.clone(),
+            self.commit_entry.clone(),
+        ) else {
+            return;
+        };
+        let _ = owner.update(cx, |workspace, cx| {
+            workspace.generate_commit_message(root, entry, cx);
+        });
+        cx.notify();
+    }
+
     fn commit_footer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let root = self.root.clone()?;
         if ssh_project::is_remote(&root) {
@@ -576,20 +605,31 @@ impl ProjectFiles {
         });
         let disabled = !self.can_commit_changes(cx);
         let submitting = self.commit_task.is_some();
+        let generating = self
+            .owner
+            .as_ref()
+            .and_then(|owner| {
+                owner
+                    .read_with(cx, |workspace: &AgentWorkspace, _| {
+                        workspace.edits_ui.commit_generation.contains_key(&root)
+                    })
+                    .ok()
+            })
+            .unwrap_or(false);
         let submit = div()
             .id("project-commit-submit")
             .debug_selector(|| "project-commit-submit".into())
-            .size(px(28.))
+            .size(px(24.))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(8.))
-            .bg(rgb(if disabled { p.surface_subtle } else { p.accent }))
-            .text_color(rgb(if disabled { p.text_muted } else { 0xffffff }))
+            .rounded(px(6.))
+            .text_color(rgb(if disabled { p.text_muted } else { p.accent }))
             .when(!disabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|style| style.opacity(0.88))
+                    .hover(move |style| style.bg(rgb(p.accent_tint)))
                     .on_click(cx.listener(|this, _, _, cx| this.commit_changes(cx)))
             })
             .child(if submitting {
@@ -608,6 +648,69 @@ impl ProjectFiles {
             } else {
                 Icon::ArrowUp.render(16.).into_any_element()
             });
+        // The wand reads the index, then the working tree, so any change is
+        // worth a click; it stays live when idle so a click can explain why
+        // nothing can be written.
+        let has_changes = staged > 0 || has_conflicts;
+        let mut wand = div()
+            .id("project-commit-generate")
+            .debug_selector(|| "project-commit-generate".into())
+            .size(px(24.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .text_color(rgb(if has_changes || generating {
+                p.accent
+            } else {
+                p.text_muted
+            }));
+        if !generating {
+            wand = wand
+                .cursor_pointer()
+                .hover(move |style| style.bg(rgb(p.accent_tint)))
+                .on_click(cx.listener(|this, _, _, cx| this.request_commit_message(cx)));
+        }
+        wand = wand.child(if generating {
+            Icon::Spinner
+                .render(14.)
+                .with_animation(
+                    "project-commit-generation-spinner",
+                    Animation::new(Duration::from_millis(900)).repeat(),
+                    |spinner, delta| {
+                        spinner.with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            std::f32::consts::TAU * delta,
+                        )))
+                    },
+                )
+                .into_any_element()
+        } else {
+            Icon::Wand.render(15.).into_any_element()
+        });
+        let owner = self.owner.clone()?;
+        let (label, options, value, open, generation_notice) = owner
+            .read_with(cx, |workspace: &AgentWorkspace, _| {
+                (
+                    workspace.commit_model_label(),
+                    workspace.commit_model_options(),
+                    workspace.commit_model_value(),
+                    workspace.edits_ui.commit_model_open,
+                    workspace.commit_notice_for(&root),
+                )
+            })
+            .ok()?;
+        let model = commit_message::model_picker(
+            "project-commit-model",
+            self.theme,
+            label,
+            options,
+            value,
+            open,
+            owner.clone(),
+            |this: &mut AgentWorkspace, open| this.edits_ui.commit_model_open = open,
+            |this: &mut AgentWorkspace, value, cx| this.choose_commit_model(value, cx),
+        );
         Some(
             div()
                 .debug_selector(|| "project-commit-footer".into())
@@ -641,11 +744,21 @@ impl ProjectFiles {
                                 .child(entry),
                         )
                         .child(
-                            div().flex().justify_end().child(
-                                Tooltip::new(submit, if submitting { "提交中…" } else { "提交" })
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(wand)
+                                .child(model)
+                                .child(div().flex_1())
+                                .child(
+                                    Tooltip::new(
+                                        submit,
+                                        if submitting { "提交中…" } else { "提交" },
+                                    )
                                     .theme(self.theme)
                                     .render(cx),
-                            ),
+                                ),
                         ),
                 )
                 .when(has_conflicts || (staged > 0 && !submitting), |footer| {
@@ -668,14 +781,17 @@ impl ProjectFiles {
                             .child(notice),
                     )
                 })
-                .when_some(self.commit_notice.clone(), |footer, notice| {
-                    footer.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child(notice),
-                    )
-                }),
+                .when_some(
+                    self.commit_notice.clone().or(generation_notice),
+                    |footer, notice| {
+                        footer.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(p.text_muted))
+                                .child(notice),
+                        )
+                    },
+                ),
         )
     }
 

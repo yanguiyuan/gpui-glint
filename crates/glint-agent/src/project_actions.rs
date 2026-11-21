@@ -390,25 +390,20 @@ impl AgentWorkspace {
             .as_ref()
             .and_then(|r| self.project_actions.runs.get(r))
             .is_some_and(|r| r.terminal.read(cx).busy());
-        let trigger = div()
-            .debug_selector(|| "agent-topbar-actions".into())
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(px(5.))
-            .text_color(rgb(p.accent))
-            .bg(rgb(p.accent_tint))
-            .child(
-                if busy { Icon::Pulse } else { Icon::Play }
-                    .render(15.)
-                    .when(!busy, |icon| {
-                        icon.text_color(rgb(self.theme.color(0x16833a)))
-                    }),
-            )
-            .child(if busy { "运行中" } else { "项目操作" })
-            .child(Icon::disclosure(12., self.project_actions.open));
+        // Quiet by default; only a running action earns a status color.
+        let trigger = Button::new(if busy { "运行中" } else { "项目操作" })
+            .icon(if busy { Icon::Pulse } else { Icon::Play })
+            .disclosure(self.project_actions.open)
+            .kind(ButtonKind::Ghost)
+            .size(ButtonSize::Compact)
+            .foreground(if busy {
+                self.theme.color(0x16833a)
+            } else {
+                p.text_muted
+            })
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "agent-topbar-actions".into());
         let mut content = div().flex().flex_col().min_w_0();
         if let Some(root) = root {
             content = content.child(

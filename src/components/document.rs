@@ -201,6 +201,8 @@ impl RenderBlock {
 /// by subscribers to DocumentEvent::Changed. Register bind_document_editor_keys once.
 pub struct DocumentEditor {
     embedded_preview: bool,
+    /// Project root used to expand relative link destinations in tooltips.
+    link_root: Option<std::path::PathBuf>,
     preview_links: bool,
     scrollable_preview: bool,
     follow_tail: bool,
@@ -294,6 +296,7 @@ impl DocumentEditor {
             pending_leaf: None,
             source_mode: None,
             preview: false,
+            link_root: None,
             rounded_corners: true,
             status_bar_visible: true,
             status_message: None,
@@ -324,6 +327,12 @@ impl DocumentEditor {
     /// Enable LinkActivated events for links in read-only preview text.
     pub fn activate_preview_links(mut self, enabled: bool) -> Self {
         self.preview_links = enabled;
+        self
+    }
+
+    /// Project root used to expand relative link destinations in hover tooltips.
+    pub fn link_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.link_root = root;
         self
     }
 
@@ -1103,6 +1112,7 @@ impl DocumentEditor {
                         CodeCard::new(cx, "text", "")
                             .theme(self.theme)
                             .rich_text(&text)
+                            .link_root(self.link_root.clone())
                             .document_managed(true)
                             .block_editing(split)
                     });
@@ -1122,6 +1132,7 @@ impl DocumentEditor {
                         CodeCard::new(cx, "text", "")
                             .theme(self.theme)
                             .rich_text(name)
+                            .link_root(self.link_root.clone())
                             .document_managed(true)
                     });
                     let subscription =

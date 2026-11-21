@@ -170,6 +170,91 @@ fn checked(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A bounded, model-readable summary of the staged diff — or of the working
+/// tree when nothing is staged yet. Status lines come first so a truncated
+/// file list still tells the model what changed.
+pub fn commit_context(root: &Path) -> Result<String, String> {
+    const FILE_LIMIT: usize = 60;
+    const BYTE_LIMIT: usize = 12_000;
+    let staged = git(root, &["diff", "--cached", "--quiet", "--exit-code"])?;
+    let cached = matches!(staged.status.code(), Some(1));
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+    if cached {
+        args.push("--cached");
+    }
+    let mut context = String::new();
+    let names = if cached {
+        checked(root, &["diff", "--cached", "--name-status"])?
+    } else {
+        checked(root, &["diff", "--name-status"])?
+    };
+    let branch = checked(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .unwrap_or_default();
+    context.push_str(if cached {
+        "【已暂存】\n"
+    } else {
+        "【工作区未暂存】\n"
+    });
+    if !branch.is_empty() && branch != "HEAD" {
+        context.push_str(&format!("当前分支：{branch}\n"));
+    }
+    let mut listed = 0;
+    for line in names.split(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if listed == FILE_LIMIT {
+            context.push_str("- …（更多文件省略）\n");
+            break;
+        }
+        context.push_str(&format!("- {line}\n"));
+        listed += 1;
+    }
+    if !cached {
+        // Untracked files never show up in `git diff`, but they are still part
+        // of what the reader changed.
+        let untracked =
+            checked(root, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+        let untracked = String::from_utf8_lossy(&untracked);
+        for line in untracked.lines() {
+            if listed == FILE_LIMIT {
+                context.push_str("- …（更多文件省略）\n");
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            context.push_str(&format!("- ?? {line}\n"));
+            listed += 1;
+        }
+    }
+    args.push("--unified=2");
+    let diff = checked(root, &args)?;
+    let diff = String::from_utf8_lossy(&diff);
+    let mut used = 0usize;
+    context.push_str("\n【改动内容】\n");
+    for line in diff.lines() {
+        if used + line.len() + 1 > BYTE_LIMIT {
+            context.push_str("…（改动内容已截断）\n");
+            break;
+        }
+        context.push_str(line);
+        context.push('\n');
+        used += line.len() + 1;
+    }
+    if listed == 0 {
+        return Err(if cached {
+            "没有已暂存的更改。".into()
+        } else {
+            "没有可提交的更改。".into()
+        });
+    }
+    Ok(context)
+}
+
 /// Commit the index as-is. Never stage working-tree changes implicitly.
 pub fn commit_staged(root: &Path, message: &str) -> Result<(), String> {
     let message = message.trim();

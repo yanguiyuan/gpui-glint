@@ -1,5 +1,5 @@
 use super::*;
-use gpui_glint::components::{CollapsePanel, InputField, MenuItem, Skeleton, Switch};
+use gpui_glint::components::{CollapsePanel, InputField, MenuItem, PromptEditor, Skeleton, Switch};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -157,6 +157,8 @@ pub struct Settings {
     pub shortcut_message: Option<String>,
     pub compaction_threshold: Entity<TextEntry>,
     compaction_message: Option<String>,
+    /// Optional override for the commit-message system prompt.
+    pub commit_prompt: Entity<PromptEditor>,
     pub discovered: Vec<discovery::DiscoveredProvider>,
     pub selected: Option<Uuid>,
     original: provider::Config,
@@ -218,6 +220,11 @@ impl Settings {
                     ThemePreset::Moonstone,
                 ))
         });
+        let commit_prompt = cx.new(|cx| {
+            PromptEditor::new(cx, commit_message::DEFAULT_PROMPT)
+                .theme(ThemePreset::Moonstone)
+                .min_rows(3)
+        });
         let mut entry = |hint: &str, value: &str| {
             cx.new(|cx| {
                 TextEntry::new(cx, hint.to_owned(), value.to_owned()).theme(ThemePreset::Moonstone)
@@ -228,6 +235,7 @@ impl Settings {
             shortcut_message: None,
             compaction_threshold: entry("1–99，例如 75", "75"),
             compaction_message: None,
+            commit_prompt,
             selected,
             discovered,
             models: config.models.clone(),
@@ -341,6 +349,9 @@ impl Settings {
         for entry in self.window_inputs.values() {
             entry.update(cx, |entry, cx| entry.set_theme(theme, cx));
         }
+        self.commit_prompt.update(cx, |editor, cx| {
+            editor.set_theme(theme, cx);
+        });
         for entry in [
             &self.search,
             &self.compaction_threshold,
@@ -1979,6 +1990,100 @@ impl AgentWorkspace {
                         card.child(div().pb_4().text_size(px(12.)).child(message))
                     });
                 page = page.child(card);
+                page = page.child(
+                    div()
+                        .mt_4()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("提交信息"),
+                );
+                let commit_card = div()
+                    .w_full()
+                    .px_5()
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .child(
+                        div()
+                            .py_4()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("默认提示语")
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child("提交信息输入框左下角的魔法棒会按这段提示语生成信息。留空或恢复默认时使用内置提示语。"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pb_3()
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .p_2()
+                            .min_h(px(84.))
+                            .child(self.provider_settings.commit_prompt.clone()),
+                    )
+                    .child(
+                        div()
+                            .pb_4()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("保存提示语")
+                                    .size(ButtonSize::Small)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "save-commit-prompt".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let value = this
+                                            .provider_settings
+                                            .commit_prompt
+                                            .read(cx)
+                                            .value()
+                                            .to_owned();
+                                        this.history.commit_message.prompt =
+                                            if value.trim() == commit_message::DEFAULT_PROMPT {
+                                                String::new()
+                                            } else {
+                                                value
+                                            };
+                                        this.save(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("恢复默认")
+                                    .kind(ButtonKind::Plain)
+                                    .size(ButtonSize::Small)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "reset-commit-prompt".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.history.commit_message.prompt.clear();
+                                        let prompt = this.history.commit_message.prompt().to_owned();
+                                        this.provider_settings
+                                            .commit_prompt
+                                            .update(cx, |editor, cx| editor.set_value(prompt, cx));
+                                        this.save(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(if self.history.commit_message.custom_prompt() {
+                                        "当前使用自定义提示语"
+                                    } else {
+                                        "当前使用内置提示语"
+                                    }),
+                            ),
+                    );
+                page = page.child(commit_card);
             }
             Section::Appearance => {
                 page = page.child(div().mt_4().font_weight(FontWeight::SEMIBOLD).child("主题"));

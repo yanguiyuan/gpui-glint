@@ -18,6 +18,7 @@ mod code_fonts_ui;
 mod code_mode;
 mod command_output;
 mod command_runner;
+mod commit_message;
 mod executable;
 mod panel_repositories;
 mod vault_environment;
@@ -342,6 +343,10 @@ impl AgentWorkspace {
                     cx,
                 );
             });
+        let commit_prompt = history.commit_message.prompt().to_owned();
+        provider_settings
+            .commit_prompt
+            .update(cx, |editor, cx| editor.set_value(commit_prompt, cx));
         let theme = ThemePreset::Moonstone;
         let memory = memory::Repository::new(path.clone());
         let memory_ui = memory_ui::State::new(&memory, history.active().project.as_deref(), cx);
@@ -696,7 +701,14 @@ impl AgentWorkspace {
             right_sidebar_resize: None,
             panel_repositories: Default::default(),
             file_preview: file_preview::State::new(cx),
-            project_files: cx.new(project_files::ProjectFiles::new),
+            project_files: {
+                let owner = cx.entity().downgrade();
+                cx.new(|cx| {
+                    let mut files = project_files::ProjectFiles::new(cx);
+                    files.set_owner(owner, cx);
+                    files
+                })
+            },
             terminal_ui: terminal_ui::State::new(history.terminal_default_position),
             show_background_tasks: false,
             host_background_tasks: false,
@@ -2781,7 +2793,7 @@ impl AgentWorkspace {
                     .when_some(session.compaction.as_ref(), |row, summary| {
                         row.child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(px(12.))
                                 .text_color(rgb(p.text_muted))
                                 .child(format!("已压缩前 {} 条", summary.through)),
                         )
@@ -2790,7 +2802,8 @@ impl AgentWorkspace {
                     .child(self.edits_button(cx))
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .pr_1()
+                            .text_size(px(12.))
                             .text_color(rgb(p.text_muted))
                             .child(format!("{} 条消息", session.messages.len())),
                     ),

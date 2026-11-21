@@ -5,6 +5,18 @@ use gpui::{
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::ops::Range;
 
+/// Spaces inserted before an inline file link to reserve room for its icon.
+/// A space advances roughly a quarter em, so four of them give the glyph a
+/// slot of its own at body sizes instead of squeezing it against the text.
+pub(super) const LINK_ICON_SPACES: usize = 4;
+
+/// Web destinations keep their blue underline, so they are drawn without an
+/// icon and without a reserved slot; local file references read as body text
+/// and rely on the icon to signal that they can be opened.
+pub(super) fn is_web_link(url: &str) -> bool {
+    url.contains("://") || url.starts_with("mailto:") || url.starts_with('#')
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Format {
     Bold,
@@ -98,7 +110,70 @@ impl RichText {
                 _ => {}
             }
         }
+        result.reserve_link_icons();
         result
+    }
+
+    /// Inline links are drawn with a leading icon. [`LINK_ICON_SPACES`] spaces
+    /// placed just outside the link mark reserve room for it without entering
+    /// copied or quoted text. The reservation is idempotent so re-parsing the
+    /// generated Markdown cannot accumulate spaces.
+    fn reserve_link_icons(&mut self) {
+        let mut starts: Vec<usize> = self
+            .marks
+            .iter()
+            .filter(|mark| match &mark.format {
+                Format::Link(url) => !is_web_link(url),
+                _ => false,
+            })
+            .map(|mark| mark.range.start)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let mut insertions = Vec::new();
+        for start in starts {
+            if start > self.text.len() {
+                continue;
+            }
+            let existing = self.text[..start]
+                .chars()
+                .rev()
+                .take_while(|c| *c == ' ')
+                .count();
+            if existing >= LINK_ICON_SPACES {
+                continue;
+            }
+            insertions.push((start, LINK_ICON_SPACES - existing));
+        }
+        if insertions.is_empty() {
+            return;
+        }
+        let mut text = String::with_capacity(self.text.len() + insertions.len() * LINK_ICON_SPACES);
+        let mut cursor = 0;
+        for (start, count) in &insertions {
+            text.push_str(&self.text[cursor..*start]);
+            for _ in 0..*count {
+                text.push(' ');
+            }
+            cursor = *start;
+        }
+        text.push_str(&self.text[cursor..]);
+        self.text = text;
+        let shifted = |offset: usize| {
+            insertions
+                .iter()
+                .filter(|(at, _)| *at <= offset)
+                .map(|(_, count)| count)
+                .sum::<usize>()
+        };
+        for mark in &mut self.marks {
+            mark.range.start += shifted(mark.range.start);
+            mark.range.end += insertions
+                .iter()
+                .filter(|(at, _)| *at < mark.range.end)
+                .map(|(_, count)| count)
+                .sum::<usize>();
+        }
     }
     pub fn update_text(&mut self, next: &str) {
         let mut prefix = 0;
@@ -271,6 +346,8 @@ impl RichText {
             ),
             _ => open(f),
         };
+        // The spaces that reserve room for a link icon are a display detail.
+        let reserved = self.reserved_link_spaces();
         let mut out = String::new();
         let mut current = Vec::new();
         for (offset, ch) in self.text.char_indices() {
@@ -285,6 +362,10 @@ impl RichText {
             }
             for format in &next[common..] {
                 out.push_str(&open(format));
+            }
+            if reserved.contains(&offset) {
+                current = next;
+                continue;
             }
             if !next.contains(&Format::Code)
                 && matches!(
@@ -338,7 +419,11 @@ impl RichText {
         };
         let mut out = String::new();
         let mut current = Vec::new();
+        let reserved = self.reserved_link_spaces();
         for (i, ch) in self.text.char_indices() {
+            if reserved.contains(&i) {
+                continue;
+            }
             let next = self.formats(i);
             let common = current
                 .iter()
@@ -365,6 +450,81 @@ impl RichText {
         }
         out
     }
+    /// Text for a selection with the spaces that reserve link icons removed,
+    /// so copied and quoted text never carries the visual padding.
+    pub fn copy_text(&self, range: Range<usize>) -> String {
+        let mut text = self.text[range.clone()].to_owned();
+        let mut starts: Vec<usize> = self
+            .link_starts()
+            .into_iter()
+            .filter(|start| *start >= range.start && *start < range.end)
+            .map(|start| start - range.start)
+            .collect();
+        starts.sort_unstable();
+        // Walk backwards so earlier offsets stay valid after each removal.
+        for start in starts.into_iter().rev() {
+            let absolute = range.start + start;
+            let reserved = self.icon_slot(absolute).min(start);
+            if reserved > 0 {
+                text.replace_range(start - reserved..start, "");
+            }
+        }
+        text
+    }
+
+    /// Spaces immediately before `start` that form the icon slot of a link at
+    /// that offset. Counting them instead of assuming a constant keeps the slot
+    /// exact when a link wraps to a new row or sits at a line start.
+    pub fn icon_slot(&self, start: usize) -> usize {
+        let mut count = 0;
+        for ch in self.text[..start].chars().rev() {
+            if ch != ' ' || count == LINK_ICON_SPACES {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Offsets of the spaces inserted to reserve room for link icons.
+    pub fn reserved_link_spaces(&self) -> Vec<usize> {
+        self.link_starts()
+            .into_iter()
+            .flat_map(|start| start.saturating_sub(self.icon_slot(start))..start)
+            .collect()
+    }
+
+    /// Start offsets of inline links that carry a leading icon slot, i.e. the
+    /// local file references. Web links are underlined instead.
+    pub fn link_starts(&self) -> Vec<usize> {
+        let mut starts: Vec<usize> = self
+            .marks
+            .iter()
+            .filter(|mark| match &mark.format {
+                Format::Link(url) => !is_web_link(url),
+                _ => false,
+            })
+            .map(|mark| mark.range.start)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    }
+
+    /// Inline link spans: `(range, destination)` for each `Format::Link` mark.
+    pub fn link_ranges(&self) -> Vec<(Range<usize>, String)> {
+        let mut links: Vec<(Range<usize>, String)> = self
+            .marks
+            .iter()
+            .filter_map(|mark| match &mark.format {
+                Format::Link(url) => Some((mark.range.clone(), url.clone())),
+                _ => None,
+            })
+            .collect();
+        links.sort_by_key(|(range, _)| range.start);
+        links
+    }
+
     pub fn runs(&self, range: Range<usize>, base: &Font, color: Hsla) -> Vec<TextRun> {
         let mut cuts = vec![range.start, range.end];
         for mark in &self.marks {
@@ -401,13 +561,18 @@ impl RichText {
                         Format::Code => {
                             run.font.family = crate::code_font::family();
                         }
-                        Format::Link(_) => {
-                            run.color = gpui::rgb_to_hsla(rgb(0x007aff));
-                            run.underline = Some(UnderlineStyle {
-                                color: None,
-                                thickness: px(1.),
-                                wavy: false,
-                            });
+                        Format::Link(url) => {
+                            // File links read as body text: the icon drawn
+                            // before them carries the affordance, so the blue
+                            // underline only marks real web destinations.
+                            if is_web_link(&url) {
+                                run.color = gpui::rgb_to_hsla(rgb(0x007aff));
+                                run.underline = Some(UnderlineStyle {
+                                    color: None,
+                                    thickness: px(1.),
+                                    wavy: false,
+                                });
+                            }
                         }
                     }
                 }

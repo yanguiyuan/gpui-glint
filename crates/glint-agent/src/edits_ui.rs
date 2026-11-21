@@ -166,6 +166,10 @@ pub struct State {
     commit_task: Option<Task<()>>,
     commit_drafts: RefCell<HashMap<PathBuf, Entity<PromptEditor>>>,
     commit_notice: Option<(PathBuf, String)>,
+    /// One in-flight commit-message request per repository.
+    pub(super) commit_generation: HashMap<PathBuf, Task<()>>,
+    /// Whether the footer's model menu is open.
+    pub(super) commit_model_open: bool,
     stage_queue: std::collections::VecDeque<StageRequest>,
     stage_pending: std::collections::HashSet<PathBuf>,
     stage_refresh_pending: bool,
@@ -816,10 +820,19 @@ impl AgentWorkspace {
 
     pub fn edits_button(&self, cx: &mut Context<Self>) -> gpui::Div {
         let files = self.session_edits();
+        let p = self.theme.palette();
+        // Quiet unless there is something to look at; hover carries the accent.
+        let foreground = if files.is_empty() {
+            p.text_muted
+        } else {
+            p.text
+        };
         div().flex_shrink_0().child(
             Button::new(format!("变更 {}", files.len()))
                 .icon(Icon::Pencil)
-                .kind(ButtonKind::Plain)
+                .kind(ButtonKind::Ghost)
+                .size(ButtonSize::Compact)
+                .foreground(foreground)
                 .theme(self.theme)
                 .render()
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2100,6 +2113,57 @@ impl AgentWorkspace {
             })
     }
 
+    /// The wand's latest notice for one repository, if it belongs to `root`.
+    pub(super) fn commit_notice_for(&self, root: &std::path::Path) -> Option<String> {
+        self.edits_ui
+            .commit_notice
+            .as_ref()
+            .filter(|(project, _)| project == root)
+            .map(|(_, notice)| notice.clone())
+    }
+
+    /// Writes a commit message from the staged diff with the configured model.
+    pub(super) fn generate_commit_message(
+        &mut self,
+        root: PathBuf,
+        entry: Entity<PromptEditor>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.edits_ui.commit_generation.contains_key(&root) {
+            return;
+        }
+        let config = match self.commit_model_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.edits_ui.commit_notice = Some((root, error));
+                cx.notify();
+                return;
+            }
+        };
+        self.edits_ui.commit_notice = None;
+        let prompt = self.history.commit_message.prompt().to_owned();
+        let finished = root.clone();
+        let task = self.spawn_commit_message(
+            root.clone(),
+            entry,
+            config,
+            prompt,
+            cx,
+            move |this, root, result, cx| {
+                if let Some(task) = this.edits_ui.commit_generation.remove(&root) {
+                    task.detach();
+                }
+                if let Err(error) = result {
+                    this.edits_ui.commit_notice =
+                        Some((root, format!("生成提交信息失败：{error}")));
+                }
+                cx.notify();
+            },
+        );
+        self.edits_ui.commit_generation.insert(finished, task);
+        cx.notify();
+    }
+
     fn git_commit_footer(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let root = self.diff_repository_root()?;
         if crate::ssh_project::is_remote(&root) {
@@ -2134,20 +2198,80 @@ impl AgentWorkspace {
         };
         let disabled = !self.can_commit_workspace(cx);
         let submitting = self.edits_ui.commit_task.is_some();
+        let generating = self.edits_ui.commit_generation.contains_key(&root);
+        // Anything the repository can read counts; the wand stays live either
+        // way so a click can explain what is missing instead of doing nothing.
+        let has_changes = matches
+            && (self
+                .edits_ui
+                .workspace_sources
+                .values()
+                .any(|source| source.staged || source.unstaged)
+                || !self.edits_ui.conflicts.is_empty());
+        let wand = {
+            // Always clickable: with nothing to read the request answers with a
+            // notice instead of leaving the button silently dead.
+            let enabled = !generating && !submitting;
+            let mut icon = div()
+                .id("diff-commit-generate")
+                .debug_selector(|| "diff-commit-generate".into())
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .text_color(rgb(if enabled && has_changes {
+                    p.accent
+                } else {
+                    p.text_muted
+                }))
+                .when(enabled, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(rgb(p.accent_tint)))
+                        .on_click(cx.listener({
+                            let root = root.clone();
+                            let entry = entry.clone();
+                            move |this, _, _, cx| {
+                                this.generate_commit_message(root.clone(), entry.clone(), cx)
+                            }
+                        }))
+                });
+            if generating {
+                icon = icon.child(
+                    Icon::Spinner
+                        .render(14.)
+                        .with_animation(
+                            "diff-commit-generation-spinner",
+                            Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                            |spinner, delta| {
+                                spinner.with_transformation(gpui::Transformation::rotate(
+                                    gpui::radians(std::f32::consts::TAU * delta),
+                                ))
+                            },
+                        )
+                        .into_any_element(),
+                );
+            } else {
+                icon = icon.child(Icon::Wand.render(15.).into_any_element());
+            }
+            icon
+        };
         let submit = div()
             .id("diff-commit-submit")
             .debug_selector(|| "diff-commit-submit".into())
-            .size(px(28.))
+            .size(px(24.))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(8.))
-            .bg(rgb(if disabled { p.surface_subtle } else { p.accent }))
-            .text_color(rgb(if disabled { p.text_muted } else { 0xffffff }))
+            .rounded(px(6.))
+            .text_color(rgb(if disabled { p.text_muted } else { p.accent }))
             .when(!disabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|style| style.opacity(0.88))
+                    .hover(move |style| style.bg(rgb(p.accent_tint)))
                     .on_click(cx.listener(|this, _, _, cx| this.commit_workspace(cx)))
             })
             .child(if submitting {
@@ -2166,6 +2290,17 @@ impl AgentWorkspace {
             } else {
                 Icon::ArrowUp.render(16.).into_any_element()
             });
+        let model = commit_message::model_picker(
+            "diff-commit-model",
+            self.theme,
+            self.commit_model_label(),
+            self.commit_model_options(),
+            self.commit_model_value(),
+            self.edits_ui.commit_model_open,
+            cx.entity().downgrade(),
+            |this, open| this.edits_ui.commit_model_open = open,
+            |this, value, cx| this.choose_commit_model(value, cx),
+        );
         Some(
             div()
                 .debug_selector(|| "diff-commit-footer".into())
@@ -2199,11 +2334,21 @@ impl AgentWorkspace {
                                 .child(entry),
                         )
                         .child(
-                            div().flex().justify_end().child(
-                                Tooltip::new(submit, if submitting { "提交中…" } else { "提交" })
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(wand)
+                                .child(model)
+                                .child(div().flex_1())
+                                .child(
+                                    Tooltip::new(
+                                        submit,
+                                        if submitting { "提交中…" } else { "提交" },
+                                    )
                                     .theme(self.theme)
                                     .render(cx),
-                            ),
+                                ),
                         ),
                 )
                 .when_some(

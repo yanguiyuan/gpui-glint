@@ -94,6 +94,8 @@ pub enum Icon {
     Shield,
     Spinner,
     Grip,
+    /// Magic wand: generates content from context (e.g. commit messages).
+    Wand,
 }
 
 impl Icon {
@@ -180,6 +182,7 @@ impl Icon {
             Self::Shield => "shield",
             Self::Spinner => "spinner",
             Self::Grip => "grip",
+            Self::Wand => "wand",
         }
     }
 
@@ -600,6 +603,11 @@ fn icon_svg(name: &str) -> Option<String> {
             "none",
         ),
         "spinner" => ("<path d='M12 3a9 9 0 1 1-9 9'/>", "none"),
+        // Wand: diagonal shaft with three sparks at the tip.
+        "wand" => (
+            "<path d='M4.5 19.5 15 9'/><path d='m14 5.5.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1Z'/><path d='M19.5 11.5v3M18 13h3M9.5 3.5v2M8.5 4.5h2'/>",
+            "none",
+        ),
         "calendar" => (
             "<rect x='3' y='5' width='18' height='16' rx='2'/><path d='M7 3v4M17 3v4M3 11h18M7 15h2M13 15h2'/>",
             "none",
