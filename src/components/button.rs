@@ -19,6 +19,16 @@ pub enum ButtonKind {
     DangerTinted,
 }
 
+/// How much depth a button casts. `Glass` defaults to `Subtle` because it
+/// already carries a 1px border and a full `shadow_md` reads too heavy next to
+/// flat cards.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ButtonShadow {
+    Flat,
+    Subtle,
+    Normal,
+}
+
 #[derive(Clone, Copy, Default)]
 pub enum ButtonSize {
     Large,
@@ -38,6 +48,7 @@ pub struct Button {
     pill: bool,
     disabled: bool,
     truncate_label: bool,
+    shadow: Option<ButtonShadow>,
 }
 
 impl Button {
@@ -57,6 +68,7 @@ impl Button {
             pill: false,
             disabled: false,
             truncate_label: false,
+            shadow: None,
         }
     }
 
@@ -83,6 +95,12 @@ impl Button {
         self.pill = true;
         self
     }
+    /// Override the depth this button casts. Defaults to the per-kind choice
+    /// (`Glass` is `Subtle`, `Primary`/`Danger` are `Normal`, the rest flat).
+    pub fn shadow(mut self, shadow: ButtonShadow) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
         self
@@ -107,51 +125,52 @@ impl Button {
                 0xffffff,
                 theme.color(0x087bfa),
                 theme.color(0x1688ff),
-                true,
+                ButtonShadow::Normal,
             ),
             ButtonKind::Tinted => (
                 theme.color(0xe1efff),
                 theme.color(0x0874e8),
                 theme.color(0xe1efff),
                 theme.color(0xd4e8ff),
-                false,
+                ButtonShadow::Flat,
             ),
             ButtonKind::Glass => (
                 theme.color(0xfafcff),
                 theme.color(0x262a32),
                 theme.color(0xd5dae2),
                 theme.color(0xf0f4f9),
-                true,
+                ButtonShadow::Subtle,
             ),
             ButtonKind::Plain => (
                 theme.color(0xf3f5f8),
                 theme.color(0x0874e8),
                 theme.color(0xf3f5f8),
                 theme.color(0xe6f1ff),
-                false,
+                ButtonShadow::Flat,
             ),
             ButtonKind::Gray => (
                 theme.color(0xe8ebf0),
                 theme.color(0x262a32),
                 theme.color(0xe8ebf0),
                 theme.color(0xdde1e8),
-                false,
+                ButtonShadow::Flat,
             ),
             ButtonKind::Danger => (
                 theme.color(0xf0443a),
                 0xffffff,
                 theme.color(0xf0443a),
                 theme.color(0xff5a50),
-                true,
+                ButtonShadow::Normal,
             ),
             ButtonKind::DangerTinted => (
                 theme.color(0xffe9e7),
                 theme.color(0xd9342b),
                 theme.color(0xffe9e7),
                 theme.color(0xffdeda),
-                false,
+                ButtonShadow::Flat,
             ),
         };
+        let shadow = self.shadow.unwrap_or(shadow);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.label.hash(&mut hasher);
         let id = ("glass-button", hasher.finish());
@@ -191,9 +210,11 @@ impl Button {
                 .hover(move |style| style.bg(rgb(hover)))
                 .active(move |style| style.opacity(0.82));
         }
-        if shadow {
-            button = button.shadow_md();
-        }
+        button = match shadow {
+            ButtonShadow::Flat => button,
+            ButtonShadow::Subtle => button.shadow_xs(),
+            ButtonShadow::Normal => button.shadow_md(),
+        };
         button
     }
 }

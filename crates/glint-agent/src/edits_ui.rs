@@ -4541,7 +4541,9 @@ impl Render for Summary {
                     )
                     .child(
                         Button::new("查看变更")
-                            .kind(ButtonKind::Plain)
+                            .kind(ButtonKind::Glass)
+                            .size(ButtonSize::Small)
+                            .pill()
                             .theme(self.theme)
                             .render()
                             .on_click(move |_, _, cx| {

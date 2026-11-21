@@ -57,7 +57,7 @@ pub use badge::{
     ContentBadge, ContentType, CountBadge, CountBadgeKind, OverlayBadge, OverlayBadgeKind,
     ReadStatus, StatusBadge, TagBadge, TagBadgeKind,
 };
-pub use button::{Button, ButtonKind, ButtonSize};
+pub use button::{Button, ButtonKind, ButtonShadow, ButtonSize};
 pub use closable_tabs::{ClosableTab, ClosableTabs};
 pub use dialog::{Dialog, DialogDismiss};
 pub use dropdown::{DropdownGroup, DropdownItem, GroupedDropdown};
