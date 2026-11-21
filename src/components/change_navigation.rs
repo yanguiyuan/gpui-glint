@@ -99,6 +99,11 @@ pub enum ChangeNavigationEvent {
         layer: bool,
         staged: bool,
     },
+    StageDirectory {
+        path: String,
+        layer: bool,
+        staged: bool,
+    },
     Menu {
         path: String,
         position: gpui::Point<gpui::Pixels>,
@@ -114,6 +119,7 @@ pub struct ChangeNavigation {
     blocked_files: HashSet<String>,
     stage_intents: HashMap<String, bool>,
     available_groups: [bool; 2],
+    available_directories: [HashSet<String>; 2],
     background_visible: bool,
     empty_label: &'static str,
     error: Option<String>,
@@ -135,6 +141,7 @@ impl ChangeNavigation {
             blocked_files: HashSet::new(),
             stage_intents: HashMap::new(),
             available_groups: [true; 2],
+            available_directories: Default::default(),
             background_visible: true,
             empty_label: "工作区没有未提交的变更",
             error: None,
@@ -209,6 +216,17 @@ impl ChangeNavigation {
     pub fn set_stage_intents(&mut self, intents: HashMap<String, bool>, cx: &mut Context<Self>) {
         if self.stage_intents != intents {
             self.stage_intents = intents;
+            cx.notify();
+        }
+    }
+
+    pub fn set_stage_directory_availability(
+        &mut self,
+        available: [HashSet<String>; 2],
+        cx: &mut Context<Self>,
+    ) {
+        if self.available_directories != available {
+            self.available_directories = available;
             cx.notify();
         }
     }
@@ -459,14 +477,28 @@ impl ChangeNavigation {
             Some(layer) => format!("change-directory:{path}:{layer}"),
             None => format!("change-directory:{path}"),
         };
-        Self::directory_element(selector, label, depth, count, collapsed, self.theme).on_click(
-            cx.listener(move |_, _, _, cx| {
-                cx.emit(ChangeNavigationEvent::ToggleDirectory {
+        let mut row = Self::directory_element(selector, label, depth, count, collapsed, self.theme);
+        if self.stage_controls
+            && let Some(layer) = staged
+        {
+            row = row.child(self.stage_checkbox(
+                format!("stage-directory:{path}:{layer}"),
+                layer,
+                self.available_directories[usize::from(layer)].contains(&path),
+                ChangeNavigationEvent::StageDirectory {
                     path: path.clone(),
-                    staged,
-                });
-            }),
-        )
+                    layer,
+                    staged: !layer,
+                },
+                cx,
+            ));
+        }
+        row.on_click(cx.listener(move |_, _, _, cx| {
+            cx.emit(ChangeNavigationEvent::ToggleDirectory {
+                path: path.clone(),
+                staged,
+            });
+        }))
     }
 
     fn file_row(

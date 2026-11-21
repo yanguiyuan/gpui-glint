@@ -335,7 +335,8 @@ impl ProjectFiles {
                     ChangeNavigationEvent::StageGroup { layer, staged } => {
                         this.queue_staging(StageSelection::Group(*layer), *staged, cx)
                     }
-                    ChangeNavigationEvent::ToggleDirectory { .. }
+                    ChangeNavigationEvent::StageDirectory { .. }
+                    | ChangeNavigationEvent::ToggleDirectory { .. }
                     | ChangeNavigationEvent::Menu { .. } => {}
                 },
             )
