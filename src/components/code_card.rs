@@ -1,5 +1,5 @@
 mod source_syntax;
-use super::rich_text::{Format, RichText};
+use super::rich_text::{Format, RichText, file_link_color};
 use super::text_completion::{CompletionKey, CompletionState, TextCompletion, completion_menu};
 use super::text_reference::{TextReference, TextReferenceResolver, reference_colors, references};
 use crate::theme::ThemePreset;
@@ -427,15 +427,13 @@ impl CodeCard {
     ) -> Vec<gpui::AnyElement> {
         let (start, line) = source_line;
         let end = start + line.len();
-        let activate = self.read_only && self.preview_links;
         let label_color = if self.dark {
             ThemePreset::DarkObsidian
         } else {
             ThemePreset::Moonstone
         };
         let root = self.link_root.clone();
-        rich.link_ranges()
-            .into_iter()
+        rich.links()
             .filter_map(|(range, url)| {
                 let from = range.start.max(start);
                 let to = range.end.min(end);
@@ -444,10 +442,8 @@ impl CodeCard {
                 }
                 let left = line.x_for_index(from - start);
                 let width = line.x_for_index(to - start) - left;
-                let label = link_tooltip_label(&url, root.as_deref());
+                let label = link_tooltip_label(url, root.as_deref());
                 let offset = range.start;
-                let weak = cx.entity().downgrade();
-                let link = url.clone();
                 let overlay = super::Tooltip::new(div().size_full(), label)
                     .theme(label_color)
                     .render(cx)
@@ -458,15 +454,7 @@ impl CodeCard {
                     .top_0()
                     .w(width)
                     .h(height)
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        if !activate {
-                            return;
-                        }
-                        let _ = weak.update(cx, |_, cx| {
-                            cx.emit(CodeCardEvent::LinkActivated(link.clone().into()));
-                        });
-                    });
+                    .cursor_pointer();
                 Some(overlay.into_any_element())
             })
             .collect()
@@ -1646,19 +1634,25 @@ impl CodeCard {
     /// click lands on the ink rather than the empty corners of the slot.
     fn link_url_at(&self, position: gpui::Point<Pixels>) -> Option<String> {
         let rich = self.rich.as_ref()?;
-        if let Some((distance, offset)) = self.mouse_text_hit(position)
-            && distance == 0.
-            && let Some(url) = rich.link_at(offset)
-        {
-            return Some(url.to_owned());
-        }
         let (start, line, bounds) = self
             .last_lines
             .iter()
             .find(|(_, _, bounds)| position.y >= bounds.top() && position.y < bounds.bottom())?;
+        let end = start + line.len();
         let x = position.x - bounds.left();
-        for link in rich.link_starts() {
-            if link < *start || link > *start + line.len() {
+        for (range, url) in rich.links() {
+            let from = range.start.max(*start);
+            let to = range.end.min(end);
+            if from >= to {
+                continue;
+            }
+            if x >= line.x_for_index(from - start) && x < line.x_for_index(to - start) {
+                return Some(url.to_owned());
+            }
+        }
+        for (range, url) in rich.file_links() {
+            let link = range.start;
+            if link < *start || link >= end {
                 continue;
             }
             let Some(icon) = link_icon_bounds(
@@ -1676,7 +1670,7 @@ impl CodeCard {
             let dx: f32 = (x - center.x).into();
             let dy: f32 = (position.y - bounds.top() - center.y).into();
             if dx * dx + dy * dy <= radius * radius {
-                return rich.link_at(link).map(str::to_owned);
+                return Some(url.to_owned());
             }
         }
         None
@@ -2718,7 +2712,30 @@ struct CodeLine {
 struct LinkIcon {
     bounds: Bounds<Pixels>,
     icon: super::Icon,
-    color: u32,
+}
+
+fn file_link_icon(url: &str) -> super::Icon {
+    let mut path = url.rsplit_once("#L").map_or(url, |(path, _)| path);
+    for _ in 0..2 {
+        let Some((prefix, number)) = path.rsplit_once(':') else {
+            break;
+        };
+        if number
+            .split('-')
+            .next()
+            .unwrap_or_default()
+            .parse::<usize>()
+            .is_err()
+        {
+            break;
+        }
+        path = prefix;
+    }
+    if path.ends_with('/') {
+        super::Icon::Folder
+    } else {
+        super::Icon::for_file_name(path)
+    }
 }
 
 /// Size of the link glyph inside its reserved slot. It follows the body font
@@ -2794,6 +2811,7 @@ fn link_tooltip_label(url: &str, root: Option<&std::path::Path>) -> String {
 struct LinePaint {
     inline_code_backgrounds: Vec<gpui::PaintQuad>,
     link_icons: Vec<LinkIcon>,
+    file_link_underlines: Vec<gpui::PaintQuad>,
     search_highlights: Vec<gpui::PaintQuad>,
     cursor: Option<gpui::PaintQuad>,
     selection: Option<gpui::PaintQuad>,
@@ -2898,32 +2916,48 @@ impl Element for CodeLine {
                     rgb(colors.selection),
                 )
             });
-        let link_icons = input
-            .rich
-            .as_ref()
-            .map(|rich| {
-                rich.link_starts()
-                    .into_iter()
-                    .filter(|start| *start >= self.start && *start < end)
-                    .filter_map(|start| {
-                        // The reserved spaces bound the icon slot, so it tracks
-                        // the body font size instead of a fixed glyph size.
-                        link_icon_bounds(
-                            &self.line,
-                            start - self.start,
-                            rich.icon_slot(start),
-                            bounds.origin,
-                            self.line_height,
-                        )
-                        .map(|bounds| LinkIcon {
-                            bounds,
-                            icon: super::Icon::Link,
-                            color: 0x007aff,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut link_icons = Vec::new();
+        let mut file_link_underlines = Vec::new();
+        if let Some(rich) = &input.rich {
+            let baseline = bounds.top()
+                + (self.line_height - self.line.ascent - self.line.descent) / 2.
+                + self.line.ascent;
+            let underline_y = baseline + self.line.descent * 0.618;
+            for (range, url) in rich.file_links() {
+                let start = range.start.max(self.start);
+                let stop = range.end.min(end);
+                if start >= stop {
+                    continue;
+                }
+                let left = bounds.left() + self.line.x_for_index(start - self.start);
+                let right = bounds.left() + self.line.x_for_index(stop - self.start);
+                file_link_underlines.push(gpui::quad(
+                    Bounds::new(point(left, underline_y), size(right - left, px(1.))),
+                    px(0.),
+                    gpui::transparent_black(),
+                    gpui::Edges {
+                        top: px(1.),
+                        ..Default::default()
+                    },
+                    rgb(file_link_color(input.dark)),
+                    gpui::BorderStyle::Dashed,
+                ));
+                if start == range.start
+                    && let Some(bounds) = link_icon_bounds(
+                        &self.line,
+                        start - self.start,
+                        rich.icon_slot(start),
+                        bounds.origin,
+                        self.line_height,
+                    )
+                {
+                    link_icons.push(LinkIcon {
+                        bounds,
+                        icon: file_link_icon(url),
+                    });
+                }
+            }
+        }
         let cursor = (focused
             && input.document_selection.is_none()
             && !input.read_only
@@ -2999,6 +3033,7 @@ impl Element for CodeLine {
         LinePaint {
             inline_code_backgrounds,
             link_icons,
+            file_link_underlines,
             cursor,
             selection,
             search_highlights,
@@ -3031,23 +3066,27 @@ impl Element for CodeLine {
         for background in paint.inline_code_backgrounds.drain(..) {
             window.paint_quad(background);
         }
-        for icon in paint.link_icons.drain(..) {
-            let _ = window.paint_svg(
-                icon.bounds,
-                format!("glint-ui/icons/{}.svg", icon.icon.name()).into(),
-                None,
-                gpui::TransformationMatrix::unit(),
-                gpui::rgb_to_hsla(rgb(icon.color)),
-                cx,
-            );
-        }
         for highlight in paint.search_highlights.drain(..) {
             window.paint_quad(highlight);
         }
         if let Some(selection) = paint.selection.take() {
             window.paint_quad(selection);
         }
+        let link_color = gpui::rgb_to_hsla(rgb(file_link_color(self.input.read(cx).dark)));
+        for icon in paint.link_icons.drain(..) {
+            let _ = window.paint_svg(
+                icon.bounds,
+                format!("glint-ui/icons/{}.svg", icon.icon.name()).into(),
+                None,
+                gpui::TransformationMatrix::unit(),
+                link_color,
+                cx,
+            );
+        }
         self.line.paint(bounds.origin, self.line_height, window, cx);
+        for underline in paint.file_link_underlines.drain(..) {
+            window.paint_quad(underline);
+        }
         if let Some(underline) = paint.underline.take() {
             window.paint_quad(underline);
         }
@@ -3909,6 +3948,7 @@ impl Render for CodeCard {
                                         wrap_start..wrap_start + text.len(),
                                         &font,
                                         window.text_style().color,
+                                        self.dark,
                                     )
                                 })
                                 .unwrap_or_else(|| vec![run]),
@@ -3934,6 +3974,20 @@ impl Render for CodeCard {
                             && space > cut / 2
                         {
                             cut = space + 1;
+                        }
+                        if let Some(rich) = &self.rich {
+                            let wrap_at = wrap_start + cut;
+                            // Keep the icon's spaces on the same row as the label.
+                            for (range, _) in rich.file_links() {
+                                let slot_start = range.start - rich.icon_slot(range.start);
+                                if wrap_start < slot_start
+                                    && slot_start < wrap_at
+                                    && wrap_at <= range.start
+                                {
+                                    cut = slot_start - wrap_start;
+                                    break;
+                                }
+                            }
                         }
                         segments.push((text[..cut].to_owned(), false));
                         text = &text[cut..];
@@ -3971,7 +4025,7 @@ impl Render for CodeCard {
                     })
                     .collect();
                 let runs = if let Some(rich) = &self.rich {
-                    rich.runs(start..end, &font, window.text_style().color)
+                    rich.runs(start..end, &font, window.text_style().color, self.dark)
                 } else {
                     reference_runs(runs, start, &refs, self.reference_theme())
                 };
@@ -4460,7 +4514,7 @@ mod tests {
     fn read_only_preview_links_activate_on_click_but_not_selection(cx: &mut gpui::TestAppContext) {
         let (editor, window) = cx.add_window_view(|_, cx| {
             let mut editor = CodeCard::new(cx, "text", "")
-                .rich_text("前 [`src/main.rs`](glint-preview:test) 后")
+                .rich_text("前 [src/main.rs (line 42)](src/main.rs#L42) 后")
                 .read_only(true);
             editor.set_preview_links(true, cx);
             editor
@@ -4493,23 +4547,33 @@ mod tests {
         let from = at(offset + 1, window);
         let to = at(offset + 5, window);
         window.simulate_click(from, Default::default());
-        assert_eq!(events.borrow().len(), 1);
+        assert_eq!(events.borrow().as_slice(), &["src/main.rs#L42"]);
         window.simulate_mouse_down(from, MouseButton::Left, Default::default());
         window.simulate_mouse_move(to, MouseButton::Left, Default::default());
         window.simulate_mouse_up(to, MouseButton::Left, Default::default());
         assert_eq!(events.borrow().len(), 1);
-        editor.read_with(window, |editor, _| {
+        let icon = editor.read_with(window, |editor, _| {
             // The reserved icon spaces live outside the link mark.
-            assert_eq!(editor.content(), "前   src/main.rs 后");
+            let rich = editor.rich.as_ref().unwrap();
+            let (range, url) = rich.file_links().next().unwrap();
+            assert_eq!(file_link_icon(url), super::super::Icon::Rust);
             assert_eq!(
-                editor
-                    .rich
-                    .as_ref()
-                    .unwrap()
-                    .copy_text(0..editor.content().len()),
-                "前 src/main.rs 后"
+                rich.copy_text(0..editor.content().len()),
+                "前 src/main.rs (line 42) 后"
             );
+            let (start, line, bounds) = &editor.last_lines[0];
+            link_icon_bounds(
+                line,
+                range.start - start,
+                rich.icon_slot(range.start),
+                bounds.origin,
+                bounds.size.height,
+            )
+            .unwrap()
+            .center()
         });
+        window.simulate_click(icon, Default::default());
+        assert_eq!(events.borrow().as_slice(), &["src/main.rs#L42"; 2]);
     }
 
     #[gpui::test]

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Built-in system prompt. The settings page can replace it per user.
-pub const DEFAULT_PROMPT: &str = "你是 Git 提交信息生成器。根据用户给出的改动摘要写一条提交信息：第一行概括改动目的，不超过 50 个字，结尾不加句号；若涉及多个方面，空一行后写 1 至 3 条要点，每条不超过 60 个字并以「- 」开头。使用中文，只输出提交信息本身，不要解释、不要 Markdown 代码块、不要引号，不要虚构改动内容。";
+pub const DEFAULT_PROMPT: &str = "你是 Git 提交信息生成器。根据改动摘要，只输出一行提交信息，格式为 type(module):中文摘要，例如 feat(editor):支持粘贴图片 或 bugfix(git):修复暂存区刷新。新增功能用 feat，修复缺陷用 bugfix，其他改动按主要目的选用 refactor、perf、docs、test、build、ci 或 chore。module 使用实际模块名。使用半角括号和冒号，冒号后直接写摘要。整行不超过 50 个字，末尾不加句号。不要虚构改动内容。";
 
 /// Persisted preferences for the commit-message wand.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,11 +10,18 @@ use std::ops::Range;
 /// slot of its own at body sizes instead of squeezing it against the text.
 pub(super) const LINK_ICON_SPACES: usize = 4;
 
-/// Web destinations keep their blue underline, so they are drawn without an
-/// icon and without a reserved slot; local file references read as body text
-/// and rely on the icon to signal that they can be opened.
-pub(super) fn is_web_link(url: &str) -> bool {
-    url.contains("://") || url.starts_with("mailto:") || url.starts_with('#')
+/// Links to local or SSH files use the same inline reference style.
+pub(super) fn is_file_link(url: &str) -> bool {
+    url.starts_with("file://")
+        || url.starts_with("ssh://")
+        || !(url.contains("://")
+            || url.starts_with("mailto:")
+            || url.starts_with('#')
+            || url.starts_with("//"))
+}
+
+pub(super) fn file_link_color(dark: bool) -> u32 {
+    if dark { 0x82baff } else { 0x1458a0 }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,60 +126,27 @@ impl RichText {
     /// copied or quoted text. The reservation is idempotent so re-parsing the
     /// generated Markdown cannot accumulate spaces.
     fn reserve_link_icons(&mut self) {
-        let mut starts: Vec<usize> = self
-            .marks
-            .iter()
-            .filter(|mark| match &mark.format {
-                Format::Link(url) => !is_web_link(url),
-                _ => false,
-            })
-            .map(|mark| mark.range.start)
-            .collect();
-        starts.sort_unstable();
-        starts.dedup();
-        let mut insertions = Vec::new();
-        for start in starts {
-            if start > self.text.len() {
-                continue;
-            }
-            let existing = self.text[..start]
-                .chars()
-                .rev()
-                .take_while(|c| *c == ' ')
-                .count();
-            if existing >= LINK_ICON_SPACES {
-                continue;
-            }
-            insertions.push((start, LINK_ICON_SPACES - existing));
-        }
+        let insertions = self.link_starts();
         if insertions.is_empty() {
             return;
         }
         let mut text = String::with_capacity(self.text.len() + insertions.len() * LINK_ICON_SPACES);
         let mut cursor = 0;
-        for (start, count) in &insertions {
-            text.push_str(&self.text[cursor..*start]);
-            for _ in 0..*count {
+        for &start in &insertions {
+            text.push_str(&self.text[cursor..start]);
+            for _ in 0..LINK_ICON_SPACES {
                 text.push(' ');
             }
-            cursor = *start;
+            cursor = start;
         }
         text.push_str(&self.text[cursor..]);
         self.text = text;
-        let shifted = |offset: usize| {
-            insertions
-                .iter()
-                .filter(|(at, _)| *at <= offset)
-                .map(|(_, count)| count)
-                .sum::<usize>()
-        };
+        let shifted =
+            |offset: usize| insertions.partition_point(|&at| at <= offset) * LINK_ICON_SPACES;
         for mark in &mut self.marks {
             mark.range.start += shifted(mark.range.start);
-            mark.range.end += insertions
-                .iter()
-                .filter(|(at, _)| *at < mark.range.end)
-                .map(|(_, count)| count)
-                .sum::<usize>();
+            mark.range.end +=
+                insertions.partition_point(|&at| at < mark.range.end) * LINK_ICON_SPACES;
         }
     }
     pub fn update_text(&mut self, next: &str) {
@@ -270,13 +244,6 @@ impl RichText {
         });
         formats
     }
-    pub fn link_at(&self, offset: usize) -> Option<&str> {
-        self.marks.iter().find_map(|mark| match &mark.format {
-            Format::Link(url) if mark.range.contains(&offset) => Some(url.as_str()),
-            _ => None,
-        })
-    }
-
     pub fn code_ranges(&self, range: Range<usize>) -> Vec<Range<usize>> {
         self.marks
             .iter()
@@ -494,38 +461,27 @@ impl RichText {
             .collect()
     }
 
-    /// Start offsets of inline links that carry a leading icon slot, i.e. the
-    /// local file references. Web links are underlined instead.
+    /// Start offsets of file references that carry a leading icon slot.
     pub fn link_starts(&self) -> Vec<usize> {
-        let mut starts: Vec<usize> = self
-            .marks
-            .iter()
-            .filter(|mark| match &mark.format {
-                Format::Link(url) => !is_web_link(url),
-                _ => false,
-            })
-            .map(|mark| mark.range.start)
-            .collect();
+        let mut starts: Vec<usize> = self.file_links().map(|(range, _)| range.start).collect();
         starts.sort_unstable();
         starts.dedup();
         starts
     }
 
-    /// Inline link spans: `(range, destination)` for each `Format::Link` mark.
-    pub fn link_ranges(&self) -> Vec<(Range<usize>, String)> {
-        let mut links: Vec<(Range<usize>, String)> = self
-            .marks
-            .iter()
-            .filter_map(|mark| match &mark.format {
-                Format::Link(url) => Some((mark.range.clone(), url.clone())),
-                _ => None,
-            })
-            .collect();
-        links.sort_by_key(|(range, _)| range.start);
-        links
+    pub fn file_links(&self) -> impl Iterator<Item = (&Range<usize>, &str)> {
+        self.links()
+            .filter(|(range, url)| !range.is_empty() && is_file_link(url))
     }
 
-    pub fn runs(&self, range: Range<usize>, base: &Font, color: Hsla) -> Vec<TextRun> {
+    pub fn links(&self) -> impl Iterator<Item = (&Range<usize>, &str)> {
+        self.marks.iter().filter_map(|mark| match &mark.format {
+            Format::Link(url) => Some((&mark.range, url.as_str())),
+            _ => None,
+        })
+    }
+
+    pub fn runs(&self, range: Range<usize>, base: &Font, color: Hsla, dark: bool) -> Vec<TextRun> {
         let mut cuts = vec![range.start, range.end];
         for mark in &self.marks {
             if mark.range.start > range.start && mark.range.start < range.end {
@@ -561,18 +517,16 @@ impl RichText {
                         Format::Code => {
                             run.font.family = crate::code_font::family();
                         }
-                        Format::Link(url) => {
-                            // File links read as body text: the icon drawn
-                            // before them carries the affordance, so the blue
-                            // underline only marks real web destinations.
-                            if is_web_link(&url) {
-                                run.color = gpui::rgb_to_hsla(rgb(0x007aff));
-                                run.underline = Some(UnderlineStyle {
-                                    color: None,
-                                    thickness: px(1.),
-                                    wavy: false,
-                                });
-                            }
+                        Format::Link(url) if is_file_link(&url) => {
+                            run.color = gpui::rgb_to_hsla(rgb(file_link_color(dark)));
+                        }
+                        Format::Link(_) => {
+                            run.color = gpui::rgb_to_hsla(rgb(0x007aff));
+                            run.underline = Some(UnderlineStyle {
+                                color: None,
+                                thickness: px(1.),
+                                wavy: false,
+                            });
                         }
                     }
                 }
@@ -668,6 +622,31 @@ pub(super) fn leaves(source: &str) -> Vec<Leaf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_references_share_a_tint_and_icon_slot_across_path_formats() {
+        let text = RichText::parse(
+            "[说明 (line 42)](src/main.rs#L42) [本地](file:///tmp/main.rs:42) \
+             [远程](ssh://host/src/main.rs:42:5) [网站](https://example.com/main.rs)",
+        );
+        let file_links: Vec<_> = text.file_links().collect();
+        assert_eq!(file_links.len(), 3);
+        for (range, _) in file_links {
+            assert_eq!(text.icon_slot(range.start), LINK_ICON_SPACES);
+            for dark in [false, true] {
+                let runs = text.runs(range.clone(), &gpui::font("System"), Hsla::default(), dark);
+                assert!(runs.iter().all(|run| {
+                    run.color == gpui::rgb_to_hsla(rgb(file_link_color(dark)))
+                        && run.underline.is_none()
+                }));
+            }
+        }
+        let (range, _) = text.links().last().unwrap();
+        assert_eq!(text.icon_slot(range.start), 1);
+        let runs = text.runs(range.clone(), &gpui::font("System"), Hsla::default(), false);
+        assert!(runs.iter().all(|run| run.underline.is_some()));
+    }
+
     #[test]
     fn typing_preserves_inline_formats_and_unicode() {
         let mut t = RichText::parse("**中文** 与 [链接](https://example.com)");
