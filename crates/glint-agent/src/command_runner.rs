@@ -981,15 +981,27 @@ pub async fn shutdown(anchor: PathBuf) {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Deserialize, Default)]
+#[allow(dead_code)]
 struct Args {
-    program: String,
-    args: Vec<String>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(rename = "CommandLine", default)]
+    command_line: Option<String>,
     cwd: Option<String>,
     timeout_seconds: Option<u64>,
     #[serde(default)]
     background: bool,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(rename = "toolSummary", default)]
+    tool_summary: Option<String>,
 }
 pub async fn run(
     context: &ToolContext,
@@ -998,6 +1010,17 @@ pub async fn run(
 ) -> Result<String, String> {
     let args: Args =
         serde_json::from_value(args.clone()).map_err(|e| format!("命令参数无效：{e}"))?;
+    let (program, cmd_args) = match (args.program, args.args) {
+        (Some(p), Some(a)) => (p, a),
+        (Some(p), None) => (p, Vec::new()),
+        (None, _) => {
+            let cmd = args.command.or(args.command_line).unwrap_or_default();
+            ("sh".into(), vec!["-c".into(), cmd])
+        }
+    };
+    if program.trim().is_empty() {
+        return Err("命令参数无效：缺少 program 或 command".into());
+    }
     let seconds = args
         .timeout_seconds
         .unwrap_or(if args.background { 3600 } else { 60 });
@@ -1039,8 +1062,8 @@ pub async fn run(
     let result = foreground(
         context,
         cwd,
-        args.program,
-        args.args,
+        program,
+        cmd_args,
         seconds,
         args.background,
         (!args.background).then(|| (call_id.into(), context.events.clone())),

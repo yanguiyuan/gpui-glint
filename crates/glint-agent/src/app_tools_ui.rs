@@ -1,4 +1,5 @@
 use super::*;
+use gpui::{StyledText, TextRun};
 use gpui_glint::components::ChainScroll;
 use std::hash::{Hash, Hasher};
 
@@ -97,7 +98,233 @@ fn process_signature(
     hash.finish()
 }
 
+fn command_description(call: &tools::ToolCall) -> Option<String> {
+    call.arguments["description"]
+        .as_str()
+        .or_else(|| call.arguments["summary"].as_str())
+        .or_else(|| call.arguments["toolSummary"].as_str())
+        .or_else(|| call.arguments["title"].as_str())
+        .or_else(|| call.arguments["explanation"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn command_text(call: &tools::ToolCall) -> String {
+    if let Some(cmd) = call.arguments["command"]
+        .as_str()
+        .or_else(|| call.arguments["CommandLine"].as_str())
+        .or_else(|| call.arguments["cmd"].as_str())
+    {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    command_summary(call)
+}
+
+fn format_command_prompt(call: &tools::ToolCall, preview_root: Option<&std::path::Path>) -> String {
+    let cwd_val = call.arguments["cwd"].as_str().filter(|s| !s.trim().is_empty());
+    let cwd = cwd_val.map(std::path::Path::new).or(preview_root);
+    let folder_name = cwd
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            cwd.and_then(|p| p.to_str()).unwrap_or("project")
+        });
+    let folder_name = folder_name.rsplit(['/', '\\']).next().unwrap_or(folder_name);
+    format!("~/.../{folder_name} $ ")
+}
+
+fn highlight_command_line(prompt: &str, cmd: &str, theme: ThemePreset) -> gpui::StyledText {
+    let p = theme.palette();
+    let dark = theme.is_dark();
+    let cmd_color = if dark { 0xe06c75 } else { 0xd9342b };
+    let flag_color = if dark { 0xd19a66 } else { 0xb37716 };
+    let string_color = if dark { 0x98c379 } else { 0x24864c };
+    let op_color = if dark { 0x56b6c2 } else { 0x007aff };
+    let plain_color = p.text;
+    let prompt_color = p.text_muted;
+
+    let full_text = format!("{prompt}{cmd}");
+    let mut runs = Vec::new();
+
+    if !prompt.is_empty() {
+        runs.push(TextRun {
+            len: prompt.len(),
+            font: gpui::Font::default(),
+            color: gpui::rgb_to_hsla(rgb(prompt_color)),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            letter_spacing: None,
+        });
+    }
+
+    let mut is_command_start = true;
+    let mut expect_subcommand = false;
+    let mut i = 0;
+    let bytes = cmd.as_bytes();
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            runs.push(TextRun {
+                len: i - start,
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(plain_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            continue;
+        }
+
+        if bytes[i..].starts_with(b"&&") || bytes[i..].starts_with(b"||") {
+            runs.push(TextRun {
+                len: 2,
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(op_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            i += 2;
+            is_command_start = true;
+            expect_subcommand = false;
+            continue;
+        }
+        if bytes[i] == b'|' || bytes[i] == b';' || bytes[i] == b'&' {
+            runs.push(TextRun {
+                len: 1,
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(op_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            i += 1;
+            is_command_start = true;
+            expect_subcommand = false;
+            continue;
+        }
+
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            runs.push(TextRun {
+                len: i - start,
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(string_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            is_command_start = false;
+            expect_subcommand = false;
+            continue;
+        }
+
+        let start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'|'
+            && bytes[i] != b';'
+            && bytes[i] != b'&'
+        {
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                break;
+            }
+            i += 1;
+        }
+        let word = &cmd[start..i];
+
+        if word.starts_with('-') {
+            runs.push(TextRun {
+                len: word.len(),
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(flag_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            is_command_start = false;
+        } else if is_command_start {
+            runs.push(TextRun {
+                len: word.len(),
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(cmd_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            is_command_start = false;
+            if matches!(
+                word,
+                "cargo" | "git" | "npm" | "pnpm" | "bun" | "yarn" | "docker" | "kubectl" | "go" | "rustup"
+            ) {
+                expect_subcommand = true;
+            }
+        } else if expect_subcommand {
+            runs.push(TextRun {
+                len: word.len(),
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(cmd_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+            expect_subcommand = false;
+        } else {
+            runs.push(TextRun {
+                len: word.len(),
+                font: gpui::Font::default(),
+                color: gpui::rgb_to_hsla(rgb(plain_color)),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: None,
+            });
+        }
+    }
+
+    StyledText::new(full_text).with_runs(runs)
+}
+
 fn command_summary(call: &tools::ToolCall) -> String {
+    if let Some(cmd) = call.arguments["command"]
+        .as_str()
+        .or_else(|| call.arguments["CommandLine"].as_str())
+        .or_else(|| call.arguments["cmd"].as_str())
+    {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
     fn quote(value: &str) -> String {
         let value = value.replace(['\r', '\n'], " ");
         if !value.is_empty()
@@ -250,27 +477,31 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
             },
             format!("{} 个调用", record.nested_tools.len()),
         ),
-        "run_command" => (
-            Icon::Shell,
-            if running {
-                "正在运行"
-            } else if serde_json::from_str::<serde_json::Value>(&record.result)
-                .ok()
-                .is_some_and(|v| v["status"] == "running")
-            {
-                "已启动后台命令"
-            } else if success {
-                "已运行"
-            } else if serde_json::from_str::<serde_json::Value>(&record.result)
-                .ok()
-                .is_some_and(|value| value["status"] == "cancelled")
-            {
-                "命令已终止"
-            } else {
-                "命令失败"
-            },
-            command_summary(&record.call),
-        ),
+        "run_command" => {
+            let target = command_description(&record.call)
+                .unwrap_or_else(|| command_summary(&record.call));
+            (
+                Icon::Shell,
+                if running {
+                    "正在运行"
+                } else if serde_json::from_str::<serde_json::Value>(&record.result)
+                    .ok()
+                    .is_some_and(|v| v["status"] == "running")
+                {
+                    "已启动后台命令"
+                } else if success {
+                    "已运行"
+                } else if serde_json::from_str::<serde_json::Value>(&record.result)
+                    .ok()
+                    .is_some_and(|value| value["status"] == "cancelled")
+                {
+                    "命令已终止"
+                } else {
+                    "命令失败"
+                },
+                target,
+            )
+        }
         "read_file" => (
             Icon::Text,
             if running {
@@ -422,7 +653,25 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
             record.call.name.clone(),
         ),
     };
-    let mut summary = format!("{action} {target}");
+    let mut summary = if action == "已运行" {
+        if let Some(stripped) = target.strip_prefix("已运行 ") {
+            format!("{action} {stripped}")
+        } else if let Some(stripped) = target.strip_prefix("Ran ") {
+            format!("{action} {stripped}")
+        } else {
+            format!("{action} {target}")
+        }
+    } else if action == "正在运行" {
+        if let Some(stripped) = target.strip_prefix("正在运行 ") {
+            format!("{action} {stripped}")
+        } else if let Some(stripped) = target.strip_prefix("Running ") {
+            format!("{action} {stripped}")
+        } else {
+            format!("{action} {target}")
+        }
+    } else {
+        format!("{action} {target}")
+    };
     if record.call.name == "run_command" && !running {
         summary.push_str(&format!(" · {:.1}s", record.elapsed_ms as f64 / 1000.));
     }
@@ -955,6 +1204,9 @@ impl AgentWorkspace {
             let scope = format!("{key}:tool:{}", record.call.id);
             let preview_root = self.history.active().project.clone();
             let preview_workspace = cx.entity().downgrade();
+            let is_run_command = record.call.name == "run_command";
+            let raw_cmd = command_text(&record.call);
+            let cmd_prompt = format_command_prompt(&record.call, preview_root.as_deref());
             let operation_title = match record.call.name.as_str() {
                 "run_command" | "command_poll" | "command_stop" => "Shell",
                 "code_mode" => "JavaScript",
@@ -1295,6 +1547,124 @@ impl AgentWorkspace {
                 }
                 panel.set_content(
                     move |_, cx| {
+                        if is_run_command {
+                            let styled_cmd =
+                                highlight_command_line(&cmd_prompt, &raw_cmd, theme);
+                            let cmd_to_copy = raw_cmd.clone();
+                            let host = weak.clone();
+                            return div()
+                                .id("command-card")
+                                .debug_selector(|| "command-card".into())
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .bg(rgb(p.canvas))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .id("command-card-header")
+                                        .debug_selector(|| "command-card-header".into())
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_start()
+                                        .justify_between()
+                                        .gap(px(8.))
+                                        .px_3()
+                                        .py(px(8.))
+                                        .border_b_1()
+                                        .border_color(rgb(p.border))
+                                        .bg(rgb(p.surface))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .font_family("monospace")
+                                                .text_size(px(12.))
+                                                .line_height(px(19.))
+                                                .child(styled_cmd),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("command-card-copy-btn")
+                                                .debug_selector(|| {
+                                                    "command-card-copy-btn".into()
+                                                })
+                                                .flex_shrink_0()
+                                                .p(px(3.))
+                                                .rounded(px(4.))
+                                                .cursor_pointer()
+                                                .text_color(rgb(p.text_muted))
+                                                .hover(|s| {
+                                                    s.text_color(rgb(p.text))
+                                                        .bg(rgb(p.surface_subtle))
+                                                })
+                                                .child(Icon::Copy.render(13.))
+                                                .on_click(move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(
+                                                            cmd_to_copy.clone(),
+                                                        ),
+                                                    );
+                                                    let _ = host.update(cx, |this, cx| {
+                                                        this.git_ui.toasts.update(
+                                                            cx,
+                                                            |toasts, cx| {
+                                                                toasts.push(
+                                                                    gpui_glint::components::Toast::new(
+                                                                        "已复制命令",
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        );
+                                                    });
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("tool-output")
+                                        .debug_selector(|| "tool-output".into())
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex_shrink_0()
+                                        .max_h(px(320.))
+                                        .relative()
+                                        .p_3()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&result_scroll)
+                                        .text_size(px(12.))
+                                        .line_height(px(20.))
+                                        .font_family("monospace")
+                                        .text_color(rgb(p.text_muted))
+                                        .child(div().w_full().min_w_0().child(
+                                            if pending_body {
+                                                div()
+                                                    .py_1()
+                                                    .child(pending_skeleton(
+                                                        pending_id.clone(),
+                                                        theme,
+                                                    ))
+                                                    .into_any_element()
+                                            } else if let Some(output) = &command_output {
+                                                output.render().into_any_element()
+                                            } else {
+                                                div().child(result.clone()).into_any_element()
+                                            },
+                                        ))
+                                        .child(crate::command_output::scroll_guard(
+                                            &result_scroll,
+                                            20.,
+                                        )),
+                                )
+                                .into_any_element();
+                        }
                         let body = (|| {
                             if script.is_some() || output_panel.is_some() || !nested.is_empty() {
                                 return weak
@@ -3954,6 +4324,161 @@ mod tests {
         assert_eq!(process_prefix_len(&blocks, false), 4);
         assert_eq!(process_prefix_len(&blocks, true), 3);
         assert_eq!(process_prefix_len(&[Text("answer".into())], true), 0);
+    }
+
+    #[gpui::test]
+    fn command_panel_header_and_body_and_description_compatibility(cx: &mut gpui::TestAppContext) {
+        // 1. Description in arguments
+        let mut with_desc = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "c1".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({
+                    "program": "cargo",
+                    "args": ["test", "--features", "webview", "grouped_options"],
+                    "description": "run grouped_options test",
+                    "cwd": "/Users/ygy/Workspace/gpui-glint"
+                }),
+            },
+            result: "running 1 test\ntest ok".into(),
+            success: true,
+            elapsed_ms: 200,
+            live_output: None,
+            nested_tools: Default::default(),
+            subagent: None,
+            change: None,
+        };
+        let view = tool_presentation(&with_desc);
+        assert_eq!(view.summary, "已运行 run grouped_options test · 0.2s");
+
+        // 2. Running state with description
+        with_desc.result = "执行中…".into();
+        let running_view = tool_presentation(&with_desc);
+        assert_eq!(running_view.summary, "正在运行 run grouped_options test");
+
+        // 3. toolSummary alias
+        let with_tool_summary = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "c2".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({
+                    "program": "git",
+                    "args": ["status"],
+                    "toolSummary": "check git status"
+                }),
+            },
+            result: "On branch main".into(),
+            success: true,
+            elapsed_ms: 100,
+            live_output: None,
+            nested_tools: Default::default(),
+            subagent: None,
+            change: None,
+        };
+        assert_eq!(
+            tool_presentation(&with_tool_summary).summary,
+            "已运行 check git status · 0.1s"
+        );
+
+        // 4. Historical data without description falls back to command_summary
+        let historical = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "c3".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({
+                    "program": "cargo",
+                    "args": ["check", "-p", "glint-agent"]
+                }),
+            },
+            result: "Finished dev".into(),
+            success: true,
+            elapsed_ms: 500,
+            live_output: None,
+            nested_tools: Default::default(),
+            subagent: None,
+            change: None,
+        };
+        assert_eq!(
+            tool_presentation(&historical).summary,
+            "已运行 cargo check -p glint-agent · 0.5s"
+        );
+
+        // 5. CommandLine / command compatibility
+        let cmd_line_record = tools::ToolRecord {
+            call: tools::ToolCall {
+                id: "c4".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({
+                    "CommandLine": "git diff --stat"
+                }),
+            },
+            result: "1 file changed".into(),
+            success: true,
+            elapsed_ms: 150,
+            live_output: None,
+            nested_tools: Default::default(),
+            subagent: None,
+            change: None,
+        };
+        assert_eq!(
+            tool_presentation(&cmd_line_record).summary,
+            "已运行 git diff --stat · 0.1s"
+        );
+        assert_eq!(command_text(&cmd_line_record.call), "git diff --stat");
+
+        // 6. UI rendering: Command Card with header, copy button and body
+        struct CommandPreview {
+            _host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+        }
+        impl Render for CommandPreview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.panel.clone())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let project_dir = directory.path().join("gpui-glint");
+        std::fs::create_dir(&project_dir).unwrap();
+        with_desc.result = "running 1 test\ntest ok".into();
+        let (_preview, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| {
+                let mut host =
+                    AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+                host.history.active_mut().project = Some(project_dir.clone());
+                host
+            });
+            let panel = host.update(cx, |h, cx| h.tool_panel("test-key", &with_desc, cx));
+            panel.update(cx, |p, cx| p.set_expanded(true, cx));
+            CommandPreview {
+                _host: host,
+                panel,
+            }
+        });
+        window.run_until_parked();
+
+        assert!(window.debug_bounds("command-card").is_some());
+        assert!(window.debug_bounds("command-card-header").is_some());
+        assert!(window.debug_bounds("command-card-copy-btn").is_some());
+        assert!(window.debug_bounds("tool-output").is_some());
+
+        // 7. Prompt formatting
+        let prompt = format_command_prompt(&with_desc.call, Some(&project_dir));
+        assert_eq!(prompt, "~/.../gpui-glint $ ");
+
+        // 8. Copy button click
+        let copy_btn = window.debug_bounds("command-card-copy-btn").unwrap();
+        window.simulate_click(copy_btn.center(), Default::default());
+        window.run_until_parked();
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clipboard.as_deref(),
+            Some("cargo test --features webview grouped_options")
+        );
     }
 }
 
