@@ -99,6 +99,14 @@ impl Output {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut log, source.as_bytes());
         log.lines.push(log.line);
+        while log.lines.len() > 1
+            && log
+                .lines
+                .last()
+                .is_some_and(|line| line.iter().all(|(c, _)| c.is_whitespace()))
+        {
+            log.lines.pop();
+        }
         let mut text = String::new();
         let mut spans: Vec<(Style, usize)> = Vec::new();
         for (index, line) in log.lines.into_iter().enumerate() {

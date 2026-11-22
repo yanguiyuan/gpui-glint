@@ -282,6 +282,8 @@ pub struct State {
     summaries: RefCell<HashMap<String, (Vec<Uuid>, Entity<Summary>)>>,
     diffs: RefCell<HashMap<String, (Uuid, Entity<DiffCard>)>>,
     pub(super) workspace_mode: bool,
+    pub(super) single_mode: bool,
+    pub(super) single_change: Option<crate::edits::Change>,
     selected_staged: bool,
     stage_task: Option<Task<()>>,
     commit_task: Option<Task<()>>,
@@ -852,6 +854,46 @@ impl AgentWorkspace {
         )
     }
 
+    pub fn latest_session_change(&self) -> Option<Change> {
+        let active = self.history.active();
+        for msg in active.messages.iter().rev() {
+            for tool in msg.tools.iter().rev() {
+                if let Some(change) = &tool.change {
+                    return Some(change.clone());
+                }
+            }
+        }
+        let running = self.session_busy(self.history.active);
+        if running {
+            for tool in self.active_run().tool_activity.iter().rev() {
+                if let Some(change) = &tool.change {
+                    return Some(change.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn open_single_edit(&mut self, change: Change, cx: &mut Context<Self>) {
+        self.adopt_panel_repository(
+            crate::panel_repositories::Panel::Diff,
+            &change.path.to_string_lossy(),
+            cx,
+        );
+        self.file_preview.open = false;
+        if !self.terminal_ui.bottom {
+            self.terminal_ui.open = false;
+        }
+        self.edits_ui.open = true;
+        self.edits_ui.workspace_mode = false;
+        self.edits_ui.single_mode = true;
+        self.edits_ui.selected = Some(change.path.clone());
+        self.edits_ui.single_change = Some(change);
+        self.edits_ui.reveal_revision += 1;
+        self.edits_ui.reveal_pending.set(true);
+        cx.notify();
+    }
+
     pub fn open_edits(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         if let Some(path) = &path {
             self.adopt_panel_repository(
@@ -866,6 +908,7 @@ impl AgentWorkspace {
         }
         self.edits_ui.open = true;
         self.edits_ui.workspace_mode = false;
+        self.edits_ui.single_mode = false;
         self.edits_ui.selected = path;
         self.edits_ui.reveal_revision += 1;
         self.edits_ui.reveal_pending.set(true);
@@ -1050,8 +1093,9 @@ impl AgentWorkspace {
                 .as_ref()
                 .filter(|source| source.layer.is_some() && !diff_on_demand(&source.label))
                 .map(|_| self.edits_ui.diff_prefetch.clone());
-            if view.undo_visible != !self.edits_ui.workspace_mode || view.undo_enabled != can_undo {
-                view.undo_visible = !self.edits_ui.workspace_mode;
+            let undo_visible = !self.edits_ui.workspace_mode && !self.edits_ui.single_mode;
+            if view.undo_visible != undo_visible || view.undo_enabled != can_undo {
+                view.undo_visible = undo_visible;
                 view.undo_enabled = can_undo;
                 cx.notify();
             }
@@ -1366,6 +1410,14 @@ impl AgentWorkspace {
             } else {
                 Rc::new(Vec::new())
             }
+        } else if self.edits_ui.single_mode {
+            if let Some(change) = &self.edits_ui.single_change {
+                Rc::new(vec![change.clone()])
+            } else if let Some(latest) = self.latest_session_change() {
+                Rc::new(vec![latest])
+            } else {
+                Rc::new(Vec::new())
+            }
         } else {
             self.session_edits()
         };
@@ -1402,6 +1454,12 @@ impl AgentWorkspace {
             .flex_col();
         let scope = if workspace_mode {
             format!("workspace:{:?}", self.edits_ui.workspace_root)
+        } else if self.edits_ui.single_mode {
+            if let Some(change) = &self.edits_ui.single_change {
+                format!("single:{}", change.id)
+            } else {
+                format!("single:{}", self.history.active)
+            }
         } else {
             format!("session:{}", self.history.active)
         };
@@ -1457,6 +1515,7 @@ impl AgentWorkspace {
                 .children(self.edits_ui.conflicts.iter().cloned());
         }
         let can_undo = !workspace_mode
+            && !self.edits_ui.single_mode
             && !self.any_run_busy()
             && self.edits_ui.undo_task.is_none()
             && self.queued_requests.is_empty();
@@ -1523,7 +1582,9 @@ impl AgentWorkspace {
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
-                                if workspace_mode
+                                if self.edits_ui.single_mode {
+                                    format!("单次修改 · {}", files.len())
+                                } else if workspace_mode
                                     && files.is_empty()
                                     && (self.edits_ui.workspace_task.is_some()
                                         || (self.edits_ui.workspace_conflicts_task.is_some()
@@ -1544,7 +1605,7 @@ impl AgentWorkspace {
                             ),
                     )
                     .children(self.repository_select(crate::panel_repositories::Panel::Diff, cx))
-                    .when(!workspace_mode, |header| {
+                    .when(!workspace_mode && !self.edits_ui.single_mode, |header| {
                         header
                             .child(
                                 Button::new("全部撤销")
@@ -1609,18 +1670,45 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         SegmentedControl::new([
+                            SegmentOption::new("单次修改"),
                             SegmentOption::new("会话记录"),
                             SegmentOption::new("Git 工作区"),
                         ])
                         .id("edit-diff-source")
-                        .selected(usize::from(workspace_mode))
+                        .selected(if workspace_mode {
+                            2
+                        } else if self.edits_ui.single_mode {
+                            0
+                        } else {
+                            1
+                        })
                         .theme(self.theme)
                         .on_change(move |index, _, cx| {
                             let _ = source_weak.update(cx, |this, cx| {
-                                this.edits_ui.workspace_mode = index == 1;
-                                this.edits_ui.reveal_pending.set(true);
-                                if index == 1 {
-                                    this.refresh_workspace_edits(cx);
+                                match index {
+                                    0 => {
+                                        this.edits_ui.workspace_mode = false;
+                                        this.edits_ui.single_mode = true;
+                                        if this.edits_ui.single_change.is_none() {
+                                            this.edits_ui.single_change = this.latest_session_change();
+                                            if let Some(change) = &this.edits_ui.single_change {
+                                                this.edits_ui.selected = Some(change.path.clone());
+                                            }
+                                        }
+                                        this.edits_ui.reveal_pending.set(true);
+                                    }
+                                    1 => {
+                                        this.edits_ui.workspace_mode = false;
+                                        this.edits_ui.single_mode = false;
+                                        this.edits_ui.reveal_pending.set(true);
+                                    }
+                                    2 => {
+                                        this.edits_ui.workspace_mode = true;
+                                        this.edits_ui.single_mode = false;
+                                        this.edits_ui.reveal_pending.set(true);
+                                        this.refresh_workspace_edits(cx);
+                                    }
+                                    _ => {}
                                 }
                                 cx.notify();
                             });
@@ -1717,6 +1805,8 @@ impl AgentWorkspace {
                     .text_color(rgb(p.text_muted))
                     .child(if workspace_mode {
                         "暂无可显示的文本变更。"
+                    } else if self.edits_ui.single_mode {
+                        "当前会话暂无单次修改记录。"
                     } else {
                         "当前会话暂无文件工具记录的修改。"
                     }),
@@ -1758,7 +1848,11 @@ impl AgentWorkspace {
                             .py_2()
                             .text_size(px(10.))
                             .text_color(rgb(p.text_muted))
-                            .child("会话内文件工具的累计净变更，含子代理。")
+                            .child(if self.edits_ui.single_mode {
+                                "单次工具调用的文件修改记录。"
+                            } else {
+                                "会话内文件工具的累计净变更，含子代理。"
+                            })
                     }),
             )
     }

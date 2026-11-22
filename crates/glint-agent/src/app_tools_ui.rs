@@ -1231,6 +1231,7 @@ impl AgentWorkspace {
                     let diff_stats = record.change.as_ref().map(|change| {
                         (change.added, change.removed)
                     });
+                    let record_change = record.change.clone();
 
                     let diff_colors = if theme.is_dark() {
                         gpui_glint::components::DiffColors::DARK
@@ -1243,6 +1244,7 @@ impl AgentWorkspace {
                             let path_buf = path_buf.clone();
                             let root = root.clone();
                             let workspace = workspace.clone();
+                            let record_change = record_change.clone();
                             div()
                                 .w_full()
                                 .min_w_0()
@@ -1330,7 +1332,11 @@ impl AgentWorkspace {
                                             .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
                                                 let _ = workspace.update(cx, |this, cx| {
-                                                    this.open_edits(Some(path_buf.clone()), cx);
+                                                    if let Some(change) = record_change.clone() {
+                                                        this.open_single_edit(change, cx);
+                                                    } else {
+                                                        this.open_edits(Some(path_buf.clone()), cx);
+                                                    }
                                                 });
                                             }),
                                     )
@@ -1513,6 +1519,11 @@ impl AgentWorkspace {
                                 highlight_command_line(&cmd_prompt, &raw_cmd, theme);
                             let cmd_to_copy = raw_cmd.clone();
                             let host = weak.clone();
+                            let (header_bg, body_bg) = if theme.is_dark() {
+                                (p.panel, p.canvas)
+                            } else {
+                                (p.panel, p.surface)
+                            };
                             return div()
                                 .id("command-card")
                                 .debug_selector(|| "command-card".into())
@@ -1523,7 +1534,7 @@ impl AgentWorkspace {
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(rgb(p.border))
-                                .bg(rgb(p.canvas))
+                                .bg(rgb(body_bg))
                                 .overflow_hidden()
                                 .child(
                                     div()
@@ -1539,7 +1550,7 @@ impl AgentWorkspace {
                                         .py(px(8.))
                                         .border_b_1()
                                         .border_color(rgb(p.border))
-                                        .bg(rgb(p.surface))
+                                        .bg(rgb(header_bg))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -1597,7 +1608,8 @@ impl AgentWorkspace {
                                         .flex_shrink_0()
                                         .max_h(px(320.))
                                         .relative()
-                                        .p_3()
+                                        .px_3()
+                                        .py(px(10.))
                                         .overflow_y_scroll()
                                         .track_scroll(&result_scroll)
                                         .text_size(px(12.))

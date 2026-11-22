@@ -147,6 +147,56 @@ pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbS
     segments
 }
 
+pub const ELLIPSIS_BREADCRUMB_INDEX: usize = usize::MAX;
+
+pub fn calculate_visible_breadcrumb_start(
+    segments: &[BreadcrumbSegment],
+    available_width: f32,
+) -> usize {
+    if segments.len() <= 1 {
+        return 0;
+    }
+
+    let estimate_item_width = |seg: &BreadcrumbSegment| -> f32 {
+        let mut text_w = 0.0;
+        for ch in seg.name.chars() {
+            if ch.is_ascii() {
+                text_w += 7.0;
+            } else {
+                text_w += 13.0;
+            }
+        }
+        let icon_w = if seg.is_file { 17.0 } else { 0.0 };
+        // chevron (12) + padding (8) + gap (4) + icon + text
+        24.0 + icon_w + text_w
+    };
+
+    let total_width: f32 = segments.iter().map(estimate_item_width).sum();
+    if total_width <= available_width {
+        return 0;
+    }
+
+    let ellipsis_width = 34.0;
+    let space = (available_width - ellipsis_width).max(60.0);
+
+    let last_idx = segments.len() - 1;
+    let mut used = estimate_item_width(&segments[last_idx]);
+    let mut start_idx = last_idx;
+
+    while start_idx > 0 {
+        let prev_idx = start_idx - 1;
+        let w = estimate_item_width(&segments[prev_idx]);
+        if used + w <= space {
+            used += w;
+            start_idx = prev_idx;
+        } else {
+            break;
+        }
+    }
+
+    start_idx
+}
+
 #[derive(Clone, Debug)]
 pub struct FilePreviewEntry {
     pub name: String,
@@ -198,6 +248,8 @@ pub struct FilePreview {
     folders: std::collections::HashMap<String, FolderNode>,
     next_request: u64,
     open_breadcrumb: Option<usize>,
+    breadcrumb_scroll: gpui::ScrollHandle,
+    breadcrumb_width: Option<f32>,
     path: String,
     parent: Option<String>,
     page: Page,
@@ -247,6 +299,8 @@ impl FilePreview {
             folders: Default::default(),
             next_request: 0,
             open_breadcrumb: None,
+            breadcrumb_scroll: gpui::ScrollHandle::new(),
+            breadcrumb_width: None,
             path: String::new(),
             parent: None,
             page: Page::Loading,
@@ -347,6 +401,7 @@ impl FilePreview {
     pub fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
         if self.expanded != expanded {
             self.expanded = expanded;
+            self.breadcrumb_width = None;
             cx.notify();
         }
     }
@@ -1286,6 +1341,79 @@ impl FilePreview {
             .child(body)
     }
 
+    fn breadcrumb_ellipsis_dropdown(
+        &self,
+        hidden_segments: &[BreadcrumbSegment],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = self.theme.palette();
+        let weak = cx.entity().downgrade();
+
+        let mut list = div()
+            .id("breadcrumb-ellipsis-list")
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .w_full()
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .px_2()
+                    .py(px(3.))
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(p.text_muted))
+                    .child("上层路径"),
+            )
+            .child(div().h(px(1.)).bg(rgb(p.border)).my(px(2.)));
+
+        for seg in hidden_segments {
+            let seg_clone = seg.clone();
+            let weak_click = weak.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("breadcrumb-ellipsis-item-{}", seg.name)))
+                    .debug_selector(move || format!("breadcrumb-ellipsis-item:{}", seg_clone.name))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .text_size(px(12.))
+                    .text_color(rgb(p.text))
+                    .hover(|el| el.bg(rgb(p.surface_subtle)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(p.text_muted))
+                            .child(Icon::Folder.render(13.)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(seg.name.clone()),
+                    )
+                    .on_click({
+                        let seg_dir_path = seg.dir_path.clone();
+                        move |_, _, cx| {
+                            cx.stop_propagation();
+                            let _ = weak_click.update(cx, |this, cx| {
+                                this.open_breadcrumb = None;
+                                cx.emit(FilePreviewEvent::OpenRequested(seg_dir_path.clone()));
+                            });
+                        }
+                    }),
+            );
+        }
+
+        list.into_any_element()
+    }
+
     fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let is_leaf_file = match &self.page {
             Page::Directory(_) => false,
@@ -1296,16 +1424,98 @@ impl FilePreview {
         let segments = split_breadcrumbs(&self.path, is_leaf_file);
         let p = self.theme.palette();
 
+        let available_width = self
+            .breadcrumb_width
+            .unwrap_or(if self.expanded { 1200.0 } else { 260.0 });
+        let start_idx = calculate_visible_breadcrumb_start(&segments, available_width);
+
+        let weak = cx.entity().downgrade();
+        let scroll_handle = self.breadcrumb_scroll.clone();
+
         let mut row = div()
+            .on_children_prepainted(move |_, _, cx| {
+                let width = f32::from(scroll_handle.bounds().size.width);
+                if width > 0.0 {
+                    let _ = weak.update(cx, |this, cx| {
+                        if this.breadcrumb_width.map_or(true, |w| (w - width).abs() >= 8.0) {
+                            this.breadcrumb_width = Some(width);
+                            let id = cx.entity_id();
+                            cx.defer(move |cx| cx.notify(id));
+                        }
+                    });
+                }
+            })
             .id("breadcrumb-segments-bar")
+            .track_scroll(&self.breadcrumb_scroll)
             .flex_1()
             .min_w_0()
             .flex()
             .items_center()
             .gap(px(2.))
-            .overflow_x_scroll();
+            .overflow_x_hidden();
 
-        for (idx, seg) in segments.iter().enumerate() {
+        if start_idx > 0 {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(p.text_muted))
+                    .child(Icon::ChevronRight.render(10.)),
+            );
+
+            let is_ellipsis_open = self.open_breadcrumb == Some(ELLIPSIS_BREADCRUMB_INDEX);
+            let ellipsis_trigger = div()
+                .id("breadcrumb-seg-ellipsis")
+                .debug_selector(|| "breadcrumb-seg:ellipsis".into())
+                .cursor_pointer()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(5.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .text_color(if is_ellipsis_open {
+                    rgb(p.accent)
+                } else {
+                    rgb(p.text_muted)
+                })
+                .hover(|el| el.bg(rgb(p.surface_subtle)).text_color(rgb(p.text)))
+                .child("…");
+
+            let weak_ell = cx.entity().downgrade();
+            let hidden_segments = segments[0..start_idx].to_vec();
+            let ellipsis_popover = Popover::new(
+                "breadcrumb-popover-ellipsis",
+                ellipsis_trigger,
+                self.breadcrumb_ellipsis_dropdown(&hidden_segments, cx),
+            )
+            .open(is_ellipsis_open)
+            .align_left()
+            .width(220.)
+            .trigger_height(24.)
+            .gap(4.)
+            .padding(6.)
+            .theme(self.theme)
+            .on_open_change(move |open, _window, cx| {
+                let _ = weak_ell.update(cx, |this, cx| {
+                    if open {
+                        this.open_breadcrumb = Some(ELLIPSIS_BREADCRUMB_INDEX);
+                    } else if this.open_breadcrumb == Some(ELLIPSIS_BREADCRUMB_INDEX) {
+                        this.open_breadcrumb = None;
+                    }
+                    cx.notify();
+                });
+            });
+
+            row = row.child(ellipsis_popover);
+        }
+
+        for idx in start_idx..segments.len() {
+            let seg = &segments[idx];
+            let is_last = idx == segments.len() - 1;
             row = row.child(
                 div()
                     .flex_shrink_0()
@@ -1323,7 +1533,8 @@ impl FilePreview {
                 .id(SharedString::from(format!("breadcrumb-seg-{idx}")))
                 .debug_selector(move || format!("breadcrumb-seg:{}", seg_clone.name))
                 .cursor_pointer()
-                .flex_shrink_0()
+                .when(!is_last, |el| el.flex_shrink_0())
+                .when(is_last, |el| el.flex_shrink_1().min_w_0())
                 .flex()
                 .items_center()
                 .gap(px(4.))
@@ -1350,7 +1561,8 @@ impl FilePreview {
                 })
                 .child(
                     div()
-                        .whitespace_nowrap()
+                        .when(!is_last, |el| el.whitespace_nowrap())
+                        .when(is_last, |el| el.min_w_0().truncate())
                         .child(seg.name.clone()),
                 );
 
@@ -2042,6 +2254,12 @@ mod tests {
             // Preload folder entries for components
             let entries = vec![
                 FilePreviewEntry {
+                    name: "code_card".into(),
+                    path: "/Users/ygy/Workspace/gpui-glint/src/components/code_card".into(),
+                    directory: true,
+                    previewable: true,
+                },
+                FilePreviewEntry {
                     name: "code_font.rs".into(),
                     path: "/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs".into(),
                     directory: false,
@@ -2059,6 +2277,22 @@ mod tests {
                 FolderNode {
                     expanded: false,
                     entries: Some(entries),
+                    loading: None,
+                    error: None,
+                },
+            );
+            preview.folders.insert(
+                "/Users/ygy/Workspace/gpui-glint/src/components/code_card".into(),
+                FolderNode {
+                    expanded: false,
+                    entries: Some(vec![
+                        FilePreviewEntry {
+                            name: "source_syntax.rs".into(),
+                            path: "/Users/ygy/Workspace/gpui-glint/src/components/code_card/source_syntax.rs".into(),
+                            directory: false,
+                            previewable: true,
+                        },
+                    ]),
                     loading: None,
                     error: None,
                 },
@@ -2092,15 +2326,116 @@ mod tests {
 
         // Check header and entries inside popover dropdown are rendered
         assert!(window.debug_bounds("breadcrumb-dropdown-header").is_some());
-        assert!(window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs").is_some());
+        assert!(window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_card").is_some());
+        // source_syntax.rs should not be visible yet because code_card is collapsed
+        assert!(window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_card/source_syntax.rs").is_none());
 
-        // Click entry "code_font.rs"
-        let entry_bounds = window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs").unwrap();
-        window.simulate_click(entry_bounds.center(), Default::default());
+        // Click code_card directory to expand it
+        let dir_bounds = window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_card").unwrap();
+        window.simulate_click(dir_bounds.center(), Default::default());
         window.run_until_parked();
 
-        // Verify OpenRequested was emitted and popover closed
-        assert_eq!(*opened.borrow(), vec!["/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs".to_owned()]);
+        // Now source_syntax.rs should be visible inside the tree! Popover must stay open!
+        assert_eq!(view.read_with(window, |p, _| p.open_breadcrumb()), Some(4));
+        assert!(window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_card/source_syntax.rs").is_some());
+
+        // Click nested entry "source_syntax.rs"
+        let child_bounds = window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_card/source_syntax.rs").unwrap();
+        window.simulate_click(child_bounds.center(), Default::default());
+        window.run_until_parked();
+
+        // Verify OpenRequested was emitted for the nested child and popover closed
+        assert_eq!(*opened.borrow(), vec!["/Users/ygy/Workspace/gpui-glint/src/components/code_card/source_syntax.rs".to_owned()]);
+        assert_eq!(view.read_with(window, |p, _| p.open_breadcrumb()), None);
+    }
+
+    #[test]
+    fn calculate_visible_breadcrumb_start_prioritizes_leaf_and_hides_root() {
+        let segs = split_breadcrumbs(
+            "/Users/ygy/Workspace/gpui-glint/crates/glint-agent/src/edits_ui.rs",
+            true,
+        );
+        assert_eq!(segs.len(), 7);
+        assert_eq!(segs.last().unwrap().name, "edits_ui.rs");
+
+        // When ample width (e.g. 1000px): all 7 items shown from index 0
+        let start_wide = calculate_visible_breadcrumb_start(&segs, 1000.0);
+        assert_eq!(start_wide, 0);
+
+        // When narrow sidebar width (e.g. 240px, like in sidebar): root paths hidden, leaf edits_ui.rs visible
+        let start_narrow = calculate_visible_breadcrumb_start(&segs, 240.0);
+        assert!(start_narrow > 0);
+        assert!(start_narrow < segs.len());
+        // Leaf segment (index 6) is always included!
+        assert!(segs[start_narrow..].iter().any(|s| s.name == "edits_ui.rs"));
+        // Root segments (like "ygy", "Workspace") are hidden!
+        assert!(!segs[start_narrow..].iter().any(|s| s.name == "ygy"));
+
+        // When very tight (e.g. 80px): only leaf item shown
+        let start_tiny = calculate_visible_breadcrumb_start(&segs, 80.0);
+        assert_eq!(start_tiny, segs.len() - 1);
+        assert_eq!(segs[start_tiny].name, "edits_ui.rs");
+    }
+
+    #[gpui::test]
+    fn breadcrumbs_narrow_width_hides_root_paths_and_shows_leaf_with_ellipsis_popover(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window) = cx.add_window_view(|_, cx| {
+            let mut preview = FilePreview::new(cx);
+            preview.set_file(
+                "/Users/ygy/Workspace/gpui-glint/crates/glint-agent/src/edits_ui.rs".into(),
+                Some("/Users/ygy/Workspace/gpui-glint/crates/glint-agent/src".into()),
+                "rust".into(),
+                "pub struct State;".into(),
+                cx,
+            );
+            // Simulate narrow width of 240px
+            preview.breadcrumb_width = Some(240.0);
+            preview
+        });
+        window.simulate_resize(gpui::size(px(340.), px(400.)));
+
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let received = opened.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&view, move |_, _, event: &FilePreviewEvent, _| {
+                if let FilePreviewEvent::OpenRequested(path) = event {
+                    received.borrow_mut().push(path.clone());
+                }
+            })
+            .detach();
+        });
+
+        window.run_until_parked();
+
+        // Leaf file edits_ui.rs MUST be visible
+        assert!(window.debug_bounds("breadcrumb-seg:edits_ui.rs").is_some());
+        // Ellipsis button MUST be visible
+        assert!(window.debug_bounds("breadcrumb-seg:ellipsis").is_some());
+        // Root item "ygy" MUST be hidden from the main bar
+        assert!(window.debug_bounds("breadcrumb-seg:ygy").is_none());
+
+        // Open ellipsis popover
+        view.update(window, |preview, cx| {
+            preview.set_open_breadcrumb(Some(ELLIPSIS_BREADCRUMB_INDEX), cx);
+        });
+        window.run_until_parked();
+
+        // Hidden root item "ygy" should now be in the ellipsis dropdown
+        assert!(window
+            .debug_bounds("breadcrumb-ellipsis-item:ygy")
+            .is_some());
+
+        // Click "ygy" in the ellipsis dropdown
+        let ygy_bounds = window
+            .debug_bounds("breadcrumb-ellipsis-item:ygy")
+            .unwrap();
+        window.simulate_click(ygy_bounds.center(), Default::default());
+        window.run_until_parked();
+
+        // Verify OpenRequested was emitted for /Users/ygy and popover closed
+        assert_eq!(*opened.borrow(), vec!["/Users/ygy".to_owned()]);
         assert_eq!(view.read_with(window, |p, _| p.open_breadcrumb()), None);
     }
 }

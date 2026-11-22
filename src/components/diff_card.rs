@@ -1427,15 +1427,11 @@ impl Render for DiffCard {
                             .flex()
                             .when_some(tint, |row: gpui::Div, tint| row.bg(tint));
                         if let Some(color) = marker {
-                            let deleted = line.kind == DiffLineKind::Deleted;
-                            let mut bar = div()
+                            let bar = div()
                                 .w(px(6.))
                                 .flex_shrink_0()
                                 .border_l_3()
                                 .border_color(rgb(color));
-                            if deleted {
-                                bar = bar.border_dashed();
-                            }
                             row = row.child(bar);
                         } else {
                             row = row.child(div().w(px(6.)).flex_shrink_0());
