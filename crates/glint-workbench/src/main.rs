@@ -25,6 +25,7 @@ struct Workbench {
     _api_tools_task: gpui::Task<()>,
     api: Entity<glint_api::Workbench>,
     agent: Entity<glint_agent::AgentWorkspace>,
+    db: Entity<glint_db::DbWorkspace>,
     navigation: Entity<Navigation>,
     route: Route,
     theme: ThemePreset,
@@ -84,6 +85,7 @@ impl Workbench {
             }));
             agent
         });
+        let db = cx.new(|cx| glint_db::DbWorkspace::hosted(shell.clone(), cx));
         api.update(cx, |api, _| api.set_host_background_tasks(true));
         agent.update(cx, |agent, _| agent.set_host_background_tasks(true));
         let task_owner = cx.entity().downgrade();
@@ -158,12 +160,21 @@ impl Workbench {
                     cx.notify();
                 }
             }),
+            cx.observe(&db, |this, _, cx| {
+                let theme = this.db.read(cx).host_theme();
+                if theme != this.theme {
+                    this.sync_theme(theme, cx);
+                    this.sync_navigation(cx);
+                    cx.notify();
+                }
+            }),
         ];
         Self {
             vault,
             _api_tools_task: api_tools_task,
             api,
             agent,
+            db,
             navigation,
             route: Route::Agent(glint_agent::Page::Chat),
             theme: ThemePreset::Moonstone,
@@ -186,6 +197,12 @@ impl Workbench {
                 self.agent
                     .update(cx, |agent, cx| agent.navigate(page, window, cx));
             }
+            Action::Navigate(Route::Db) => {
+                if matches!(self.route, Route::Api(_)) {
+                    self.api.update(cx, |api, cx| api.deactivate(window, cx));
+                }
+                self.route = Route::Db;
+            }
             Action::NewSession => {
                 self.dispatch(
                     Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
@@ -205,6 +222,8 @@ impl Workbench {
                     .update(cx, |api, cx| api.set_host_theme(self.theme, cx));
                 self.agent
                     .update(cx, |agent, cx| agent.set_host_theme(self.theme, cx));
+                self.db
+                    .update(cx, |db, cx| db.set_host_theme(self.theme, cx));
             }
         }
         self.sync_navigation(cx);
@@ -242,6 +261,11 @@ impl Workbench {
                 agent.set_host_theme(theme, cx);
             }
         });
+        self.db.update(cx, |db, cx| {
+            if db.host_theme() != theme {
+                db.set_host_theme(theme, cx);
+            }
+        });
     }
 }
 
@@ -249,10 +273,10 @@ impl Render for Workbench {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .child(if matches!(self.route, Route::Agent(_)) {
-                self.agent.clone().into_any_element()
-            } else {
-                self.api.clone().into_any_element()
+            .child(match self.route {
+                Route::Agent(_) => self.agent.clone().into_any_element(),
+                Route::Api(_) => self.api.clone().into_any_element(),
+                Route::Db => self.db.clone().into_any_element(),
             })
     }
 }

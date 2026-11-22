@@ -49,6 +49,7 @@ pub enum Icon {
     Close,
     ArrowLeft,
     ArrowUp,
+    ArrowDown,
     ChevronUp,
     ChevronDown,
     ChevronRight,
@@ -136,7 +137,7 @@ impl Icon {
             Self::Filter => "filter",
             Self::Close => "close",
             Self::ArrowLeft => "arrow-left",
-            Self::ArrowUp => "arrow-up",
+            Self::ArrowUp | Self::ArrowDown => "arrow-up",
             Self::ChevronUp => "chevron-up",
             Self::ChevronDown => "chevron-down",
             Self::ChevronRight => "chevron-right",
@@ -292,14 +293,16 @@ impl Icon {
     }
 
     pub fn render(self, size: f32) -> IconSvg {
-        IconSvg(
-            svg()
-                .path(SharedString::from(format!(
-                    "glint-ui/icons/{}.svg",
-                    self.name()
-                )))
-                .size(px(size)),
-        )
+        let mut icon = svg()
+            .path(SharedString::from(format!(
+                "glint-ui/icons/{}.svg",
+                self.name()
+            )))
+            .size(px(size));
+        if self == Self::ArrowDown {
+            icon = icon.with_transformation(Transformation::rotate(radians(std::f32::consts::PI)));
+        }
+        IconSvg(icon)
     }
 
     /// A right-pointing chevron that rotates down when its panel expands.

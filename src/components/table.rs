@@ -2,7 +2,7 @@ use super::{ContentType, Icon};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
+    App, AppContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Window, deferred, div, px, rgb, rgba,
 };
@@ -333,13 +333,24 @@ pub enum TableEvent {
         row_id: SharedString,
         action_id: SharedString,
     },
+    CellContextMenu {
+        row_id: SharedString,
+        row_index: usize,
+        column_index: usize,
+        column_label: SharedString,
+        value: SharedString,
+        position: gpui::Point<gpui::Pixels>,
+    },
 }
 
 /// A local-data table with sorting, multi-selection, pagination, and upward action menus.
 /// Create as an entity, then subscribe to [`TableEvent`] for application integration.
 pub struct DataTable {
     max_height: Option<f32>,
+    fill_height: bool,
     row_list: gpui::ListState,
+    horizontal_scroll: gpui::ScrollHandle,
+    horizontal_scrollbar_drag: super::ScrollbarState,
     list_width: Rc<std::cell::Cell<gpui::Pixels>>,
     list_dirty: bool,
     reset_scroll: bool,
@@ -376,7 +387,10 @@ impl DataTable {
     ) -> Self {
         Self {
             max_height: None,
+            fill_height: false,
             row_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(100.)),
+            horizontal_scroll: gpui::ScrollHandle::new(),
+            horizontal_scrollbar_drag: super::ScrollbarState::default(),
             list_width: Rc::new(std::cell::Cell::new(px(-1.))),
             list_dirty: true,
             reset_scroll: false,
@@ -414,6 +428,10 @@ impl DataTable {
     /// the header and pagination stay visible; shorter tables keep their natural height.
     pub fn max_height(mut self, height: f32) -> Self {
         self.max_height = Some(height.max(0.));
+        self
+    }
+    pub fn fill_height(mut self) -> Self {
+        self.fill_height = true;
         self
     }
     /// Reduce header height and row padding for dense editable tables.
@@ -829,7 +847,9 @@ impl DataTable {
                 .child(div().min_w_0().truncate().child(label.clone()))
         } else {
             div()
-                .h(px(120.))
+                .w_full()
+                .when(self.fill_height, |d| d.flex_1())
+                .min_h(px(120.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -905,12 +925,38 @@ impl DataTable {
             element = element.border_b_1().border_color(rgba(0x78788014));
         }
         for (cell_index, column) in self.columns.iter().enumerate() {
-            let mut cell =
-                column
-                    .container(self.compact)
-                    .py(px(if self.compact { 4. } else { 9. }));
+            let mut cell = column
+                .container(self.compact)
+                .id(SharedString::from(format!("table-cell-{index}-{cell_index}")))
+                .py(px(if self.compact { 4. } else { 9. }));
             if let Some(content) = row.cells.get(cell_index) {
-                cell = cell.child(content.render(self.theme, &self.search_query, cx));
+                let raw_value = content.text.clone();
+                let col_label = column.label.clone();
+                let ctx_row_id = row.id.clone();
+                let theme = self.theme;
+                if raw_value.chars().count() > 20 || raw_value.contains('\n') {
+                    let preview_value = raw_value.clone();
+                    cell = cell.tooltip(move |_, cx| {
+                        let formatted = format_cell_preview(&preview_value);
+                        cx.new(|_| CellTooltip(formatted, theme)).into()
+                    });
+                }
+                cell = cell
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(TableEvent::CellContextMenu {
+                                row_id: ctx_row_id.clone(),
+                                row_index: index,
+                                column_index: cell_index,
+                                column_label: col_label.clone(),
+                                value: raw_value.clone(),
+                                position: event.position,
+                            });
+                        }),
+                    )
+                    .child(content.render(self.theme, &self.search_query, cx));
             } else {
                 cell = cell.child("—");
             }
@@ -1249,11 +1295,17 @@ impl Render for DataTable {
             let mut cell = column
                 .container(self.compact)
                 .h_full()
+                .overflow_hidden()
                 .debug_selector(move || format!("table-header-cell-{index}"));
             if let Some(control) = &column.control {
                 cell = cell.child(control.clone());
             } else {
-                cell = cell.child(column.label.clone());
+                cell = cell.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(column.label.clone()),
+                );
             }
             if column.sortable {
                 let mut sortable = cell
@@ -1275,7 +1327,7 @@ impl Render for DataTable {
                     if self.sort == Some((index, false)) {
                         Icon::ArrowUp
                     } else if self.sort == Some((index, true)) {
-                        Icon::ChevronDown
+                        Icon::ArrowDown
                     } else {
                         Icon::Sort
                     }
@@ -1322,7 +1374,9 @@ impl Render for DataTable {
             .min_h_0()
             .flex()
             .flex_col();
-        if self.max_height.is_some() {
+        if visible.is_empty() && self.fill_height {
+            body = body.flex_1().child(self.render_empty());
+        } else if self.max_height.is_some() || self.fill_height {
             self.sync_list(&visible, item_count, cx);
             if self.pending_focus.is_some() {
                 self.row_list.scroll_to_end();
@@ -1331,6 +1385,7 @@ impl Render for DataTable {
             let last_width = self.list_width.clone();
             let row_height = px(if self.compact { 34. } else { 53. });
             body = body
+                .flex_1()
                 .relative()
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
@@ -1341,7 +1396,7 @@ impl Render for DataTable {
                         }),
                     )
                     .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-                    .w_full()
+                    .size_full()
                     .min_h_0(),
                 )
                 .child(
@@ -1456,8 +1511,9 @@ impl Render for DataTable {
             .debug_selector(|| "data-table".into())
             .w_full()
             .min_w_0()
+            .when(self.fill_height, |table| table.flex_1().h_full().min_h_0())
             .when_some(self.max_height, |table, height| table.max_h(px(height)))
-            .flex_shrink_0()
+            .when(!self.fill_height, |table| table.flex_shrink_0())
             .relative()
             .flex()
             .flex_col()
@@ -1483,28 +1539,138 @@ impl Render for DataTable {
             .shadow_sm()
             .child(
                 div()
-                    .id("table-horizontal-scroll")
-                    .flex()
-                    .flex_col()
+                    .relative()
                     .w_full()
                     .min_w_0()
-                    .min_h_0()
-                    .overflow_x_scroll()
-                    .rounded_t(px(16.))
+                    .when(self.fill_height || self.max_height.is_some(), |d| {
+                        d.flex_1().min_h_0()
+                    })
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .w_full()
-                            .min_w(px(width.max(660.)))
-                            .min_h_0()
+                            .id("table-horizontal-scroll")
+                            .track_scroll(&self.horizontal_scroll)
                             .flex()
                             .flex_col()
-                            .child(header)
-                            .child(body),
-                    ),
+                            .w_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .when(self.fill_height || self.max_height.is_some(), |d| d.flex_1())
+                            .overflow_x_scroll()
+                            .rounded_t(px(16.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(width.max(660.)))
+                                    .min_h_0()
+                                    .when(self.fill_height || self.max_height.is_some(), |d| {
+                                        d.flex_1()
+                                    })
+                                    .flex()
+                                    .flex_col()
+                                    .child(header)
+                                    .child(body),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(12.))
+                            .child(
+                                super::Scrollbar::horizontal(
+                                    &self.horizontal_scroll,
+                                    &self.horizontal_scrollbar_drag,
+                                )
+                                .theme(self.theme)
+                                .render(),
+                            ),
+                    )
+                    .child(table_wheel_guard(&self.horizontal_scroll)),
             )
             .children(self.add_row_label.as_ref().map(|_| self.render_add_row(cx)))
             .children((!self.document).then_some(footer))
     }
+}
+
+fn format_cell_preview(raw: &str) -> SharedString {
+    let trimmed = raw.trim();
+    let formatted = if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| raw.to_owned())
+    } else {
+        raw.to_owned()
+    };
+    const MAX_PREVIEW_CHARS: usize = 2000;
+    if formatted.chars().count() > MAX_PREVIEW_CHARS {
+        let mut out: String = formatted.chars().take(MAX_PREVIEW_CHARS).collect();
+        out.push_str("\n…（内容过长，右键点击“查看完整内容”可查看全部）");
+        out.into()
+    } else {
+        formatted.into()
+    }
+}
+
+struct CellTooltip(SharedString, ThemePreset);
+
+impl Render for CellTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let p = self.1.palette();
+        div()
+            .max_w(px(520.))
+            .max_h(px(360.))
+            .overflow_hidden()
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.surface))
+            .shadow_md()
+            .font_family("Menlo")
+            .text_size(px(11.5))
+            .line_height(px(16.))
+            .text_color(rgb(p.text))
+            .child(self.0.clone())
+    }
+}
+
+fn table_wheel_guard(horizontal_scroll: &gpui::ScrollHandle) -> impl IntoElement {
+    let h_scroll = horizontal_scroll.clone();
+    gpui::canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_, hitbox: gpui::Hitbox, window, _| {
+            let view = window.current_view();
+            window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
+                    return;
+                }
+                if event.modifiers.shift {
+                    let delta = event.delta.pixel_delta(px(20.));
+                    let dx = if delta.x != px(0.) { delta.x } else { delta.y };
+                    let max_x = h_scroll.max_offset().x;
+                    if max_x > px(0.) && dx != px(0.) {
+                        let offset = h_scroll.offset();
+                        let next_x = (offset.x + dx).clamp(-max_x, px(0.));
+                        if next_x != offset.x {
+                            h_scroll.set_offset(gpui::point(next_x, offset.y));
+                            cx.notify(view);
+                        }
+                    }
+                    cx.stop_propagation();
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 #[cfg(test)]

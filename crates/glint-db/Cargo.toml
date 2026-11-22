@@ -1,0 +1,24 @@
+[package]
+name = "glint-db"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Database management workspace for SQLite, MySQL, and PostgreSQL."
+license = "MIT"
+publish = false
+
+[dependencies]
+chrono = "0.4"
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+gpui-glint = { path = "../.." }
+mysql = { version = "25", default-features = false, features = ["minimal-rust"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11", "test-support"] }
+tempfile = "3"

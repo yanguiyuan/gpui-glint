@@ -5,6 +5,7 @@ use gpui_glint::{components::Icon, theme::ThemePreset};
 pub enum Route {
     Api(glint_api::Page),
     Agent(glint_agent::Page),
+    Db,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +87,7 @@ mod tests {
                 "nav-mcp",
                 Action::Navigate(Route::Api(glint_api::Page::Mcp)),
             ),
+            ("nav-db", Action::Navigate(Route::Db)),
             (
                 "nav-agent",
                 Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
@@ -212,6 +214,7 @@ impl Render for Navigation {
                 "MCP 调用历史",
                 Route::Api(Api::Mcp),
             ),
+            ("nav-db", Icon::Database, "数据库管理", Route::Db),
             ("nav-vault", Icon::Key, "密码箱", Route::Api(Api::Vault)),
             (
                 "nav-settings",

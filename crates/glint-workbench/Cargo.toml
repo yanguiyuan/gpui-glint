@@ -15,6 +15,7 @@ webview = ["glint-api/webview"]
 glint-vault = { path = "../glint-vault" }
 glint-api = { path = "../glint-api", default-features = false }
 glint-agent = { path = "../glint-agent" }
+glint-db = { path = "../glint-db" }
 gpui-glint = { path = "../.." }
 async-channel = "2"
 serde_json = "1"
