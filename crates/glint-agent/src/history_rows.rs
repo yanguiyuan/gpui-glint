@@ -36,15 +36,16 @@ impl HistoryRows {
     }
 
     pub fn set_rows(&mut self, rows: Vec<AnyView>, cx: &mut Context<Self>) {
-        if self.rows.len() != rows.len()
-            || self
+        if self.rows.len() == rows.len()
+            && self
                 .rows
                 .iter()
                 .zip(&rows)
-                .any(|(a, b)| a.entity_id() != b.entity_id())
+                .all(|(a, b)| a.entity_id() == b.entity_id())
         {
-            self.measured.clear();
+            return;
         }
+        self.measured.clear();
         self.rows = rows;
         cx.notify();
     }
@@ -61,9 +62,7 @@ impl Render for HistoryRows {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = window.viewport_size().width;
         let scroll_width = self.scroll.bounds().size.width;
-        let can_clip = self.viewport_width == width
-            && self.scroll_width == scroll_width
-            && self.measured.len() == self.rows.len()
+        let can_clip = self.measured.len() == self.rows.len()
             && self.scroll.bounds().size.height > px(0.);
         let mut mounted = Vec::with_capacity(self.rows.len());
         let mut body = div().w_full().min_w_0().flex().flex_col().gap_2();

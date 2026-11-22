@@ -251,6 +251,21 @@ struct MessageLayout {
     pin: Option<PinnedEnd>,
 }
 
+fn estimated_message_height(message: &model::Message) -> f32 {
+    let mut height = 56.0;
+    if !message.tools.is_empty() || message.blocks.len() > 1 {
+        height += 44.0;
+    }
+    if !message.images.is_empty() {
+        height += 84.0;
+    }
+    let text_len = message.text.len();
+    let newlines = message.text.bytes().filter(|&b| b == b'\n').count();
+    let wrapped_lines = (text_len / 72).max(1) + newlines;
+    height += (wrapped_lines as f32 * 21.0).min(900.0);
+    height.clamp(68.0, 1100.0)
+}
+
 /// Landing on the newest message only works once the rows measured, so the pin
 /// records the geometry it scrolled to: a changed extent means the layout
 /// reflowed and should be followed, while an unchanged extent with the offset
@@ -2372,20 +2387,36 @@ impl AgentWorkspace {
             let layout_context = (session.id, self.theme, session.messages.len());
             let viewport = self.scroll.bounds();
             let offset = self.scroll.offset();
-            let can_clip = self.message_layout.context == Some(layout_context)
-                && self.message_layout.width == viewport.size.width
+            let resizing_sidebar = self.right_sidebar_resize.is_some();
+            let same_session_theme = self
+                .message_layout
+                .context
+                .is_some_and(|(id, theme, _)| id == session.id && theme == self.theme);
+            let can_clip = same_session_theme
+                && (self.message_layout.width == viewport.size.width || resizing_sidebar)
                 && self.message_layout.measure_passes == 0
                 && viewport.size.height > px(0.);
+            let mounted_messages = std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(
+                session.messages.len(),
+            )));
+            let mounted_for_prepaint = mounted_messages.clone();
             let workspace = cx.entity().downgrade();
             let mut messages = div()
                 .on_children_prepainted(move |_, _, cx| {
                     let _ = workspace.update(cx, |this, cx| {
                         let width = this.scroll.bounds().size.width;
                         let layout = &mut this.message_layout;
-                        if layout.context != Some(layout_context) || layout.width != width {
+                        let same_session_theme = layout
+                            .context
+                            .is_some_and(|(id, theme, _)| id == layout_context.0 && theme == layout_context.1);
+                        if !same_session_theme
+                            || (layout.width != width && this.right_sidebar_resize.is_none())
+                        {
                             layout.context = Some(layout_context);
                             layout.width = width;
                             layout.measure_passes = 2;
+                        } else if layout.context != Some(layout_context) {
+                            layout.context = Some(layout_context);
                         }
                         // A conversation opened from the list must land on its
                         // newest message. The handle only knows its extent once
@@ -2421,7 +2452,31 @@ impl AgentWorkspace {
                                 }
                             }
                         }
-                        if layout.measure_passes > 0 || pinned || this.scroll.offset() != offset {
+                        let mut needs_scroll_refresh = false;
+                        if this.scroll.offset() != offset {
+                            if !can_clip {
+                                needs_scroll_refresh = true;
+                            } else {
+                                let cur_viewport = this.scroll.bounds();
+                                let cur_offset = this.scroll.offset();
+                                let flags = mounted_for_prepaint.borrow();
+                                for (index, &was_mounted) in flags.iter().enumerate() {
+                                    if index + 1 < flags.len()
+                                        && let Some(bounds) = this.scroll.bounds_for_item(index)
+                                    {
+                                        let now_nearby = bounds.bottom() + cur_offset.y
+                                            >= cur_viewport.top() - px(600.)
+                                            && bounds.top() + cur_offset.y
+                                                <= cur_viewport.bottom() + px(600.);
+                                        if now_nearby != was_mounted {
+                                            needs_scroll_refresh = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if layout.measure_passes > 0 || pinned || needs_scroll_refresh {
                             layout.measure_passes = layout.measure_passes.saturating_sub(1);
                             let id = cx.entity_id();
                             cx.defer(move |cx| cx.notify(id));
@@ -2466,12 +2521,14 @@ impl AgentWorkspace {
             if session.messages.is_empty() {
                 // The empty state places the composer in the centered stack below.
             } else {
+                let tail_start = session.messages.len().saturating_sub(8);
                 for (index, message) in session.messages.iter().enumerate() {
                     if can_clip && index + 1 < session.messages.len() {
                         if let Some(bounds) = self.scroll.bounds_for_item(index) {
                             let nearby = bounds.bottom() + offset.y >= viewport.top() - px(600.)
                                 && bounds.top() + offset.y <= viewport.bottom() + px(600.);
                             if !nearby {
+                                mounted_messages.borrow_mut().push(false);
                                 messages = messages.child(
                                     div()
                                         .id(("message", index))
@@ -2486,7 +2543,31 @@ impl AgentWorkspace {
                                 continue;
                             }
                         }
+                    } else if !can_clip
+                        && self.message_layout.context.is_none()
+                        && self.message_layout.pin.is_some()
+                        && index < tail_start
+                    {
+                        // Cold session switch: keep older off-screen messages as
+                        // lightweight estimated spacers so only the newest tail mounts.
+                        let est_height = self
+                            .scroll
+                            .bounds_for_item(index)
+                            .map(|b| b.size.height)
+                            .unwrap_or_else(|| px(estimated_message_height(message)));
+                        mounted_messages.borrow_mut().push(false);
+                        messages = messages.child(
+                            div()
+                                .id(("message", index))
+                                .debug_selector(move || format!("message-spacer-{index}").into())
+                                .w_full()
+                                .max_w(px(800.))
+                                .h(est_height)
+                                .flex_shrink_0(),
+                        );
+                        continue;
                     }
+                    mounted_messages.borrow_mut().push(true);
                     let user = message.role == Role::User;
                     let compacted_label = message
                         .compacted_at
@@ -2969,13 +3050,17 @@ impl Render for AgentWorkspace {
                     }
                     if let Some((start, width)) = this.right_sidebar_resize {
                         if event.dragging() {
-                            this.right_sidebar_width =
-                                (width + f32::from(start - event.position.x)).clamp(240., maximum);
+                            let next = (width + f32::from(start - event.position.x))
+                                .clamp(240., maximum);
+                            if (this.right_sidebar_width - next).abs() >= 1. {
+                                this.right_sidebar_width = next;
+                                cx.notify();
+                            }
                         } else {
                             this.right_sidebar_resize = None;
+                            cx.notify();
                         }
                         cx.stop_propagation();
-                        cx.notify();
                     }
                 }),
             )

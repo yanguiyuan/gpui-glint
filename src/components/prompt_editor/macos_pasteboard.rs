@@ -33,14 +33,12 @@ impl ImageSource {
     fn probe(board: &NSPasteboard) -> Option<Self> {
         let change_count = board.changeCount();
         let types = board.types()?;
-        // Keep GPUI's file and text precedence. Only inspect type metadata here.
-        if [
-            "NSFilenamesPboardType",
-            "public.file-url",
-            "public.utf8-plain-text",
-        ]
-        .iter()
-        .any(|kind| types.containsObject(&NSString::from_str(kind)))
+        // Keep GPUI's file precedence. Only inspect type metadata here.
+        // Do not bail out on plain-text metadata: browsers and chat apps often
+        // attach text/URL alongside image data, and PromptEditor prefers images.
+        if ["NSFilenamesPboardType", "public.file-url"]
+            .iter()
+            .any(|kind| types.containsObject(&NSString::from_str(kind)))
         {
             return None;
         }

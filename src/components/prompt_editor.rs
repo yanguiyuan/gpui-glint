@@ -113,8 +113,19 @@ impl gpui::Asset for AttachmentThumbnail {
                     // GPUI supplies BGRA pixels. Resizing each channel preserves that order.
                     // The composer displays a 48 px preview. Keep two device pixels per point.
                     let extent = side.min(96);
+                    let thumb = if side > 192 {
+                        let pre = image::imageops::resize(
+                            &*crop,
+                            192,
+                            192,
+                            image::imageops::FilterType::Nearest,
+                        );
+                        image::imageops::thumbnail(&pre, extent, extent)
+                    } else {
+                        image::imageops::thumbnail(&*crop, extent, extent)
+                    };
                     Some(image::Frame::from_parts(
-                        image::imageops::thumbnail(&*crop, extent, extent),
+                        thumb,
                         0,
                         0,
                         decoded.delay(index),
