@@ -1428,7 +1428,17 @@ impl Workbench {
     pub(super) fn environment_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = self.theme.palette();
         let applied = self.selected_environment(cx);
-        let mut list = div().flex().flex_col().gap_2().px_2().py_3();
+        let env_count = self.workspace.environment_names.len().saturating_sub(1);
+        let mut list = div().flex().flex_col().gap_2().px_2().pb_3();
+        if env_count == 0 {
+            list = list.child(
+                div()
+                    .p_3()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child("暂无环境，点击右上角 + 创建"),
+            );
+        }
         for (index, name) in self.workspace.environment_names.iter().enumerate().skip(1) {
             let selected = self.editing_environment == index;
             let scoped = self.editor_environment(index);
@@ -1447,33 +1457,50 @@ impl Workbench {
                 div()
                     .id(("environment-profile", index))
                     .px_3()
-                    .py_3()
+                    .py_2p5()
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(rgb(if selected { p.accent } else { p.panel }))
-                    .bg(rgb(if selected { p.accent_tint } else { p.panel }))
+                    .border_color(rgb(if selected { p.accent } else { p.border }))
+                    .bg(rgb(if selected { p.accent_tint } else { p.surface }))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(p.accent_tint)))
+                    .hover(move |s| {
+                        if selected {
+                            s
+                        } else {
+                            s.bg(rgb(p.surface_subtle))
+                        }
+                    })
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(if index == 2 {
-                                Icon::Code.render(15.)
-                            } else {
-                                Icon::Globe.render(15.)
-                            })
+                            .child(
+                                if index == 2 {
+                                    Icon::Code.render(14.)
+                                } else {
+                                    Icon::Globe.render(14.)
+                                }
+                                .text_color(rgb(if selected { p.accent } else { p.text_muted }))
+                                .flex_shrink_0(),
+                            )
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .truncate()
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(name.clone()),
                             )
                             .when(index == applied, |row| {
                                 row.child(
                                     div()
-                                        .text_size(px(9.))
+                                        .flex_shrink_0()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(p.accent_tint))
+                                        .text_size(px(10.))
                                         .text_color(rgb(p.accent))
                                         .child("使用中"),
                                 )
@@ -1481,7 +1508,7 @@ impl Workbench {
                     )
                     .child(
                         div()
-                            .mt_2()
+                            .mt_1p5()
                             .font_family("Menlo")
                             .text_size(px(10.))
                             .text_color(rgb(p.text_muted))
@@ -1518,16 +1545,29 @@ impl Workbench {
                     .px_3()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_2()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("请求环境"))
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(rgb(p.text_muted))
-                            .child(format!(
-                                "{} 个环境",
-                                self.workspace.environment_names.len() - 1
-                            )),
+                            .child(format!("{env_count}")),
+                    )
+                    .child(div().flex_1())
+                    .when(
+                        self.workspace.environment_names.len() > 1
+                            || !self.workspace.collections.is_empty(),
+                        |header| {
+                            header.child(
+                                IconButton::new(Icon::Plus, "创建环境")
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "sidebar-create-environment".into())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.begin_create_environment(window, cx);
+                                    })),
+                            )
+                        },
                     ),
             )
             .child(
@@ -1536,26 +1576,7 @@ impl Workbench {
                     .min_h_0()
                     .id("environment-list-scroll")
                     .overflow_y_scroll()
-                    .child(list)
-                    .when(
-                        self.workspace.environment_names.len() > 1
-                            || !self.workspace.collections.is_empty(),
-                        |list| {
-                            list.child(
-                                Button::new("创建环境")
-                                    .icon(Icon::Plus)
-                                    .kind(ButtonKind::Gray)
-                                    .size(ButtonSize::Mini)
-                                    .theme(self.theme)
-                                    .render()
-                                    .debug_selector(|| "sidebar-create-environment".into())
-                                    .mx_2()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_create_environment(window, cx);
-                                    })),
-                            )
-                        },
-                    ),
+                    .child(list),
             )
             .child(
                 div()

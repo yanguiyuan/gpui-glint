@@ -596,14 +596,6 @@ impl ProjectFiles {
             let changes = changes.read(cx);
             (changes.staged_count(), changes.has_conflicts())
         });
-        let stage_state = self.changes_by_root.get(&root);
-        let sync_notice = stage_state.and_then(|state| {
-            if state.busy() {
-                Some("正在同步暂存区…".to_owned())
-            } else {
-                state.error.clone()
-            }
-        });
         let disabled = !self.can_commit_changes(cx);
         let submitting = self.commit_task.is_some();
         let generating = self
@@ -690,14 +682,13 @@ impl ProjectFiles {
             Icon::Wand.render(15.).into_any_element()
         });
         let owner = self.owner.clone()?;
-        let (label, options, value, open, generation_notice) = owner
+        let (label, options, value, open) = owner
             .read_with(cx, |workspace: &AgentWorkspace, _| {
                 (
                     workspace.commit_model_label(),
                     workspace.commit_model_options(),
                     workspace.commit_model_value(),
                     workspace.edits_ui.commit_model_open,
-                    workspace.commit_notice_for(&root),
                 )
             })
             .ok()?;
@@ -761,37 +752,6 @@ impl ProjectFiles {
                                     .render(cx),
                                 ),
                         ),
-                )
-                .when(has_conflicts || (staged > 0 && !submitting), |footer| {
-                    footer.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child(if has_conflicts {
-                                "请先解决所有合并冲突".to_owned()
-                            } else {
-                                format!("提交 {staged} 个已暂存文件")
-                            }),
-                    )
-                })
-                .when_some(sync_notice, |footer, notice| {
-                    footer.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(p.text_muted))
-                            .child(notice),
-                    )
-                })
-                .when_some(
-                    self.commit_notice.clone().or(generation_notice),
-                    |footer, notice| {
-                        footer.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child(notice),
-                        )
-                    },
                 ),
         )
     }
@@ -1883,24 +1843,36 @@ impl Render for ProjectFiles {
                         column.children(self.commit_footer(cx))
                     }),
             )
-            .child(
+            .child({
+                let dragging = self.explorer_resize.is_some();
                 div()
                     .id("project-explorer-resize")
                     .debug_selector(|| "project-explorer-resize".into())
+                    .group("project-explorer-resize-group")
                     .w(px(EXPLORER_DIVIDER_WIDTH))
                     .h_full()
                     .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .bg(rgb(p.border))
-                    .hover(|style| style.bg(rgb(p.accent)))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(if dragging { 2. } else { 1. }))
+                            .bg(rgb(if dragging { p.accent } else { p.border }))
+                            .group_hover("project-explorer-resize-group", move |style| {
+                                style.w(px(2.)).bg(rgb(p.accent))
+                            }),
+                    )
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                             this.explorer_resize = Some((event.position.x, explorer_width));
                             cx.stop_propagation();
                         }),
-                    ),
-            )
+                    )
+            })
             .child(div().flex_1().min_w_0().h_full().child(document_pane))
             .children(self.tab_context_menu(window, cx))
     }

@@ -191,9 +191,13 @@ pub(super) fn scroll_guard(
                 if phase != gpui::DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
                     return;
                 }
+                let max_y = scroll.max_offset().y;
+                if max_y <= px(1.) {
+                    return;
+                }
                 let delta = event.delta.pixel_delta(px(line_height));
                 let offset = scroll.offset();
-                let next = (offset.y + delta.y).clamp(-scroll.max_offset().y, px(0.));
+                let next = (offset.y + delta.y).clamp(-max_y, px(0.));
                 if next != offset.y {
                     scroll.set_offset(gpui::point(offset.x, next));
                     cx.stop_propagation();

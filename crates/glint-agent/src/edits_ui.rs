@@ -2129,16 +2129,28 @@ impl AgentWorkspace {
             .min_h_0()
             .flex()
             .child(self.diff_navigation(navigation, cx))
-            .child(
+            .child({
+                let dragging = self.edits_ui.navigation_resize.is_some();
                 div()
                     .id("diff-navigation-resize")
                     .debug_selector(|| "diff-navigation-resize".into())
+                    .group("diff-navigation-resize-group")
                     .w(px(5.))
                     .h_full()
                     .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .bg(rgb(p.border))
-                    .hover(|style| style.bg(rgb(p.accent)))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(if dragging { 2. } else { 1. }))
+                            .bg(rgb(if dragging { p.accent } else { p.border }))
+                            .group_hover("diff-navigation-resize-group", move |style| {
+                                style.w(px(2.)).bg(rgb(p.accent))
+                            }),
+                    )
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -2149,8 +2161,8 @@ impl AgentWorkspace {
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    ),
-            )
+                    )
+            })
             .child(
                 div()
                     .relative()
@@ -2450,15 +2462,6 @@ impl AgentWorkspace {
             .clone();
         entry.update(cx, |entry, cx| entry.set_theme(self.theme, cx));
         let matches = self.edits_ui.workspace_root.as_ref() == Some(&root);
-        let staged = if matches {
-            self.edits_ui
-                .workspace_sources
-                .values()
-                .filter(|source| source.staged)
-                .count()
-        } else {
-            0
-        };
         let disabled = !self.can_commit_workspace(cx);
         let submitting = self.edits_ui.commit_task.is_some();
         let generating = self.edits_ui.commit_generation.contains_key(&root);
@@ -2613,37 +2616,6 @@ impl AgentWorkspace {
                                     .render(cx),
                                 ),
                         ),
-                )
-                .when_some(
-                    if matches && !self.edits_ui.conflicts.is_empty() {
-                        Some("请先解决合并冲突".to_owned())
-                    } else if staged > 0 {
-                        Some(format!("提交 {staged} 个已暂存文件"))
-                    } else {
-                        None
-                    },
-                    |footer, status| {
-                        footer.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child(status),
-                        )
-                    },
-                )
-                .when_some(
-                    self.edits_ui
-                        .commit_notice
-                        .as_ref()
-                        .filter(|(project, _)| project == &root),
-                    |footer, (_, notice)| {
-                        footer.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(p.text_muted))
-                                .child(notice.clone()),
-                        )
-                    },
                 ),
         )
     }
@@ -5064,17 +5036,23 @@ impl Render for Summary {
             .border_1()
             .border_color(rgb(p.border))
             .bg(rgb(p.surface))
+            .overflow_hidden()
             .flex()
             .flex_col()
             .child(
                 div()
+                    .id("edit-summary-header")
+                    .debug_selector(|| "edit-summary-header".into())
                     .px_3()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(rgb(p.border))
+                    .py_2p5()
+                    .when(self.expanded, |header| {
+                        header.border_b_1().border_color(rgb(p.border))
+                    })
                     .flex()
                     .items_center()
                     .gap_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(p.surface_subtle)))
                     .child(Icon::Pencil.render(18.).text_color(rgb(p.text_muted)))
                     .child(
                         div()
@@ -5082,7 +5060,7 @@ impl Render for Summary {
                             .min_w_0()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap_2()
                             .child(
                                 div()
                                     .min_w_0()
@@ -5094,6 +5072,11 @@ impl Render for Summary {
                                 counts(total_add, total_remove)
                                     .flex_shrink_0()
                                     .debug_selector(|| "edit-summary-totals".into()),
+                            )
+                            .child(
+                                Icon::disclosure(12., self.expanded)
+                                    .text_color(rgb(p.text_muted))
+                                    .flex_shrink_0(),
                             ),
                     )
                     .child(
@@ -5104,69 +5087,48 @@ impl Render for Summary {
                             .theme(self.theme)
                             .render()
                             .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
                                 let _ = weak.update(cx, |this, cx| this.open_edits(None, cx));
                             }),
-                    ),
-            );
-        for file in self
-            .files
-            .iter()
-            .take(if self.expanded { usize::MAX } else { 3 })
-        {
-            let weak = self.workspace.clone();
-            let path = file.path.clone();
-            panel = panel.child(
-                div()
-                    .id(SharedString::from(format!("edit-summary:{}", file.id)))
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(rgb(p.text_muted))
-                            .child(file.label.clone()),
                     )
-                    .child(counts(file.added, file.removed))
-                    .on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |this, cx| this.open_edits(Some(path.clone()), cx));
-                    }),
-            );
-        }
-        if self.files.len() > 3 {
-            // A quiet text toggle sits inside the card like one more row: the
-            // filled button read as a separate action and split the list.
-            panel = panel.child(
-                div()
-                    .id("edit-summary-more")
-                    .debug_selector(|| "edit-summary-more".into())
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .cursor_pointer()
-                    .rounded_b(px(10.))
-                    .hover(|style| style.bg(rgb(p.surface_subtle)))
-                    .child(div().text_size(px(12.)).text_color(rgb(p.text)).child(
-                        if self.expanded {
-                            "收起".to_owned()
-                        } else {
-                            format!("再显示 {} 个文件", self.files.len() - 3)
-                        },
-                    ))
-                    .child(Icon::disclosure(12., self.expanded))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.expanded = !this.expanded;
                         cx.notify();
                     })),
             );
+        if self.expanded {
+            for file in self.files.iter() {
+                let weak = self.workspace.clone();
+                let path = file.path.clone();
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(format!("edit-summary:{}", file.id)))
+                        .debug_selector({
+                            let id = file.id;
+                            move || format!("edit-summary:{id}")
+                        })
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(p.surface_subtle)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(p.text_muted))
+                                .child(file.label.clone()),
+                        )
+                        .child(counts(file.added, file.removed))
+                        .on_click(move |_, _, cx| {
+                            let _ =
+                                weak.update(cx, |this, cx| this.open_edits(Some(path.clone()), cx));
+                        }),
+                );
+            }
         }
         panel
     }
@@ -6890,5 +6852,46 @@ mod tests {
             );
         });
         files[1].update(window, |file, _| assert!(file.expanded));
+    }
+
+    #[gpui::test]
+    async fn summary_card_is_collapsed_by_default_and_toggles_on_header_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut first = change("first.rs", "a\n");
+        first.id = Uuid::new_v4();
+        let mut second = change("second.rs", "b\n");
+        second.id = Uuid::new_v4();
+        let first_selector: &'static str =
+            Box::leak(format!("edit-summary:{}", first.id).into_boxed_str());
+        let second_selector: &'static str =
+            Box::leak(format!("edit-summary:{}", second.id).into_boxed_str());
+        let (summary, window) = cx.add_window_view(|_, _| Summary {
+            files: Rc::new(vec![first, second]),
+            workspace: gpui::WeakEntity::new_invalid(),
+            theme: ThemePreset::default(),
+            expanded: false,
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("edit-summary-header").is_some());
+        assert!(
+            window.debug_bounds(first_selector).is_none(),
+            "summary file list should be collapsed by default"
+        );
+        assert!(window.debug_bounds(second_selector).is_none());
+
+        let header = window.debug_bounds("edit-summary-header").unwrap();
+        window.simulate_click(header.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(summary.read_with(window, |view, _| view.expanded));
+        assert!(window.debug_bounds(first_selector).is_some());
+        assert!(window.debug_bounds(second_selector).is_some());
+
+        let header = window.debug_bounds("edit-summary-header").unwrap();
+        window.simulate_click(header.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(!summary.read_with(window, |view, _| view.expanded));
+        assert!(window.debug_bounds(first_selector).is_none());
+        assert!(window.debug_bounds(second_selector).is_none());
     }
 }

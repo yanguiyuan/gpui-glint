@@ -10,6 +10,21 @@ use gpui::{
     rgb,
 };
 
+fn file_or_folder_icon(directory: bool, name: &str) -> super::IconSvg {
+    let icon = if directory {
+        Icon::Folder
+    } else {
+        Icon::for_file_name(name)
+    }
+    .render(15.);
+    if !directory {
+        if let Some(color) = Icon::color_for_file_name(name) {
+            return icon.text_color(rgb(color));
+        }
+    }
+    icon
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BreadcrumbSegment {
     pub name: String,
@@ -765,14 +780,7 @@ impl FilePreview {
                     } else {
                         p.text_muted
                     }))
-                    .child(
-                        if entry.directory {
-                            Icon::Folder
-                        } else {
-                            Icon::for_file_name(&entry.name)
-                        }
-                        .render(15.),
-                    )
+                    .child(file_or_folder_icon(entry.directory, &entry.name))
                     .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
                     .when(entry.directory || entry.previewable, |row| {
                         let path = entry.path.clone();
@@ -971,14 +979,7 @@ impl FilePreview {
                                             row.child(Icon::disclosure(12., expanded))
                                         }),
                                 )
-                                .child(
-                                    if entry.directory {
-                                        Icon::Folder
-                                    } else {
-                                        Icon::for_file_name(&entry.name)
-                                    }
-                                    .render(15.),
-                                )
+                                .child(file_or_folder_icon(entry.directory, &entry.name))
                                 .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
                                 .when(entry.directory || entry.previewable, |row| {
                                     let path = entry.path.clone();

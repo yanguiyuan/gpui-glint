@@ -1221,11 +1221,11 @@ impl AgentWorkspace {
                     let workspace = preview_workspace.clone();
 
                     let status_label = if record.result == "执行中…" {
-                        "Editing"
+                        "正在编辑"
                     } else if !tool_succeeded(record) {
-                        "Edit failed"
+                        "编辑失败"
                     } else {
-                        "Edited"
+                        "已编辑"
                     };
 
                     let diff_stats = record.change.as_ref().map(|change| {
@@ -1266,8 +1266,11 @@ impl AgentWorkspace {
                                         .items_center()
                                         .gap(px(5.))
                                         .min_w_0()
+                                        .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
                                         .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(p.accent)))
+                                        .hover(move |style| style.bg(rgb(p.surface_subtle)))
                                         .child(
                                             div()
                                                 .flex_shrink_0()
@@ -1279,9 +1282,6 @@ impl AgentWorkspace {
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_color(rgb(p.text_muted))
-                                                .hover(|style| {
-                                                    style.text_color(rgb(p.accent)).underline()
-                                                })
                                                 .child(file_display_name.clone()),
                                         )
                                         .on_click({
@@ -1362,11 +1362,11 @@ impl AgentWorkspace {
                     let workspace = preview_workspace.clone();
 
                     let status_label = if record.result == "执行中…" {
-                        "Analyzing"
+                        "正在分析"
                     } else if !tool_succeeded(record) {
-                        "Analyze failed"
+                        "分析失败"
                     } else {
-                        "Analyzed"
+                        "已分析"
                     };
 
                     let line_range = read_file_line_range(record);
@@ -1407,8 +1407,11 @@ impl AgentWorkspace {
                                         .items_center()
                                         .gap(px(5.))
                                         .min_w_0()
+                                        .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
                                         .cursor_pointer()
-                                        .hover(|style| style.text_color(rgb(p.accent)))
+                                        .hover(move |style| style.bg(rgb(p.surface_subtle)))
                                         .child(
                                             div()
                                                 .flex_shrink_0()
@@ -1420,9 +1423,6 @@ impl AgentWorkspace {
                                                 .min_w_0()
                                                 .truncate()
                                                 .text_color(rgb(p.text_muted))
-                                                .hover(|style| {
-                                                    style.text_color(rgb(p.accent)).underline()
-                                                })
                                                 .child(file_display_name.clone()),
                                         )
                                         .when_some(line_label.clone(), |row, label| {
@@ -1608,29 +1608,36 @@ impl AgentWorkspace {
                                         .flex_shrink_0()
                                         .max_h(px(320.))
                                         .relative()
-                                        .px_3()
-                                        .py(px(10.))
                                         .overflow_y_scroll()
                                         .track_scroll(&result_scroll)
                                         .text_size(px(12.))
                                         .line_height(px(20.))
                                         .font_family("monospace")
                                         .text_color(rgb(p.text_muted))
-                                        .child(div().w_full().min_w_0().child(
-                                            if pending_body {
-                                                div()
-                                                    .py_1()
-                                                    .child(pending_skeleton(
-                                                        pending_id.clone(),
-                                                        theme,
-                                                    ))
-                                                    .into_any_element()
-                                            } else if let Some(output) = &command_output {
-                                                output.render().into_any_element()
-                                            } else {
-                                                div().child(result.clone()).into_any_element()
-                                            },
-                                        ))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .px_3()
+                                                .py(px(10.))
+                                                .child(
+                                                    if pending_body {
+                                                        div()
+                                                            .py_1()
+                                                            .child(pending_skeleton(
+                                                                pending_id.clone(),
+                                                                theme,
+                                                            ))
+                                                            .into_any_element()
+                                                    } else if let Some(output) = &command_output {
+                                                        output.render().into_any_element()
+                                                    } else {
+                                                        div()
+                                                            .child(result.clone())
+                                                            .into_any_element()
+                                                    },
+                                                ),
+                                        )
                                         .child(crate::command_output::scroll_guard(
                                             &result_scroll,
                                             20.,
@@ -3481,7 +3488,7 @@ mod tests {
             viewer.size.width >= px(990.) && viewer.size.height >= px(750.),
             "the viewer must cover the window: {viewer:?}"
         );
-        assert!(host.read_with(window, |host, _| host.image_preview.is_some()));
+        assert!(host.read_with(window, |host, cx| host.image_preview.read(cx).is_open()));
         // The source is 300x200; the viewer must show it whole (the 160x120
         // thumbnail crops it), hence both sides grow and the 3:2 ratio holds.
         let shown = window
@@ -3502,7 +3509,7 @@ mod tests {
             window.debug_bounds("agent-image-lightbox").is_none(),
             "Escape must close the viewer"
         );
-        assert!(host.read_with(window, |host, _| host.image_preview.is_none()));
+        assert!(host.read_with(window, |host, cx| !host.image_preview.read(cx).is_open()));
         // Reopening and clicking the scrim also dismisses it.
         window.simulate_click(thumbnail.center(), Default::default());
         window.run_until_parked();

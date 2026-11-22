@@ -667,25 +667,133 @@ impl Workbench {
         })
     }
     pub(super) fn proxy_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
         let mut list = div()
-            .w_full()
-            .min_w_0()
+            .id("proxy-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pb_3()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .child("代理管理");
-        for (index, profile) in self.workspace.proxies.iter().enumerate() {
+            .gap_2();
+        if self.workspace.proxies.is_empty() {
             list = list.child(
-                Button::new(profile.name.clone())
-                    .kind(ButtonKind::Gray)
-                    .truncate_label()
-                    .theme(self.theme)
-                    .render()
+                div()
+                    .p_3()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.text_muted))
+                    .child("暂无代理，点击右上角 + 新建"),
+            );
+        }
+        for (index, profile) in self.workspace.proxies.iter().enumerate() {
+            let selected = index == self.editing_proxy;
+            let input = self.profile_inputs.get(index);
+            let enabled = input.map_or(profile.settings.enabled, |i| i.enabled);
+            let built_in = input.map_or(profile.settings.built_in, |i| i.built_in);
+            let port_text = input
+                .map(|i| i.listener_port.read(cx).value().trim().to_owned())
+                .unwrap_or_else(|| profile.settings.listener.port.to_string());
+            let endpoint = if built_in {
+                if port_text.is_empty() || port_text == "0" {
+                    "内置代理 · 自动端口".to_owned()
+                } else {
+                    format!("内置代理 · 端口 {port_text}")
+                }
+            } else {
+                let url = input
+                    .map(|i| i.url.read(cx).value().trim().to_owned())
+                    .unwrap_or_else(|| profile.settings.url.clone());
+                if url.is_empty() {
+                    "未配置代理地址".to_owned()
+                } else {
+                    url
+                }
+            };
+            let mapping_count = input.map_or(profile.settings.mappings.len(), |i| i.mappings.len());
+            let bound_count = self
+                .workspace
+                .environment_inputs
+                .iter()
+                .filter(|env| env.proxy_id.as_ref() == Some(&profile.id))
+                .count();
+            list = list.child(
+                div()
                     .id(("proxy-profile", index))
-                    .when(index == self.editing_proxy, |button| {
-                        button.bg(rgb(self.theme.palette().accent_tint))
+                    .px_3()
+                    .py_2p5()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(if selected { p.accent } else { p.border }))
+                    .bg(rgb(if selected { p.accent_tint } else { p.surface }))
+                    .cursor_pointer()
+                    .hover(move |style| {
+                        if selected {
+                            style
+                        } else {
+                            style.bg(rgb(p.surface_subtle))
+                        }
                     })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::Shuffle
+                                    .render(14.)
+                                    .text_color(rgb(if selected {
+                                        p.accent
+                                    } else {
+                                        p.text_muted
+                                    }))
+                                    .flex_shrink_0(),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(profile.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(if enabled {
+                                        p.accent_tint
+                                    } else {
+                                        p.surface_subtle
+                                    }))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(if enabled {
+                                        p.accent
+                                    } else {
+                                        p.text_muted
+                                    }))
+                                    .child(if enabled { "已启用" } else { "已停用" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1p5()
+                            .font_family("Menlo")
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .truncate()
+                            .child(endpoint),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(p.text_muted))
+                            .child(format!("{mapping_count} 条映射 · {bound_count} 个绑定环境")),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.editing_proxy = index;
                         this.variable_error = None;
@@ -693,45 +801,60 @@ impl Workbench {
                     })),
             );
         }
-        list.child(
-            Button::new("新建代理")
-                .kind(ButtonKind::Gray)
-                .theme(self.theme)
-                .render()
-                .debug_selector(|| "proxy-create".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let mut n = this.workspace.proxies.len() + 1;
-                    while this
-                        .workspace
-                        .proxies
-                        .iter()
-                        .any(|p| p.name == format!("代理 {n}"))
-                    {
-                        n += 1;
-                    }
-                    let settings = environment::ProxySettings {
-                        built_in: true,
-                        ..Default::default()
-                    };
-                    let input = this.new_proxy_input(&settings, cx);
-                    let name = format!("代理 {n}");
-                    this.profile_inputs.push(input);
-                    let entry = Self::entry(&name, "代理名称", cx);
-                    entry.update(cx, |entry, cx| entry.set_theme(this.theme, cx));
-                    this.profile_names.push(entry);
-                    this.editing_proxy = this.workspace.proxies.len();
-                    this.workspace.proxies.push(environment::ProxyProfile {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name,
-                        settings,
-                    });
-                    this.sync_proxy_binding_options(cx);
-                    this.variable_error = None;
-                    this.workspace.storage_dirty = true;
-                    this.persist(cx);
-                    cx.notify();
-                })),
-        )
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.panel))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .h(px(44.))
+                    .gap_1()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("代理管理"))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new(Icon::Plus, "新建代理")
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "proxy-create".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let mut n = this.workspace.proxies.len() + 1;
+                                while this
+                                    .workspace
+                                    .proxies
+                                    .iter()
+                                    .any(|p| p.name == format!("代理 {n}"))
+                                {
+                                    n += 1;
+                                }
+                                let settings = environment::ProxySettings {
+                                    built_in: true,
+                                    ..Default::default()
+                                };
+                                let input = this.new_proxy_input(&settings, cx);
+                                let name = format!("代理 {n}");
+                                this.profile_inputs.push(input);
+                                let entry = Self::entry(&name, "代理名称", cx);
+                                entry.update(cx, |entry, cx| entry.set_theme(this.theme, cx));
+                                this.profile_names.push(entry);
+                                this.editing_proxy = this.workspace.proxies.len();
+                                this.workspace.proxies.push(environment::ProxyProfile {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    name,
+                                    settings,
+                                });
+                                this.sync_proxy_binding_options(cx);
+                                this.variable_error = None;
+                                this.workspace.storage_dirty = true;
+                                this.persist(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
     }
     pub(super) fn proxy_settings_workspace(&self, cx: &mut Context<Self>) -> gpui::Div {
         if self.workspace.proxies.is_empty() {

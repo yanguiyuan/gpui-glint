@@ -177,8 +177,7 @@ pub struct AgentWorkspace {
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::MarkdownView>>,
     image_views: std::cell::RefCell<images::PreviewCache>,
     /// Full-window view of a message image opened from its thumbnail.
-    image_preview: Option<ImageLightbox>,
-    image_preview_focus: gpui::FocusHandle,
+    image_preview: Entity<gpui_glint::components::ImageLightbox>,
     process_panels:
         std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ProcessPanel>>,
     tool_panels: std::cell::RefCell<std::collections::HashMap<String, app_tools_ui::ToolPanel>>,
@@ -232,13 +231,6 @@ pub struct AgentWorkspace {
     project_context: project_context::State,
     memory_task: Option<Task<()>>,
     memory_last_probe: Option<std::time::Instant>,
-}
-
-/// Decoded message image plus the focus to return to when the viewer closes.
-#[derive(Clone)]
-struct ImageLightbox {
-    source: std::sync::Arc<Image>,
-    origin: Option<gpui::FocusHandle>,
 }
 
 /// Measured rows keep their exact height while distant history is unmounted.
@@ -440,7 +432,7 @@ impl AgentWorkspace {
                 }
             },
         );
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             recall_subscription,
             cx.subscribe(&outline, |this, _, event: &outline::Jump, cx| {
                 this.message_layout.pin = None;
@@ -762,8 +754,27 @@ impl AgentWorkspace {
             subagent_ui: Default::default(),
             markdown_views: std::cell::RefCell::new(std::collections::HashMap::new()),
             image_views: std::cell::RefCell::new(images::PreviewCache::default()),
-            image_preview: None,
-            image_preview_focus: cx.focus_handle(),
+            image_preview: {
+                let image_preview = cx.new(gpui_glint::components::ImageLightbox::new);
+                subscriptions.push(cx.subscribe(
+                    &image_preview,
+                    |this, _, event: &gpui_glint::components::ImageLightboxEvent, cx| match event {
+                        gpui_glint::components::ImageLightboxEvent::CloseRequested => cx.notify(),
+                        gpui_glint::components::ImageLightboxEvent::CopyRequested(_) => {
+                            this.git_ui.toasts.update(cx, |toasts, cx| {
+                                toasts.push(
+                                    gpui_glint::components::Toast::new("已复制图片"),
+                                    cx,
+                                );
+                            });
+                        }
+                        gpui_glint::components::ImageLightboxEvent::SaveRequested(image, index) => {
+                            this.save_lightbox_image(image.clone(), *index, cx);
+                        }
+                    },
+                ));
+                image_preview
+            },
             process_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_panels: std::cell::RefCell::new(std::collections::HashMap::new()),
             access,
@@ -2190,85 +2201,53 @@ impl AgentWorkspace {
 
     fn open_image_preview(
         &mut self,
-        source: std::sync::Arc<Image>,
+        images: Vec<std::sync::Arc<Image>>,
+        index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.image_preview = Some(ImageLightbox {
-            source,
-            origin: window.focused(cx),
-        });
-        window.focus(&self.image_preview_focus, cx);
+        self.image_preview
+            .update(cx, |lb, cx| lb.open(images, index, window, cx));
         cx.notify();
     }
 
-    fn close_image_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preview) = self.image_preview.take() else {
-            return;
-        };
-        if let Some(origin) = preview.origin {
-            window.focus(&origin, cx);
-        }
-        cx.notify();
-    }
-
-    /// Full-window view of a clicked message image; the scrim closes it on click or Escape.
-    fn image_lightbox(
-        &self,
-        preview: ImageLightbox,
-        viewport: gpui::Size<gpui::Pixels>,
+    fn save_lightbox_image(
+        &mut self,
+        image: std::sync::Arc<Image>,
+        index: usize,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        // Leave a margin so the photo never touches the window edge.
-        let maximum_width = (f32::from(viewport.width) - 96.).max(120.);
-        let maximum_height = (f32::from(viewport.height) - 96.).max(90.);
-        gpui::deferred(
-            div()
-                .id("agent-image-lightbox")
-                .debug_selector(|| "agent-image-lightbox".into())
-                .absolute()
-                .inset_0()
-                .size_full()
-                .bg(gpui::rgba(0x0c121cd8))
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .track_focus(&self.image_preview_focus)
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                    if event.keystroke.key != "escape" {
-                        return;
-                    }
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    this.close_image_preview(window, cx);
-                }))
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.close_image_preview(window, cx);
-                    }),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "agent-image-viewer".into())
-                        .rounded(px(6.))
-                        .shadow_lg()
-                        // Intrinsic size, capped to the window: small images stay
-                        // sharp instead of stretching, screenshots shrink to fit.
-                        .child(
-                            img(preview.source)
-                                .max_w(px(maximum_width))
-                                .max_h(px(maximum_height))
-                                .object_fit(ObjectFit::Contain)
-                                .rounded(px(6.)),
-                        ),
-                ),
-        )
-        .with_priority(120)
-        .into_any_element()
+    ) {
+        let ext = gpui_glint::components::image_format_ext(image.format);
+        let default_name = format!("image-{}.{ext}", index + 1);
+        let directory = self
+            .history
+            .active()
+            .project
+            .clone()
+            .filter(|p| !ssh_project::is_remote(p) && p.is_dir())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let picker = cx.prompt_for_new_path(&directory, Some(&default_name));
+        let toasts = self.git_ui.toasts.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(dest))) = picker.await else {
+                return;
+            };
+            let write_res = cx
+                .background_executor()
+                .spawn(async move { std::fs::write(&dest, &image.bytes) })
+                .await;
+            let _ = cx.update(|cx| {
+                toasts.update(cx, |toasts, cx| {
+                    let toast = match write_res {
+                        Ok(()) => gpui_glint::components::Toast::new("已保存图片"),
+                        Err(err) => gpui_glint::components::Toast::new("保存图片失败")
+                            .description(err.to_string()),
+                    };
+                    toasts.push(toast, cx);
+                });
+            });
+        })
+        .detach();
     }
 
     fn welcome(&self) -> gpui::Div {
@@ -2599,47 +2578,51 @@ impl AgentWorkspace {
                                 .items_end()
                                 .gap_2()
                                 .when(!self.is_editing_message(index) && !message.images.is_empty(), |col| {
+                                    let decoded_images: Vec<std::sync::Arc<Image>> = message
+                                        .images
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, img)| {
+                                            let key = format!("{}:{index}:img{i}", self.history.active);
+                                            self.user_image(key, img, cx)
+                                        })
+                                        .collect();
                                     col.child(div().flex().flex_wrap().justify_end().gap_2().children(
-                                        message.images.iter().enumerate().filter_map(
-                                            |(image_index, image)| {
-                                                let key = format!(
-                                                    "{}:{index}:img{image_index}",
-                                                    self.history.active
+                                        decoded_images.iter().enumerate().map(
+                                            |(image_index, source)| {
+                                                let gallery = decoded_images.clone();
+                                                let selector = format!(
+                                                    "message-image:{index}:{image_index}"
                                                 );
-                                                self.user_image(key, image, cx).map(|source| {
-                                                    let full = source.clone();
-                                                    let selector = format!(
-                                                        "message-image:{index}:{image_index}"
-                                                    );
-                                                    div()
-                                                        .id(("message-image", index * 16 + image_index))
-                                                        .debug_selector(move || selector.clone())
-                                                        .w(px(160.))
-                                                        .h(px(120.))
-                                                        .flex_shrink_0()
-                                                        .overflow_hidden()
-                                                        .rounded(px(12.))
-                                                        .border_1()
-                                                        .border_color(rgb(p.border))
-                                                        .cursor_pointer()
-                                                        .hover(|style| {
-                                                            style.border_color(rgb(p.accent))
-                                                        })
-                                                        .child(
-                                                            img(source)
-                                                                .size_full()
-                                                                .object_fit(ObjectFit::Cover),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _, window, cx| {
-                                                                this.open_image_preview(
-                                                                    full.clone(),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        ))
-                                                })
+                                                div()
+                                                    .id(("message-image", index * 16 + image_index))
+                                                    .debug_selector(move || selector.clone())
+                                                    .w(px(160.))
+                                                    .h(px(120.))
+                                                    .flex_shrink_0()
+                                                    .overflow_hidden()
+                                                    .rounded(px(12.))
+                                                    .border_1()
+                                                    .border_color(rgb(p.border))
+                                                    .cursor_pointer()
+                                                    .hover(|style| {
+                                                        style.border_color(rgb(p.accent))
+                                                    })
+                                                    .child(
+                                                        img(source.clone())
+                                                            .size_full()
+                                                            .object_fit(ObjectFit::Cover),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.open_image_preview(
+                                                                gallery.clone(),
+                                                                image_index,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
                                             },
                                         ),
                                     ))
@@ -3056,9 +3039,10 @@ impl Render for AgentWorkspace {
         let viewport = window.viewport_size();
         let image_lightbox = self
             .image_preview
-            .clone()
-            .map(|preview| self.image_lightbox(preview, viewport, cx));
-        let maximum = (f32::from(window.viewport_size().width)
+            .read(cx)
+            .is_open()
+            .then(|| self.image_preview.clone().into_any_element());
+        let maximum = (f32::from(viewport.width)
             - if self.show_sessions { 706. } else { 446. })
         .clamp(240., 1000.);
         self.right_sidebar_width = self.right_sidebar_width.clamp(240., maximum);
@@ -3204,15 +3188,30 @@ impl Render for AgentWorkspace {
                                     || self.git_ui.open
                                     || (self.terminal_ui.open && !self.terminal_ui.bottom),
                                 |body| {
+                                    let p = self.theme.palette();
+                                    let dragging = self.right_sidebar_resize.is_some();
                                     body.child(
                                         div()
                                             .id("agent-right-sidebar-resize")
                                             .debug_selector(|| "agent-right-sidebar-resize".into())
+                                            .group("agent-right-sidebar-resize-group")
                                             .w(px(5.))
                                             .h_full()
                                             .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
                                             .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                            .hover(|s| s.bg(rgb(self.theme.palette().accent)))
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .w(px(if dragging { 2. } else { 1. }))
+                                                    .when(dragging, |d| d.bg(rgb(p.accent)))
+                                                    .group_hover(
+                                                        "agent-right-sidebar-resize-group",
+                                                        move |s| s.w(px(2.)).bg(rgb(p.accent)),
+                                                    ),
+                                            )
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
                                                 cx.listener(
