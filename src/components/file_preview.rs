@@ -1486,11 +1486,16 @@ impl FilePreview {
                 .child("…");
 
             let weak_ell = cx.entity().downgrade();
-            let hidden_segments = segments[0..start_idx].to_vec();
+            let ellipsis_content = if is_ellipsis_open {
+                let hidden_segments = segments[0..start_idx].to_vec();
+                self.breadcrumb_ellipsis_dropdown(&hidden_segments, cx)
+            } else {
+                div().into_any_element()
+            };
             let ellipsis_popover = Popover::new(
                 "breadcrumb-popover-ellipsis",
                 ellipsis_trigger,
-                self.breadcrumb_ellipsis_dropdown(&hidden_segments, cx),
+                ellipsis_content,
             )
             .open(is_ellipsis_open)
             .align_left()
@@ -1567,10 +1572,15 @@ impl FilePreview {
                 );
 
             let weak = cx.entity().downgrade();
+            let dropdown_content = if is_open {
+                self.breadcrumb_dropdown(idx, seg, cx).into_any_element()
+            } else {
+                div().into_any_element()
+            };
             let popover = Popover::new(
                 SharedString::from(format!("breadcrumb-popover-{idx}")),
                 trigger_btn,
-                self.breadcrumb_dropdown(idx, seg, cx),
+                dropdown_content,
             )
             .open(is_open)
             .align_left()

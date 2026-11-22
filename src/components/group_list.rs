@@ -157,6 +157,38 @@ impl GroupListGroup {
     }
 }
 
+fn item_equal(a: &GroupListItem, b: &GroupListItem) -> bool {
+    a.id == b.id
+        && a.icon == b.icon
+        && a.label == b.label
+        && a.meta == b.meta
+        && a.prefix == b.prefix
+        && a.prefix_color == b.prefix_color
+        && a.hover_icon == b.hover_icon
+        && a.reserve_icon_space == b.reserve_icon_space
+        && a.action == b.action
+        && a.action_confirmation == b.action_confirmation
+}
+
+fn header_equal(a: &GroupListHeader, b: &GroupListHeader) -> bool {
+    a.id == b.id
+        && a.icon == b.icon
+        && a.avatar.is_some() == b.avatar.is_some()
+        && a.label == b.label
+        && a.actions == b.actions
+        && a.menu == b.menu
+}
+
+fn groups_equal(a: &[GroupListGroup], b: &[GroupListGroup]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(ga, gb)| {
+            header_equal(&ga.header, &gb.header)
+                && ga.items.len() == gb.items.len()
+                && ga.items.iter().zip(&gb.items).all(|(ia, ib)| item_equal(ia, ib))
+                && groups_equal(&ga.children, &gb.children)
+        })
+}
+
 fn contains_item(groups: &[GroupListGroup], id: &SharedString) -> bool {
     groups.iter().any(|group| {
         group.items.iter().any(|item| &item.id == id) || contains_item(&group.children, id)
@@ -308,7 +340,11 @@ impl GroupList {
         groups: impl IntoIterator<Item = GroupListGroup>,
         cx: &mut Context<Self>,
     ) {
-        self.groups = groups.into_iter().collect();
+        let next: Vec<GroupListGroup> = groups.into_iter().collect();
+        if groups_equal(&self.groups, &next) {
+            return;
+        }
+        self.groups = next;
         if self
             .confirming
             .as_ref()

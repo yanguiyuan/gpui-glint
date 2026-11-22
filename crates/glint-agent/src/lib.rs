@@ -218,6 +218,7 @@ pub struct AgentWorkspace {
     save_delay: Option<Task<()>>,
     save_revision: u64,
     save_full_pending: bool,
+    dirty_sessions: std::collections::HashSet<Uuid>,
     save_drafts_pending: std::collections::HashMap<Uuid, String>,
     draft_attachments_pending: std::collections::HashMap<Uuid, storage::DraftAttachments>,
     context_models: Option<Task<()>>,
@@ -775,7 +776,7 @@ impl AgentWorkspace {
             provider_settings,
             provider_error,
 
-            path,
+            path: path.clone(),
             storage_error,
             storage_readable,
             theme,
@@ -802,7 +803,10 @@ impl AgentWorkspace {
             save_worker: None,
             save_delay: None,
             save_revision: 0,
-            save_full_pending: true,
+            save_full_pending: !path
+                .parent()
+                .is_some_and(|dir| dir.join("glint-agent.sqlite3").exists()),
+            dirty_sessions: Default::default(),
             save_drafts_pending: Default::default(),
             draft_attachments_pending: Default::default(),
             context_models: None,
@@ -1110,7 +1114,7 @@ impl AgentWorkspace {
         self.history.new_default_session();
         self.restore_draft(cx);
         self.open_conversation_at_latest();
-        self.save(cx);
+        self.save_session(self.history.active, cx);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
@@ -1554,7 +1558,7 @@ impl AgentWorkspace {
                 editor.set_references(Vec::new(), cx);
             });
         }
-        self.save(cx);
+        self.save_session(id, cx);
         if self.history.active == id && self.subagent_ui.selected.is_none() {
             scroll_follow::follow_if_at_bottom(&self.scroll);
         }
@@ -1681,7 +1685,7 @@ impl AgentWorkspace {
                 }
                 this.finish_run_ui(id, error, cx);
                 this.refresh_calendar(cx);
-                this.save(cx);
+                this.save_session(id, cx);
                 if this.history.active == id && this.subagent_ui.selected.is_none() {
                     scroll_follow::follow_if_at_bottom(&this.scroll);
                 }
@@ -1744,7 +1748,7 @@ impl AgentWorkspace {
                 .lock()
                 .map(|mut store| store.finish(schedule, Some("用户已停止任务".into())));
         }
-        self.save(cx);
+        self.save_session(id, cx);
         cx.notify();
     }
 
@@ -2351,12 +2355,6 @@ impl AgentWorkspace {
             .session_model(self.history.active, self.provider.clone())
             .unwrap_or_default();
         let session = self.history.active();
-        let partner = session.partner_id.and_then(|id| {
-            self.cached_partners(cx)
-                .iter()
-                .find(|p| p.id == id)
-                .cloned()
-        });
         let conversation = if self.trajectory.open {
             self.trajectory_page(cx)
         } else {
@@ -2577,67 +2575,154 @@ impl AgentWorkspace {
                             (legacy_compaction_boundary == Some(index + 1))
                                 .then(|| "此前的上下文已压缩".to_owned())
                         });
-                    let author = match message.role {
-                        Role::User => "你".to_owned(),
-                        Role::Notice => "提示".to_owned(),
-                        Role::Agent => partner
-                            .as_ref()
-                            .map(|p| p.name.clone())
-                            .unwrap_or_else(|| "Glint Agent".into()),
+                    let time_label = message.time.format("%H:%M").to_string();
+                    let bubble_bg = if self.theme.is_dark() {
+                        p.panel
+                    } else {
+                        p.surface
                     };
-                    let avatar = match (&message.role, partner.as_ref()) {
-                        (Role::Agent, Some(partner)) => self.partner_avatar(partner, 28.),
-                        _ => div()
-                            .size(px(28.))
-                            .flex_shrink_0()
-                            .rounded(px(8.))
-                            .bg(rgb(if user {
-                                p.surface_subtle
-                            } else {
-                                p.accent_tint
-                            }))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(if user { Icon::User } else { Icon::Workflow }.render(16.)),
-                    };
-                    messages = messages.child(
-                        div()
-                            .id(("message", index))
-                            .group(SharedString::from(format!("message-actions-{index}")))
-                            .flex_shrink_0()
-                            .w_full()
-                            .max_w(px(800.))
-                            .flex()
-                            .gap_3()
-                            .child(avatar)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
+
+                    if user {
+                        let user_display = message.display_markdown(self.history.active, index);
+                        let has_rich_markdown = user_display.contains(['`', '[', '*', '#', '\n'])
+                            || user_display.contains("http");
+                        let has_text = !user_display.trim().is_empty();
+                        messages = messages.child(
+                            div()
+                                .id(("message", index))
+                                .group(SharedString::from(format!("message-actions-{index}")))
+                                .flex_shrink_0()
+                                .w_full()
+                                .max_w(px(800.))
+                                .flex()
+                                .flex_col()
+                                .items_end()
+                                .gap_2()
+                                .when(!self.is_editing_message(index) && !message.images.is_empty(), |col| {
+                                    col.child(div().flex().flex_wrap().justify_end().gap_2().children(
+                                        message.images.iter().enumerate().filter_map(
+                                            |(image_index, image)| {
+                                                let key = format!(
+                                                    "{}:{index}:img{image_index}",
+                                                    self.history.active
+                                                );
+                                                self.user_image(key, image, cx).map(|source| {
+                                                    let full = source.clone();
+                                                    let selector = format!(
+                                                        "message-image:{index}:{image_index}"
+                                                    );
+                                                    div()
+                                                        .id(("message-image", index * 16 + image_index))
+                                                        .debug_selector(move || selector.clone())
+                                                        .w(px(160.))
+                                                        .h(px(120.))
+                                                        .flex_shrink_0()
+                                                        .overflow_hidden()
+                                                        .rounded(px(12.))
+                                                        .border_1()
+                                                        .border_color(rgb(p.border))
+                                                        .cursor_pointer()
+                                                        .hover(|style| {
+                                                            style.border_color(rgb(p.accent))
+                                                        })
+                                                        .child(
+                                                            img(source)
+                                                                .size_full()
+                                                                .object_fit(ObjectFit::Cover),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.open_image_preview(
+                                                                    full.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                })
+                                            },
+                                        ),
+                                    ))
+                                })
+                                .when_some(self.message_retry_editor(index, cx), |col, editor| {
+                                    col.child(div().w_full().max_w(px(620.)).child(editor))
+                                })
+                                .when(!self.is_editing_message(index) && has_text, |col| {
+                                    col.child(
                                         div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_3()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(author)
-                                            .child(
+                                            .max_w(px(620.))
+                                            .rounded(px(18.))
+                                            .border_1()
+                                            .border_color(rgb(p.border))
+                                            .bg(rgb(bubble_bg))
+                                            .px_4()
+                                            .py(px(10.))
+                                            .text_size(px(14.))
+                                            .line_height(px(22.))
+                                            .text_color(rgb(p.text))
+                                            .child(if !message.blocks.is_empty() {
+                                                self.response_view(
+                                                    &format!("{}:{index}", self.history.active),
+                                                    &message.blocks,
+                                                    message.stats.as_ref(),
+                                                    &message.thinking_ms,
+                                                    true,
+                                                    cx,
+                                                )
+                                                .into_any_element()
+                                            } else if has_rich_markdown {
+                                                self.markdown_text(
+                                                    format!("{}:{index}:legacy", self.history.active),
+                                                    &user_display,
+                                                    cx,
+                                                )
+                                                .into_any_element()
+                                            } else {
                                                 div()
-                                                    .text_size(px(10.))
-                                                    .font_weight(FontWeight::NORMAL)
-                                                    .text_color(rgb(p.text_muted))
-                                                    .child(
-                                                        message.time.format("%H:%M").to_string(),
-                                                    ),
-                                            ),
+                                                    .child(user_display.into_owned())
+                                                    .into_any_element()
+                                            }),
                                     )
-                                    .children(self.message_retry_editor(index, cx))
-                                    .when(!self.is_editing_message(index), |body| body.child(if message.blocks.is_empty() {
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap_2()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(time_label)
+                                        .children(self.message_retry_action(index, cx)),
+                                )
+                                .when_some(compacted_label, |col, label| {
+                                    col.child(
                                         div()
+                                            .debug_selector(|| "context-compacted".into())
+                                            .text_size(px(12.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(label),
+                                    )
+                                }),
+                        );
+                    } else {
+                        messages = messages.child(
+                            div()
+                                .id(("message", index))
+                                .group(SharedString::from(format!("message-actions-{index}")))
+                                .flex_shrink_0()
+                                .w_full()
+                                .max_w(px(800.))
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_2()
+                                .children(self.message_retry_editor(index, cx))
+                                .when(!self.is_editing_message(index), |body| {
+                                    body.child(if message.blocks.is_empty() {
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
                                             .child(self.markdown_text(
                                                 format!("{}:{index}:legacy", self.history.active),
                                                 &message.display_markdown(self.history.active, index),
@@ -2652,6 +2737,8 @@ impl AgentWorkspace {
                                             })
                                     } else {
                                         div()
+                                            .w_full()
+                                            .min_w_0()
                                             .child(self.response_view(
                                                 &format!("{}:{index}", self.history.active),
                                                 &message.blocks,
@@ -2670,111 +2757,70 @@ impl AgentWorkspace {
                                                     cx,
                                                 ))
                                             })
-                                    }))
-                                    .when_some(message.memory_recall.as_ref(), |body, recall| {
-                                        body.child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .text_color(rgb(p.text_muted))
-                                                .child(format!(
-                                                    "自动回忆 {} 条：{}",
-                                                    recall.matches.len(),
-                                                    recall
-                                                        .matches
-                                                        .iter()
-                                                        .map(|memory| memory.title.as_str())
-                                                        .collect::<Vec<_>>()
-                                                        .join("、")
-                                                )),
-                                        )
                                     })
-                                    .when(user && !self.is_editing_message(index) && !message.images.is_empty(), |body| {
-                                        body.child(div().flex().flex_wrap().gap_2().children(
-                                            message.images.iter().enumerate().filter_map(
-                                                |(image_index, image)| {
-                                                    let key = format!(
-                                                        "{}:{index}:img{image_index}",
-                                                        self.history.active
-                                                    );
-                                                    self.user_image(key, image, cx).map(|source| {
-                                                        let full = source.clone();
-                                                        let selector = format!(
-                                                            "message-image:{index}:{image_index}"
-                                                        );
-                                                        div()
-                                                            .id(("message-image", index * 16 + image_index))
-                                                            .debug_selector(move || selector.clone())
-                                                            .w(px(160.))
-                                                            .h(px(120.))
-                                                            .flex_shrink_0()
-                                                            .overflow_hidden()
-                                                            .rounded(px(8.))
-                                                            .border_1()
-                                                            .border_color(rgb(p.border))
-                                                            .cursor_pointer()
-                                                            .hover(|style| {
-                                                                style.border_color(rgb(p.accent))
-                                                            })
-                                                            .child(
-                                                                img(source)
-                                                                    .size_full()
-                                                                    .object_fit(ObjectFit::Cover),
-                                                            )
-                                                            .on_click(cx.listener(
-                                                                move |this, _, window, cx| {
-                                                                    this.open_image_preview(
-                                                                        full.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                    })
-                                                },
-                                            ),
-                                        ))
-                                    })
-                                    .children(self.message_retry_action(index, cx))
-                                    .when(!user && !message.tools.is_empty(), |body| {
-                                        body.child(self.edits_summary(
-                                            &format!("{}:{index}:edits", self.history.active),
-                                            &message.tools,
+                                })
+                                .when_some(message.memory_recall.as_ref(), |body, recall| {
+                                    body.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(format!(
+                                                "自动回忆 {} 条：{}",
+                                                recall.matches.len(),
+                                                recall
+                                                    .matches
+                                                    .iter()
+                                                    .map(|memory| memory.title.as_str())
+                                                    .collect::<Vec<_>>()
+                                                    .join("、")
+                                            )),
+                                    )
+                                })
+                                .when(!message.tools.is_empty(), |body| {
+                                    body.child(self.edits_summary(
+                                        &format!("{}:{index}:edits", self.history.active),
+                                        &message.tools,
+                                        cx,
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(time_label)
+                                        .when_some(message.stats.as_ref(), |row, stats| {
+                                            row.child(stats.caption())
+                                        })
+                                        .children(self.message_retry_action(index, cx)),
+                                )
+                                .when(
+                                    self.history.quick_replies_enabled
+                                        && message.role == Role::Agent
+                                        && index + 1 == session.messages.len()
+                                        && !self.session_busy(self.history.active)
+                                        && !message.quick_replies.is_empty(),
+                                    |body| {
+                                        body.child(self.quick_reply_bubbles(
+                                            index,
+                                            &message.quick_replies,
                                             cx,
                                         ))
-                                    })
-                                    .when_some(message.stats.as_ref(), |body, stats| {
-                                        body.child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .text_color(rgb(p.text_muted))
-                                                .child(stats.caption()),
-                                        )
-                                    })
-                                    .when(
-                                        self.history.quick_replies_enabled
-                                            && message.role == Role::Agent
-                                            && index + 1 == session.messages.len()
-                                            && !self.session_busy(self.history.active)
-                                            && !message.quick_replies.is_empty(),
-                                        |body| {
-                                            body.child(self.quick_reply_bubbles(
-                                                index,
-                                                &message.quick_replies,
-                                                cx,
-                                            ))
-                                        },
+                                    },
+                                )
+                                .when_some(compacted_label, |body, label| {
+                                    body.child(
+                                        div()
+                                            .debug_selector(|| "context-compacted".into())
+                                            .text_size(px(12.))
+                                            .text_color(rgb(p.text_muted))
+                                            .child(label),
                                     )
-                                    .when_some(compacted_label, |body, label| {
-                                        body.child(
-                                            div()
-                                                .debug_selector(|| "context-compacted".into())
-                                                .text_size(px(12.))
-                                                .text_color(rgb(p.text_muted))
-                                                .child(label),
-                                        )
-                                    }),
-                            ),
-                    );
+                                }),
+                        );
+                    }
                 }
             }
             if running {

@@ -401,18 +401,9 @@ impl History {
             std::fs::create_dir_all(parent)?;
         }
         // Snapshots share image bytes; all file work runs on the save worker.
-        let directory = path.with_extension("images");
         let mut snapshot = self.clone();
         for session in &mut snapshot.sessions {
-            for image in session
-                .messages
-                .iter_mut()
-                .flat_map(|message| &mut message.images)
-            {
-                image.file = Some(write_image_file(&directory, image.data.as_bytes(), "b64")?);
-                image.data = Arc::from("");
-            }
-            session.draft_image_files = persist_draft_images(path, &session.draft_images)?;
+            prepare_session_for_save(session, path)?;
         }
         crate::database::save_history(path, &snapshot).map_err(io::Error::other)
     }
@@ -483,6 +474,22 @@ impl History {
         }
         true
     }
+}
+
+pub(super) fn prepare_session_for_save(session: &mut Session, path: &Path) -> io::Result<()> {
+    let directory = path.with_extension("images");
+    for image in session
+        .messages
+        .iter_mut()
+        .flat_map(|message| &mut message.images)
+    {
+        if image.file.is_none() || !image.data.is_empty() {
+            image.file = Some(write_image_file(&directory, image.data.as_bytes(), "b64")?);
+            image.data = Arc::from("");
+        }
+    }
+    session.draft_image_files = persist_draft_images(path, &session.draft_images)?;
+    Ok(())
 }
 
 pub(super) fn persist_draft_images(

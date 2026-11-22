@@ -7,8 +7,11 @@ pub(super) struct DraftAttachments {
     pub references: Vec<ComposerReference>,
 }
 
+#[derive(Default)]
 pub struct SaveRequest {
     pub history: Option<History>,
+    pub dirty_sessions: Vec<(usize, crate::model::Session)>,
+    pub session_order: Vec<Uuid>,
     pub drafts: Vec<(Uuid, String)>,
     draft_attachments: std::collections::HashMap<Uuid, DraftAttachments>,
     pub navigation: Option<(Uuid, Option<Uuid>)>,
@@ -32,9 +35,19 @@ async fn write_requests(
             }
             if let Some(history) = next.history.take() {
                 request.history = Some(history);
+                request.dirty_sessions.clear();
+                request.session_order.clear();
                 request.drafts.clear();
                 request.draft_attachments.clear();
                 request.navigation = None;
+            } else if !next.dirty_sessions.is_empty() {
+                request.session_order = next.session_order;
+                for (ordinal, session) in next.dirty_sessions {
+                    request
+                        .dirty_sessions
+                        .retain(|(_, existing)| existing.id != session.id);
+                    request.dirty_sessions.push((ordinal, session));
+                }
             }
             request.drafts.extend(next.drafts);
             request.draft_attachments.extend(next.draft_attachments);
@@ -60,6 +73,26 @@ async fn write_requests(
                 history.preferred_partner = partner;
             }
             history.save(&path).map_err(|error| error.to_string())
+        } else if !request.dirty_sessions.is_empty() {
+            let mut prep_err = None;
+            for (_, session) in &mut request.dirty_sessions {
+                if let Err(err) = crate::model::prepare_session_for_save(session, &path) {
+                    prep_err = Some(err.to_string());
+                    break;
+                }
+            }
+            if let Some(err) = prep_err {
+                Err(err)
+            } else {
+                database::save_dirty_sessions(
+                    &path,
+                    &request.session_order,
+                    &request.dirty_sessions,
+                    &request.drafts,
+                    request.draft_attachments,
+                    request.navigation,
+                )
+            }
         } else {
             database::save_ui_state(
                 &path,
@@ -138,6 +171,11 @@ impl AgentWorkspace {
         self.save_draft(cx);
     }
 
+    pub fn save_session(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.dirty_sessions.insert(id);
+        self.save_draft(cx);
+    }
+
     pub fn save_draft(&mut self, cx: &mut Context<Self>) {
         if !self.storage_readable {
             return;
@@ -170,11 +208,29 @@ impl AgentWorkspace {
 
     fn enqueue_save(&mut self, complete: Option<tokio::sync::oneshot::Sender<()>>) {
         if let Some(sender) = &self.save_sender {
-            if self.save_full_pending {
+            let (history, dirty_sessions, session_order) = if self.save_full_pending {
+                self.dirty_sessions.clear();
                 self.draft_attachments_pending.clear();
-            }
+                (Some(self.history.clone()), Vec::new(), Vec::new())
+            } else if !self.dirty_sessions.is_empty() {
+                let dirty: Vec<_> = self
+                    .history
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| self.dirty_sessions.contains(&s.id))
+                    .map(|(ordinal, s)| (ordinal, s.clone()))
+                    .collect();
+                let order: Vec<_> = self.history.sessions.iter().map(|s| s.id).collect();
+                self.dirty_sessions.clear();
+                (None, dirty, order)
+            } else {
+                (None, Vec::new(), Vec::new())
+            };
             let _ = sender.try_send(SaveRequest {
-                history: self.save_full_pending.then(|| self.history.clone()),
+                history,
+                dirty_sessions,
+                session_order,
                 drafts: self.save_drafts_pending.drain().collect(),
                 draft_attachments: std::mem::take(&mut self.draft_attachments_pending),
                 navigation: Some((self.history.active, self.history.preferred_partner)),
@@ -283,25 +339,20 @@ mod tests {
                 sender
                     .try_send(SaveRequest {
                         history: Some(history.clone()),
-                        drafts: vec![],
-                        navigation: None,
-                        draft_attachments: Default::default(),
                         revision: 1,
-                        complete: None,
+                        ..Default::default()
                     })
                     .unwrap();
             }
             sender
                 .try_send(SaveRequest {
-                    history: None,
                     drafts: vec![
                         (first, "first draft".into()),
                         (second, "second draft".into()),
                     ],
                     navigation: Some((second, None)),
-                    draft_attachments: Default::default(),
                     revision: 2,
-                    complete: None,
+                    ..Default::default()
                 })
                 .unwrap();
             drop(sender);
@@ -332,18 +383,13 @@ mod tests {
         let (results, completed) = async_channel::unbounded();
         sender
             .try_send(SaveRequest {
-                navigation: None,
                 history: Some(history),
-                drafts: vec![],
-                draft_attachments: Default::default(),
                 revision: 1,
-                complete: None,
+                ..Default::default()
             })
             .unwrap();
         sender
             .try_send(SaveRequest {
-                navigation: None,
-                history: None,
                 drafts: vec![(id, "new draft".into())],
                 draft_attachments: [(
                     id,
@@ -354,7 +400,7 @@ mod tests {
                 )]
                 .into(),
                 revision: 2,
-                complete: None,
+                ..Default::default()
             })
             .unwrap();
         drop(sender);
@@ -374,8 +420,6 @@ mod tests {
         let (results, completed) = async_channel::unbounded();
         sender
             .try_send(SaveRequest {
-                navigation: None,
-                history: None,
                 drafts: vec![(id, "latest".into())],
                 draft_attachments: [(
                     id,
@@ -386,7 +430,7 @@ mod tests {
                 )]
                 .into(),
                 revision: 3,
-                complete: None,
+                ..Default::default()
             })
             .unwrap();
         drop(sender);
@@ -413,24 +457,20 @@ mod tests {
         let (done_one, flushed_one) = tokio::sync::oneshot::channel();
         sender
             .try_send(SaveRequest {
-                navigation: None,
                 history: Some(history.clone()),
-                drafts: Vec::new(),
-                draft_attachments: Default::default(),
                 revision: 1,
                 complete: Some(done_one),
+                ..Default::default()
             })
             .unwrap();
         history.active_mut().draft = "latest".into();
         let (done_two, flushed_two) = tokio::sync::oneshot::channel();
         sender
             .try_send(SaveRequest {
-                navigation: None,
                 history: Some(history),
-                drafts: Vec::new(),
-                draft_attachments: Default::default(),
                 revision: 2,
                 complete: Some(done_two),
+                ..Default::default()
             })
             .unwrap();
         drop(sender);
@@ -442,5 +482,57 @@ mod tests {
         result.unwrap();
         assert!(completed.try_recv().is_err());
         assert_eq!(History::load(&path).unwrap().active().draft, "latest");
+    }
+
+    #[gpui::test]
+    fn incremental_session_save_only_clones_dirty_session_and_persists_to_sqlite(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let mut initial = History::default();
+        initial
+            .active_mut()
+            .push(Role::User, "existing large history".repeat(500));
+        let first_id = initial.active;
+        initial.save(&path).unwrap();
+
+        let workspace = cx.new(|cx| AgentWorkspace::with_path(path.clone(), cx));
+        let (sender, receiver) = async_channel::unbounded();
+        let (new_id, composer) = workspace.update(cx, |workspace, cx| {
+            assert!(!workspace.save_full_pending);
+            workspace.save_sender = Some(sender);
+            workspace.history.new_default_session();
+            let new_id = workspace.history.active;
+            workspace.save_session(new_id, cx);
+            (new_id, workspace.composer.clone())
+        });
+        composer.update(cx, |composer, cx| {
+            composer.set_draft("hello", Vec::new(), cx);
+            cx.emit(ComposerEvent::Changed("hello".into()));
+        });
+        workspace.update(cx, |workspace, _| workspace.enqueue_save(None));
+        let request = receiver.try_recv().unwrap();
+        assert!(
+            request.history.is_none(),
+            "save_session must not clone full history on the main thread"
+        );
+        assert_eq!(request.dirty_sessions.len(), 1);
+        assert_eq!(request.dirty_sessions[0].1.id, new_id);
+
+        let (results, completed) = async_channel::unbounded();
+        let (tx, rx) = async_channel::unbounded();
+        tx.try_send(request).unwrap();
+        drop(tx);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(write_requests(rx, path.clone(), results));
+        completed.try_recv().unwrap().1.unwrap();
+
+        let loaded = History::load(&path).unwrap();
+        assert_eq!(loaded.active, new_id);
+        assert_eq!(loaded.sessions.len(), 2);
+        let first = loaded.sessions.iter().find(|s| s.id == first_id).unwrap();
+        assert_eq!(first.messages[0].text, "existing large history".repeat(500));
     }
 }

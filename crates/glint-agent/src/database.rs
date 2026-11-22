@@ -218,28 +218,58 @@ pub fn load_history(anchor: &Path) -> Result<Option<Value>, String> {
     Ok(Some(history))
 }
 /// Update navigation and drafts without touching historical message payloads.
-pub fn save_ui_state(
-    anchor: &Path,
+fn save_session_row(
+    transaction: &rusqlite::Transaction<'_>,
+    ordinal: usize,
+    session: &crate::model::Session,
+    partner_ids: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let session = if session
+        .partner_id
+        .is_some_and(|id| !partner_ids.contains(&id.to_string()))
+    {
+        let mut copy = session.clone();
+        copy.partner_id = None;
+        copy.partner_goal = None;
+        std::borrow::Cow::Owned(copy)
+    } else {
+        std::borrow::Cow::Borrowed(session)
+    };
+    let session = &*session;
+    let id = session.id.to_string();
+    let mut payload = serde_json::to_value(session).map_err(|e| e.to_string())?;
+    let map = payload.as_object_mut().unwrap();
+    for key in ["id", "project", "title", "updated", "draft", "messages"] {
+        map.remove(key);
+    }
+    transaction.execute("INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,project=excluded.project,title=excluded.title,updated=excluded.updated,draft=excluded.draft,payload=excluded.payload WHERE ordinal!=excluded.ordinal OR project IS NOT excluded.project OR title!=excluded.title OR updated!=excluded.updated OR draft!=excluded.draft OR payload!=excluded.payload",params![id,ordinal as i64,session.project.as_ref().map(|path|path.to_string_lossy().into_owned()),session.title,session.updated.to_rfc3339(),session.draft,payload.to_string()]).map_err(|e|e.to_string())?;
+    for (index, message) in session.messages.iter().enumerate() {
+        let mut payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
+        let role = payload["role"].as_str().unwrap_or("Notice").to_owned();
+        let map = payload.as_object_mut().unwrap();
+        for key in ["role", "text", "time"] {
+            map.remove(key);
+        }
+        transaction.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,ordinal) DO UPDATE SET role=excluded.role,text=excluded.text,time=excluded.time,payload=excluded.payload WHERE role!=excluded.role OR text!=excluded.text OR time!=excluded.time OR payload!=excluded.payload",params![id,index as i64,role,message.text,message.time.to_rfc3339(),payload.to_string()]).map_err(|e|e.to_string())?;
+    }
+    crate::partners::capture(transaction, session)?;
+    transaction
+        .execute(
+            "DELETE FROM messages WHERE session_id=?1 AND ordinal>=?2",
+            params![id, session.messages.len() as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn apply_ui_state(
+    transaction: &rusqlite::Transaction<'_>,
     drafts: &[(uuid::Uuid, String)],
-    draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
+    draft_attachments: Vec<(uuid::Uuid, String, String)>,
     navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
 ) -> Result<(), String> {
-    let draft_attachments = draft_attachments
-        .into_iter()
-        .map(|(id, attachments)| {
-            let files = crate::model::persist_draft_images(anchor, &attachments.images)
-                .map_err(|e| e.to_string())?;
-            Ok((
-                id,
-                serde_json::to_string(&attachments.references).map_err(|e| e.to_string())?,
-                serde_json::to_string(&files).map_err(|e| e.to_string())?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut connection = open(anchor)?;
-    let transaction = connection.transaction().map_err(|e| e.to_string())?;
     if let Some((active, partner)) = navigation {
-        let mut state = meta(&transaction, "history")?.ok_or("会话尚未保存，需要重试完整保存")?;
+        let mut state = meta(transaction, "history")?.ok_or("会话尚未保存，需要重试完整保存")?;
         state["active"] = json!(active);
         let partner = match partner {
             Some(id)
@@ -256,7 +286,7 @@ pub fn save_ui_state(
             _ => None,
         };
         state["preferred_partner"] = json!(partner);
-        set_meta(&transaction, "history", &state)?;
+        set_meta(transaction, "history", &state)?;
     }
     for (id, draft) in drafts {
         let updated = transaction
@@ -280,6 +310,76 @@ pub fn save_ui_state(
             return Err("草稿所属会话尚未保存，需要重试完整保存".into());
         }
     }
+    Ok(())
+}
+
+pub fn save_ui_state(
+    anchor: &Path,
+    drafts: &[(uuid::Uuid, String)],
+    draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
+    navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+) -> Result<(), String> {
+    let draft_attachments = draft_attachments
+        .into_iter()
+        .map(|(id, attachments)| {
+            let files = crate::model::persist_draft_images(anchor, &attachments.images)
+                .map_err(|e| e.to_string())?;
+            Ok((
+                id,
+                serde_json::to_string(&attachments.references).map_err(|e| e.to_string())?,
+                serde_json::to_string(&files).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut connection = open(anchor)?;
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    apply_ui_state(&transaction, drafts, draft_attachments, navigation)?;
+    transaction.commit().map_err(|e| e.to_string())
+}
+
+pub fn save_dirty_sessions(
+    anchor: &Path,
+    session_order: &[uuid::Uuid],
+    dirty_sessions: &[(usize, crate::model::Session)],
+    drafts: &[(uuid::Uuid, String)],
+    draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
+    navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+) -> Result<(), String> {
+    let draft_attachments = draft_attachments
+        .into_iter()
+        .map(|(id, attachments)| {
+            let files = crate::model::persist_draft_images(anchor, &attachments.images)
+                .map_err(|e| e.to_string())?;
+            Ok((
+                id,
+                serde_json::to_string(&attachments.references).map_err(|e| e.to_string())?,
+                serde_json::to_string(&files).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut connection = open(anchor)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    if meta(&transaction, "history")?.is_none() {
+        return Err("会话尚未保存，需要重试完整保存".into());
+    }
+    let partner_ids: std::collections::HashSet<String> =
+        strings(&transaction, "SELECT id FROM partners")?
+            .into_iter()
+            .collect();
+    for (ordinal, id) in session_order.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE sessions SET ordinal=?2 WHERE id=?1 AND ordinal!=?2",
+                params![id.to_string(), ordinal as i64],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for (ordinal, session) in dirty_sessions {
+        save_session_row(&transaction, *ordinal, session, &partner_ids)?;
+    }
+    apply_ui_state(&transaction, drafts, draft_attachments, navigation)?;
     transaction.commit().map_err(|e| e.to_string())
 }
 
@@ -307,45 +407,11 @@ pub fn save_history(anchor: &Path, history: &crate::model::History) -> Result<()
             .into_iter()
             .collect();
     for (ordinal, session) in history.sessions.iter().enumerate() {
-        // An older queued save must not restore a deleted companion binding.
-        let session = if session
-            .partner_id
-            .is_some_and(|id| !partner_ids.contains(&id.to_string()))
-        {
-            let mut copy = session.clone();
-            copy.partner_id = None;
-            copy.partner_goal = None;
-            std::borrow::Cow::Owned(copy)
-        } else {
-            std::borrow::Cow::Borrowed(session)
-        };
-        let session = &*session;
         let id = session.id.to_string();
         transaction
             .execute("INSERT INTO keep_sessions VALUES(?1)", [&id])
             .map_err(|e| e.to_string())?;
-        let mut payload = serde_json::to_value(session).map_err(|e| e.to_string())?;
-        let map = payload.as_object_mut().unwrap();
-        for key in ["id", "project", "title", "updated", "draft", "messages"] {
-            map.remove(key);
-        }
-        transaction.execute("INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,project=excluded.project,title=excluded.title,updated=excluded.updated,draft=excluded.draft,payload=excluded.payload WHERE ordinal!=excluded.ordinal OR project IS NOT excluded.project OR title!=excluded.title OR updated!=excluded.updated OR draft!=excluded.draft OR payload!=excluded.payload",params![id,ordinal as i64,session.project.as_ref().map(|path|path.to_string_lossy().into_owned()),session.title,session.updated.to_rfc3339(),session.draft,payload.to_string()]).map_err(|e|e.to_string())?;
-        for (index, message) in session.messages.iter().enumerate() {
-            let mut payload = serde_json::to_value(message).map_err(|e| e.to_string())?;
-            let role = payload["role"].as_str().unwrap_or("Notice").to_owned();
-            let map = payload.as_object_mut().unwrap();
-            for key in ["role", "text", "time"] {
-                map.remove(key);
-            }
-            transaction.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,ordinal) DO UPDATE SET role=excluded.role,text=excluded.text,time=excluded.time,payload=excluded.payload WHERE role!=excluded.role OR text!=excluded.text OR time!=excluded.time OR payload!=excluded.payload",params![id,index as i64,role,message.text,message.time.to_rfc3339(),payload.to_string()]).map_err(|e|e.to_string())?;
-        }
-        crate::partners::capture(&transaction, session)?;
-        transaction
-            .execute(
-                "DELETE FROM messages WHERE session_id=?1 AND ordinal>=?2",
-                params![id, session.messages.len() as i64],
-            )
-            .map_err(|e| e.to_string())?;
+        save_session_row(&transaction, ordinal, session, &partner_ids)?;
     }
     transaction
         .execute(
