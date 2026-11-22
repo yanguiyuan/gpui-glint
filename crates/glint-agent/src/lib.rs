@@ -503,7 +503,7 @@ impl AgentWorkspace {
                         this.history.new_session_for(Some(path));
                         this.restore_draft(cx);
                         this.page = crate::Page::Chat;
-                        this.save(cx);
+                        this.save_draft(cx);
                         cx.notify();
                     }
                 }
@@ -680,7 +680,7 @@ impl AgentWorkspace {
                                 }
                             }
                         }
-                        this.save(cx);
+                        this.save_draft(cx);
                         cx.notify();
                     }
                     ComposerEvent::ChipSelected { chip, value } if chip.as_ref() == "model" => {

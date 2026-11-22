@@ -267,25 +267,31 @@ fn apply_ui_state(
     drafts: &[(uuid::Uuid, String)],
     draft_attachments: Vec<(uuid::Uuid, String, String)>,
     navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+    access_mode: Option<crate::tools::AccessMode>,
 ) -> Result<(), String> {
-    if let Some((active, partner)) = navigation {
+    if navigation.is_some() || access_mode.is_some() {
         let mut state = meta(transaction, "history")?.ok_or("会话尚未保存，需要重试完整保存")?;
-        state["active"] = json!(active);
-        let partner = match partner {
-            Some(id)
-                if transaction
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM partners WHERE id=?1)",
-                        [id.to_string()],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .map_err(|e| e.to_string())? =>
-            {
+        if let Some((active, partner)) = navigation {
+            state["active"] = json!(active);
+            let partner = match partner {
                 Some(id)
-            }
-            _ => None,
-        };
-        state["preferred_partner"] = json!(partner);
+                    if transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM partners WHERE id=?1)",
+                            [id.to_string()],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(|e| e.to_string())? =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            };
+            state["preferred_partner"] = json!(partner);
+        }
+        if let Some(mode) = access_mode {
+            state["access_mode"] = json!(mode);
+        }
         set_meta(transaction, "history", &state)?;
     }
     for (id, draft) in drafts {
@@ -318,6 +324,7 @@ pub fn save_ui_state(
     drafts: &[(uuid::Uuid, String)],
     draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
     navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+    access_mode: Option<crate::tools::AccessMode>,
 ) -> Result<(), String> {
     let draft_attachments = draft_attachments
         .into_iter()
@@ -333,7 +340,7 @@ pub fn save_ui_state(
         .collect::<Result<Vec<_>, String>>()?;
     let mut connection = open(anchor)?;
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
-    apply_ui_state(&transaction, drafts, draft_attachments, navigation)?;
+    apply_ui_state(&transaction, drafts, draft_attachments, navigation, access_mode)?;
     transaction.commit().map_err(|e| e.to_string())
 }
 
@@ -344,6 +351,7 @@ pub fn save_dirty_sessions(
     drafts: &[(uuid::Uuid, String)],
     draft_attachments: std::collections::HashMap<uuid::Uuid, crate::storage::DraftAttachments>,
     navigation: Option<(uuid::Uuid, Option<uuid::Uuid>)>,
+    access_mode: Option<crate::tools::AccessMode>,
 ) -> Result<(), String> {
     let draft_attachments = draft_attachments
         .into_iter()
@@ -379,7 +387,7 @@ pub fn save_dirty_sessions(
     for (ordinal, session) in dirty_sessions {
         save_session_row(&transaction, *ordinal, session, &partner_ids)?;
     }
-    apply_ui_state(&transaction, drafts, draft_attachments, navigation)?;
+    apply_ui_state(&transaction, drafts, draft_attachments, navigation, access_mode)?;
     transaction.commit().map_err(|e| e.to_string())
 }
 

@@ -15,6 +15,7 @@ pub struct SaveRequest {
     pub drafts: Vec<(Uuid, String)>,
     draft_attachments: std::collections::HashMap<Uuid, DraftAttachments>,
     pub navigation: Option<(Uuid, Option<Uuid>)>,
+    pub access_mode: Option<crate::tools::AccessMode>,
     pub revision: u64,
     pub complete: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -40,6 +41,7 @@ async fn write_requests(
                 request.drafts.clear();
                 request.draft_attachments.clear();
                 request.navigation = None;
+                request.access_mode = None;
             } else if !next.dirty_sessions.is_empty() {
                 request.session_order = next.session_order;
                 for (ordinal, session) in next.dirty_sessions {
@@ -53,6 +55,9 @@ async fn write_requests(
             request.draft_attachments.extend(next.draft_attachments);
             if next.navigation.is_some() {
                 request.navigation = next.navigation;
+            }
+            if next.access_mode.is_some() {
+                request.access_mode = next.access_mode;
             }
             request.revision = next.revision;
         }
@@ -71,6 +76,9 @@ async fn write_requests(
             if let Some((active, partner)) = request.navigation {
                 history.active = active;
                 history.preferred_partner = partner;
+            }
+            if let Some(access_mode) = request.access_mode {
+                history.access_mode = access_mode;
             }
             history.save(&path).map_err(|error| error.to_string())
         } else if !request.dirty_sessions.is_empty() {
@@ -91,6 +99,7 @@ async fn write_requests(
                     &request.drafts,
                     request.draft_attachments,
                     request.navigation,
+                    request.access_mode,
                 )
             }
         } else {
@@ -99,6 +108,7 @@ async fn write_requests(
                 &request.drafts,
                 request.draft_attachments,
                 request.navigation,
+                request.access_mode,
             )
         };
         let _ = results.try_send((request.revision, result));
@@ -234,6 +244,7 @@ impl AgentWorkspace {
                 drafts: self.save_drafts_pending.drain().collect(),
                 draft_attachments: std::mem::take(&mut self.draft_attachments_pending),
                 navigation: Some((self.history.active, self.history.preferred_partner)),
+                access_mode: Some(self.history.access_mode),
                 revision: self.save_revision,
                 complete,
             });

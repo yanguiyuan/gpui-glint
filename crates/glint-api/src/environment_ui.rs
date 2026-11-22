@@ -1081,22 +1081,14 @@ impl Workbench {
             return div()
                 .size_full()
                 .flex()
-                .flex_col()
-                .gap_4()
-                .child(self.variable_scope_tabs(cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(p.text_muted))
-                        .child(if self.workspace.environment_names.len() <= 1 {
-                            "选择任意集合来管理其变量，或创建请求环境。"
-                        } else {
-                            "请选择环境来管理全局变量；集合变量可单独设置。"
-                        }),
-                );
+                .items_center()
+                .justify_center()
+                .text_color(rgb(p.text_muted))
+                .child(if self.workspace.environment_names.len() <= 1 {
+                    "选择任意集合来管理其变量，或创建请求环境。"
+                } else {
+                    "请选择环境来管理全局变量；集合变量可单独设置。"
+                });
         }
         let index = self.editing_environment;
         let applied = self.selected_environment(cx) == index;
