@@ -127,6 +127,7 @@ struct Run {
     scope: Scope,
     program: String,
     call_id: Option<String>,
+    background: bool,
     state: Mutex<State>,
     cancel: watch::Sender<bool>,
     done: Notify,
@@ -163,6 +164,7 @@ fn command_tasks(anchor: &Path, include_finished: bool) -> Vec<ActiveCommand> {
         .iter()
         .filter(|(_, run)| {
             run.scope.anchor == anchor
+                && run.background
                 && (include_finished || !run.finished.load(Ordering::Acquire))
         })
         .map(|(id, run)| ActiveCommand {
@@ -189,7 +191,7 @@ pub(super) fn background_command_outcome(
         .lock()
         .unwrap()
         .get(&id)
-        .filter(|r| r.scope.anchor == anchor)
+        .filter(|r| r.scope.anchor == anchor && r.background)
         .cloned();
     let Some(run) = run else {
         return State::Finished;
@@ -699,6 +701,7 @@ async fn start(
     program: String,
     args: Vec<String>,
     seconds: u64,
+    background: bool,
     events: Option<(String, async_channel::Sender<ToolEvent>)>,
 ) -> Result<Arc<Run>, String> {
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -754,6 +757,7 @@ async fn start(
         scope,
         program: program.clone(),
         call_id: events.as_ref().map(|(call_id, _)| call_id.clone()),
+        background,
         state: Mutex::new(State {
             result: ResultData {
                 run_id: id,
@@ -849,7 +853,7 @@ async fn foreground_scope(
     background: bool,
     events: Option<(String, async_channel::Sender<ToolEvent>)>,
 ) -> Result<ResultData, String> {
-    let run = start(scope, cwd, program, args, seconds, events).await?;
+    let run = start(scope, cwd, program, args, seconds, background, events).await?;
     let mut waiter = Waiter {
         cancel: run.cancel.clone(),
         armed: !background,
@@ -1107,7 +1111,22 @@ mod windows_tests {
             session: Some(uuid::Uuid::new_v4()),
         };
         let (events, _) = async_channel::unbounded();
-        let first = start(scope.clone(), temp.path().into(), "powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "[Console]::WriteLine('before stop'); [IO.File]::WriteAllText('ready.txt','ready'); Start-Sleep -Seconds 30".into()], 60, Some(("first-call".into(), events.clone()))).await.unwrap();
+        let first = start(
+            scope.clone(),
+            temp.path().into(),
+            "powershell.exe".into(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::WriteLine('before stop'); [IO.File]::WriteAllText('ready.txt','ready'); Start-Sleep -Seconds 30".into(),
+            ],
+            60,
+            true,
+            Some(("first-call".into(), events.clone())),
+        )
+        .await
+        .unwrap();
         let other = start(
             scope.clone(),
             temp.path().into(),
@@ -1119,6 +1138,7 @@ mod windows_tests {
                 "Start-Sleep -Seconds 30".into(),
             ],
             60,
+            true,
             Some(("other-call".into(), events)),
         )
         .await
@@ -1372,6 +1392,28 @@ mod tests {
         let saved: Value = serde_json::from_str(&poll(&c, &args, false).await.unwrap()).unwrap();
         assert_eq!(saved["status"], "cancelled");
         assert!(poll(&foreign, &args, false).await.is_err());
+    }
+    #[tokio::test]
+    async fn foreground_command_not_in_background_tasks_but_background_command_is() {
+        let temp = tempfile::tempdir().unwrap();
+        let c = context(temp.path());
+
+        let _ = shell(&c, "echo foreground", false, 5).await;
+        assert!(background_commands(&c.memory.anchor).is_empty());
+
+        let v = shell(&c, "echo started; sleep 30", true, 60).await;
+        let tasks = background_commands(&c.memory.anchor);
+        assert_eq!(tasks.len(), 1);
+        let id = uuid::Uuid::parse_str(v["run_id"].as_str().unwrap()).unwrap();
+        assert_eq!(tasks[0].id, id);
+        assert_eq!(tasks[0].state, gpui_glint::components::BackgroundTaskState::Running);
+
+        let args = json!({"run_id": v["run_id"]});
+        let _ = poll(&c, &args, true).await;
+        assert_eq!(
+            background_command_outcome(&c.memory.anchor, id),
+            gpui_glint::components::BackgroundTaskState::Cancelled
+        );
     }
     #[tokio::test]
     async fn timeout_cleans_process_group_and_shutdown_waits_for_background_cleanup() {
