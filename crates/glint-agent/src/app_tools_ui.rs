@@ -774,46 +774,7 @@ fn coalesce_tool_snapshots(events: Vec<tools::ToolEvent>) -> Vec<tools::ToolEven
 }
 
 fn file_icon_color(path: &str) -> Option<u32> {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "rs" => Some(0xde5b27),
-        "ts" | "tsx" | "mts" | "cts" => Some(0x3178c6),
-        "js" | "jsx" | "mjs" | "cjs" => Some(0xf7df1e),
-        "py" | "pyw" => Some(0x3776ab),
-        "go" => Some(0x00add8),
-        "html" | "htm" => Some(0xe34f26),
-        "css" | "scss" | "sass" | "less" => Some(0x1572b6),
-        "json" => Some(0xcb171e),
-        "md" | "markdown" => Some(0x083fa1),
-        "yaml" | "yml" => Some(0xcb171e),
-        "sh" | "bash" | "zsh" => Some(0x4eaa25),
-        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(0x00599c),
-        "rb" => Some(0xcc342d),
-        "java" => Some(0xb07219),
-        "kt" | "kts" => Some(0x7f52ff),
-        "swift" => Some(0xf05138),
-        "zig" => Some(0xec915c),
-        "toml" => Some(0x9c4221),
-        "sql" => Some(0xe38c00),
-        _ => {
-            let file = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path)
-                .to_ascii_lowercase();
-            if file == "dockerfile" || file.ends_with(".dockerfile") {
-                Some(0x2496ed)
-            } else if file == ".gitignore" {
-                Some(0xf05032)
-            } else {
-                None
-            }
-        }
-    }
+    gpui_glint::components::Icon::color_for_file_name(path)
 }
 
 fn read_file_line_range(record: &tools::ToolRecord) -> Option<(usize, usize)> {

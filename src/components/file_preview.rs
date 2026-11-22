@@ -1,7 +1,7 @@
 //! Reusable read-only file/directory preview. The host supplies data and performs I/O.
 use super::{
-    CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, SegmentOption,
-    SegmentedControl, Skeleton, TextEntry,
+    CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, Popover,
+    SegmentOption, SegmentedControl, Skeleton, TextEntry,
 };
 use crate::paths::display_path;
 use crate::theme::ThemePreset;
@@ -9,6 +9,143 @@ use gpui::{
     AppContext, Context, Entity, EventEmitter, Render, SharedString, Window, div, prelude::*, px,
     rgb,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreadcrumbSegment {
+    pub name: String,
+    pub path: String,
+    pub dir_path: String,
+    pub is_file: bool,
+}
+
+pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbSegment> {
+    let trimmed = full_path.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let (prefix, path_part) = if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        if let Some(slash_idx) = rest.find('/') {
+            (format!("ssh://{}", &rest[..slash_idx]), &rest[slash_idx..])
+        } else {
+            (format!("ssh://{rest}"), "")
+        }
+    } else {
+        (String::new(), trimmed)
+    };
+
+    if path_part.is_empty() {
+        if !prefix.is_empty() {
+            return vec![BreadcrumbSegment {
+                name: prefix.clone(),
+                path: prefix.clone(),
+                dir_path: prefix,
+                is_file: false,
+            }];
+        }
+        return Vec::new();
+    }
+
+    let p = std::path::Path::new(path_part);
+    let mut prefix_str = prefix;
+    let mut has_root = false;
+    let mut normal_names = Vec::new();
+
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Prefix(pfx) => {
+                prefix_str = pfx.as_os_str().to_string_lossy().into_owned();
+            }
+            std::path::Component::RootDir => {
+                has_root = true;
+            }
+            std::path::Component::Normal(name) => {
+                normal_names.push(name.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+    }
+
+    if normal_names.is_empty() {
+        let display = if has_root {
+            if prefix_str.is_empty() {
+                "/".to_owned()
+            } else if prefix_str.ends_with('/') || prefix_str.ends_with('\\') {
+                prefix_str
+            } else {
+                format!("{prefix_str}/")
+            }
+        } else {
+            prefix_str
+        };
+        return vec![BreadcrumbSegment {
+            name: display.clone(),
+            path: display.clone(),
+            dir_path: display,
+            is_file: false,
+        }];
+    }
+
+    let skip_first = has_root
+        && normal_names.len() >= 2
+        && (normal_names[0].eq_ignore_ascii_case("users")
+            || normal_names[0].eq_ignore_ascii_case("home"));
+
+    let mut segments = Vec::new();
+    let mut current_path = if has_root {
+        if prefix_str.is_empty() {
+            "/".to_owned()
+        } else if prefix_str.ends_with('/') || prefix_str.ends_with('\\') {
+            prefix_str.clone()
+        } else {
+            format!("{prefix_str}/")
+        }
+    } else if !prefix_str.is_empty() {
+        format!("{prefix_str}/")
+    } else {
+        String::new()
+    };
+
+    let total = normal_names.len();
+    for (i, name) in normal_names.into_iter().enumerate() {
+        let is_last = i + 1 == total;
+        let is_file = is_last && is_leaf_file;
+
+        if current_path.is_empty()
+            || current_path == "/"
+            || current_path.ends_with('/')
+            || current_path.ends_with('\\')
+        {
+            current_path.push_str(&name);
+        } else {
+            current_path.push('/');
+            current_path.push_str(&name);
+        }
+
+        if i == 0 && skip_first {
+            continue;
+        }
+
+        let dir_path = if is_file {
+            std::path::Path::new(&current_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_owned())
+        } else {
+            current_path.clone()
+        };
+
+        segments.push(BreadcrumbSegment {
+            name,
+            path: current_path.clone(),
+            dir_path,
+            is_file,
+        });
+    }
+
+    segments
+}
 
 #[derive(Clone, Debug)]
 pub struct FilePreviewEntry {
@@ -60,6 +197,7 @@ pub struct FilePreview {
     navigation_scroll: gpui::UniformListScrollHandle,
     folders: std::collections::HashMap<String, FolderNode>,
     next_request: u64,
+    open_breadcrumb: Option<usize>,
     path: String,
     parent: Option<String>,
     page: Page,
@@ -108,6 +246,7 @@ impl FilePreview {
             navigation_scroll: Default::default(),
             folders: Default::default(),
             next_request: 0,
+            open_breadcrumb: None,
             path: String::new(),
             parent: None,
             page: Page::Loading,
@@ -169,10 +308,22 @@ impl FilePreview {
         }
     }
 
+    pub fn open_breadcrumb(&self) -> Option<usize> {
+        self.open_breadcrumb
+    }
+
+    pub fn set_open_breadcrumb(&mut self, idx: Option<usize>, cx: &mut Context<Self>) {
+        if self.open_breadcrumb != idx {
+            self.open_breadcrumb = idx;
+            cx.notify();
+        }
+    }
+
     /// Synchronize an explorer's selected row without replacing its directory data.
     pub fn set_selected_path(&mut self, path: String, cx: &mut Context<Self>) {
         if self.path != path {
             self.path = path;
+            self.open_breadcrumb = None;
             cx.notify();
         }
     }
@@ -215,6 +366,7 @@ impl FilePreview {
     }
     pub fn set_loading(&mut self, path: String, cx: &mut Context<Self>) {
         self.pending_line = None;
+        self.open_breadcrumb = None;
         if self
             .navigation
             .as_ref()
@@ -234,6 +386,7 @@ impl FilePreview {
     }
     pub fn set_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.clear_html();
+        self.open_breadcrumb = None;
         self.page = Page::Error(message);
         self.markdown = None;
         self.markdown_preview = false;
@@ -251,6 +404,7 @@ impl FilePreview {
             self.navigation = None;
         }
         self.path = path;
+        self.open_breadcrumb = None;
         self.parent = parent;
         self.markdown = None;
         self.markdown_preview = false;
@@ -267,6 +421,7 @@ impl FilePreview {
         text: String,
         cx: &mut Context<Self>,
     ) {
+        self.open_breadcrumb = None;
         let language = crate::syntax::global()
             .language_for_path(&path)
             .unwrap_or_else(|| match Icon::for_file_name(&path) {
@@ -597,14 +752,18 @@ impl FilePreview {
     fn toggle_folder(&mut self, path: String, cx: &mut Context<Self>) {
         let node = self.folders.entry(path.clone()).or_default();
         node.expanded = !node.expanded;
-        if node.expanded && node.entries.is_none() && node.loading.is_none() {
-            self.next_request += 1;
-            node.loading = Some(self.next_request);
-            node.error = None;
-            cx.emit(FilePreviewEvent::DirectoryRequested {
-                path,
-                request: self.next_request,
-            });
+        if node.expanded && node.entries.is_none() {
+            if let Some(entries) = Self::read_local_directory_entries(&path) {
+                node.entries = Some(entries);
+            } else if node.loading.is_none() {
+                self.next_request += 1;
+                node.loading = Some(self.next_request);
+                node.error = None;
+                cx.emit(FilePreviewEvent::DirectoryRequested {
+                    path,
+                    request: self.next_request,
+                });
+            }
         }
         cx.notify();
     }
@@ -829,6 +988,7 @@ impl FilePreview {
     ) {
         self.set_navigation(path.clone(), entries.clone(), false, cx);
         self.path = path;
+        self.open_breadcrumb = None;
         self.parent = parent;
         self.clear_html();
         self.page = Page::Directory(entries);
@@ -837,6 +997,392 @@ impl FilePreview {
         self.subscriptions.clear();
         self.scroll = Default::default();
         cx.notify();
+    }
+
+    fn read_local_directory_entries(dir_path: &str) -> Option<Vec<FilePreviewEntry>> {
+        let p = std::path::Path::new(dir_path);
+        if !p.is_dir() {
+            return None;
+        }
+        let read_dir = std::fs::read_dir(p).ok()?;
+        let mut entries = Vec::new();
+        for item in read_dir.flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name == ".DS_Store" || name == ".git" {
+                continue;
+            }
+            let item_path = item.path();
+            let is_dir = item_path.is_dir();
+            entries.push(FilePreviewEntry {
+                name,
+                path: item_path.to_string_lossy().into_owned(),
+                directory: is_dir,
+                previewable: true,
+            });
+        }
+        entries.sort_by(|a, b| match (a.directory, b.directory) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        Some(entries)
+    }
+
+    fn request_directory_if_needed(&mut self, dir_path: &str, cx: &mut Context<Self>) {
+        if self.navigation.as_ref().is_some_and(|(root, _)| root == dir_path) {
+            return;
+        }
+        let node = self.folders.entry(dir_path.to_owned()).or_default();
+        if node.entries.is_some() {
+            return;
+        }
+        if let Some(entries) = Self::read_local_directory_entries(dir_path) {
+            node.entries = Some(entries);
+            return;
+        }
+        if node.loading.is_none() {
+            self.next_request += 1;
+            node.loading = Some(self.next_request);
+            node.error = None;
+            cx.emit(FilePreviewEvent::DirectoryRequested {
+                path: dir_path.to_owned(),
+                request: self.next_request,
+            });
+        }
+    }
+
+    fn breadcrumb_dropdown(
+        &self,
+        idx: usize,
+        seg: &BreadcrumbSegment,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let p = self.theme.palette();
+        let folder_name = std::path::Path::new(&seg.dir_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                if seg.dir_path.is_empty() || seg.dir_path == "/" {
+                    "根目录".to_owned()
+                } else {
+                    seg.name.clone()
+                }
+            });
+
+        let dir_path_clone = seg.dir_path.clone();
+        let header = div()
+            .id("breadcrumb-dropdown-header")
+            .debug_selector(|| "breadcrumb-dropdown-header".into())
+            .flex()
+            .items_center()
+            .gap_2()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .bg(rgb(p.surface_subtle))
+            .cursor_pointer()
+            .hover(|el| el.bg(rgb(p.workspace)))
+            .child(Icon::Folder.render(13.).text_color(rgb(p.text_muted)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(12.))
+                    .text_color(rgb(p.text))
+                    .child(folder_name),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_breadcrumb = None;
+                cx.emit(FilePreviewEvent::OpenRequested(dir_path_clone.clone()));
+            }));
+
+        let cached_entries = if let Some((root, entries)) = &self.navigation {
+            if root == &seg.dir_path {
+                Some(entries.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let node = self.folders.get(&seg.dir_path);
+        let entries = cached_entries
+            .or_else(|| node.and_then(|n| n.entries.clone()))
+            .or_else(|| Self::read_local_directory_entries(&seg.dir_path));
+
+        let is_loading = node.is_some_and(|n| n.loading.is_some()) && entries.is_none();
+        let error_msg = node.and_then(|n| n.error.clone());
+
+        let body: gpui::AnyElement = if is_loading {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px(px(8.))
+                .py(px(6.))
+                .text_size(px(12.))
+                .text_color(rgb(p.text_muted))
+                .child(Icon::Spinner.render(12.).text_color(rgb(p.text_muted)))
+                .child("正在加载…")
+                .into_any_element()
+        } else if let Some(err) = error_msg {
+            div()
+                .px(px(8.))
+                .py(px(6.))
+                .text_size(px(12.))
+                .text_color(rgb(0xef4444))
+                .child(err)
+                .into_any_element()
+        } else if let Some(entries) = entries {
+            if entries.is_empty() {
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .text_size(px(12.))
+                    .text_color(rgb(p.text_muted))
+                    .child("空目录")
+                    .into_any_element()
+            } else {
+                let mut rows = Vec::new();
+                self.tree_rows(&entries, 0, &mut rows);
+
+                let current_path = self.path.clone();
+                let mut list = div()
+                    .id(SharedString::from(format!("breadcrumb-entries-list-{idx}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .max_h(px(260.))
+                    .overflow_y_scroll();
+
+                for (entry, depth) in rows {
+                    let entry_path = entry.path.clone();
+                    let is_active = !entry.path.is_empty() && entry.path == current_path;
+                    let is_placeholder = entry.path.is_empty();
+
+                    let is_folder_expanded = if entry.directory {
+                        self.folders.get(&entry.path).is_some_and(|n| n.expanded)
+                    } else {
+                        false
+                    };
+
+                    let icon = if entry.directory {
+                        if is_folder_expanded {
+                            Icon::FolderOpen.render(13.).text_color(rgb(p.text_muted)).into_any_element()
+                        } else {
+                            Icon::Folder.render(13.).text_color(rgb(p.text_muted)).into_any_element()
+                        }
+                    } else if is_placeholder {
+                        div().w(px(13.)).into_any_element()
+                    } else {
+                        let file_icon = Icon::for_file_name(&entry.name);
+                        let icon_color = Icon::color_for_file_name(&entry.name);
+                        let svg = file_icon.render(13.);
+                        if let Some(c) = icon_color {
+                            svg.text_color(rgb(c))
+                        } else {
+                            svg.text_color(rgb(p.text))
+                        }
+                        .into_any_element()
+                    };
+
+                    let entry_click_path = entry.path.clone();
+                    let is_dir = entry.directory;
+
+                    let mut entry_row = div()
+                        .id(SharedString::from(format!(
+                            "breadcrumb-entry-{}-{}",
+                            depth,
+                            if entry.path.is_empty() {
+                                &entry.name
+                            } else {
+                                &entry.path
+                            }
+                        )))
+                        .debug_selector(move || format!("breadcrumb-entry:{}", entry_path))
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(8. + depth as f32 * 16.))
+                        .pr(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .when(is_active || (is_dir && is_folder_expanded && depth == 0), |el| {
+                            el.bg(rgb(p.surface_subtle))
+                        })
+                        .hover(|el| el.bg(rgb(p.surface_subtle)))
+                        .when(!is_placeholder, |el| el.cursor_pointer());
+
+                    for d in 1..=depth {
+                        entry_row = entry_row.child(
+                            div()
+                                .absolute()
+                                .left(px(8. + (d - 1) as f32 * 16. + 6.))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.))
+                                .bg(rgb(p.border)),
+                        );
+                    }
+
+                    entry_row = entry_row
+                        .child(icon)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .text_size(px(12.))
+                                .text_color(if is_active {
+                                    rgb(p.accent)
+                                } else if is_placeholder {
+                                    rgb(p.text_muted)
+                                } else {
+                                    rgb(p.text)
+                                })
+                                .child(entry.name),
+                        );
+
+                    if is_dir {
+                        entry_row = entry_row.on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_folder(entry_click_path.clone(), cx);
+                        }));
+                    } else if !is_placeholder {
+                        entry_row = entry_row.on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_breadcrumb = None;
+                            cx.emit(FilePreviewEvent::OpenRequested(entry_click_path.clone()));
+                        }));
+                    }
+
+                    list = list.child(entry_row);
+                }
+                list.into_any_element()
+            }
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px(px(8.))
+                .py(px(6.))
+                .text_size(px(12.))
+                .text_color(rgb(p.text_muted))
+                .child(Icon::Spinner.render(12.).text_color(rgb(p.text_muted)))
+                .child("正在加载…")
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .child(header)
+            .child(div().h(px(1.)).bg(rgb(p.border)).my(px(2.)))
+            .child(body)
+    }
+
+    fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let is_leaf_file = match &self.page {
+            Page::Directory(_) => false,
+            Page::File(_) | Page::Image(_) => true,
+            _ => !std::path::Path::new(&self.path).is_dir(),
+        };
+
+        let segments = split_breadcrumbs(&self.path, is_leaf_file);
+        let p = self.theme.palette();
+
+        let mut row = div()
+            .id("breadcrumb-segments-bar")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .overflow_x_scroll();
+
+        for (idx, seg) in segments.iter().enumerate() {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(p.text_muted))
+                    .child(Icon::ChevronRight.render(10.)),
+            );
+
+            let is_open = self.open_breadcrumb == Some(idx);
+            let seg_clone = seg.clone();
+            let seg_dir_path = seg.dir_path.clone();
+
+            let trigger_btn = div()
+                .id(SharedString::from(format!("breadcrumb-seg-{idx}")))
+                .debug_selector(move || format!("breadcrumb-seg:{}", seg_clone.name))
+                .cursor_pointer()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(4.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .text_color(if is_open {
+                    rgb(p.accent)
+                } else {
+                    rgb(p.text)
+                })
+                .hover(|el| el.bg(rgb(p.surface_subtle)).text_color(rgb(p.text)))
+                .when(seg.is_file, |el| {
+                    let file_icon = Icon::for_file_name(&seg.name);
+                    let icon_color = Icon::color_for_file_name(&seg.name);
+                    let svg = file_icon.render(13.);
+                    let svg = if let Some(color) = icon_color {
+                        svg.text_color(rgb(color))
+                    } else {
+                        svg.text_color(rgb(p.text))
+                    };
+                    el.child(svg)
+                })
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .child(seg.name.clone()),
+                );
+
+            let weak = cx.entity().downgrade();
+            let popover = Popover::new(
+                SharedString::from(format!("breadcrumb-popover-{idx}")),
+                trigger_btn,
+                self.breadcrumb_dropdown(idx, seg, cx),
+            )
+            .open(is_open)
+            .align_left()
+            .width(240.)
+            .trigger_height(24.)
+            .gap(4.)
+            .padding(6.)
+            .theme(self.theme)
+            .on_open_change(move |open, _window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    if open {
+                        this.open_breadcrumb = Some(idx);
+                        this.request_directory_if_needed(&seg_dir_path, cx);
+                    } else if this.open_breadcrumb == Some(idx) {
+                        this.open_breadcrumb = None;
+                    }
+                    cx.notify();
+                });
+            });
+
+            row = row.child(popover);
+        }
+
+        row
     }
 }
 impl Render for FilePreview {
@@ -923,39 +1469,28 @@ impl Render for FilePreview {
                         .py_2()
                         .border_b_1()
                         .border_color(rgb(p.border))
-                        .when_some(
-                            self.parent.clone().filter(|_| !self.standalone),
-                            |row, path| {
-                                row.child(
-                                    IconButton::new(Icon::ArrowUp, "上级目录")
-                                        .plain()
-                                        .theme(self.theme)
-                                        .render()
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(FilePreviewEvent::OpenRequested(path.clone()))
-                                        })),
-                                )
-                            },
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_ellipsis()
-                                .text_size(px(12.))
-                                .child(
-                                    if self.standalone && matches!(self.page, Page::Directory(_)) {
-                                        "项目文件".to_owned()
-                                    } else if self.standalone {
-                                        std::path::Path::new(&self.path)
-                                            .file_name()
-                                            .map(|name| name.to_string_lossy().into_owned())
-                                            .unwrap_or_default()
-                                    } else {
-                                        display_path(&self.path)
-                                    },
-                                ),
-                        )
+                        .when(!self.standalone, |row| {
+                            row.child(self.render_breadcrumbs(cx))
+                        })
+                        .when(self.standalone, |row| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .text_size(px(12.))
+                                    .child(
+                                        if matches!(self.page, Page::Directory(_)) {
+                                            "项目文件".to_owned()
+                                        } else {
+                                            std::path::Path::new(&self.path)
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or_default()
+                                        },
+                                    ),
+                            )
+                        })
                         .children(self.header_accessory.clone())
                         .child(self.document_controls(cx))
                         .when(!self.standalone, |row| {
@@ -1445,5 +1980,127 @@ mod tests {
         assert_eq!(selection.text, content);
         window.simulate_input("cannot edit");
         editor.read_with(window, |editor, _| assert_eq!(editor.content(), content));
+    }
+
+    #[test]
+    fn split_breadcrumbs_handles_various_paths() {
+        let segs = split_breadcrumbs("/Users/ygy/Workspace/gpui-glint/src/components/icon.rs", true);
+        assert_eq!(segs.len(), 6);
+        assert_eq!(segs[0].name, "ygy");
+        assert_eq!(segs[0].path, "/Users/ygy");
+        assert_eq!(segs[0].dir_path, "/Users/ygy");
+        assert!(!segs[0].is_file);
+
+        assert_eq!(segs[1].name, "Workspace");
+        assert_eq!(segs[2].name, "gpui-glint");
+        assert_eq!(segs[3].name, "src");
+        assert_eq!(segs[4].name, "components");
+        assert_eq!(segs[4].dir_path, "/Users/ygy/Workspace/gpui-glint/src/components");
+        assert!(!segs[4].is_file);
+
+        assert_eq!(segs[5].name, "icon.rs");
+        assert_eq!(segs[5].path, "/Users/ygy/Workspace/gpui-glint/src/components/icon.rs");
+        assert_eq!(segs[5].dir_path, "/Users/ygy/Workspace/gpui-glint/src/components");
+        assert!(segs[5].is_file);
+
+        // Directory leaf
+        let dir_segs = split_breadcrumbs("/Users/ygy/Workspace/gpui-glint/src/components", false);
+        assert_eq!(dir_segs.len(), 5);
+        assert_eq!(dir_segs.last().unwrap().name, "components");
+        assert!(!dir_segs.last().unwrap().is_file);
+
+        // Linux home
+        let linux_segs = split_breadcrumbs("/home/ubuntu/project/main.py", true);
+        assert_eq!(linux_segs[0].name, "ubuntu");
+        assert_eq!(linux_segs.last().unwrap().name, "main.py");
+        assert!(linux_segs.last().unwrap().is_file);
+
+        // Relative path
+        let rel_segs = split_breadcrumbs("crates/glint-agent/src/lib.rs", true);
+        assert_eq!(rel_segs.len(), 4);
+        assert_eq!(rel_segs[0].name, "crates");
+        assert_eq!(rel_segs.last().unwrap().name, "lib.rs");
+
+        // SSH URI
+        let ssh_segs = split_breadcrumbs("ssh://user@host/home/user/app/index.js", true);
+        assert_eq!(ssh_segs[0].name, "user");
+        assert_eq!(ssh_segs.last().unwrap().name, "index.js");
+        assert_eq!(ssh_segs.last().unwrap().dir_path, "ssh://user@host/home/user/app");
+    }
+
+    #[gpui::test]
+    fn breadcrumbs_sidebar_navigation_and_popover_entry_click(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, cx| {
+            let mut preview = FilePreview::new(cx);
+            preview.set_file(
+                "/Users/ygy/Workspace/gpui-glint/src/components/icon.rs".into(),
+                Some("/Users/ygy/Workspace/gpui-glint/src/components".into()),
+                "rust".into(),
+                "pub struct Icon;".into(),
+                cx,
+            );
+            // Preload folder entries for components
+            let entries = vec![
+                FilePreviewEntry {
+                    name: "code_font.rs".into(),
+                    path: "/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs".into(),
+                    directory: false,
+                    previewable: true,
+                },
+                FilePreviewEntry {
+                    name: "icon.rs".into(),
+                    path: "/Users/ygy/Workspace/gpui-glint/src/components/icon.rs".into(),
+                    directory: false,
+                    previewable: true,
+                },
+            ];
+            preview.folders.insert(
+                "/Users/ygy/Workspace/gpui-glint/src/components".into(),
+                FolderNode {
+                    expanded: false,
+                    entries: Some(entries),
+                    loading: None,
+                    error: None,
+                },
+            );
+            preview
+        });
+        window.simulate_resize(gpui::size(px(600.), px(400.)));
+
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let received = opened.clone();
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&view, move |_, _, event: &FilePreviewEvent, _| {
+                if let FilePreviewEvent::OpenRequested(path) = event {
+                    received.borrow_mut().push(path.clone());
+                }
+            })
+            .detach();
+        });
+
+        window.run_until_parked();
+
+        // Check breadcrumb segments are rendered
+        assert!(window.debug_bounds("breadcrumb-seg:components").is_some());
+        assert!(window.debug_bounds("breadcrumb-seg:icon.rs").is_some());
+
+        // Open breadcrumb popover for "components"
+        view.update(window, |preview, cx| {
+            preview.set_open_breadcrumb(Some(4), cx); // segment 4 is "components"
+        });
+        window.run_until_parked();
+
+        // Check header and entries inside popover dropdown are rendered
+        assert!(window.debug_bounds("breadcrumb-dropdown-header").is_some());
+        assert!(window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs").is_some());
+
+        // Click entry "code_font.rs"
+        let entry_bounds = window.debug_bounds("breadcrumb-entry:/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs").unwrap();
+        window.simulate_click(entry_bounds.center(), Default::default());
+        window.run_until_parked();
+
+        // Verify OpenRequested was emitted and popover closed
+        assert_eq!(*opened.borrow(), vec!["/Users/ygy/Workspace/gpui-glint/src/components/code_font.rs".to_owned()]);
+        assert_eq!(view.read_with(window, |p, _| p.open_breadcrumb()), None);
     }
 }

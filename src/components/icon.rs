@@ -245,6 +245,52 @@ impl Icon {
         }
     }
 
+    /// Resolve an iconic brand color (RGB hex) for a file name based on its extension.
+    pub fn color_for_file_name(name: &str) -> Option<u32> {
+        let file = std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        if file == "dockerfile"
+            || file == "containerfile"
+            || file.starts_with("dockerfile.")
+            || file.ends_with(".dockerfile")
+        {
+            return Some(0x2496ed);
+        }
+        if file == ".gitignore" {
+            return Some(0xf05032);
+        }
+        let extension = std::path::Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "rs" => Some(0xde5b27),
+            "ts" | "tsx" | "mts" | "cts" => Some(0x3178c6),
+            "js" | "jsx" | "mjs" | "cjs" => Some(0xf7df1e),
+            "py" | "pyw" => Some(0x3776ab),
+            "go" => Some(0x00add8),
+            "html" | "htm" => Some(0xe34f26),
+            "css" | "scss" | "sass" | "less" => Some(0x1572b6),
+            "json" => Some(0xcb171e),
+            "md" | "markdown" => Some(0x083fa1),
+            "yaml" | "yml" => Some(0xcb171e),
+            "sh" | "bash" | "zsh" => Some(0x4eaa25),
+            "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(0x00599c),
+            "rb" => Some(0xcc342d),
+            "java" => Some(0xb07219),
+            "kt" | "kts" => Some(0x7f52ff),
+            "swift" => Some(0xf05138),
+            "zig" => Some(0xec915c),
+            "toml" => Some(0x9c4221),
+            "sql" => Some(0xe38c00),
+            _ => None,
+        }
+    }
+
     pub fn render(self, size: f32) -> IconSvg {
         IconSvg(
             svg()

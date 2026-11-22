@@ -21,6 +21,7 @@ pub struct Popover {
     padding: f32,
     right_trigger_width: Option<f32>,
     above_trigger: bool,
+    align_left: bool,
     theme: ThemePreset,
     on_open_change: Option<OpenHandler>,
 }
@@ -41,6 +42,7 @@ impl Popover {
             padding: 16.,
             right_trigger_width: None,
             above_trigger: false,
+            align_left: false,
             theme: ThemePreset::default(),
             on_open_change: None,
         }
@@ -71,6 +73,11 @@ impl Popover {
     pub fn above_trigger(mut self) -> Self {
         self.above_trigger = true;
         self.right_trigger_width = None;
+        self
+    }
+    /// Aligns the dropdown to the left edge of the trigger when opening below.
+    pub fn align_left(mut self) -> Self {
+        self.align_left = true;
         self
     }
 
@@ -175,7 +182,13 @@ impl Popover {
                         )
                         .when(
                             self.right_trigger_width.is_none() && !self.above_trigger,
-                            |el| el.top_0().right_0(),
+                            |el| {
+                                if self.align_left {
+                                    el.top_0().left_0()
+                                } else {
+                                    el.top_0().right_0()
+                                }
+                            },
                         )
                         .w(px(self.width))
                         .child(
