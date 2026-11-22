@@ -110,6 +110,42 @@ impl ComposerChip {
         self.options.push(ComposerOption {
             value: value.into(),
             label: label.into(),
+            group: None,
+            chip_label: None,
+        });
+        self
+    }
+
+    /// Adds a selectable option belonging to a named group (e.g. a provider).
+    pub fn grouped_option(
+        mut self,
+        group: impl Into<SharedString>,
+        value: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.options.push(ComposerOption {
+            value: value.into(),
+            label: label.into(),
+            group: Some(group.into()),
+            chip_label: None,
+        });
+        self
+    }
+
+    /// Adds a selectable option belonging to a group, with a custom chip label
+    /// to display on the toolbar button when selected.
+    pub fn grouped_option_with_chip_label(
+        mut self,
+        group: impl Into<SharedString>,
+        value: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        chip_label: impl Into<SharedString>,
+    ) -> Self {
+        self.options.push(ComposerOption {
+            value: value.into(),
+            label: label.into(),
+            group: Some(group.into()),
+            chip_label: Some(chip_label.into()),
         });
         self
     }
@@ -132,6 +168,8 @@ impl ComposerChip {
 pub struct ComposerOption {
     pub value: SharedString,
     pub label: SharedString,
+    pub group: Option<SharedString>,
+    pub chip_label: Option<SharedString>,
 }
 
 /// One row of the context panel: an optional icon, a label, and an optional
@@ -1396,7 +1434,15 @@ impl Render for Composer {
                 chip.options
                     .iter()
                     .find(|option| &option.value == value)
-                    .map(|option| option.label.clone())
+                    .map(|option| {
+                        if let Some(chip_label) = &option.chip_label {
+                            chip_label.clone()
+                        } else if let Some(group) = &option.group {
+                            format!("{group} · {}", option.label).into()
+                        } else {
+                            option.label.clone()
+                        }
+                    })
             });
             let is_menu_open = self.open_chip.as_ref() == Some(&chip.id);
             let tint = chip.tint.map(|t| theme.color(t));
@@ -2018,12 +2064,32 @@ impl Composer {
                     underline: None,
                     strikethrough: None,
                 };
-                f32::from(
+                let w = f32::from(
                     window
                         .text_system()
                         .shape_line(option.label.clone(), px(13.), &[run], None)
                         .width,
-                )
+                );
+                if let Some(group) = &option.group {
+                    let run_g = gpui::TextRun {
+                        len: group.len(),
+                        font: style.font(),
+                        color: style.color,
+                        letter_spacing: None,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let wg = f32::from(
+                        window
+                            .text_system()
+                            .shape_line(group.clone(), px(11.), &[run_g], None)
+                            .width,
+                    );
+                    w.max(wg)
+                } else {
+                    w
+                }
             })
             .fold(0_f32, f32::max);
         let avatar_width = if chip.option_avatars.is_empty() {
@@ -2034,77 +2100,129 @@ impl Composer {
         let menu_width = (label_width + 64. + avatar_width)
             .clamp(168., 360.)
             .min((f32::from(window.viewport_size().width) - 32.).max(120.));
-        let rows = chip.options.iter().enumerate().map(|(index, option)| {
-            let is_selected = selection.as_ref() == Some(&option.value);
-            div()
-                .id(SharedString::from(format!(
-                    "glass-composer-option-{}-{index}",
-                    chip.id
-                )))
-                .debug_selector({
-                    let id = chip.id.clone();
-                    let value = option.value.clone();
-                    move || format!("composer-option:{id}:{value}")
-                })
-                .h(px(30.))
-                .flex_shrink_0()
-                .w_full()
-                .min_w_0()
-                .px(px(9.))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .rounded(px(6.))
-                .text_size(px(13.))
-                .text_color(rgb(if is_selected { p.accent } else { p.text }))
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(p.accent)).text_color(rgb(0xffffff)))
-                .on_click({
-                    let chip_id = chip.id.clone();
-                    let value = option.value.clone();
-                    cx.listener(move |this, _, _, cx| {
-                        this.chip_values.insert(chip_id.clone(), value.clone());
-                        this.open_chip = None;
-                        cx.emit(ComposerEvent::ChipSelected {
-                            chip: chip_id.clone(),
-                            value: value.clone(),
-                        });
-                        cx.notify();
-                    })
-                })
-                .when(!chip.option_avatars.is_empty(), |row| {
-                    let leading = if let Some(avatar) = chip.option_avatars.get(&option.value) {
-                        avatar.clone().size(18.).theme(theme).render()
-                    } else {
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        let mut current_group: Option<SharedString> = None;
+        let mut group_index = 0;
+
+        for (index, option) in chip.options.iter().enumerate() {
+            if let Some(group) = &option.group {
+                let is_new_group = match &current_group {
+                    Some(prev) => prev != group,
+                    None => true,
+                };
+                if is_new_group {
+                    current_group = Some(group.clone());
+                    let is_first_group = group_index == 0;
+                    group_index += 1;
+                    rows.push(
                         div()
-                            .size(px(18.))
+                            .id(SharedString::from(format!(
+                                "glass-composer-option-group-{}-{index}",
+                                chip.id
+                            )))
+                            .debug_selector({
+                                let id = chip.id.clone();
+                                let group = group.clone();
+                                move || format!("composer-option-group:{id}:{group}")
+                            })
+                            .w_full()
+                            .when(!is_first_group, |this| {
+                                this.pt(px(6.))
+                                    .mt(px(4.))
+                                    .border_t_1()
+                                    .border_color(if dark {
+                                        rgba(theme.glass_line())
+                                    } else {
+                                        rgb(p.border)
+                                    })
+                            })
+                            .px(px(9.))
+                            .pt(px(if is_first_group { 4. } else { 0. }))
+                            .pb(px(4.))
+                            .text_size(px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(p.text_muted))
+                            .child(group.clone())
+                            .into_any_element(),
+                    );
+                }
+            } else {
+                current_group = None;
+            }
+
+            let is_selected = selection.as_ref() == Some(&option.value);
+            rows.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "glass-composer-option-{}-{index}",
+                        chip.id
+                    )))
+                    .debug_selector({
+                        let id = chip.id.clone();
+                        let value = option.value.clone();
+                        move || format!("composer-option:{id}:{value}")
+                    })
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .w_full()
+                    .min_w_0()
+                    .px(px(9.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(6.))
+                    .text_size(px(13.))
+                    .text_color(rgb(if is_selected { p.accent } else { p.text }))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(p.accent)).text_color(rgb(0xffffff)))
+                    .on_click({
+                        let chip_id = chip.id.clone();
+                        let value = option.value.clone();
+                        cx.listener(move |this, _, _, cx| {
+                            this.chip_values.insert(chip_id.clone(), value.clone());
+                            this.open_chip = None;
+                            cx.emit(ComposerEvent::ChipSelected {
+                                chip: chip_id.clone(),
+                                value: value.clone(),
+                            });
+                            cx.notify();
+                        })
+                    })
+                    .when(!chip.option_avatars.is_empty(), |row| {
+                        let leading = if let Some(avatar) = chip.option_avatars.get(&option.value) {
+                            avatar.clone().size(18.).theme(theme).render()
+                        } else {
+                            div()
+                                .size(px(18.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when_some(chip.icon, |slot, icon| slot.child(icon.render(14.)))
+                        };
+                        row.child(leading)
+                    })
+                    .child(
+                        div()
+                            .id(("composer-option-label", index))
+                            .debug_selector(move || format!("composer-option-label-{index}").into())
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .child(option.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("composer-option-check", index))
+                            .debug_selector(move || format!("composer-option-check-{index}").into())
+                            .w(px(14.))
                             .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when_some(chip.icon, |slot, icon| slot.child(icon.render(14.)))
-                    };
-                    row.child(leading)
-                })
-                .child(
-                    div()
-                        .id(("composer-option-label", index))
-                        .debug_selector(move || format!("composer-option-label-{index}").into())
-                        .flex_1()
-                        .min_w_0()
-                        .text_ellipsis()
-                        .child(option.label.clone()),
-                )
-                .child(
-                    div()
-                        .id(("composer-option-check", index))
-                        .debug_selector(move || format!("composer-option-check-{index}").into())
-                        .w(px(14.))
-                        .flex_shrink_0()
-                        .text_size(px(12.))
-                        .child(if is_selected { "✓" } else { "" }),
-                )
-        });
+                            .text_size(px(12.))
+                            .child(if is_selected { "✓" } else { "" }),
+                    )
+                    .into_any_element(),
+            );
+        }
         deferred(
             div()
                 .absolute()
@@ -2113,7 +2231,7 @@ impl Composer {
                 .id("glass-composer-chip-menu")
                 .debug_selector(|| "composer-chip-menu".into())
                 .w(px(menu_width))
-                .max_h(px(280.))
+                .max_h(px(340.))
                 .overflow_y_scroll()
                 .p(px(6.))
                 .flex()
@@ -3257,6 +3375,43 @@ mod tests {
             composer.set_menu_chip(ComposerChip::new("model"), cx);
             assert!(composer.open_chip.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn grouped_options_render_group_headers_and_prefix_chip_label(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Host(Entity<Composer>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.0.clone())
+            }
+        }
+        let (_host, window) = cx.add_window_view(|_, cx| {
+            let composer = cx.new(|cx| {
+                Composer::new("Message", cx).menu_chip(
+                    ComposerChip::new("model")
+                        .grouped_option("Zhipu", "glm5", "glm-5.3")
+                        .grouped_option("Zhipu", "glm5f", "glm-5.3-flashx")
+                        .grouped_option("ChatGPT", "gpt6", "gpt-6-luna")
+                        .default_selected("glm5"),
+                )
+            });
+            composer.update(cx, |c, _| {
+                c.open_chip = Some("model".into());
+            });
+            Host(composer)
+        });
+        window.run_until_parked();
+
+        // Check group headers are rendered
+        assert!(window.debug_bounds("composer-option-group:model:Zhipu").is_some());
+        assert!(window.debug_bounds("composer-option-group:model:ChatGPT").is_some());
+
+        // Check option labels exist
+        assert!(window.debug_bounds("composer-option:model:glm5").is_some());
+        assert!(window.debug_bounds("composer-option:model:glm5f").is_some());
+        assert!(window.debug_bounds("composer-option:model:gpt6").is_some());
     }
 
     #[gpui::test]

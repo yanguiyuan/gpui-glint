@@ -374,7 +374,7 @@ pub struct State {
     pub open: bool,
     pub expanded: bool,
     pub view: Entity<FilePreview>,
-    target: Option<Target>,
+    pub(super) target: Option<Target>,
     task: Option<Task<()>>,
     revision: u64,
     directory_tasks: HashMap<u64, Task<()>>,
@@ -623,6 +623,16 @@ impl AgentWorkspace {
     ) {
         if let Some(target) = target(&path.to_string_lossy(), &root) {
             self.open_file_preview_mode(target, true, cx);
+        }
+    }
+    pub(super) fn preview_file_target(
+        &mut self,
+        value: &str,
+        root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = target(value, &root) {
+            self.open_file_preview(target, cx);
         }
     }
     pub(super) fn open_file_preview(&mut self, target: Target, cx: &mut Context<Self>) {

@@ -34,6 +34,7 @@ pub struct CollapsePanel {
     /// Draw the left hairline and indent the body under the trigger. Off by
     /// default, so a single result lines up with the trigger icon.
     guard_line: bool,
+    expandable: bool,
     theme: ThemePreset,
 }
 
@@ -51,7 +52,33 @@ impl CollapsePanel {
             expanded: false,
             compact: false,
             guard_line: false,
+            expandable: true,
             theme: ThemePreset::default(),
+        }
+    }
+
+    pub fn expandable(mut self, expandable: bool) -> Self {
+        self.expandable = expandable;
+        if !expandable {
+            self.expanded = false;
+        }
+        self
+    }
+
+    pub fn set_expandable(&mut self, expandable: bool, cx: &mut Context<Self>) {
+        if self.expandable != expandable {
+            self.expandable = expandable;
+            if !expandable {
+                self.expanded = false;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn set_icon(&mut self, icon: Option<Icon>, cx: &mut Context<Self>) {
+        if self.icon != icon {
+            self.icon = icon;
+            cx.notify();
         }
     }
 
@@ -132,7 +159,14 @@ impl CollapsePanel {
         cx.notify();
     }
 
+    pub fn is_expandable(&self) -> bool {
+        self.expandable
+    }
+
     pub fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if !self.expandable && expanded {
+            return;
+        }
         if self.expanded != expanded {
             self.expanded = expanded;
             cx.emit(CollapsePanelEvent::Toggled { expanded });
@@ -141,6 +175,9 @@ impl CollapsePanel {
     }
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
+        if !self.expandable {
+            return;
+        }
         self.set_expanded(!self.expanded, cx);
     }
 
@@ -225,9 +262,11 @@ impl Render for CollapsePanel {
             .items_center()
             .gap(px(8.))
             .rounded(px(7.))
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover_bg))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)))
+            .when(self.expandable, |row| {
+                row.cursor_pointer()
+                    .hover(move |style| style.bg(hover_bg))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)))
+            })
             .when_some(self.icon, |row, icon| {
                 row.child(
                     div()
@@ -237,12 +276,14 @@ impl Render for CollapsePanel {
                 )
             })
             .child(summary)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(p.text_muted))
-                    .child(Icon::disclosure(12., self.expanded)),
-            );
+            .when(self.expandable, |row| {
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(p.text_muted))
+                        .child(Icon::disclosure(12., self.expanded)),
+                )
+            });
 
         let mut root = div()
             .id("glass-collapse-panel")
@@ -254,7 +295,8 @@ impl Render for CollapsePanel {
             .flex_col()
             .child(trigger);
 
-        if self.expanded
+        if self.expandable
+            && self.expanded
             && let Some(content) = &self.content
         {
             let body = div().py(px(2.)).flex_shrink_0();
@@ -286,6 +328,34 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().w(px(240.)).child(self.0.clone())
         }
+    }
+
+    #[gpui::test]
+    fn non_expandable_panel_does_not_toggle_and_hides_body(cx: &mut TestAppContext) {
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            Preview(
+                cx.new(|_| {
+                    CollapsePanel::new("Edited")
+                        .expandable(false)
+                        .content(|_, _| div().id("panel-body").child("Body content").into_any_element())
+                }),
+            )
+        });
+        let panel = preview.read_with(window, |preview, _| preview.0.clone());
+        assert!(!panel.read_with(window, |panel, _| panel.is_expanded()));
+        assert!(!panel.read_with(window, |panel, _| panel.is_expandable()));
+        assert!(window.debug_bounds("panel-body").is_none());
+
+        panel.update(window, |panel, cx| {
+            panel.toggle(cx);
+        });
+        assert!(!panel.read_with(window, |panel, _| panel.is_expanded()));
+
+        panel.update(window, |panel, cx| {
+            panel.set_expanded(true, cx);
+        });
+        assert!(!panel.read_with(window, |panel, _| panel.is_expanded()));
+        assert!(window.debug_bounds("panel-body").is_none());
     }
 
     #[gpui::test]

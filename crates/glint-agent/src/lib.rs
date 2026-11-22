@@ -3229,17 +3229,15 @@ fn model_chip(catalog: &provider_catalog::ProviderCatalog) -> ComposerChip {
             profile.models.clone()
         };
         for model in models {
-            chip = chip.option(
+            let display_model = if model.is_empty() {
+                "默认模型"
+            } else {
+                &model
+            };
+            chip = chip.grouped_option(
+                profile.name.clone(),
                 format!("{}:{model}", profile.id),
-                format!(
-                    "{} · {}",
-                    profile.name,
-                    if model.is_empty() {
-                        "默认模型"
-                    } else {
-                        &model
-                    }
-                ),
+                display_model,
             );
         }
     }
@@ -3391,6 +3389,52 @@ mod tests {
         assert_eq!(session_title("  \n \"。\" \n更多"), Some("。".into()));
         assert_eq!(session_title("   "), None);
         assert_eq!(session_title(""), None);
+    }
+
+    #[test]
+    fn model_chip_groups_options_by_provider() {
+        let p1 = provider::Config {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            name: "Zhipu".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            model: "glm-5.3".into(),
+            models: vec!["glm-5.3".into(), "glm-5.3-flashx".into()],
+            enabled: true,
+            ..Default::default()
+        };
+        let p2 = provider::Config {
+            id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            name: "ChatGPT".into(),
+            kind: provider::Kind::ChatGpt,
+            base_url: "https://chatgpt.com".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let catalog = provider_catalog::ProviderCatalog {
+            providers: vec![p1, p2],
+            active: Some(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()),
+            active_model: "glm-5.3".into(),
+        };
+
+        let chip = model_chip(&catalog);
+        assert_eq!(chip.options.len(), 3);
+        assert_eq!(chip.options[0].group.as_deref(), Some("Zhipu"));
+        assert_eq!(chip.options[0].label.as_ref(), "glm-5.3");
+        assert_eq!(
+            chip.options[0].value.as_ref(),
+            "11111111-1111-1111-1111-111111111111:glm-5.3"
+        );
+
+        assert_eq!(chip.options[1].group.as_deref(), Some("Zhipu"));
+        assert_eq!(chip.options[1].label.as_ref(), "glm-5.3-flashx");
+
+        assert_eq!(chip.options[2].group.as_deref(), Some("ChatGPT"));
+        assert_eq!(chip.options[2].label.as_ref(), "默认模型");
+
+        assert_eq!(
+            chip.default_selected.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111:glm-5.3")
+        );
     }
 }
 

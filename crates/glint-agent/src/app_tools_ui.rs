@@ -524,6 +524,91 @@ fn coalesce_tool_snapshots(events: Vec<tools::ToolEvent>) -> Vec<tools::ToolEven
     latest
 }
 
+fn file_icon_color(path: &str) -> Option<u32> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "rs" => Some(0xde5b27),
+        "ts" | "tsx" | "mts" | "cts" => Some(0x3178c6),
+        "js" | "jsx" | "mjs" | "cjs" => Some(0xf7df1e),
+        "py" | "pyw" => Some(0x3776ab),
+        "go" => Some(0x00add8),
+        "html" | "htm" => Some(0xe34f26),
+        "css" | "scss" | "sass" | "less" => Some(0x1572b6),
+        "json" => Some(0xcb171e),
+        "md" | "markdown" => Some(0x083fa1),
+        "yaml" | "yml" => Some(0xcb171e),
+        "sh" | "bash" | "zsh" => Some(0x4eaa25),
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(0x00599c),
+        "rb" => Some(0xcc342d),
+        "java" => Some(0xb07219),
+        "kt" | "kts" => Some(0x7f52ff),
+        "swift" => Some(0xf05138),
+        "zig" => Some(0xec915c),
+        "toml" => Some(0x9c4221),
+        "sql" => Some(0xe38c00),
+        _ => {
+            let file = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_ascii_lowercase();
+            if file == "dockerfile" || file.ends_with(".dockerfile") {
+                Some(0x2496ed)
+            } else if file == ".gitignore" {
+                Some(0xf05032)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn read_file_line_range(record: &tools::ToolRecord) -> Option<(usize, usize)> {
+    let (res_start, res_count) = serde_json::from_str::<serde_json::Value>(&record.result)
+        .ok()
+        .map(|v| {
+            let start = v["start_line"].as_u64().map(|n| n as usize);
+            let count = v["content"].as_str().map(|c| c.lines().count());
+            (start, count)
+        })
+        .unwrap_or((None, None));
+
+    let args = &record.call.arguments;
+    let arg_start = args["start_line"]
+        .as_u64()
+        .or_else(|| args["StartLine"].as_u64())
+        .or_else(|| args["offset"].as_u64())
+        .map(|n| n as usize);
+    let arg_end = args["EndLine"].as_u64().map(|n| n as usize);
+    let arg_lines = args["lines"]
+        .as_u64()
+        .or_else(|| args["limit"].as_u64())
+        .map(|n| n as usize);
+
+    let start = res_start.or(arg_start);
+    if let Some(start) = start {
+        if let Some(end) = arg_end {
+            Some((start, end.max(start)))
+        } else if let Some(count) = res_count {
+            if count > 0 {
+                Some((start, start + count - 1))
+            } else {
+                Some((start, start))
+            }
+        } else if let Some(lines) = arg_lines {
+            Some((start, start + lines.saturating_sub(1)))
+        } else {
+            Some((start, start))
+        }
+    } else {
+        None
+    }
+}
+
 impl AgentWorkspace {
     pub fn watch_tools(
         &mut self,
@@ -762,14 +847,18 @@ impl AgentWorkspace {
         let p = theme.palette();
         let mut cache = self.tool_panels.borrow_mut();
         let signature = tool_signature(record);
+        let is_edit = matches!(record.call.name.as_str(), "write_file" | "replace_in_file")
+            || record.change.is_some();
+        let is_read = record.call.name == "read_file";
+        let is_file_op = is_edit || is_read;
         let entry = cache
             .entry(format!("{key}:tool:{}", record.call.id))
             .or_insert_with(|| {
-                let panel = cx.new(|_| {
-                    CollapsePanel::new("")
-                        .icon(tool_presentation(record).icon)
-                        .theme(theme)
-                });
+                let mut panel = CollapsePanel::new("").expandable(!is_file_op).theme(theme);
+                if !is_file_op {
+                    panel = panel.icon(tool_presentation(record).icon);
+                }
+                let panel = cx.new(|_| panel);
                 // A tool toggle also changes the layout of the surrounding conversation.
                 cx.subscribe(
                     &panel,
@@ -893,8 +982,254 @@ impl AgentWorkspace {
             // answer, not as a list to be grouped.
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
+                panel.set_expandable(!is_file_op, cx);
+                panel.set_icon(if is_file_op { None } else { Some(presentation.icon) }, cx);
                 panel.set_summary(presentation.summary.clone(), cx);
-                if record.call.name == "run_command" && record.result == "执行中…" {
+                if is_edit {
+                    let path_str = record.call.arguments["path"]
+                        .as_str()
+                        .or_else(|| record.call.arguments["file"].as_str())
+                        .or_else(|| record.change.as_ref().map(|c| c.label.as_str()))
+                        .unwrap_or("")
+                        .to_owned();
+                    let path_buf = record
+                        .change
+                        .as_ref()
+                        .map(|c| c.path.clone())
+                        .unwrap_or_else(|| PathBuf::from(&path_str));
+                    let file_display_name = std::path::Path::new(&path_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&path_str)
+                        .to_owned();
+                    let file_icon = gpui_glint::components::Icon::for_file_name(&path_str);
+                    let icon_color = file_icon_color(&path_str);
+                    let root = preview_root.clone();
+                    let workspace = preview_workspace.clone();
+
+                    let status_label = if record.result == "执行中…" {
+                        "Editing"
+                    } else if !tool_succeeded(record) {
+                        "Edit failed"
+                    } else {
+                        "Edited"
+                    };
+
+                    let diff_stats = record.change.as_ref().map(|change| {
+                        (change.added, change.removed)
+                    });
+
+                    let diff_colors = if theme.is_dark() {
+                        gpui_glint::components::DiffColors::DARK
+                    } else {
+                        gpui_glint::components::DiffColors::LIGHT
+                    };
+
+                    panel.set_summary_content(
+                        move |_, _| {
+                            let path_buf = path_buf.clone();
+                            let root = root.clone();
+                            let workspace = workspace.clone();
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(13.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(status_label),
+                                )
+                                .child(
+                                    div()
+                                        .id("tool-file-preview-link")
+                                        .debug_selector(|| "tool-file-preview-link".into())
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .min_w_0()
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(p.accent)))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .when_some(icon_color, |d, c| d.text_color(rgb(c)))
+                                                .child(file_icon.render(14.)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_color(rgb(p.text_muted))
+                                                .hover(|style| {
+                                                    style.text_color(rgb(p.accent)).underline()
+                                                })
+                                                .child(file_display_name.clone()),
+                                        )
+                                        .on_click({
+                                            let path = path_buf.clone();
+                                            let root = root.clone();
+                                            let workspace = workspace.clone();
+                                            move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                let _ = workspace.update(cx, |this, cx| {
+                                                    this.preview_changed_file(
+                                                        &path,
+                                                        root.clone(),
+                                                        cx,
+                                                    )
+                                                });
+                                            }
+                                        }),
+                                )
+                                .when_some(diff_stats, |row, (adds, dels)| {
+                                    row.child(
+                                        div()
+                                            .id("tool-file-diff-link")
+                                            .debug_selector(|| "tool-file-diff-link".into())
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .flex_shrink_0()
+                                            .cursor_pointer()
+                                            .hover(|style| style.opacity(0.75))
+                                            .when(adds > 0 || dels == 0, |r| {
+                                                r.child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(rgb(diff_colors.added_marker))
+                                                        .child(format!("+{adds}")),
+                                                )
+                                            })
+                                            .when(dels > 0, |r| {
+                                                r.child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(rgb(diff_colors.deleted_marker))
+                                                        .child(format!("-{dels}")),
+                                                )
+                                            })
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                let _ = workspace.update(cx, |this, cx| {
+                                                    this.open_edits(Some(path_buf.clone()), cx);
+                                                });
+                                            }),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                        cx,
+                    );
+                } else if is_read {
+                    let path_str = record.call.arguments["path"]
+                        .as_str()
+                        .or_else(|| record.call.arguments["file"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let file_display_name = std::path::Path::new(&path_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&path_str)
+                        .to_owned();
+                    let file_icon = gpui_glint::components::Icon::for_file_name(&path_str);
+                    let icon_color = file_icon_color(&path_str);
+                    let root = preview_root.clone();
+                    let workspace = preview_workspace.clone();
+
+                    let status_label = if record.result == "执行中…" {
+                        "Analyzing"
+                    } else if !tool_succeeded(record) {
+                        "Analyze failed"
+                    } else {
+                        "Analyzed"
+                    };
+
+                    let line_range = read_file_line_range(record);
+                    let (target_str, line_label) = if let Some((start, end)) = line_range {
+                        let label = if start == end {
+                            format!("#L{start}")
+                        } else {
+                            format!("#L{start}-{end}")
+                        };
+                        (format!("{path_str}{label}"), Some(label))
+                    } else {
+                        (path_str.clone(), None)
+                    };
+
+                    panel.set_summary_content(
+                        move |_, _| {
+                            let target_str = target_str.clone();
+                            let root = root.clone();
+                            let workspace = workspace.clone();
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(13.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(status_label),
+                                )
+                                .child(
+                                    div()
+                                        .id("tool-file-read-link")
+                                        .debug_selector(|| "tool-file-read-link".into())
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .min_w_0()
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(rgb(p.accent)))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .when_some(icon_color, |d, c| d.text_color(rgb(c)))
+                                                .child(file_icon.render(14.)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_color(rgb(p.text_muted))
+                                                .hover(|style| {
+                                                    style.text_color(rgb(p.accent)).underline()
+                                                })
+                                                .child(file_display_name.clone()),
+                                        )
+                                        .when_some(line_label.clone(), |row, label| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(rgb(p.text_muted))
+                                                    .child(label),
+                                            )
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = workspace.update(cx, |this, cx| {
+                                                this.preview_file_target(
+                                                    &target_str,
+                                                    root.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                )
+                                .into_any_element()
+                        },
+                        cx,
+                    );
+                } else if record.call.name == "run_command" && record.result == "执行中…" {
                     let anchor = self.memory.anchor.clone();
                     let session = self.history.active;
                     let call_id = record.call.id.clone();
@@ -957,57 +1292,6 @@ impl AgentWorkspace {
                         },
                         cx,
                     );
-                }
-                if let Some(change) = &record.change {
-                    let path = change.path.clone();
-                    let root = preview_root.clone();
-                    let workspace = preview_workspace.clone();
-                    let label = record.call.arguments["path"]
-                        .as_str()
-                        .unwrap_or(&change.label)
-                        .to_owned();
-                    let summary = presentation.summary.clone();
-                    if let Some(index) = summary.find(&label) {
-                        let prefix = summary[..index].to_owned();
-                        let suffix = summary[index + label.len()..].to_owned();
-                        panel.set_summary_content(
-                            move |_, _cx| {
-                                let path = path.clone();
-                                let root = root.clone();
-                                let workspace = workspace.clone();
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .min_w_0()
-                                    .child(prefix.clone())
-                                    .child(
-                                        div()
-                                            .id("tool-file-preview-link")
-                                            .debug_selector(|| "tool-file-preview-link".into())
-                                            .min_w_0()
-                                            .truncate()
-                                            .cursor_pointer()
-                                            .hover(|style| {
-                                                style.text_color(rgb(p.accent)).underline()
-                                            })
-                                            .child(label.clone())
-                                            .on_click(move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                let _ = workspace.update(cx, |this, cx| {
-                                                    this.preview_changed_file(
-                                                        &path,
-                                                        root.clone(),
-                                                        cx,
-                                                    )
-                                                });
-                                            }),
-                                    )
-                                    .child(suffix.clone())
-                                    .into_any_element()
-                            },
-                            cx,
-                        );
-                    }
                 }
                 panel.set_content(
                     move |_, cx| {
@@ -2498,7 +2782,11 @@ mod tests {
             "change": {"id":uuid::Uuid::new_v4(), "path":path, "label":"test.md", "before":"", "after":"# Preview", "added":1, "removed":0}
         })).unwrap();
         let (root, window) = cx.add_window_view(|_, cx| {
-            let host = cx.new(|cx| AgentWorkspace::with_path(dir.path().join("sessions.json"), cx));
+            let host = cx.new(|cx| {
+                let mut host = AgentWorkspace::with_path(dir.path().join("sessions.json"), cx);
+                host.history.active_mut().project = Some(dir.path().to_path_buf());
+                host
+            });
             let panel = host.update(cx, |host, cx| host.tool_panel("test", &record, cx));
             Root { host, panel }
         });
@@ -2508,8 +2796,70 @@ mod tests {
         window.run_until_parked();
         root.read_with(window, |root, cx| {
             assert!(!root.panel.read(cx).is_expanded());
+            assert!(!root.panel.read(cx).is_expandable());
             assert!(root.host.read(cx).file_preview.open);
             assert!(!root.host.read(cx).edits_ui.open);
+        });
+
+        let diff_link = window.debug_bounds("tool-file-diff-link").unwrap();
+        window.simulate_click(diff_link.center(), Default::default());
+        window.run_until_parked();
+        root.read_with(window, |root, cx| {
+            assert!(!root.panel.read(cx).is_expanded());
+            assert!(!root.host.read(cx).file_preview.open);
+            assert!(root.host.read(cx).edits_ui.open);
+            assert_eq!(
+                root.host.read(cx).edits_ui.selected.as_deref(),
+                Some(path.as_path())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn read_file_tool_panel_opens_preview_at_line_anchor(cx: &mut gpui::TestAppContext) {
+        struct Root {
+            host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.panel.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("test.rs");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let record: tools::ToolRecord = serde_json::from_value(serde_json::json!({
+            "call": {"id":"read1", "name":"read_file", "arguments":{"path":"test.rs","start_line":2,"lines":2}},
+            "result": serde_json::json!({"start_line":2,"content":"2: line2\n3: line3","total_lines":3}).to_string(),
+            "success":true, "elapsed_ms":10,
+        })).unwrap();
+        let (root, window) = cx.add_window_view(|_, cx| {
+            let host = cx.new(|cx| {
+                let mut host = AgentWorkspace::with_path(dir.path().join("sessions.json"), cx);
+                host.history.active_mut().project = Some(dir.path().to_path_buf());
+                host
+            });
+            let panel = host.update(cx, |host, cx| host.tool_panel("test", &record, cx));
+            Root { host, panel }
+        });
+        window.run_until_parked();
+        root.read_with(window, |root, cx| {
+            assert!(!root.panel.read(cx).is_expandable());
+            assert!(!root.panel.read(cx).is_expanded());
+        });
+        let link = window.debug_bounds("tool-file-read-link").unwrap();
+        window.simulate_click(link.center(), Default::default());
+        window.run_until_parked();
+        root.read_with(window, |root, cx| {
+            assert!(root.host.read(cx).file_preview.open);
+            let target = root.host.read(cx).file_preview.target.as_ref().unwrap();
+            assert_eq!(target.line, Some(2));
         });
     }
 

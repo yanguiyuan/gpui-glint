@@ -1545,17 +1545,25 @@ impl AgentWorkspace {
                     )
                     .children(self.repository_select(crate::panel_repositories::Panel::Diff, cx))
                     .when(!workspace_mode, |header| {
-                        header.child(
-                            Button::new("全部撤销")
-                                .kind(ButtonKind::Plain)
-                                .when(!can_undo || files.is_empty(), |button| button.disabled())
-                                .theme(self.theme)
-                                .render()
-                                .debug_selector(|| "undo-session-changes".into())
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.undo_session_edits(None, cx)),
-                                ),
-                        )
+                        header
+                            .child(
+                                Button::new("全部撤销")
+                                    .kind(ButtonKind::Ghost)
+                                    .size(ButtonSize::Small)
+                                    .when(!can_undo || files.is_empty(), |button| button.disabled())
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "undo-session-changes".into())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.undo_session_edits(None, cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(1.))
+                                    .h(px(14.))
+                                    .bg(rgb(p.border)),
+                            )
                     })
                     .child(
                         IconButton::new(
@@ -1580,9 +1588,8 @@ impl AgentWorkspace {
                         })),
                     )
                     .child(
-                        Button::new("关闭")
-                            .icon(Icon::Close)
-                            .kind(ButtonKind::Plain)
+                        IconButton::new(Icon::Close, "关闭面板")
+                            .plain()
                             .theme(self.theme)
                             .render()
                             .on_click(cx.listener(|this, _, _, cx| {
