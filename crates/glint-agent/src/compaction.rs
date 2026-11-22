@@ -161,6 +161,7 @@ pub fn apply(
         return Err("会话已变化，请重新压缩".into());
     }
     session.compaction = Some(summary);
+    session.messages.last_mut().unwrap().compacted_at = Some(chrono::Local::now());
     // Do not invent a post-compaction token count. The next reply supplies usage.
     if let Some(context) = &mut session.context {
         context.used_tokens = None;
@@ -189,6 +190,7 @@ impl AgentWorkspace {
         };
         let previous = plan.previous();
         self.provider_error = None;
+        self.run_mut(id).compacting = true;
         self.run_mut(id).preparing = Some((
             id,
             cx.spawn(async move |weak, cx| {
@@ -210,6 +212,9 @@ impl AgentWorkspace {
                         Ok(()) => {
                             this.save(cx);
                             this.sync_context_usage(cx);
+                            if this.history.active == id {
+                                scroll_follow::follow_if_at_bottom(&this.scroll);
+                            }
                         }
                         Err(error) if this.history.active == id => {
                             this.provider_error = Some(format!("会话压缩失败：{error}"));
@@ -220,6 +225,7 @@ impl AgentWorkspace {
                 });
             }),
         ));
+        scroll_follow::follow_if_at_bottom(&self.scroll);
         self.sync_composer_run(cx);
         cx.notify();
     }
@@ -304,20 +310,23 @@ mod tests {
                     .contains("request 0")
             );
         }
-        assert_eq!(
-            serde_json::to_value(&h.active().messages).unwrap(),
-            original
+        assert_eq!(h.active().messages.len(), 12);
+        assert!(
+            h.active().messages[..11]
+                .iter()
+                .all(|message| message.compacted_at.is_none())
         );
+        let timestamp = h.active().messages[11].compacted_at.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         h.save(&path).unwrap();
         let restored = model::History::load(&path).unwrap();
         assert_eq!(restored.active().compaction.as_ref().unwrap().through, 8);
         assert_eq!(restored.compaction_settings.threshold_percent, 75);
-        assert_eq!(
-            serde_json::to_value(&restored.active().messages).unwrap(),
-            original
-        );
+        assert_eq!(restored.active().messages[11].compacted_at, Some(timestamp));
+        let mut restored_messages = restored.active().messages.clone();
+        restored_messages[11].compacted_at = None;
+        assert_eq!(serde_json::to_value(restored_messages).unwrap(), original);
         assert!(plan_is_empty(restored.active()));
         h.active_mut().push(Role::User, "next request".into());
         h.active_mut().push(Role::Agent, "next reply".into());
@@ -330,9 +339,49 @@ mod tests {
                 .unwrap()
                 .contains("已有历史摘要")
         );
+        apply(
+            h.active_mut(),
+            Summary {
+                through: 10,
+                text: "更新的摘要".into(),
+            },
+            again.previous(),
+        )
+        .unwrap();
+        assert_eq!(h.active().messages[11].compacted_at, Some(timestamp));
+        assert!(h.active().messages[13].compacted_at.is_some());
     }
     fn plan_is_empty(session: &model::Session) -> bool {
         plan(session, provider::Protocol::OpenAi).is_none()
+    }
+
+    #[gpui::test]
+    fn compaction_is_visible_in_the_conversation_after_reopening(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let mut h = model::History::default();
+        for _ in 0..3 {
+            h.active_mut().push(Role::User, "继续任务".into());
+            h.active_mut().push(Role::Agent, "进展".into());
+        }
+        apply(
+            h.active_mut(),
+            Summary {
+                through: 2,
+                text: "任务摘要".into(),
+            },
+            0,
+        )
+        .unwrap();
+        h.save(&path).unwrap();
+
+        let (_, window) = cx.add_window_view(|_, cx| AgentWorkspace::with_path(path, cx));
+        window.simulate_resize(size(px(1440.), px(1000.)));
+        window.run_until_parked();
+        let notice = window.debug_bounds("context-compacted").unwrap();
+        let conversation = window.debug_bounds("agent-chat-conversation").unwrap();
+        assert!(notice.top() >= conversation.top());
+        assert!(notice.bottom() <= conversation.bottom());
     }
 
     #[test]

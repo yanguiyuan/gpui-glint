@@ -127,6 +127,7 @@ struct SessionRun {
     questions: Vec<app_tools_ui::Question>,
     pending: Option<(Uuid, Task<()>)>,
     preparing: Option<(Uuid, Task<()>)>,
+    compacting: bool,
     subagents: subagent::Registry,
 }
 
@@ -1241,6 +1242,13 @@ impl AgentWorkspace {
                 let result = async {
                     let (images, skills, agentspace) = prepare.await?;
                     let summary = if let Some(plan) = compact_plan {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.run_mut(id).compacting = true;
+                            if this.history.active == id {
+                                scroll_follow::follow_if_at_bottom(&this.scroll);
+                            }
+                            cx.notify();
+                        });
                         let previous = plan.previous();
                         Some((
                             plan.generate(compact_config)
@@ -1255,7 +1263,9 @@ impl AgentWorkspace {
                 }
                 .await;
                 let _ = weak.update(cx, |this, cx| {
-                    if let Some((_, task)) = this.run_mut(id).preparing.take() {
+                    let run = this.run_mut(id);
+                    run.compacting = false;
+                    if let Some((_, task)) = run.preparing.take() {
                         task.detach();
                     }
                     match result {
@@ -2347,6 +2357,18 @@ impl AgentWorkspace {
                 )
             });
             let running = self.session_busy(session.id);
+            // Older sessions only saved the summary boundary.
+            let legacy_compaction_boundary = session
+                .compaction
+                .as_ref()
+                .filter(|_| {
+                    session
+                        .messages
+                        .iter()
+                        .rev()
+                        .all(|message| message.compacted_at.is_none())
+                })
+                .map(|summary| summary.through);
             let layout_context = (session.id, self.theme, session.messages.len());
             let viewport = self.scroll.bounds();
             let offset = self.scroll.offset();
@@ -2466,6 +2488,14 @@ impl AgentWorkspace {
                         }
                     }
                     let user = message.role == Role::User;
+                    let compacted_label = message
+                        .compacted_at
+                        .as_ref()
+                        .map(|time| format!("上下文已压缩 · {}", time.format("%H:%M")))
+                        .or_else(|| {
+                            (legacy_compaction_boundary == Some(index + 1))
+                                .then(|| "此前的上下文已压缩".to_owned())
+                        });
                     let author = match message.role {
                         Role::User => "你".to_owned(),
                         Role::Notice => "提示".to_owned(),
@@ -2652,7 +2682,16 @@ impl AgentWorkspace {
                                                 cx,
                                             ))
                                         },
-                                    ),
+                                    )
+                                    .when_some(compacted_label, |body, label| {
+                                        body.child(
+                                            div()
+                                                .debug_selector(|| "context-compacted".into())
+                                                .text_size(px(12.))
+                                                .text_color(rgb(p.text_muted))
+                                                .child(label),
+                                        )
+                                    }),
                             ),
                     );
                 }
@@ -2696,8 +2735,15 @@ impl AgentWorkspace {
                         .gap_2()
                         .text_color(rgb(p.text_muted))
                         .child(
-                            ShimmerText::new("agent-waiting-reply", self.subagent_waiting_label())
-                                .theme(self.theme),
+                            ShimmerText::new(
+                                "agent-waiting-reply",
+                                if self.active_run().compacting {
+                                    "正在压缩上下文…"
+                                } else {
+                                    self.subagent_waiting_label()
+                                },
+                            )
+                            .theme(self.theme),
                         ),
                 );
             }

@@ -15,6 +15,8 @@ pub enum Role {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<DateTime<Local>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<MessageDisplay>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quick_replies: Vec<String>,
@@ -227,6 +229,7 @@ impl Session {
         }
         self.updated = Local::now();
         self.messages.push(Message {
+            compacted_at: None,
             display: None,
             quick_replies: Vec::new(),
             thinking_ms: Default::default(),
