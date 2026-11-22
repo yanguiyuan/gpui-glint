@@ -1601,47 +1601,61 @@ impl AgentWorkspace {
                                 )
                                 .child(
                                     div()
-                                        .id("tool-output")
-                                        .debug_selector(|| "tool-output".into())
+                                        .relative()
                                         .w_full()
                                         .min_w_0()
                                         .flex_shrink_0()
-                                        .max_h(px(320.))
-                                        .relative()
-                                        .overflow_y_scroll()
-                                        .track_scroll(&result_scroll)
-                                        .text_size(px(12.))
-                                        .line_height(px(20.))
-                                        .font_family("monospace")
-                                        .text_color(rgb(p.text_muted))
                                         .child(
                                             div()
+                                                .id("tool-output")
+                                                .debug_selector(|| "tool-output".into())
                                                 .w_full()
                                                 .min_w_0()
-                                                .px_3()
-                                                .py(px(10.))
+                                                .max_h(px(320.))
+                                                .relative()
+                                                .overflow_y_scroll()
+                                                .track_scroll(&result_scroll)
+                                                .text_size(px(12.))
+                                                .line_height(px(20.))
+                                                .font_family("monospace")
+                                                .text_color(rgb(p.text_muted))
                                                 .child(
-                                                    if pending_body {
-                                                        div()
-                                                            .py_1()
-                                                            .child(pending_skeleton(
-                                                                pending_id.clone(),
-                                                                theme,
-                                                            ))
-                                                            .into_any_element()
-                                                    } else if let Some(output) = &command_output {
-                                                        output.render().into_any_element()
-                                                    } else {
-                                                        div()
-                                                            .child(result.clone())
-                                                            .into_any_element()
-                                                    },
-                                                ),
+                                                    div()
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .px_3()
+                                                        .py(px(10.))
+                                                        .child(
+                                                            if pending_body {
+                                                                div()
+                                                                    .py_1()
+                                                                    .child(pending_skeleton(
+                                                                        pending_id.clone(),
+                                                                        theme,
+                                                                    ))
+                                                                    .into_any_element()
+                                                            } else if let Some(output) =
+                                                                &command_output
+                                                            {
+                                                                output.render().into_any_element()
+                                                            } else {
+                                                                div()
+                                                                    .child(result.clone())
+                                                                    .into_any_element()
+                                                            },
+                                                        ),
+                                                )
+                                                .child(crate::command_output::scroll_guard(
+                                                    &result_scroll,
+                                                    20.,
+                                                )),
                                         )
-                                        .child(crate::command_output::scroll_guard(
-                                            &result_scroll,
-                                            20.,
-                                        )),
+                                        .child(
+                                            gpui_glint::components::ScrollFade::new(p.surface)
+                                                .from_scroll(&result_scroll)
+                                                .height(16.)
+                                                .render(),
+                                        ),
                                 )
                                 .into_any_element();
                         }

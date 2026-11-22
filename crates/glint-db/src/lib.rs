@@ -1,3 +1,4 @@
+pub mod agent_tools;
 mod connection_dialog;
 pub mod driver;
 pub mod model;
@@ -10,9 +11,9 @@ use gpui::{
 };
 use gpui_glint::components::{
     Button, ButtonKind, ButtonSize, CodeCard, DataTable, Dialog, Icon, IconButton, PaginationBar,
-    ResizableDivider, SegmentOption, SegmentedControl, Select, SelectEvent, SelectOption,
-    ShellRenderer, TableCell, TableColumn, TableEvent, TableRow, TextEntry, Toast, ToastHost,
-    ToastKind, WorkspaceSlots,
+    ResizableDivider, ScrollFade, SegmentOption, SegmentedControl, Select, SelectEvent,
+    SelectOption, ShellRenderer, TableCell, TableColumn, TableEvent, TableRow, TextEntry, Toast,
+    ToastHost, ToastKind, WorkspaceSlots,
 };
 use gpui_glint::theme::ThemePreset;
 use model::{ColumnInfo, ConnectionConfig, DbKind, QueryResult, TableInfo, WorkspaceTab};
@@ -57,6 +58,7 @@ pub struct DbWorkspace {
     tables: Vec<TableInfo>,
     selected_table: Option<String>,
     table_filter: Entity<TextEntry>,
+    tables_scroll: gpui::ScrollHandle,
     tab: WorkspaceTab,
     browse_result: Option<QueryResult>,
     browse_table: Option<Entity<DataTable>>,
@@ -99,7 +101,7 @@ impl DbWorkspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let saved = storage::load(&storage_path);
-        let theme = ThemePreset::default();
+        let theme = ThemePreset::Moonstone;
         let database_select = cx.new(|cx| {
             let mut s = Select::new(Vec::<SelectOption>::new(), cx);
             s.set_theme(theme, cx);
@@ -150,6 +152,7 @@ impl DbWorkspace {
             tables: Vec::new(),
             selected_table: None,
             table_filter,
+            tables_scroll: gpui::ScrollHandle::new(),
             tab: WorkspaceTab::Browse,
             browse_result: None,
             browse_table: None,
@@ -185,6 +188,24 @@ impl DbWorkspace {
 
     pub fn host_theme(&self) -> ThemePreset {
         self.theme
+    }
+
+    pub fn agent_tool_catalog() -> Vec<serde_json::Value> {
+        agent_tools::tool_catalog()
+    }
+
+    pub fn prepare_agent_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<agent_tools::PreparedDbTool, String> {
+        agent_tools::prepare(
+            &self.connections,
+            self.active_connection,
+            self.selected_database.as_deref(),
+            name,
+            args,
+        )
     }
 
     pub fn set_host_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
@@ -901,8 +922,8 @@ impl DbWorkspace {
 
         let mut table_list = div()
             .id("db-tables-scroll")
-            .flex_1()
-            .min_h_0()
+            .track_scroll(&self.tables_scroll)
+            .size_full()
             .overflow_y_scroll()
             .px_2()
             .pb_3()
@@ -1038,7 +1059,20 @@ impl DbWorkspace {
                     )
                     .child(self.table_filter.clone()),
             )
-            .child(table_list)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(table_list)
+                    .child(
+                        ScrollFade::new(p.panel)
+                            .from_scroll(&self.tables_scroll)
+                            .height(16.)
+                            .render(),
+                    ),
+            )
     }
 
     fn render_topbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {

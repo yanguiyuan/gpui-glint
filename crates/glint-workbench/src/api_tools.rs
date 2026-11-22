@@ -54,6 +54,7 @@ pub struct ApiTools {
 impl ApiTools {
     pub fn connect(
         api: &Entity<glint_api::Workbench>,
+        db: &Entity<glint_db::DbWorkspace>,
         cx: &mut Context<super::Workbench>,
     ) -> (Arc<dyn HostTools>, Task<()>, gpui::Subscription) {
         let (sender, receiver) = async_channel::bounded::<Invocation>(32);
@@ -66,6 +67,7 @@ impl ApiTools {
             }
         });
         let api = api.downgrade();
+        let db = db.downgrade();
         let task = cx.spawn(async move |_, cx| {
             while let Ok(call) = receiver.recv().await {
                 // A cancelled model turn must not execute mutations still waiting in the queue.
@@ -74,6 +76,26 @@ impl ApiTools {
                         let _ = call
                             .reply
                             .try_send(Err("API 工具排队超时，未开始执行".into()));
+                    }
+                    continue;
+                }
+                if call.name.starts_with("glint_db_") {
+                    let job = db
+                        .read_with(cx, |db, _| db.prepare_agent_tool(&call.name, call.arguments))
+                        .unwrap_or_else(|_| Err("数据库工作区已关闭".into()));
+                    let reply = call.reply;
+                    match job {
+                        Ok(job) => cx
+                            .background_executor()
+                            .spawn(async move {
+                                if !reply.is_closed() && Instant::now() < call.deadline {
+                                    let _ = reply.try_send(job());
+                                }
+                            })
+                            .detach(),
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                        }
                     }
                     continue;
                 }
@@ -122,6 +144,7 @@ impl ApiTools {
 impl HostTools for ApiTools {
     fn catalog(&self) -> Vec<Value> {
         let mut tools = glint_api::Workbench::tool_catalog();
+        tools.extend(glint_db::DbWorkspace::agent_tool_catalog());
         if let Ok(plugin_catalog) = self.plugin_catalog.read() {
             tools.extend(plugin_catalog.iter().cloned());
         }

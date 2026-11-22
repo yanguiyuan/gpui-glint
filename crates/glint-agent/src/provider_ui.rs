@@ -126,6 +126,7 @@ pub enum Section {
     Memory,
     Skills,
     Mcp,
+    Tools,
     Provider,
 }
 
@@ -140,6 +141,7 @@ impl Section {
             Self::Memory => "记忆",
             Self::Skills => "技能",
             Self::Mcp => "MCP",
+            Self::Tools => "工具",
             Self::Provider => "供应商",
         }
     }
@@ -998,9 +1000,228 @@ impl AgentWorkspace {
         cx.notify();
     }
 
+    fn collect_toggleable_tools(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        let builtin: Vec<(String, String)> = crate::tools::definitions(true)
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| {
+                let name = t["name"].as_str()?.to_owned();
+                let desc = t["description"].as_str().unwrap_or("").to_owned();
+                Some((name, desc))
+            })
+            .collect();
+
+        let mut db_tools = Vec::new();
+        let mut api_tools = Vec::new();
+        if let Some(host) = &self.host_tools {
+            for tool in host.catalog() {
+                let Some(name) = tool["name"].as_str() else {
+                    continue;
+                };
+                let desc = tool["description"].as_str().unwrap_or("").to_owned();
+                if name.starts_with("glint_db_") {
+                    db_tools.push((name.to_owned(), desc));
+                } else {
+                    api_tools.push((name.to_owned(), desc));
+                }
+            }
+        }
+
+        let mut groups = vec![("内置工具", builtin)];
+        if !db_tools.is_empty() {
+            groups.push(("数据库工具", db_tools));
+        }
+        if !api_tools.is_empty() {
+            groups.push(("API 与插件工具", api_tools));
+        }
+        groups
+    }
+
+    fn tools_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = self.theme.palette();
+        let query = self.provider_settings.search.read(cx).value().trim().to_lowercase();
+        let groups = self.collect_toggleable_tools();
+        let all_names: Vec<String> = groups
+            .iter()
+            .flat_map(|(_, items)| items.iter().map(|(n, _)| n.clone()))
+            .collect();
+        let total = all_names.len();
+        let enabled_count = all_names
+            .iter()
+            .filter(|n| !self.history.disabled_tools.contains(*n))
+            .count();
+
+        let mut content = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("工具启用"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(format!(
+                                        "默认全部启用，已启用 {enabled_count} / {total} 个工具（关闭后模型将不可见且无法调用）"
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("全部启用")
+                                    .kind(ButtonKind::Glass)
+                                    .size(ButtonSize::Small)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "settings-tools-enable-all".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.history.disabled_tools.clear();
+                                        this.save(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("全部停用")
+                                    .kind(ButtonKind::Gray)
+                                    .size(ButtonSize::Small)
+                                    .theme(self.theme)
+                                    .render()
+                                    .debug_selector(|| "settings-tools-disable-all".into())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        for name in &all_names {
+                                            this.history.disabled_tools.insert(name.clone());
+                                        }
+                                        this.save(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+
+        for (group_title, items) in groups {
+            let filtered: Vec<(String, String)> = items
+                .into_iter()
+                .filter(|(name, desc)| {
+                    query.is_empty()
+                        || name.to_lowercase().contains(&query)
+                        || desc.to_lowercase().contains(&query)
+                })
+                .collect();
+            if filtered.is_empty() {
+                continue;
+            }
+            let mut card = div()
+                .w_full()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(p.border))
+                .bg(rgb(p.surface))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.panel))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{group_title} ({})", filtered.len())),
+                );
+
+            for (idx, (name, desc)) in filtered.into_iter().enumerate() {
+                let enabled = !self.history.disabled_tools.contains(&name);
+                let toggle_name = name.clone();
+                let weak = cx.entity().downgrade();
+                let mut row = div()
+                    .id(SharedString::from(format!("settings-tool:{name}")))
+                    .px_3()
+                    .py_2p5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3();
+                if idx > 0 {
+                    row = row.border_t_1().border_color(rgb(p.border));
+                }
+                row = row
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .font_family("Menlo")
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(p.text))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .truncate()
+                                    .child(desc),
+                            ),
+                    )
+                    .child(
+                        Switch::new("")
+                            .checked(enabled)
+                            .theme(self.theme)
+                            .on_change(move |next, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    if next {
+                                        this.history.disabled_tools.remove(&toggle_name);
+                                    } else {
+                                        this.history.disabled_tools.insert(toggle_name.clone());
+                                    }
+                                    this.save(cx);
+                                    cx.notify();
+                                });
+                            })
+                            .render(),
+                    );
+                card = card.child(row);
+            }
+            content = content.child(card);
+        }
+
+        self.settings_container(content)
+    }
+
     pub fn settings_page(&self, cx: &mut Context<Self>) -> gpui::Div {
         if self.provider_settings.section == Section::Mcp {
             return self.mcp_page(cx);
+        }
+        if self.provider_settings.section == Section::Tools {
+            return self.tools_page(cx);
         }
         if self.provider_settings.section == Section::Skills {
             return self.skills_page(cx);
@@ -1657,6 +1878,7 @@ impl AgentWorkspace {
             (Section::Memory, Icon::Database),
             (Section::Skills, Icon::Workflow),
             (Section::Mcp, Icon::Workflow),
+            (Section::Tools, Icon::Puzzle),
             (Section::Shortcuts, Icon::Code),
         ] {
             if !query.is_empty() && !section.title().to_lowercase().contains(&query) {

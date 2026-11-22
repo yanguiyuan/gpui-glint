@@ -1432,7 +1432,8 @@ impl AgentWorkspace {
             subagents: subagents.clone(),
             delegation: Default::default(),
             registry: tool_registry::ToolRegistry::new(self.path.with_file_name("mcp.json"))
-                .with_host_tools(self.host_tools.clone()),
+                .with_host_tools(self.host_tools.clone())
+                .with_disabled_tools(self.history.disabled_tools.clone()),
             skills: skills.clone(),
             memory: request_memory.clone(),
             access: self.access.clone(),
@@ -2967,7 +2968,22 @@ impl AgentWorkspace {
             .when_some(self.storage_error.clone(), |root, error| {
                 root.child(div().px_5().py_2().text_color(rgb(0xd9342b)).child(error))
             })
-            .child(conversation)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(conversation)
+                    .child(
+                        gpui_glint::components::ScrollFade::new(p.workspace)
+                            .from_scroll(&self.scroll)
+                            .height(22.)
+                            .render(),
+                    ),
+            )
             .when(!self.trajectory.open, |root| {
                 root.child(
                     div()

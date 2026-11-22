@@ -709,6 +709,9 @@ async fn execute_inner(call: &ToolCall, context: &ToolContext) -> Result<String,
         return crate::channels::tools::execute(call, context).await;
     }
 
+    if context.registry.is_tool_disabled(&call.name) {
+        return Err(format!("工具 {} 已在设置中禁用", call.name));
+    }
     if context.registry.has_host_tool(&call.name) {
         return context
             .registry

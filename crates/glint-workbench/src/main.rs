@@ -70,8 +70,9 @@ impl Workbench {
         let api = cx.new(|cx| {
             glint_api::Workbench::hosted_with_vault(shell.clone(), Some(vault.clone()), cx)
         });
+        let db = cx.new(|cx| glint_db::DbWorkspace::hosted(shell.clone(), cx));
         let (tools, api_tools_task, plugin_catalog_subscription) =
-            api_tools::ApiTools::connect(&api, cx);
+            api_tools::ApiTools::connect(&api, &db, cx);
         let agent = cx.new(|cx| {
             let mut agent = glint_agent::AgentWorkspace::hosted_with_vault(
                 shell.clone(),
@@ -85,8 +86,10 @@ impl Workbench {
             }));
             agent
         });
-        let db = cx.new(|cx| glint_db::DbWorkspace::hosted(shell.clone(), cx));
-        api.update(cx, |api, _| api.set_host_background_tasks(true));
+        api.update(cx, |api, cx| {
+            api.set_host_theme(ThemePreset::Moonstone, cx);
+            api.set_host_background_tasks(true);
+        });
         agent.update(cx, |agent, _| agent.set_host_background_tasks(true));
         let task_owner = cx.entity().downgrade();
         *task_menu.borrow_mut() =

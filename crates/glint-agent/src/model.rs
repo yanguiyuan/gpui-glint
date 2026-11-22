@@ -276,6 +276,8 @@ pub struct History {
     #[serde(default)]
     pub access_mode: crate::tools::AccessMode,
     #[serde(default)]
+    pub disabled_tools: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub projects: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub project_metadata:
@@ -308,6 +310,7 @@ impl Default for History {
             commit_message: Default::default(),
             preferred_partner: None,
             access_mode: crate::tools::AccessMode::default(),
+            disabled_tools: Default::default(),
             agentspace: None,
             projects: vec![],
             project_metadata: Default::default(),
