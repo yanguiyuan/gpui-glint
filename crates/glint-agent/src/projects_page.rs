@@ -251,7 +251,7 @@ impl AgentWorkspace {
             .when_some(self.browser_repositories.error.clone(), |bar, error| {
                 bar.child(div().truncate().text_color(rgb(p.text_muted)).child(error))
             })
-            .child(div().flex_1())
+            .child(window_drag_region())
             .child(
                 IconButton::new(Icon::Shell, "打开项目终端")
                     .theme(self.theme)

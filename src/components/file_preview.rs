@@ -260,6 +260,7 @@ pub struct FilePreview {
     content_only: bool,
     navigation: Option<(String, Vec<FilePreviewEntry>)>,
     navigation_scroll: gpui::UniformListScrollHandle,
+    hovered_nav: Option<String>,
     folders: std::collections::HashMap<String, FolderNode>,
     next_request: u64,
     open_breadcrumb: Option<usize>,
@@ -311,6 +312,7 @@ impl FilePreview {
             content_only: false,
             navigation: None,
             navigation_scroll: Default::default(),
+            hovered_nav: None,
             folders: Default::default(),
             next_request: 0,
             open_breadcrumb: None,
@@ -966,6 +968,12 @@ impl FilePreview {
                                 .pr_2()
                                 .py_1()
                                 .when(entry.path == this.path, |row| row.bg(rgb(p.accent_tint)))
+                                .when(
+                                    entry.path != this.path
+                                        && this.hovered_nav.as_deref() == Some(entry.path.as_str())
+                                        && (entry.directory || entry.previewable),
+                                    |row| row.bg(rgb(p.surface_subtle)),
+                                )
                                 .text_color(rgb(if entry.directory || entry.previewable {
                                     p.text
                                 } else {
@@ -983,8 +991,21 @@ impl FilePreview {
                                 .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
                                 .when(entry.directory || entry.previewable, |row| {
                                     let path = entry.path.clone();
+                                    let hover_path = entry.path.clone();
                                     row.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(p.surface_subtle)))
+                                        .on_hover(cx.listener(move |this, hovered, _, cx| {
+                                            let prev = this.hovered_nav.clone();
+                                            if *hovered {
+                                                this.hovered_nav = Some(hover_path.clone());
+                                            } else if this.hovered_nav.as_deref()
+                                                == Some(hover_path.as_str())
+                                            {
+                                                this.hovered_nav = None;
+                                            }
+                                            if prev != this.hovered_nav {
+                                                cx.notify();
+                                            }
+                                        }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if entry.directory {
                                                 this.toggle_folder(path.clone(), cx);

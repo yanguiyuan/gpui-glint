@@ -1071,7 +1071,7 @@ impl DbWorkspace {
             .when(!self.databases.is_empty(), |bar| {
                 bar.child(div().w(px(180.)).child(self.database_select.clone()))
             })
-            .child(div().flex_1())
+            .child(gpui_glint::components::window_drag_region())
             .child(
                 Button::new("SQL 查询")
                     .kind(ButtonKind::Glass)
