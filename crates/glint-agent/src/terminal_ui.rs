@@ -2651,9 +2651,12 @@ impl AgentWorkspace {
                     .overflow_hidden()
                     .child(panel),
             )
-            .when(self.terminal_ui.open && self.terminal_ui.bottom, |body| {
-                body.child(self.project_terminal_sidebar(cx))
-            })
+            .when(
+                self.terminal_ui.open
+                    && self.terminal_ui.bottom
+                    && self.page != crate::Page::Projects,
+                |body| body.child(self.project_terminal_sidebar(cx)),
+            )
     }
 
     pub(super) fn set_terminal_position(&mut self, position: Position) {
@@ -2909,9 +2912,6 @@ impl AgentWorkspace {
                 }
             });
         let terminal = selected.map(|(_, terminal)| terminal.clone());
-        let busy = terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).busy());
         let owner = cx.entity().downgrade();
         let close_owner = owner.clone();
         let add_owner = owner.clone();
@@ -2935,6 +2935,7 @@ impl AgentWorkspace {
                 })
             }))
             .selected(terminal.as_ref().map(|view| view.entity_id().as_u64()))
+            .pills(true)
             .theme(self.theme)
             .fill_height()
             .content_padding(0.)
@@ -2970,58 +2971,17 @@ impl AgentWorkspace {
         if let Some(view) = &terminal {
             tab_bar = tab_bar.content(view.entity_id().as_u64(), view.clone());
         }
-        let stop_terminal = terminal.clone();
         let copy_terminal = terminal.clone();
-        let restart_root = root.clone();
-        let restart_terminal = terminal.clone();
         let controls = div()
             .flex()
             .items_center()
             .gap_2()
             .when(!action_panel, |controls| {
-                controls.children(
-                    self.repository_select(crate::panel_repositories::Panel::Terminal, cx),
-                )
-            })
-            .when(busy, |controls| {
-                controls.child(
-                    IconButton::new(Icon::Pause, "停止当前终端")
-                        .plain()
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if let Some(terminal) = &stop_terminal {
-                                terminal.update(cx, |terminal, cx| terminal.stop(cx));
-                            }
-                        })),
-                )
-            })
-            .when(!busy, |controls| {
-                controls.child(
-                    IconButton::new(Icon::Refresh, "重启当前终端")
-                        .plain()
-                        .theme(self.theme)
-                        .render()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let (Some(root), Some(terminal)) = (&restart_root, &restart_terminal)
-                            {
-                                if this
-                                    .project_action_terminal(root)
-                                    .is_some_and(|(_, action)| action == *terminal)
-                                {
-                                    this.rerun_project_action_terminal(root.clone(), window, cx);
-                                } else {
-                                    this.close_terminal_tab(root, terminal.entity_id(), window, cx);
-                                    this.new_terminal_tab(root.clone(), window, cx);
-                                    if action_panel {
-                                        this.project_actions.panel = true;
-                                    } else {
-                                        this.terminal_ui.open = true;
-                                    }
-                                }
-                            }
-                        })),
-                )
+                controls
+                    .children(
+                        self.repository_select(crate::panel_repositories::Panel::Terminal, cx),
+                    )
+                    .child(self.project_action_trigger(cx))
             })
             .child(
                 IconButton::new(Icon::Copy, "复制输出")

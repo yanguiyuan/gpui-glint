@@ -83,6 +83,7 @@ pub enum Icon {
     Tag,
     Star,
     Sparkles,
+    Check,
     CheckCircle,
     HalfCircle,
     Seal,
@@ -171,6 +172,7 @@ impl Icon {
             Self::Tag => "tag",
             Self::Star => "star",
             Self::Sparkles => "sparkles",
+            Self::Check => "check",
             Self::CheckCircle => "check-circle",
             Self::HalfCircle => "half-circle",
             Self::Seal => "seal",
@@ -775,6 +777,7 @@ fn icon_svg(name: &str) -> Option<String> {
             "<path d='M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z'/><circle cx='12' cy='12' r='2.8'/>",
             "none",
         ),
+        "check" => ("<path d='M20 6 9 17l-5-5'/>", "none"),
         "check-circle" => (
             "<circle cx='12' cy='12' r='8.5'/><path d='m8.3 12.2 2.5 2.5 4.9-5.2'/>",
             "none",

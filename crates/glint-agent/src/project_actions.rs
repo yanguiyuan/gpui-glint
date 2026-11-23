@@ -1,6 +1,6 @@
 //! User-triggered, project-scoped commands. Discovery never evaluates Makefiles.
 use super::*;
-use gpui_glint::components::{Dialog, InputField, MenuItem, Tooltip};
+use gpui_glint::components::{Dialog, IconButton, InputField, MenuItem, Tooltip};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -35,6 +35,7 @@ pub struct State {
     before: Option<String>,
     readable: bool,
     runs: HashMap<PathBuf, Run>,
+    selected: HashMap<PathBuf, String>,
     pub(super) editor: Option<(PathBuf, Option<usize>)>,
     name: Entity<TextEntry>,
     command: Entity<TextEntry>,
@@ -67,6 +68,7 @@ impl State {
             before,
             readable,
             runs: HashMap::new(),
+            selected: HashMap::new(),
             editor: None,
             name: cx.new(|cx| TextEntry::new(cx, "例如：启动开发", "")),
             command: cx.new(|cx| TextEntry::new(cx, "例如：cargo run -p glint-workbench", "")),
@@ -222,17 +224,22 @@ impl AgentWorkspace {
             .map(|run| run.terminal.read(cx).background_task_state())
             .unwrap_or(gpui_glint::components::BackgroundTaskState::Finished)
     }
+    fn active_project_action_root(&self) -> Option<PathBuf> {
+        self.panel_repository_root(crate::panel_repositories::Panel::Terminal)
+            .or_else(|| self.history.active().project.clone())
+    }
+
     pub(super) fn sync_project_actions(&mut self, cx: &mut Context<Self>) {
         for run in self.project_actions.runs.values() {
             run.terminal
                 .update(cx, |view, cx| view.set_theme(self.theme, cx));
         }
-        if self.project_actions.open && self.project_actions.root != self.history.active().project {
+        if self.project_actions.root != self.active_project_action_root() {
             self.refresh_project_actions(cx);
         }
     }
     fn refresh_project_actions(&mut self, cx: &mut Context<Self>) {
-        let root = self.history.active().project.clone();
+        let root = self.active_project_action_root();
         self.project_actions.root = root.clone();
         self.project_actions.discovered.clear();
         self.project_actions.discovery = None;
@@ -307,13 +314,15 @@ impl AgentWorkspace {
         window.focus(&terminal.read(cx).focus_handle(cx), cx);
         self.select_terminal_tab(root.clone(), terminal.entity_id());
         self.project_actions
+            .selected
+            .insert(root.clone(), action.name.clone());
+        self.project_actions
             .runs
             .insert(root, Run { action, terminal });
         self.project_actions.open = false;
-        self.project_actions.panel = true;
+        self.project_actions.panel = false;
         self.background_tasks(cx);
-        self.terminal_ui.open = false;
-        self.page = crate::Page::Chat;
+        self.terminal_ui.open = true;
         cx.notify();
     }
     fn edit_project_action(
@@ -383,29 +392,69 @@ impl AgentWorkspace {
         }
         cx.notify();
     }
+    fn actions_for_project(&self, root: &Path) -> (Vec<Action>, usize) {
+        let mut actions = self
+            .project_actions
+            .config
+            .projects
+            .get(root)
+            .cloned()
+            .unwrap_or_default();
+        let custom_count = actions.len();
+        if self.project_actions.root.as_deref() == Some(root) {
+            actions.extend(self.project_actions.discovered.clone());
+        }
+        (actions, custom_count)
+    }
+
+    fn selected_project_action(&self, root: &Path) -> Option<Action> {
+        let (actions, _) = self.actions_for_project(root);
+        if let Some(selected_name) = self.project_actions.selected.get(root)
+            && let Some(found) = actions.iter().find(|action| &action.name == selected_name)
+        {
+            return Some(found.clone());
+        }
+        actions.into_iter().next()
+    }
+
     pub(super) fn project_action_trigger(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.theme.palette();
-        let root = self.history.active().project.clone();
+        let root = self.active_project_action_root();
         let busy = root
             .as_ref()
             .and_then(|r| self.project_actions.runs.get(r))
             .is_some_and(|r| r.terminal.read(cx).busy());
-        // Quiet by default; only a running action earns a status color.
-        let trigger = Button::new(if busy { "运行中" } else { "项目操作" })
-            .icon(if busy { Icon::Pulse } else { Icon::Play })
-            .disclosure(self.project_actions.open)
-            .kind(ButtonKind::Ghost)
-            .size(ButtonSize::Compact)
-            .foreground(if busy {
-                self.theme.color(0x16833a)
-            } else {
-                p.text_muted
-            })
-            .theme(self.theme)
-            .render()
-            .debug_selector(|| "agent-topbar-actions".into());
+        let selected_action = root
+            .as_ref()
+            .and_then(|r| self.selected_project_action(r));
+        let selector_label = selected_action
+            .as_ref()
+            .map(|action| action.name.clone())
+            .unwrap_or_else(|| "运行配置".into());
+        let trigger = div()
+            .id("agent-topbar-actions")
+            .debug_selector(|| "agent-topbar-actions".into())
+            .h(px(26.))
+            .max_w(px(150.))
+            .px(px(8.))
+            .rounded(px(6.))
+            .bg(rgb(p.surface_subtle))
+            .hover(move |style| style.bg(rgb(p.accent_tint)))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(12.))
+            .text_color(rgb(p.text))
+            .child(div().min_w_0().truncate().child(selector_label))
+            .child(
+                Icon::ChevronDown
+                    .render(12.)
+                    .flex_shrink_0()
+                    .text_color(rgb(p.text_muted)),
+            );
         let mut content = div().flex().flex_col().min_w_0();
-        if let Some(root) = root {
+        if let Some(root) = root.clone() {
             content = content.child(
                 Tooltip::new(
                     div()
@@ -442,17 +491,7 @@ impl AgentWorkspace {
                 .theme(self.theme)
                 .render(cx),
             );
-            let mut actions = self
-                .project_actions
-                .config
-                .projects
-                .get(&root)
-                .cloned()
-                .unwrap_or_default();
-            let custom_count = actions.len();
-            if self.project_actions.root.as_ref() == Some(&root) {
-                actions.extend(self.project_actions.discovered.clone());
-            }
+            let (actions, custom_count) = self.actions_for_project(&root);
             let mut list = div()
                 .id("project-actions-list")
                 .max_h(px(320.))
@@ -493,6 +532,9 @@ impl AgentWorkspace {
                 let project = root.clone();
                 let edit_root = root.clone();
                 let delete_root = root.clone();
+                let is_selected = selected_action
+                    .as_ref()
+                    .is_some_and(|sel| sel.name == action.name);
                 let row = div()
                     .flex()
                     .flex_shrink_0()
@@ -515,9 +557,11 @@ impl AgentWorkspace {
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(p.surface_subtle)))
                             .child(
-                                Icon::Play
-                                    .render(13.)
-                                    .text_color(rgb(self.theme.color(0x16833a))),
+                                div()
+                                    .w(px(14.))
+                                    .flex_shrink_0()
+                                    .text_color(rgb(p.text))
+                                    .when(is_selected, |check| check.child(Icon::Check.render(13.))),
                             )
                             .child(
                                 div()
@@ -548,8 +592,12 @@ impl AgentWorkspace {
                                         .w_full(),
                                     ),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run_project_action(project.clone(), action.clone(), window, cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.project_actions
+                                    .selected
+                                    .insert(project.clone(), action.name.clone());
+                                this.project_actions.open = false;
+                                cx.notify();
                             })),
                     )
                     .when(index < custom_count, |row| {
@@ -610,6 +658,7 @@ impl AgentWorkspace {
                         .child("暂无操作，添加命令或在项目根目录创建 Makefile"),
                 );
             }
+            let add_root = root.clone();
             content = content.child(
                 div()
                     .mt_2()
@@ -627,7 +676,7 @@ impl AgentWorkspace {
                                 .render()
                                 .debug_selector(|| "add-project-action".into())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.edit_project_action(root.clone(), None, window, cx)
+                                    this.edit_project_action(add_root.clone(), None, window, cx)
                                 })),
                         ),
                     )
@@ -647,28 +696,21 @@ impl AgentWorkspace {
                         .render(cx),
                     ),
             );
-            if self
-                .history
-                .active()
-                .project
-                .as_ref()
-                .is_some_and(|r| self.project_actions.runs.contains_key(r))
-            {
+            if self.project_actions.runs.contains_key(&root) {
                 content = content.child(
                     MenuItem::new("show-project-action-output", "显示运行输出")
                         .icon(Icon::Shell)
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(root) = this.history.active().project.clone() {
+                            if let Some(root) = this.active_project_action_root() {
                                 if let Some((_, terminal)) = this.project_action_terminal(&root) {
                                     this.select_terminal_tab(root, terminal.entity_id());
                                 }
                             }
-                            this.project_actions.panel = true;
-                            this.terminal_ui.open = false;
+                            this.project_actions.panel = false;
+                            this.terminal_ui.open = true;
                             this.project_actions.open = false;
-                            this.page = crate::Page::Chat;
                             cx.notify();
                         })),
                 );
@@ -680,9 +722,9 @@ impl AgentWorkspace {
             body.child(div().p_2().text_color(rgb(0xd9342b)).child(e))
         });
         let weak = cx.entity().downgrade();
-        Popover::new("project-actions", trigger, content)
+        let selector = Popover::new("project-actions", trigger, content)
             .open(self.project_actions.open)
-            .width(360.)
+            .width(320.)
             .padding(6.)
             .theme(self.theme)
             .on_open_change(move |open, _, cx| {
@@ -693,7 +735,40 @@ impl AgentWorkspace {
                     }
                     cx.notify();
                 });
-            })
+            });
+        let run_root = root.clone();
+        let run_action = selected_action.clone();
+        let play_color = self.theme.color(0x16833a);
+        let run_button = IconButton::new(
+            if busy { Icon::Pulse } else { Icon::Play },
+            if busy {
+                "正在运行项目操作"
+            } else {
+                "运行当前项目操作"
+            },
+        )
+        .plain()
+        .theme(self.theme)
+        .render()
+        .debug_selector(|| "project-action-run".into())
+        .text_color(rgb(play_color))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if let (Some(root), Some(action)) = (run_root.clone(), run_action.clone()) {
+                this.run_project_action(root, action, window, cx);
+            } else {
+                this.project_actions.open = !this.project_actions.open;
+                if this.project_actions.open {
+                    this.refresh_project_actions(cx);
+                }
+                cx.notify();
+            }
+        }));
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(selector)
+            .child(run_button)
     }
     pub(super) fn project_action_editor(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let root = self
@@ -838,7 +913,11 @@ mod tests {
             })
         });
         window.run_until_parked();
-        assert!(window.debug_bounds("project-action-output").is_some());
+        host.read_with(window, |host, _| {
+            assert!(host.terminal_ui.open);
+            assert!(!host.project_actions.panel);
+        });
+        assert!(window.debug_bounds("project-terminal-dock").is_some());
         host.update(window, |host, cx| {
             let terminal = host.project_actions.runs[&root].terminal.clone();
             terminal.update(cx, |view, cx| view.stop(cx));
@@ -884,6 +963,7 @@ mod tests {
         window.simulate_resize(size(px(1440.), px(900.)));
         host.update(window, |host, cx| {
             host.history.active_mut().project = Some(dir.path().into());
+            host.terminal_ui.open = true;
             cx.notify();
         });
         window.run_until_parked();

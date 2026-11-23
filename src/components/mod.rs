@@ -66,7 +66,7 @@ pub use badge::{
     ReadStatus, StatusBadge, TagBadge, TagBadgeKind,
 };
 pub use button::{Button, ButtonKind, ButtonShadow, ButtonSize};
-pub use closable_tabs::{ClosableTab, ClosableTabs};
+pub use closable_tabs::{ClosableTab, ClosableTabs, ClosableTabsVariant};
 pub use dialog::{Dialog, DialogDismiss};
 pub use dropdown::{DropdownGroup, DropdownItem, GroupedDropdown};
 pub use icon::{DisclosureChevron, GlintAssets, Icon, IconButton, IconSvg};

@@ -2404,6 +2404,13 @@ impl AgentWorkspace {
         let config = match self.commit_model_config() {
             Ok(config) => config,
             Err(error) => {
+                self.git_ui.toasts.update(cx, |toasts, cx| {
+                    toasts.push(
+                        gpui_glint::components::Toast::new("生成提交信息失败")
+                            .description(error.clone()),
+                        cx,
+                    );
+                });
                 self.edits_ui.commit_notice = Some((root, error));
                 cx.notify();
                 return;
@@ -2423,6 +2430,13 @@ impl AgentWorkspace {
                     task.detach();
                 }
                 if let Err(error) = result {
+                    this.git_ui.toasts.update(cx, |toasts, cx| {
+                        toasts.push(
+                            gpui_glint::components::Toast::new("生成提交信息失败")
+                                .description(error.clone()),
+                            cx,
+                        );
+                    });
                     this.edits_ui.commit_notice =
                         Some((root, format!("生成提交信息失败：{error}")));
                 }

@@ -130,6 +130,7 @@ pub(super) struct ProjectFiles {
     directories: std::collections::HashMap<u64, Task<()>>,
     theme: ThemePreset,
     visible: bool,
+    bottom_panel: Option<gpui::AnyElement>,
     next_document_id: u64,
 }
 
@@ -201,6 +202,7 @@ impl ProjectFiles {
             directories: Default::default(),
             theme: ThemePreset::Moonstone,
             visible: true,
+            bottom_panel: None,
             next_document_id: 0,
         }
     }
@@ -209,6 +211,10 @@ impl ProjectFiles {
     /// preferences. Set once, when the workspace is created. The footer reads
     /// live workspace state (busy flag, menu, notice), so it must repaint
     /// whenever that state changes.
+    pub fn set_bottom_panel(&mut self, panel: Option<gpui::AnyElement>) {
+        self.bottom_panel = panel;
+    }
+
     pub fn set_owner(&mut self, owner: gpui::WeakEntity<AgentWorkspace>, cx: &mut Context<Self>) {
         if let Some(owner) = owner.upgrade() {
             cx.observe(&owner, |_, _, cx| cx.notify()).detach();
@@ -819,19 +825,22 @@ impl ProjectFiles {
                         )
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
                                 .gap_1()
                                 .child(wand)
-                                .child(model)
-                                .child(div().flex_1())
+                                .child(div().flex_1().min_w_0().overflow_hidden().child(model))
                                 .child(
-                                    Tooltip::new(
+                                    div().flex_shrink_0().child(
+                                        Tooltip::new(
                                         submit,
                                         if submitting { "提交中…" } else { "提交" },
                                     )
                                     .theme(self.theme)
                                     .render(cx),
+                                    ),
                                 ),
                         ),
                 ),
@@ -2006,7 +2015,16 @@ impl Render for ProjectFiles {
                         }),
                     )
             })
-            .child(div().flex_1().min_w_0().h_full().child(document_pane))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().w_full().child(document_pane))
+                    .children(self.bottom_panel.take()),
+            )
             .children(self.tab_context_menu(window, cx))
     }
 }

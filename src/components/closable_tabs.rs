@@ -48,6 +48,15 @@ impl ClosableTab {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClosableTabsVariant {
+    /// Traditional folder-style tabs flush with the panel below.
+    #[default]
+    Folder,
+    /// Compact rounded pill tabs floating inside the panel header.
+    Pill,
+}
+
 /// A document-style card with closable folder tabs. The active tab shares the
 /// card surface and merges seamlessly into the panel below; the parent owns
 /// selection and removal.
@@ -55,6 +64,7 @@ pub struct ClosableTabs {
     tabs: Vec<ClosableTab>,
     selected: Option<u64>,
     theme: ThemePreset,
+    variant: ClosableTabsVariant,
     on_select: Option<TabHandler>,
     on_close: Option<TabHandler>,
     on_context: Option<ContextHandler>,
@@ -71,6 +81,7 @@ impl ClosableTabs {
             tabs: tabs.into_iter().collect(),
             selected: None,
             theme: ThemePreset::default(),
+            variant: ClosableTabsVariant::Folder,
             on_select: None,
             on_close: None,
             on_context: None,
@@ -89,6 +100,20 @@ impl ClosableTabs {
 
     pub fn theme(mut self, theme: ThemePreset) -> Self {
         self.theme = theme;
+        self
+    }
+
+    pub fn variant(mut self, variant: ClosableTabsVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    pub fn pills(mut self, pills: bool) -> Self {
+        self.variant = if pills {
+            ClosableTabsVariant::Pill
+        } else {
+            ClosableTabsVariant::Folder
+        };
         self
     }
 
@@ -155,26 +180,31 @@ impl ClosableTabs {
             active_content = Some(self.contents.remove(index).1);
         }
 
+        let is_pill = self.variant == ClosableTabsVariant::Pill;
+        let header_bg = if is_pill {
+            if dark {
+                rgba(0xffffff0b)
+            } else {
+                rgb(p.surface)
+            }
+        } else if dark {
+            rgba(0xffffff03)
+        } else {
+            rgb(p.canvas)
+        };
         let mut strip = div()
             .id("glass-closable-tabs")
             .w_full()
             .min_w_0()
             .flex_shrink_0()
             .rounded_t(px(12.))
-            .when(self.trailing.is_none(), |strip| {
-                strip.bg(if dark {
-                    rgba(0xffffff03)
-                } else {
-                    rgb(p.canvas)
-                })
-            })
-            .pt(px(6.))
-            .px(px(6.))
+            .when(self.trailing.is_none(), |strip| strip.bg(header_bg))
+            .when(is_pill, |strip| strip.py(px(6.)).px(px(8.)).items_center())
+            .when(!is_pill, |strip| strip.pt(px(6.)).px(px(6.)).items_end())
             // 标签变多时优先压缩自身宽度，只有压缩到最小宽度仍然放不下时才横向滚动。
             .max_w_full()
             .overflow_x_scroll()
             .flex()
-            .items_end()
             .gap_1()
             .text_size(px(13.));
 
@@ -199,27 +229,34 @@ impl ClosableTabs {
             let mut item = div()
                 .id(("glass-closable-tab", tab.id))
                 .debug_selector(move || format!("glass-closable-tab:{}", tab.id))
-                .h(px(40.))
+                .h(px(if is_pill { 28. } else { 40. }))
                 // 不再固定宽度：标签多时按比例压缩，标签少时最多 240px。
-                .min_w(px(MIN_TAB_WIDTH))
-                .max_w(px(MAX_TAB_WIDTH))
-                .px(px(12.))
+                .min_w(px(if is_pill { 72. } else { MIN_TAB_WIDTH }))
+                .max_w(px(if is_pill { 180. } else { MAX_TAB_WIDTH }))
+                .px(px(if is_pill { 10. } else { 12. }))
                 .flex_shrink_1()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_2()
                 .overflow_hidden()
-                .rounded_t(px(10.))
+                .when(is_pill, |item| item.rounded(px(7.)))
+                .when(!is_pill, |item| item.rounded_t(px(10.)))
                 .when(active, |item| {
-                    item.bg(if dark {
+                    item.bg(if is_pill {
+                        if dark {
+                            rgba(0xffffff18)
+                        } else {
+                            rgb(p.accent_tint)
+                        }
+                    } else if dark {
                         rgba(0xffffff0b)
                     } else {
                         rgb(p.surface)
                     })
                     .font_weight(gpui::FontWeight::MEDIUM)
                 })
-                .when(dark, |item| {
+                .when(dark && !is_pill, |item| {
                     item.border_t_2().border_color(if active {
                         rgb(p.accent)
                     } else {
@@ -234,7 +271,13 @@ impl ClosableTabs {
                 .cursor_pointer()
                 .when(!active, |item| {
                     item.hover(move |style| {
-                        style.bg(if dark {
+                        style.bg(if is_pill {
+                            if dark {
+                                rgba(0xffffff0a)
+                            } else {
+                                rgb(p.surface_subtle)
+                            }
+                        } else if dark {
                             rgba(0xffffff08)
                         } else {
                             rgb(p.surface)
@@ -293,7 +336,7 @@ impl ClosableTabs {
                 div()
                     .flex_shrink_0()
                     .px_1()
-                    .h(px(40.))
+                    .h(px(if is_pill { 28. } else { 40. }))
                     .flex()
                     .items_center()
                     .child(
@@ -328,18 +371,20 @@ impl ClosableTabs {
                 div()
                     .debug_selector(|| "closable-tabs-header".into())
                     .rounded_t(px(12.))
-                    .bg(if dark {
-                        rgba(0xffffff03)
-                    } else {
-                        rgb(p.canvas)
-                    })
+                    .bg(header_bg)
                     .w_full()
                     .min_w_0()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .child(strip.w_0().flex_1())
-                    .child(div().flex_shrink_0().pt(px(6.)).px_2().child(trailing)),
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .when(!is_pill, |d| d.pt(px(6.)))
+                            .px_2()
+                            .child(trailing),
+                    ),
             )
         } else {
             card.child(strip)

@@ -1908,14 +1908,6 @@ impl AgentWorkspace {
                     )
                 },
             )
-            .when(
-                self.page != crate::Page::Settings
-                    && self.page != crate::Page::Calendar
-                    && self.page != crate::Page::Vault
-                    && self.page != crate::Page::Partners
-                    && self.page != crate::Page::Channels,
-                |bar| bar.child(self.project_action_trigger(cx)),
-            )
             .when(!self.host_background_tasks, |bar| {
                 bar.child(self.background_tasks_menu(cx))
             })
@@ -3263,7 +3255,9 @@ impl Render for AgentWorkspace {
                                         body.child(self.project_action_panel(cx))
                                     })
                                     .when(
-                                        self.terminal_ui.open && self.terminal_ui.bottom,
+                                        self.terminal_ui.open
+                                            && self.terminal_ui.bottom
+                                            && self.page != crate::Page::Projects,
                                         |body| body.child(self.project_terminal_sidebar(cx)),
                                     ),
                             )

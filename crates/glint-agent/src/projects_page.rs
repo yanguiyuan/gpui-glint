@@ -307,8 +307,12 @@ impl AgentWorkspace {
     pub(super) fn projects_page(&self, cx: &mut Context<Self>) -> gpui::Div {
         let body = div().size_full().min_w_0().min_h_0();
         if self.browser_project.is_some() {
-            self.project_files
-                .update(cx, |files, cx| files.set_theme(self.theme, cx));
+            let bottom_terminal = (self.terminal_ui.open && self.terminal_ui.bottom)
+                .then(|| self.project_terminal_sidebar(cx).into_any_element());
+            self.project_files.update(cx, |files, cx| {
+                files.set_theme(self.theme, cx);
+                files.set_bottom_panel(bottom_terminal);
+            });
             body.child(self.project_files.clone())
         } else {
             body.flex()
