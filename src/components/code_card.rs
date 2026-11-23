@@ -2844,17 +2844,18 @@ fn link_tooltip_label(url: &str, root: Option<&std::path::Path>) -> String {
         None => (url, None),
     };
     let path = path.strip_prefix("file://").map_or(path, |rest| rest);
+    let format_target = |target: &std::path::Path| {
+        let display = crate::paths::display_path(target);
+        match anchor {
+            Some(anchor) => format!("{display}（第 {anchor} 行）"),
+            None => display,
+        }
+    };
     if std::path::Path::new(path).is_absolute() {
-        return url.to_owned();
+        return format_target(std::path::Path::new(path));
     }
     match root {
-        Some(root) => {
-            let joined = root.join(path);
-            match anchor {
-                Some(anchor) => format!("{}（第 {anchor} 行）", joined.display()),
-                None => joined.display().to_string(),
-            }
-        }
+        Some(root) => format_target(&root.join(path)),
         None => url.to_owned(),
     }
 }
@@ -5982,5 +5983,21 @@ mod tests {
             assert!(!editor.language_menu_open);
         });
         assert_eq!(events.borrow().as_slice(), &["json"]);
+    }
+
+    #[test]
+    fn link_tooltip_strips_windows_verbatim_prefix() {
+        let root = std::path::Path::new(r"\\?\D:\Workspace\IM");
+        assert_eq!(
+            link_tooltip_label(
+                "admin/internal/service/service_handle_user_status_delete.go#L114",
+                Some(root),
+            ),
+            r"D:\Workspace\IM\admin\internal\service\service_handle_user_status_delete.go（第 114 行）"
+        );
+        assert_eq!(
+            link_tooltip_label(r"\\?\D:\Workspace\IM\main.go#L10", None),
+            r"D:\Workspace\IM\main.go（第 10 行）"
+        );
     }
 }

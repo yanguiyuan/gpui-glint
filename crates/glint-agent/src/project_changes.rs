@@ -3,7 +3,7 @@ use crate::workspace_diff::{self, Source, StageUpdate};
 use gpui::Task;
 use gpui_glint::components::{ChangeRow, ChangeStatus};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -48,7 +48,20 @@ impl ChangeSnapshot {
         })
     }
 
+    pub fn conflict_label(&self, path: &str) -> Option<&str> {
+        let target = Path::new(path);
+        self.conflicts
+            .iter()
+            .find(|label| self.root.join(label.as_str()) == target)
+            .map(String::as_str)
+    }
+
+    #[cfg(test)]
     pub fn rows(&self) -> Vec<ChangeRow> {
+        self.tree_rows(&HashMap::new())
+    }
+
+    pub fn tree_rows(&self, collapsed: &HashMap<String, HashSet<String>>) -> Vec<ChangeRow> {
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
@@ -80,10 +93,11 @@ impl ChangeSnapshot {
             }
         }
         let groups = [
-            ("已暂存", Some(true), staged),
-            ("未暂存", Some(false), unstaged),
-            ("未跟踪", None, untracked),
+            ("已暂存", "staged", Some(true), staged),
+            ("未暂存", "unstaged", Some(false), unstaged),
+            ("未跟踪", "untracked", None, untracked),
         ];
+        let empty_collapsed = HashSet::new();
         let mut rows = Vec::new();
         let mut conflicts = self.conflicts.clone();
         if !conflicts.is_empty() {
@@ -93,18 +107,44 @@ impl ChangeSnapshot {
                 count: conflicts.len(),
                 staged: None,
             });
-            rows.extend(conflicts.into_iter().map(|label| ChangeRow::File {
-                path: self.root.join(&label).to_string_lossy().into_owned(),
-                label,
-                depth: 0,
-                status: Some(ChangeStatus::Conflict),
-                staged: false,
-                additions: None,
-                deletions: None,
-                binary: false,
-            }));
+            let tree = crate::workspace_tree::rows_for_labels(
+                conflicts.iter().map(String::as_str),
+                collapsed.get("conflicts").unwrap_or(&empty_collapsed),
+            );
+            for node in tree {
+                match node {
+                    crate::workspace_tree::Row::Directory {
+                        path,
+                        label,
+                        depth,
+                        count,
+                        collapsed,
+                    } => rows.push(ChangeRow::Directory {
+                        path,
+                        label,
+                        depth,
+                        count,
+                        collapsed,
+                        staged: None,
+                    }),
+                    crate::workspace_tree::Row::File { index, depth } => {
+                        let full_label = &conflicts[index];
+                        let name = full_label.rsplit('/').next().unwrap_or(full_label);
+                        rows.push(ChangeRow::File {
+                            path: self.root.join(full_label).to_string_lossy().into_owned(),
+                            label: name.to_owned(),
+                            depth,
+                            status: Some(ChangeStatus::Conflict),
+                            staged: false,
+                            additions: None,
+                            deletions: None,
+                            binary: false,
+                        });
+                    }
+                }
+            }
         }
-        for (title, layer, mut entries) in groups {
+        for (title, scope, layer, mut entries) in groups {
             if entries.is_empty() {
                 continue;
             }
@@ -114,23 +154,43 @@ impl ChangeSnapshot {
                 count: entries.len(),
                 staged: layer,
             });
-            rows.extend(
-                entries
-                    .into_iter()
-                    .map(|(label, path, status, stats, known)| {
-                        ChangeRow::File {
-                            path,
-                            label,
-                            depth: 0,
-                            status: Some(status.into()),
+            let tree = crate::workspace_tree::rows_for_labels(
+                entries.iter().map(|(label, ..)| label.as_str()),
+                collapsed.get(scope).unwrap_or(&empty_collapsed),
+            );
+            for node in tree {
+                match node {
+                    crate::workspace_tree::Row::Directory {
+                        path,
+                        label,
+                        depth,
+                        count,
+                        collapsed,
+                    } => rows.push(ChangeRow::Directory {
+                        path,
+                        label,
+                        depth,
+                        count,
+                        collapsed,
+                        staged: layer,
+                    }),
+                    crate::workspace_tree::Row::File { index, depth } => {
+                        let (full_label, path, status, stats, known) = &entries[index];
+                        let name = full_label.rsplit('/').next().unwrap_or(full_label);
+                        rows.push(ChangeRow::File {
+                            path: path.clone(),
+                            label: name.to_owned(),
+                            depth,
+                            status: Some((*status).into()),
                             staged: layer.unwrap_or(false),
                             additions: stats.map(|(added, _)| added),
                             deletions: stats.map(|(_, removed)| removed),
                             // Only trust "no numstat row" once the counts were actually read.
-                            binary: known && layer.is_some() && stats.is_none(),
-                        }
-                    }),
-            );
+                            binary: *known && layer.is_some() && stats.is_none(),
+                        });
+                    }
+                }
+            }
         }
         rows
     }
@@ -193,16 +253,88 @@ mod tests {
         assert!(!snapshot.sources[Path::new(&paths[1])].staged);
         assert!(snapshot.sources[Path::new(&paths[2])].staged);
     }
+
+    #[test]
+    fn tree_rows_groups_directories_toggles_and_stages_directory() {
+        let repo = workspace_diff::tests::many_files(2);
+        std::fs::create_dir_all(repo.path().join("internal/logic")).unwrap();
+        std::fs::write(repo.path().join("internal/logic/chat.go"), "package logic\n").unwrap();
+        let mut snapshot = ChangeSnapshot::read(repo.path()).unwrap();
+        snapshot.conflicts = vec!["internal/logic/chat.go".into()];
+        let mut changes = ProjectChanges {
+            snapshot: Some(snapshot),
+            ..Default::default()
+        };
+
+        let rows = changes
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .tree_rows(&changes.collapsed_directories);
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ChangeRow::Directory { path, label, count: 1, collapsed: false, staged: None, .. }
+                if path == "internal/logic" && label == "internal/logic"
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ChangeRow::Directory { path, label, count: 2, collapsed: false, staged: Some(false), .. }
+                if path == "vendor" && label == "vendor"
+        )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ChangeRow::File { label, depth: 1, .. } if label == "0000.rs"
+        )));
+        let conflict_abs = changes
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .root
+            .join("internal/logic/chat.go");
+        assert_eq!(
+            changes
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .conflict_label(&conflict_abs.to_string_lossy()),
+            Some("internal/logic/chat.go")
+        );
+
+        changes.toggle_directory("vendor", Some(false));
+        let collapsed_rows = changes
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .tree_rows(&changes.collapsed_directories);
+        assert!(!collapsed_rows.iter().any(|row| matches!(
+            row,
+            ChangeRow::File { label, .. } if label == "0000.rs"
+        )));
+
+        changes.enqueue(
+            StageSelection::Directory {
+                path: "vendor",
+                layer: false,
+            },
+            true,
+        );
+        let (staged, files) = changes.take_batch().unwrap();
+        assert!(staged);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.label.starts_with("vendor/")));
+    }
 }
 
 pub(super) enum StageSelection<'a> {
     Files(&'a [String]),
     Group(bool),
+    Directory { path: &'a str, layer: bool },
 }
 
 #[derive(Default)]
 pub(super) struct ProjectChanges {
     pub snapshot: Option<ChangeSnapshot>,
+    pub collapsed_directories: HashMap<String, HashSet<String>>,
     pending: BTreeMap<PathBuf, bool>,
     running: BTreeMap<PathBuf, bool>,
     pub debounce: Option<Task<()>>,
@@ -212,6 +344,28 @@ pub(super) struct ProjectChanges {
 }
 
 impl ProjectChanges {
+    pub fn toggle_directory(&mut self, path: &str, staged: Option<bool>) {
+        let scope = match staged {
+            Some(true) => "staged",
+            Some(false) => "unstaged",
+            None if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| !s.conflicts.is_empty()) =>
+            {
+                "conflicts"
+            }
+            None => "untracked",
+        };
+        let entry = self
+            .collapsed_directories
+            .entry(scope.to_owned())
+            .or_default();
+        if !entry.remove(path) {
+            entry.insert(path.to_owned());
+        }
+    }
+
     pub fn busy(&self) -> bool {
         !self.pending.is_empty() || !self.running.is_empty()
     }
@@ -231,6 +385,21 @@ impl ProjectChanges {
                     } else {
                         source.unstaged
                     }
+                })
+                .map(|source| source.path.clone())
+                .collect(),
+            StageSelection::Directory { path, layer } => snapshot
+                .sources
+                .values()
+                .filter(|source| {
+                    (if layer {
+                        source.staged
+                    } else {
+                        source.unstaged
+                    }) && source
+                        .label
+                        .strip_prefix(path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
                 })
                 .map(|source| source.path.clone())
                 .collect(),

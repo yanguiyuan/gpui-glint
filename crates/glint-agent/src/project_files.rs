@@ -337,21 +337,69 @@ impl ProjectFiles {
                 &changes,
                 |this, changes, event: &ChangeNavigationEvent, cx| match event {
                     ChangeNavigationEvent::Select { path, staged } => {
-                        if let Some(label) = changes.read(cx).conflict_label(path) {
-                            this.open_conflict(path.clone(), label.to_owned(), cx);
+                        let conflict = this
+                            .root
+                            .as_ref()
+                            .and_then(|root| this.changes_by_root.get(root))
+                            .and_then(|state| state.snapshot.as_ref())
+                            .and_then(|snapshot| snapshot.conflict_label(path))
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                changes
+                                    .read(cx)
+                                    .conflict_label(path)
+                                    .map(str::to_owned)
+                            });
+                        if let Some(label) = conflict {
+                            this.open_conflict(path.clone(), label, cx);
                         } else {
                             this.open_worktree_diff(path.clone(), *staged, cx);
                         }
                     }
                     ChangeNavigationEvent::Stage { paths, staged } => {
+                        if *staged
+                            && let Some(root) = this.root.clone()
+                            && let Some(snapshot) = this
+                                .changes_by_root
+                                .get(&root)
+                                .and_then(|state| state.snapshot.as_ref())
+                        {
+                            let conflict_labels: Vec<String> = paths
+                                .iter()
+                                .filter_map(|p| snapshot.conflict_label(p).map(str::to_owned))
+                                .collect();
+                            if !conflict_labels.is_empty() {
+                                this.stage_conflicts(root, conflict_labels, cx);
+                                return;
+                            }
+                        }
                         this.queue_staging(StageSelection::Files(paths), *staged, cx)
                     }
                     ChangeNavigationEvent::StageGroup { layer, staged } => {
                         this.queue_staging(StageSelection::Group(*layer), *staged, cx)
                     }
-                    ChangeNavigationEvent::StageDirectory { .. }
-                    | ChangeNavigationEvent::ToggleDirectory { .. }
-                    | ChangeNavigationEvent::Menu { .. } => {}
+                    ChangeNavigationEvent::StageDirectory {
+                        path,
+                        layer,
+                        staged,
+                    } => this.queue_staging(
+                        StageSelection::Directory {
+                            path,
+                            layer: *layer,
+                        },
+                        *staged,
+                        cx,
+                    ),
+                    ChangeNavigationEvent::ToggleDirectory { path, staged } => {
+                        if let Some(root) = this.root.clone()
+                            && let Some(state) = this.changes_by_root.get_mut(&root)
+                        {
+                            state.toggle_directory(path, *staged);
+                            this.publish_changes(&root, true, cx);
+                            cx.notify();
+                        }
+                    }
+                    ChangeNavigationEvent::Menu { .. } => {}
                 },
             )
             .detach();
@@ -427,10 +475,44 @@ impl ProjectFiles {
         };
         changes.update(cx, |changes, cx| {
             if rows_changed && let Some(snapshot) = &state.snapshot {
-                changes.set_rows(snapshot.rows(), cx);
+                changes.set_rows(snapshot.tree_rows(&state.collapsed_directories), cx);
             }
             changes.set_stage_intents(state.intents(), cx);
         });
+    }
+
+    fn stage_conflicts(
+        &mut self,
+        root: PathBuf,
+        labels: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_task.is_some() {
+            return;
+        }
+        let work_root = root.clone();
+        let work = cx.background_executor().spawn(async move {
+            for label in &labels {
+                crate::merge_conflicts::stage_resolved(&work_root, label)?;
+            }
+            Ok::<(), String>(())
+        });
+        cx.spawn(async move |weak, cx| {
+            let result = work.await;
+            let _ = weak.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.refresh_changes(cx),
+                    Err(error) => {
+                        if let Some(state) = this.changes_by_root.get_mut(&root) {
+                            state.error = Some(error);
+                        }
+                        this.publish_changes(&root, false, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn queue_staging(
@@ -901,10 +983,16 @@ impl ProjectFiles {
         if let Some(index) = self.documents.iter().position(|document| {
             document.path == path && matches!(document.view, DocumentView::Conflict { .. })
         }) {
-            if matches!(
-                self.documents[index].view,
-                DocumentView::Conflict { error: None, .. }
-            ) {
+            if let DocumentView::Conflict {
+                editor,
+                error: None,
+                scroll,
+            } = &self.documents[index].view
+            {
+                if let Some(view) = editor.clone() {
+                    let scroll = scroll.clone();
+                    view.update(cx, |view, cx| view.reveal_now(scroll, cx));
+                }
                 self.activate(index, cx);
                 return;
             }
@@ -935,9 +1023,12 @@ impl ProjectFiles {
                 };
                 match result {
                     Ok(file) => {
+                        let owner = this.owner.clone();
+                        let scroll_handle = scroll.clone();
                         let view = cx.new(|cx| {
-                            let mut view = ConflictView::new(file, root, None, this.theme, cx);
-                            view.reveal(scroll.clone(), 0, cx);
+                            let mut view = ConflictView::new(file, root, owner, this.theme, cx)
+                                .standalone(true);
+                            view.reveal(scroll_handle, 0, cx);
                             view
                         });
                         cx.subscribe(&view, move |this, _, _: &ConflictResolved, cx| {
@@ -1680,14 +1771,14 @@ impl Render for ProjectFiles {
                 DocumentView::Conflict {
                     editor,
                     error,
-                    scroll,
+                    scroll: _,
                 } => {
                     let content = div()
                         .id("project-conflict-editor")
                         .size_full()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(scroll)
+                        .flex()
+                        .flex_col()
                         .children(editor.clone())
                         .when_some(error.clone(), |body, error| {
                             body.child(div().p_3().child(error))
@@ -2474,7 +2565,7 @@ mod tests {
         let selector = Box::leak(format!("change-file:{path}:false").into_boxed_str());
         let row = wait_for(window, selector);
         let checkbox = Box::leak(format!("stage-file:{path}:false").into_boxed_str());
-        assert!(window.debug_bounds(checkbox).is_none());
+        assert!(window.debug_bounds(checkbox).is_some());
         files.update(window, |files, cx| {
             files
                 .commit_entry

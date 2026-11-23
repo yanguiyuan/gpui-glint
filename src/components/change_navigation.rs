@@ -599,7 +599,7 @@ impl ChangeNavigation {
                 );
             }
         }
-        if self.stage_controls && status.is_some() && !conflict {
+        if self.stage_controls && status.is_some() {
             let checked = self.stage_intents.get(&path).copied().unwrap_or(staged);
             row = row.child(self.stage_checkbox(
                 format!("stage-file:{path}:{staged}"),

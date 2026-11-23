@@ -281,6 +281,18 @@ pub fn save(file: &Conflict, result: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Stage a conflict file from disk only after verifying all conflict markers are gone.
+pub fn stage_resolved(root: &Path, label: &str) -> Result<(), String> {
+    let path = root.join(label);
+    let text = std::fs::read_to_string(&path).map_err(|_| "无法读取冲突文件，请确认文件为 UTF-8 文本".to_owned())?;
+    if has_markers(&text) {
+        return Err("文件仍包含冲突标记，请先解决所有冲突".into());
+    }
+    git(root, &["--literal-pathspecs", "add", "--", label])
+        .map_err(|e| format!("暂存冲突文件失败：{e}"))?;
+    Ok(())
+}
+
 /// Keep the request small; the agent must read the current file and Git stages.
 /// Returns the instruction text and the bounded snapshot as a separate
 /// `（附件名，内容）` payload, so the UI can show the snapshot as its own
@@ -550,5 +562,16 @@ pub(crate) mod tests {
         assert!(!index(&file.root, &file.label).unwrap().is_empty());
         checked(dir.path(), &["add", "--", &file.label]);
         assert!(save(&file, "merged\n").unwrap_err().contains("状态已变化"));
+    }
+
+    #[test]
+    fn stage_resolved_rejects_markers_and_stages_clean_file() {
+        let dir = conflicted();
+        let file = load(dir.path()).unwrap().0.remove(0);
+        let err = stage_resolved(&file.root, &file.label).unwrap_err();
+        assert!(err.contains("冲突标记"));
+        std::fs::write(&file.path, "clean resolved\n").unwrap();
+        stage_resolved(&file.root, &file.label).unwrap();
+        assert!(load(dir.path()).unwrap().0.is_empty());
     }
 }

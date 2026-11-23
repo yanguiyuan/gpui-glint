@@ -42,34 +42,59 @@ pub struct BackgroundTask {
 pub struct BackgroundTaskInbox {
     tasks: Vec<BackgroundTask>,
     dismissed: std::collections::HashSet<String>,
+    pending_toasts: Vec<BackgroundTask>,
 }
 impl BackgroundTaskInbox {
+    fn queue_toast(pending: &mut Vec<BackgroundTask>, task: &BackgroundTask) {
+        if let Some(existing) = pending.iter_mut().find(|item| item.id == task.id) {
+            *existing = task.clone();
+        } else {
+            pending.push(task.clone());
+        }
+    }
+
     pub fn update(
         &mut self,
         current: Vec<BackgroundTask>,
         outcome: impl Fn(&BackgroundTask) -> BackgroundTaskState,
     ) -> Vec<BackgroundTask> {
-        for task in &mut self.tasks {
+        let Self {
+            tasks,
+            dismissed,
+            pending_toasts,
+        } = self;
+        for task in tasks.iter_mut() {
             if !current.iter().any(|t| t.id == task.id) {
+                let was_running = task.state.is_running();
                 let state = outcome(task);
-                if state != BackgroundTaskState::Finished || task.state.is_running() {
+                if state != BackgroundTaskState::Finished || was_running {
                     task.state = state;
+                }
+                if was_running && !task.state.is_running() {
+                    Self::queue_toast(pending_toasts, task);
                 }
             }
         }
         for task in current {
             if task.state.is_running() {
-                self.dismissed.remove(&task.id);
-            } else if self.dismissed.contains(&task.id) {
+                dismissed.remove(&task.id);
+            } else if dismissed.contains(&task.id) {
                 continue;
             }
-            if let Some(saved) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+            if let Some(saved) = tasks.iter_mut().find(|t| t.id == task.id) {
+                let was_running = saved.state.is_running();
                 *saved = task;
+                if was_running && !saved.state.is_running() {
+                    Self::queue_toast(pending_toasts, saved);
+                }
             } else {
-                self.tasks.push(task);
+                tasks.push(task);
             }
         }
-        self.tasks.clone()
+        tasks.clone()
+    }
+    pub fn drain_finished_notifications(&mut self) -> Vec<BackgroundTask> {
+        std::mem::take(&mut self.pending_toasts)
     }
     pub fn acknowledge(&mut self, id: &str) {
         if self
@@ -80,6 +105,7 @@ impl BackgroundTaskInbox {
             self.tasks.retain(|t| t.id != id);
             self.dismissed.insert(id.to_owned());
         }
+        self.pending_toasts.retain(|t| t.id != id);
     }
     /// Sources which stop emitting a completion after it is acknowledged do
     /// not need a tombstone; the same target may immediately run again.

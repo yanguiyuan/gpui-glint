@@ -425,6 +425,69 @@ fn tool_presentation_with_body(record: &tools::ToolRecord, include_body: bool) -
     let args = &record.call.arguments;
     let path = args["path"].as_str().unwrap_or(".");
     let (icon, action, target) = match record.call.name.as_str() {
+        name if name.starts_with("glint_db_") => {
+            let (run_label, ok_label, err_label, target) = match name {
+                "glint_db_list_connections" => (
+                    "正在获取数据库连接",
+                    "已获取数据库连接",
+                    "获取数据库连接失败",
+                    String::new(),
+                ),
+                "glint_db_list_databases" => (
+                    "正在列出数据库",
+                    "已列出数据库",
+                    "列出数据库失败",
+                    String::new(),
+                ),
+                "glint_db_list_tables" => (
+                    "正在列出数据表",
+                    "已列出数据表",
+                    "列出数据表失败",
+                    args["database"].as_str().unwrap_or("").to_owned(),
+                ),
+                "glint_db_describe_table" => (
+                    "正在查看表结构",
+                    "已查看表结构",
+                    "查看表结构失败",
+                    args["table"].as_str().unwrap_or("").to_owned(),
+                ),
+                "glint_db_query" => (
+                    "正在执行 SQL 查询",
+                    "已执行 SQL 查询",
+                    "SQL 查询失败",
+                    args["sql"]
+                        .as_str()
+                        .map(|sql| truncate_single_line(sql, 48))
+                        .unwrap_or_default(),
+                ),
+                "glint_db_execute" => (
+                    "正在执行 SQL 语句",
+                    "已执行 SQL 语句",
+                    "SQL 执行失败",
+                    args["sql"]
+                        .as_str()
+                        .map(|sql| truncate_single_line(sql, 48))
+                        .unwrap_or_default(),
+                ),
+                _ => (
+                    "正在操作数据库",
+                    "数据库操作已完成",
+                    "数据库操作失败",
+                    name.trim_start_matches("glint_db_").to_owned(),
+                ),
+            };
+            (
+                Icon::Database,
+                if running {
+                    run_label
+                } else if success {
+                    ok_label
+                } else {
+                    err_label
+                },
+                target,
+            )
+        }
         name if name.starts_with("glint_") => (
             Icon::ApiDoc,
             if running {
@@ -1103,6 +1166,8 @@ impl AgentWorkspace {
             }
             let change = record.change.clone();
             let nested = record.nested_tools.clone();
+            let db_record = (record.call.name.starts_with("glint_db_") && tool_succeeded(record))
+                .then(|| record.clone());
             // A running call with nothing to show yet renders a skeleton where
             // the "waiting for the tool" placeholder sentence used to sit.
             let pending_body = record.result == "执行中…"
@@ -1745,6 +1810,13 @@ impl AgentWorkspace {
                                     })
                                     .unwrap_or_else(|_| div().into_any_element());
                             }
+                            if !pending_body
+                                && let Some(db_preview) = db_record
+                                    .as_ref()
+                                    .and_then(|rec| crate::db_tool_ui::render_db_tool_preview(rec, theme))
+                            {
+                                return db_preview;
+                            }
                             div()
                                 .relative()
                                 .w_full()
@@ -2136,7 +2208,7 @@ impl AgentWorkspace {
         let theme = self.theme;
         let mut cache = self.process_panels.borrow_mut();
         let summary = if !complete {
-            "正在工作…".into()
+            latest_working_action_label(blocks, self.active_run().visible_tools())
         } else if let Some(stats) = stats {
             let seconds = stats.elapsed_ms / 1000;
             if seconds >= 60 {
@@ -2193,9 +2265,31 @@ impl AgentWorkspace {
                 self.active_run().visible_tools().to_vec()
             };
             let content_key = key.to_owned();
+            let shimmer_id = SharedString::from(format!("process-working:{key}"));
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
-                panel.set_summary(summary, cx);
+                if complete {
+                    panel.set_summary(summary, cx);
+                } else {
+                    let shimmer_label: SharedString = summary.into();
+                    panel.set_summary_content(
+                        move |_, _| {
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(
+                                    gpui_glint::components::ShimmerText::new(
+                                        shimmer_id.clone(),
+                                        shimmer_label.clone(),
+                                    )
+                                    .theme(theme),
+                                )
+                                .into_any_element()
+                        },
+                        cx,
+                    );
+                }
                 if complete && !entry.complete {
                     panel.set_expanded(false, cx);
                 }
@@ -2643,6 +2737,84 @@ fn thinking_summary(text: &str, active: bool, elapsed_ms: Option<u64>) -> String
         // Old history has no per-block timing. Do not substitute total work time.
         "已思考".into()
     }
+}
+
+fn truncate_single_line(text: &str, max_chars: usize) -> String {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn action_label_for_tool(
+    call: &tools::ToolCall,
+    record: Option<&tools::ToolRecord>,
+) -> String {
+    let pending;
+    let record = if let Some(record) = record {
+        record
+    } else {
+        pending = unresolved_tool_record(call, false);
+        &pending
+    };
+    if record.call.name == "read_file"
+        && record.result != "正在生成参数…"
+        && !record.result.starts_with("未执行：")
+        && !record.result.starts_with("调用已中断：")
+    {
+        let path_str = record.call.arguments["path"]
+            .as_str()
+            .or_else(|| record.call.arguments["file"].as_str())
+            .unwrap_or(".");
+        let file_name = std::path::Path::new(path_str)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path_str);
+        let verb = if record.result == "执行中…" {
+            "正在分析"
+        } else if !tool_succeeded(record) {
+            "分析失败"
+        } else {
+            "已分析"
+        };
+        return truncate_single_line(&format!("{verb} {file_name}"), 64);
+    }
+    let (_, summary) = tool_summary(call, Some(record));
+    truncate_single_line(&summary, 64)
+}
+
+pub(super) fn latest_working_action_label(
+    blocks: &[generation::ContentBlock],
+    activity: &[tools::ToolRecord],
+) -> String {
+    for block in blocks.iter().rev() {
+        match block {
+            generation::ContentBlock::Thinking(_) => {
+                return "正在思考…".into();
+            }
+            generation::ContentBlock::ToolCall(call) => {
+                let record = activity.iter().find(|record| record.call.id == call.id);
+                return action_label_for_tool(call, record);
+            }
+            generation::ContentBlock::ToolResult(record) => {
+                return action_label_for_tool(&record.call, Some(record));
+            }
+            generation::ContentBlock::Text(text) => {
+                if !text.trim().is_empty() {
+                    return "正在回复…".into();
+                }
+            }
+        }
+    }
+    "正在工作…".into()
 }
 
 /// The process is a contiguous prefix; only trailing answer text stays outside.
@@ -3459,21 +3631,14 @@ mod tests {
                 .panel
                 .clone()
         });
-        let before = window.debug_bounds("waiting-for-model").unwrap();
+        let before = window.debug_bounds("live-response").unwrap();
         panel.update(window, |panel, cx| panel.set_expanded(true, cx));
         window.run_until_parked();
         let live = window.debug_bounds("live-response").unwrap();
-        let waiting = window.debug_bounds("waiting-for-model").unwrap();
+        assert!(window.debug_bounds("waiting-for-model").is_none());
         assert!(
-            waiting.top() >= live.bottom(),
-            "{waiting:?} overlaps {live:?}"
-        );
-        // A conversation resting at its newest message follows the growth by
-        // scrolling, so the waiting row may stay put instead of moving down;
-        // an overlap would pull it up over the response above.
-        assert!(
-            waiting.top() >= before.top(),
-            "expanding must never pull the waiting row up: {before:?} -> {waiting:?}"
+            live.size.height >= before.size.height,
+            "{live:?} should grow or hold height after expansion: {before:?}"
         );
     }
 
@@ -3545,7 +3710,6 @@ mod tests {
             window.run_until_parked();
         }
         let live = window.debug_bounds("live-response").unwrap();
-        let waiting = window.debug_bounds("waiting-for-model").unwrap();
         let output = window.debug_bounds("tool-output").unwrap();
         assert!(
             output.size.height <= px(320.),
@@ -3555,12 +3719,8 @@ mod tests {
             output.bottom() <= live.bottom() + px(1.),
             "expanded tool output escapes the live response: {output:?}, {live:?}"
         );
-        assert!(
-            waiting.top() >= live.bottom(),
-            "waiting label overlaps the expanded skill card: {waiting:?}, {live:?}"
-        );
         // A running command row that settles while the skill panel stays expanded
-        // must still push the waiting row down instead of drawing underneath it.
+        // must still remain inside live-response.
         host.update(window, |host, cx| {
             let run = host.run_mut(host.history.active);
             if let Some(generation::ContentBlock::ToolResult(r)) = run
@@ -3581,11 +3741,7 @@ mod tests {
         });
         window.run_until_parked();
         let live = window.debug_bounds("live-response").unwrap();
-        let waiting = window.debug_bounds("waiting-for-model").unwrap();
-        assert!(
-            waiting.top() >= live.bottom(),
-            "waiting label overlaps the settled command row: {waiting:?}, {live:?}"
-        );
+        assert!(live.size.height > px(0.));
     }
 
     #[gpui::test]
@@ -3774,20 +3930,15 @@ mod tests {
         });
         window.run_until_parked();
         let live = window.debug_bounds("live-response").unwrap();
-        let waiting = window.debug_bounds("waiting-for-model").unwrap();
         let viewport = host.read_with(window, |host, _| host.scroll.bounds());
         let composer = window.debug_bounds("agent-composer-panel").unwrap();
         assert!(
-            waiting.bottom() <= viewport.bottom() + px(1.),
-            "the last row must be reachable at the true scroll bottom: {waiting:?}, {viewport:?}"
+            live.bottom() <= viewport.bottom() + px(1.),
+            "the live response must be reachable at the true scroll bottom: {live:?}, {viewport:?}"
         );
         assert!(
             viewport.bottom() <= composer.top() + px(1.),
             "the composer must not cover the chat viewport"
-        );
-        assert!(
-            waiting.top() >= live.bottom(),
-            "waiting label overlaps expanded live response: {waiting:?}, {live:?}"
         );
         // The newest thinking row now opens automatically. The older tool may
         // be outside the virtualized viewport at the bottom; scroll back to it.
@@ -3834,6 +3985,63 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("code-mode-result").is_none());
         assert!(window.debug_bounds("code-mode-source").is_some());
+    }
+
+    #[gpui::test]
+    fn sticky_working_header_pins_when_scrolled_past_live_response(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            let session = host.history.active;
+            host.history
+                .active_mut()
+                .push_message(Role::User, "开始任务".into(), vec![]);
+            let task = cx.spawn(async move |_, _| std::future::pending::<()>().await);
+            let run = host.run_mut(session);
+            run.pending = Some((session, task));
+            run.transcript = vec![
+                generation::ContentBlock::Thinking("分析中".into()),
+                generation::ContentBlock::Text("输出\n".repeat(80)),
+            ];
+            host
+        });
+        window.simulate_resize(size(px(1000.), px(640.)));
+        window.run_until_parked();
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_top_of_item(1);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("sticky-working-header").is_none(),
+            "sticky header must stay hidden while live-response top is visible"
+        );
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        window.run_until_parked();
+        let sticky = window
+            .debug_bounds("sticky-working-header")
+            .expect("sticky header must appear when scrolled past live-response top");
+        let viewport = host.read_with(window, |host, _| host.scroll.bounds());
+        assert!(sticky.top() <= viewport.top() + px(2.));
+        host.update(window, |host, cx| {
+            host.scroll.scroll_to_top_of_item(1);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("sticky-working-header").is_none(),
+            "sticky header must disappear again when scrolled back up"
+        );
     }
 
     #[gpui::test]
@@ -4426,6 +4634,77 @@ mod tests {
             "已思考 12.3 s"
         );
         assert_eq!(thinking_summary("旧历史", false, None), "已思考");
+    }
+    #[test]
+    fn latest_working_action_label_tracks_latest_block() {
+        use generation::ContentBlock::{Text, Thinking, ToolCall, ToolResult};
+        assert_eq!(latest_working_action_label(&[], &[]), "正在工作…");
+        assert_eq!(
+            latest_working_action_label(&[Thinking("分析中".into())], &[]),
+            "正在思考…"
+        );
+
+        let read_call = tools::ToolCall {
+            id: "read-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let read_record = tools::ToolRecord {
+            call: read_call.clone(),
+            result: "执行中…".into(),
+            success: true,
+            elapsed_ms: 0,
+            live_output: None,
+            change: None,
+            subagent: None,
+            nested_tools: Vec::new().into(),
+        };
+        assert_eq!(
+            latest_working_action_label(
+                &[Thinking("分析中".into()), ToolCall(read_call.clone())],
+                &[read_record],
+            ),
+            "正在分析 main.rs"
+        );
+
+        let cmd_call = tools::ToolCall {
+            id: "cmd-1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"program": "cargo", "args": ["test"]}),
+        };
+        let cmd_record = tools::ToolRecord {
+            call: cmd_call.clone(),
+            result: "执行中…".into(),
+            success: true,
+            elapsed_ms: 0,
+            live_output: None,
+            change: None,
+            subagent: None,
+            nested_tools: Vec::new().into(),
+        };
+        assert_eq!(
+            latest_working_action_label(&[ToolCall(cmd_call)], &[cmd_record]),
+            "正在运行 cargo test"
+        );
+
+        let finished_read = tools::ToolRecord {
+            call: read_call,
+            result: "fn main() {}".into(),
+            success: true,
+            elapsed_ms: 12,
+            live_output: None,
+            change: None,
+            subagent: None,
+            nested_tools: Vec::new().into(),
+        };
+        assert_eq!(
+            latest_working_action_label(&[ToolResult(finished_read), Text("  ".into())], &[]),
+            "已分析 main.rs"
+        );
+        assert_eq!(
+            latest_working_action_label(&[Thinking("分析中".into()), Text("开始输出".into())], &[]),
+            "正在回复…"
+        );
     }
     #[test]
     fn builtin_summaries_describe_commands_and_files_and_bodies_are_only_results() {

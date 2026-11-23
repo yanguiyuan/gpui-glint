@@ -19,6 +19,7 @@ mod code_mode;
 mod command_output;
 mod command_runner;
 mod commit_message;
+mod db_tool_ui;
 mod executable;
 mod panel_repositories;
 mod vault_environment;
@@ -843,7 +844,7 @@ impl AgentWorkspace {
                 });
             }));
         workspace._subscriptions.push(cx.observe_self(|this, cx| {
-            this.background_tasks(cx);
+            this.notify_finished_background_tasks(cx);
             if !this.host_owns_vault {
                 this.vault.update(cx, |vault, cx| {
                     vault.set_host_state(this.page == crate::Page::Vault, this.theme, cx);
@@ -2827,55 +2828,31 @@ impl AgentWorkspace {
                     }
                 }
             }
-            if running {
-                if !self.active_run().visible_transcript().is_empty() {
-                    let key = format!(
-                        "{}:{}",
-                        self.history.active,
-                        self.history
-                            .sessions
-                            .iter()
-                            .find(|session| session.id == self.history.active)
-                            .map(|session| session.messages.len())
-                            .unwrap_or(0)
-                    );
-                    messages = messages.child(
-                        div()
-                            .debug_selector(|| "live-response".into())
-                            .flex_shrink_0()
-                            .w_full()
-                            .max_w(px(800.))
-                            .child(self.response_view(
-                                &key,
-                                self.active_run().visible_transcript(),
-                                None,
-                                &self.active_run().segment_timings(),
-                                false,
-                                cx,
-                            )),
-                    );
-                }
+            if running && !self.active_run().visible_transcript().is_empty() {
+                let key = format!(
+                    "{}:{}",
+                    self.history.active,
+                    self.history
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == self.history.active)
+                        .map(|session| session.messages.len())
+                        .unwrap_or(0)
+                );
                 messages = messages.child(
                     div()
-                        .debug_selector(|| "waiting-for-model".into())
+                        .debug_selector(|| "live-response".into())
                         .flex_shrink_0()
                         .w_full()
                         .max_w(px(800.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(rgb(p.text_muted))
-                        .child(
-                            ShimmerText::new(
-                                "agent-waiting-reply",
-                                if self.active_run().compacting {
-                                    "正在压缩上下文…"
-                                } else {
-                                    self.subagent_waiting_label()
-                                },
-                            )
-                            .theme(self.theme),
-                        ),
+                        .child(self.response_view(
+                            &key,
+                            self.active_run().visible_transcript(),
+                            None,
+                            &self.active_run().segment_timings(),
+                            false,
+                            cx,
+                        )),
                 );
             }
             // Questions belong to the scrollable conversation so their intrinsic
@@ -2888,6 +2865,26 @@ impl AgentWorkspace {
             {
                 messages = messages.child(self.question_panel(cx));
             }
+            let live_item_index = session.messages.len();
+            let sticky_working_label = if !running {
+                None
+            } else if self.active_run().compacting {
+                Some("正在压缩上下文…".to_owned())
+            } else if self.active_run().visible_transcript().is_empty() {
+                Some(self.subagent_waiting_label().to_owned())
+            } else {
+                let viewport = self.scroll.bounds();
+                let offset_y = self.scroll.offset().y;
+                self.scroll
+                    .bounds_for_item(live_item_index)
+                    .is_some_and(|bounds| bounds.top() + offset_y < viewport.top())
+                    .then(|| {
+                        app_tools_ui::latest_working_action_label(
+                            self.active_run().visible_transcript(),
+                            self.active_run().visible_tools(),
+                        )
+                    })
+            };
             div()
                 .flex_1()
                 .min_h_0()
@@ -2895,6 +2892,58 @@ impl AgentWorkspace {
                 .flex()
                 .flex_col()
                 .child(messages)
+                .when_some(sticky_working_label, |wrap, label| {
+                    let scroll = self.scroll.clone();
+                    wrap.child(
+                        div()
+                            .id("sticky-working-header")
+                            .debug_selector(|| "sticky-working-header".into())
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .px_6()
+                            .py_2()
+                            .bg(gpui::rgba(if self.theme.is_dark() {
+                                0x14161be6
+                            } else {
+                                0xf7f8fae6
+                            }))
+                            .border_b_1()
+                            .border_color(rgb(p.border))
+                            .flex()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_click(move |_, _, _| {
+                                scroll.scroll_to_top_of_item(live_item_index);
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(800.))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(
+                                                ShimmerText::new("agent-sticky-working", label)
+                                                    .theme(self.theme),
+                                            ),
+                                    )
+                                    .child(
+                                        Icon::ChevronDown
+                                            .render(12.)
+                                            .text_color(rgb(p.text_muted)),
+                                    ),
+                            ),
+                    )
+                })
                 .when(show_outline, |wrap| wrap.child(self.outline.clone()))
         };
         let composer = div()

@@ -3760,6 +3760,7 @@ pub(super) struct ConflictView {
     theme: ThemePreset,
     language: &'static str,
     expanded: bool,
+    standalone: bool,
     manual_edit: bool,
     /// Conflict hunks in the pristine file, shown in the collapsed badge.
     count: usize,
@@ -3769,6 +3770,7 @@ pub(super) struct ConflictView {
     result_scroll: gpui::ScrollHandle,
     detail_scroll: Option<gpui::ScrollHandle>,
     reveal_revision: Option<u64>,
+    reveal_hunk: Rc<Cell<usize>>,
     reveal_pending: Rc<Cell<bool>>,
     auto_resolve_task: Option<Task<()>>,
     /// Read-only highlighted previews keyed by (hunk index, side).
@@ -3924,18 +3926,25 @@ impl ConflictView {
             theme,
             language,
             expanded: false,
+            standalone: false,
             manual_edit: false,
             count,
             editor,
             result_scroll: gpui::ScrollHandle::new(),
             detail_scroll: None,
             reveal_revision: None,
+            reveal_hunk: Rc::new(Cell::new(0)),
             reveal_pending: Rc::new(Cell::new(false)),
             auto_resolve_task: None,
             sides: Default::default(),
             notice: None,
             task: None,
         }
+    }
+
+    pub(super) fn standalone(mut self, value: bool) -> Self {
+        self.standalone = value;
+        self
     }
 
     pub(super) fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
@@ -3960,6 +3969,25 @@ impl ConflictView {
             self.expanded = true;
             cx.notify();
         }
+    }
+
+    pub(super) fn reveal_now(&mut self, scroll: gpui::ScrollHandle, cx: &mut Context<Self>) {
+        self.detail_scroll = Some(scroll);
+        self.reveal_hunk.set(0);
+        self.reveal_pending.set(true);
+        self.expanded = true;
+        cx.notify();
+    }
+
+    fn jump_hunk(&mut self, delta: isize, total: usize, cx: &mut Context<Self>) {
+        if total == 0 {
+            return;
+        }
+        let current = self.reveal_hunk.get().min(total - 1) as isize;
+        let next = (current + delta).rem_euclid(total as isize) as usize;
+        self.reveal_hunk.set(next);
+        self.reveal_pending.set(true);
+        cx.notify();
     }
 
     fn schedule_auto_resolve(&mut self, cx: &mut Context<Self>) {
@@ -4098,15 +4126,17 @@ impl ConflictView {
                     .on_click(cx.listener(move |this, _, _, cx| this.choose(index, choice, cx))),
             );
         }
-        actions = actions.child(div().flex_1()).child(
-            Button::new("Agent 解决")
-                .icon(Icon::Sparkles)
-                .size(ButtonSize::Small)
-                .kind(ButtonKind::Plain)
-                .theme(self.theme)
-                .when(busy, |button| button.disabled())
-                .render()
-                .on_click(cx.listener(|this, _, _, cx| this.ask_agent(cx))),
+        actions = actions.child(
+            div().ml_2().child(
+                Button::new("Agent 解决")
+                    .icon(Icon::Sparkles)
+                    .size(ButtonSize::Small)
+                    .kind(ButtonKind::Plain)
+                    .theme(self.theme)
+                    .when(busy, |button| button.disabled())
+                    .render()
+                    .on_click(cx.listener(|this, _, _, cx| this.ask_agent(cx))),
+            ),
         );
         let ours = self.side_preview(index, 0, Self::preview_text(&raw[..split]), cx);
         let theirs = self.side_preview(index, 1, Self::preview_text(&raw[split..]), cx);
@@ -4134,10 +4164,11 @@ impl ConflictView {
         });
         let scroll = self.detail_scroll.clone();
         let pending = self.reveal_pending.clone();
+        let target_hunk = self.reveal_hunk.clone();
         let id = cx.entity_id();
         div()
             .on_children_prepainted(move |bounds, _, cx| {
-                if index == 0 && pending.get() {
+                if index == target_hunk.get() && pending.get() {
                     if let (Some(scroll), Some(target)) = (&scroll, bounds.first()) {
                         if scroll.bounds().size.height > px(0.) {
                             pending.set(false);
@@ -4147,8 +4178,8 @@ impl ConflictView {
                                 (offset.y + scroll.bounds().origin.y - target.origin.y + px(8.))
                                     .min(px(0.)),
                             ));
-                            cx.defer(move |cx| cx.notify(id));
                         }
+                        cx.defer(move |cx| cx.notify(id));
                     }
                 }
             })
@@ -4404,107 +4435,291 @@ impl Render for ConflictView {
                 }
             }
             let dirty = !busy && text != self.file.original;
-            let mut result_header = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("合并结果"),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.text_muted))
-                        .child("冲突消除后自动保存并暂存"),
-                )
-                .child(
-                    Button::new(if self.manual_edit {
-                        "收起编辑"
-                    } else {
-                        "手动编辑"
-                    })
-                    .size(ButtonSize::Small)
-                    .kind(ButtonKind::Plain)
-                    .theme(self.theme)
-                    .when(busy, |button| button.disabled())
-                    .render()
-                    .debug_selector(|| "toggle-merge-editor".into())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.manual_edit = !this.manual_edit;
-                        cx.notify();
-                    })),
-                );
-            if dirty {
-                result_header = result_header.child(div().flex_1()).child(
-                    Button::new("重置草稿")
+            if !self.standalone {
+                let mut result_header = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("合并结果"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(p.text_muted))
+                            .child("冲突消除后自动保存并暂存"),
+                    )
+                    .child(
+                        Button::new(if self.manual_edit {
+                            "收起编辑"
+                        } else {
+                            "手动编辑"
+                        })
+                        .size(ButtonSize::Small)
                         .kind(ButtonKind::Plain)
                         .theme(self.theme)
+                        .when(busy, |button| button.disabled())
                         .render()
-                        .debug_selector(|| "reset-merge-draft".into())
+                        .debug_selector(|| "toggle-merge-editor".into())
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.editor.update(cx, |editor, cx| {
-                                editor.set_content(this.file.original.clone(), cx)
-                            });
-                            this.notice = None;
+                            this.manual_edit = !this.manual_edit;
                             cx.notify();
                         })),
+                    );
+                if dirty {
+                    result_header = result_header.child(div().flex_1()).child(
+                        Button::new("重置草稿")
+                            .kind(ButtonKind::Plain)
+                            .theme(self.theme)
+                            .render()
+                            .debug_selector(|| "reset-merge-draft".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editor.update(cx, |editor, cx| {
+                                    editor.set_content(this.file.original.clone(), cx)
+                                });
+                                this.notice = None;
+                                cx.notify();
+                            })),
+                    );
+                }
+                content = content
+                    .child(result_header)
+                    .when(!busy && show_editor, |content| {
+                        content.child(
+                            div()
+                                .debug_selector(|| "merge-result-editor".into())
+                                .max_h(px(360.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .id("merge-result-scroll")
+                                .overflow_y_scroll()
+                                .track_scroll(&self.result_scroll)
+                                .chain_scroll_y(&self.result_scroll)
+                                .child(self.editor.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(
+                                        "当前侧 = ours · 传入侧 = theirs（rebase 时当前侧为变基目标）",
+                                    ),
+                            )
+                            .child(
+                                Button::new(if busy {
+                                    "正在保存…"
+                                } else {
+                                    "保存并标记已解决"
+                                })
+                                .size(ButtonSize::Small)
+                                .theme(self.theme)
+                                .when(
+                                    busy || crate::merge_conflicts::has_markers(&text),
+                                    |button| button.disabled(),
+                                )
+                                .render()
+                                .debug_selector(|| "save-merge-conflict".into())
+                                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                            ),
+                    );
+            } else if !busy && show_editor && !self.manual_edit {
+                content = content.child(
+                    div()
+                        .debug_selector(|| "merge-result-editor".into())
+                        .max_h(px(360.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .id("merge-result-scroll")
+                        .overflow_y_scroll()
+                        .track_scroll(&self.result_scroll)
+                        .chain_scroll_y(&self.result_scroll)
+                        .child(self.editor.clone()),
                 );
             }
-            content = content
-                .child(result_header)
-                .when(!busy && show_editor, |content| {
-                    content.child(
+            if let Some(notice) = self.notice.clone() {
+                content = content.child(self.notice_banner(notice));
+            }
+            if self.standalone {
+                let text = self.editor.read(cx).content().to_owned();
+                let hunk_total = crate::merge_conflicts::hunks(&text)
+                    .map(|h| h.len())
+                    .unwrap_or(0);
+                let has_markers = crate::merge_conflicts::has_markers(&text);
+                let busy = self.task.is_some();
+                let current_hunk = self.reveal_hunk.get().min(hunk_total.saturating_sub(1));
+                let toolbar = div()
+                    .debug_selector(|| "project-conflict-sticky-toolbar".into())
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .bg(rgb(p.surface_subtle))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
                         div()
-                            .debug_selector(|| "merge-result-editor".into())
-                            .max_h(px(360.))
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(rgb(p.border))
-                            .id("merge-result-scroll")
-                            .overflow_y_scroll()
-                            .track_scroll(&self.result_scroll)
-                            .chain_scroll_y(&self.result_scroll)
-                            .child(self.editor.clone()),
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .bg(rgb(p.surface))
+                            .text_size(px(11.))
+                            .text_color(rgb(status_color))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Icon::GitConflict.render(11.))
+                            .child(if hunk_total > 0 {
+                                format!("{} / {} 处冲突", current_hunk + 1, hunk_total)
+                            } else if has_markers {
+                                "存在未匹配冲突标记".into()
+                            } else {
+                                "冲突已消除".into()
+                            }),
                     )
-                })
-                .child(
+                    .when(!self.manual_edit && hunk_total > 1, |bar| {
+                        bar.child(
+                            IconButton::new(Icon::ChevronUp, "上一处冲突")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.jump_hunk(-1, hunk_total, cx);
+                                })),
+                        )
+                        .child(
+                            IconButton::new(Icon::ChevronDown, "下一处冲突")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.jump_hunk(1, hunk_total, cx);
+                                })),
+                        )
+                    })
+                    .when(self.workspace.is_some(), |bar| {
+                        bar.child(
+                            Button::new("Agent 解决")
+                                .icon(Icon::Sparkles)
+                                .size(ButtonSize::Small)
+                                .kind(ButtonKind::Plain)
+                                .theme(self.theme)
+                                .when(busy, |button| button.disabled())
+                                .render()
+                                .debug_selector(|| "agent-resolve-conflict".into())
+                                .on_click(cx.listener(|this, _, _, cx| this.ask_agent(cx))),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .when(dirty, |bar| {
+                        bar.child(
+                            Button::new("重置草稿")
+                                .size(ButtonSize::Small)
+                                .kind(ButtonKind::Plain)
+                                .theme(self.theme)
+                                .render()
+                                .debug_selector(|| "reset-merge-draft".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.editor.update(cx, |editor, cx| {
+                                        editor.set_content(this.file.original.clone(), cx)
+                                    });
+                                    this.notice = None;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new(if self.manual_edit {
+                            "返回冲突视图"
+                        } else {
+                            "手动编辑"
+                        })
+                        .size(ButtonSize::Small)
+                        .kind(if self.manual_edit {
+                            ButtonKind::Tinted
+                        } else {
+                            ButtonKind::Plain
+                        })
+                        .theme(self.theme)
+                        .when(busy, |button| button.disabled())
+                        .render()
+                        .debug_selector(|| "standalone-toggle-merge-editor".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.manual_edit = !this.manual_edit;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new("保存并暂存")
+                            .size(ButtonSize::Small)
+                            .kind(ButtonKind::Tinted)
+                            .theme(self.theme)
+                            .when(busy || has_markers, |button| button.disabled())
+                            .render()
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    );
+                let body = if self.manual_edit && !busy {
                     div()
+                        .id("merge-result-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.result_scroll)
+                        .p_3()
                         .flex()
-                        .items_center()
-                        .justify_end()
+                        .flex_col()
                         .gap_2()
                         .child(
                             div()
-                                .flex_1()
                                 .text_size(px(11.))
                                 .text_color(rgb(p.text_muted))
-                                .child(
-                                    "当前侧 = ours · 传入侧 = theirs（rebase 时当前侧为变基目标）",
-                                ),
+                                .child("手动编辑完整文件，消除所有冲突标记后将自动保存并暂存。"),
                         )
+                        .when_some(self.notice.clone(), |col, notice| {
+                            col.child(self.notice_banner(notice))
+                        })
                         .child(
-                            Button::new(if busy {
-                                "正在保存…"
-                            } else {
-                                "保存并标记已解决"
-                            })
-                            .size(ButtonSize::Small)
-                            .theme(self.theme)
-                            .when(
-                                busy || crate::merge_conflicts::has_markers(&text),
-                                |button| button.disabled(),
-                            )
-                            .render()
-                            .debug_selector(|| "save-merge-conflict".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                        ),
-                );
-            if let Some(notice) = self.notice.clone() {
-                content = content.child(self.notice_banner(notice));
+                            div()
+                                .debug_selector(|| "merge-result-editor".into())
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .child(self.editor.clone()),
+                        )
+                } else {
+                    let mut body = div()
+                        .id("project-conflict-scroll-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll();
+                    if let Some(scroll) = &self.detail_scroll {
+                        body = body.track_scroll(scroll);
+                    }
+                    body.child(content)
+                };
+                return div()
+                    .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(toolbar)
+                    .child(body);
             }
             row = row.child(content);
         }
@@ -6611,6 +6826,60 @@ mod tests {
             assert!(view.sides.borrow().is_empty());
         });
         assert!(window.debug_bounds("merge-resolved").is_some());
+    }
+
+    #[gpui::test]
+    fn standalone_manual_edit_switches_to_full_editor(cx: &mut gpui::TestAppContext) {
+        let repo = crate::merge_conflicts::tests::conflicted();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            AgentWorkspace::with_path(data.path().join("sessions.json"), cx)
+        });
+        let mut file = crate::merge_conflicts::load(repo.path())
+            .unwrap()
+            .0
+            .remove(0);
+        file.original = format!("before\n\n{}\n// after\n", file.original);
+        let (view, window) = window.add_window_view(|_, cx| {
+            ConflictView::new(
+                file,
+                repo.path().into(),
+                Some(host.downgrade()),
+                ThemePreset::default(),
+                cx,
+            )
+            .standalone(true)
+        });
+        window.simulate_resize(size(px(900.), px(700.)));
+        window.run_until_parked();
+        view.update(window, |view, cx| {
+            view.expanded = true;
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("merge-side:0:0").is_some());
+        assert!(window.debug_bounds("merge-result-editor").is_none());
+
+        let toggle = window
+            .debug_bounds("standalone-toggle-merge-editor")
+            .unwrap();
+        window.simulate_click(toggle.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("merge-result-editor").is_some());
+        assert!(window.debug_bounds("merge-side:0:0").is_none());
+
+        let toggle = window
+            .debug_bounds("standalone-toggle-merge-editor")
+            .unwrap();
+        window.simulate_click(toggle.center(), Default::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("merge-side:0:0").is_some());
+        assert!(window.debug_bounds("merge-result-editor").is_none());
     }
 
     #[gpui::test]

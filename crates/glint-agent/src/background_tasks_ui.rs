@@ -117,6 +117,11 @@ mod tests {
         });
         agent.update(window, |agent, cx| {
             agent.run_mut(id).pending.take();
+            agent.notify_finished_background_tasks(cx);
+            assert!(agent.git_ui.toasts.read(cx).toasts().any(|toast| {
+                toast.kind == gpui_glint::components::ToastKind::Success
+                    && toast.message.contains("另一个项目的任务")
+            }));
             agent
                 .history
                 .active_mut()
@@ -162,6 +167,7 @@ impl AgentWorkspace {
                     .timer(std::time::Duration::from_secs(1))
                     .await;
                 let result = this.update(cx, |this, cx| {
+                    this.notify_finished_background_tasks(cx);
                     let current: Vec<_> = this
                         .background_tasks(cx)
                         .into_iter()
@@ -180,6 +186,44 @@ impl AgentWorkspace {
     }
     pub fn set_host_background_tasks(&mut self, hosted: bool) {
         self.host_background_tasks = hosted;
+    }
+    pub(super) fn notify_finished_background_tasks(&mut self, cx: &mut Context<Self>) {
+        self.background_tasks(cx);
+        let finished = self
+            .background_task_inbox
+            .borrow_mut()
+            .drain_finished_notifications();
+        if finished.is_empty() {
+            return;
+        }
+        self.git_ui.toasts.update(cx, |toasts, cx| {
+            for task in finished {
+                let (title, kind) = match task.state {
+                    State::Completed | State::Finished => (
+                        format!("后台任务已完成：{}", task.label),
+                        gpui_glint::components::ToastKind::Success,
+                    ),
+                    State::Failed => (
+                        format!("后台任务失败：{}", task.label),
+                        gpui_glint::components::ToastKind::Error,
+                    ),
+                    State::Cancelled => (
+                        format!("后台任务已停止：{}", task.label),
+                        gpui_glint::components::ToastKind::Info,
+                    ),
+                    State::Running => continue,
+                };
+                let description = if task.detail.is_empty() {
+                    task.group
+                } else {
+                    format!("{} · {}", task.group, task.detail)
+                };
+                let toast = gpui_glint::components::Toast::new(title)
+                    .kind(kind)
+                    .description(description);
+                toasts.push(toast, cx);
+            }
+        });
     }
     pub fn background_tasks(&self, cx: &App) -> Vec<BackgroundTask> {
         let mut tasks: Vec<_> = self

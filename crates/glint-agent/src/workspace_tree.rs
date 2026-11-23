@@ -34,9 +34,16 @@ struct Directory {
 }
 
 pub fn rows(files: &[Change], collapsed: &HashSet<String>) -> Vec<Row> {
+    rows_for_labels(files.iter().map(|file| file.label.as_str()), collapsed)
+}
+
+pub fn rows_for_labels<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+    collapsed: &HashSet<String>,
+) -> Vec<Row> {
     let mut root = Directory::default();
-    for (index, file) in files.iter().enumerate() {
-        let mut parts = file.label.split('/').peekable();
+    for (index, label) in labels.into_iter().enumerate() {
+        let mut parts = label.split('/').peekable();
         let mut directory = &mut root;
         directory.count += 1;
         while let Some(part) = parts.next() {
