@@ -1,7 +1,7 @@
 //! Reusable read-only file/directory preview. The host supplies data and performs I/O.
 use super::{
-    CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, Popover,
-    SegmentOption, SegmentedControl, Skeleton, TextEntry,
+    CodeCard, CodeCardEvent, CodeSelection, DocumentEditor, Icon, IconButton, MenuItem, Popover,
+    SegmentOption, SegmentedControl, Skeleton, TextEntry, context_menu_surface, menu_separator,
 };
 use crate::paths::display_path;
 use crate::theme::ThemePreset;
@@ -238,6 +238,10 @@ pub enum FilePreviewEvent {
         path: String,
         selection: CodeSelection,
     },
+    SaveRequested {
+        path: String,
+        content: String,
+    },
 }
 enum Page {
     Loading,
@@ -254,6 +258,16 @@ struct FolderNode {
     error: Option<String>,
 }
 
+struct TreeContextMenu {
+    path: String,
+    name: String,
+    directory: bool,
+    previewable: bool,
+    window: gpui::WindowId,
+    position: gpui::Point<gpui::Pixels>,
+    focus: gpui::FocusHandle,
+}
+
 pub struct FilePreview {
     header_accessory: Option<gpui::AnyView>,
     quote_label: Option<SharedString>,
@@ -264,9 +278,12 @@ pub struct FilePreview {
     expanded: bool,
     standalone: bool,
     content_only: bool,
+    editable: bool,
+    saved_content: String,
     navigation: Option<(String, Vec<FilePreviewEntry>)>,
     navigation_scroll: gpui::UniformListScrollHandle,
     hovered_nav: Option<String>,
+    tree_menu: Option<TreeContextMenu>,
     folders: std::collections::HashMap<String, FolderNode>,
     next_request: u64,
     open_breadcrumb: Option<usize>,
@@ -316,9 +333,12 @@ impl FilePreview {
             expanded: false,
             standalone: false,
             content_only: false,
+            editable: false,
+            saved_content: String::new(),
             navigation: None,
             navigation_scroll: Default::default(),
             hovered_nav: None,
+            tree_menu: None,
             folders: Default::default(),
             next_request: 0,
             open_breadcrumb: None,
@@ -345,6 +365,35 @@ impl FilePreview {
     pub fn quote_label(mut self, label: impl Into<SharedString>) -> Self {
         self.quote_label = Some(label.into());
         self
+    }
+
+    pub fn editable(mut self, editable: bool) -> Self {
+        self.editable = editable;
+        self
+    }
+
+    pub fn is_dirty(&self, cx: &gpui::App) -> bool {
+        if !self.editable {
+            return false;
+        }
+        matches!(&self.page, Page::File(editor) if editor.read(cx).content() != self.saved_content)
+    }
+
+    pub fn mark_saved(&mut self, content: &str, cx: &mut Context<Self>) {
+        self.saved_content = content.to_owned();
+        cx.notify();
+    }
+
+    pub fn request_save(&self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
+        if let Page::File(editor) = &self.page {
+            cx.emit(FilePreviewEvent::SaveRequested {
+                path: self.path.clone(),
+                content: editor.read(cx).content().to_owned(),
+            });
+        }
     }
     fn clear_html(&mut self) {
         #[cfg(all(feature = "webview", any(target_os = "macos", target_os = "windows")))]
@@ -532,12 +581,14 @@ impl FilePreview {
             })
         });
         self.markdown_preview = false;
+        self.saved_content = text.clone();
         self.path = path;
         self.parent = parent;
         self.subscriptions.clear();
+        let editable = self.editable;
         let editor = cx.new(|cx| {
             let editor = CodeCard::new(cx, language, text)
-                .read_only(true)
+                .read_only(!editable)
                 .quote_context(true)
                 .track_selected_line(true)
                 .show_header(false)
@@ -550,8 +601,10 @@ impl FilePreview {
         });
         self.subscriptions
             .push(cx.subscribe(&editor, |this, _, event: &CodeCardEvent, cx| {
-                if let CodeCardEvent::QuoteRequested = event {
-                    this.quote(cx);
+                match event {
+                    CodeCardEvent::QuoteRequested => this.quote(cx),
+                    CodeCardEvent::Changed(_) if this.editable => cx.notify(),
+                    _ => {}
                 }
             }));
         self.page = Page::File(editor);
@@ -948,6 +1001,327 @@ impl FilePreview {
         }
     }
 
+    fn sticky_tree_ancestors(
+        rows: &[(FilePreviewEntry, usize)],
+        scroll_top: f32,
+    ) -> Vec<(FilePreviewEntry, usize)> {
+        const ROW_HEIGHT: f32 = 26.;
+        const MAX_STICKY_DEPTH: usize = 5;
+        if scroll_top <= 0.5 || rows.is_empty() {
+            return Vec::new();
+        }
+        let max_row = rows.len() - 1;
+        let ancestors_at = |probe: usize| -> Vec<usize> {
+            let mut chain = Vec::new();
+            let mut needed_depth = rows[probe].1;
+            for idx in (0..probe).rev() {
+                if needed_depth == 0 {
+                    break;
+                }
+                let (ref entry, depth) = rows[idx];
+                if entry.directory && depth < needed_depth {
+                    chain.push(idx);
+                    needed_depth = depth;
+                }
+            }
+            chain.reverse();
+            if chain.len() > MAX_STICKY_DEPTH {
+                chain.truncate(MAX_STICKY_DEPTH);
+            }
+            chain
+        };
+        let base_probe = ((scroll_top / ROW_HEIGHT).floor() as usize).min(max_row);
+        let mut ancestors = ancestors_at(base_probe);
+        while !ancestors.is_empty() {
+            let probe = (((scroll_top + ancestors.len() as f32 * ROW_HEIGHT) / ROW_HEIGHT).floor()
+                as usize)
+                .min(max_row);
+            let next = ancestors_at(probe);
+            let prev_len = ancestors.len();
+            ancestors.retain(|idx| next.contains(idx));
+            if ancestors.len() == prev_len {
+                break;
+            }
+        }
+        ancestors
+            .into_iter()
+            .filter_map(|idx| rows.get(idx).cloned())
+            .collect()
+    }
+
+    fn render_tree_row(
+        &self,
+        entry: FilePreviewEntry,
+        depth: usize,
+        expanded: bool,
+        sticky: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = self.theme.palette();
+        let path = entry.path.clone();
+        let id_prefix = if sticky { "tree-sticky" } else { "tree-entry" };
+
+        div()
+            .id(SharedString::from(format!("{id_prefix}:{path}")))
+            .debug_selector(move || {
+                if sticky {
+                    format!("preview-sticky-entry:{path}")
+                } else {
+                    format!("preview-entry:{path}")
+                }
+            })
+            .h(px(26.))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl(px(8. + depth as f32 * 16.))
+            .pr_2()
+            .py_1()
+            .when(entry.path == self.path, |row| row.bg(rgb(p.accent_tint)))
+            .when(
+                entry.path != self.path
+                    && (self.hovered_nav.as_deref() == Some(entry.path.as_str())
+                        || self
+                            .tree_menu
+                            .as_ref()
+                            .is_some_and(|menu| menu.path == entry.path))
+                    && (entry.directory || entry.previewable || !entry.path.is_empty()),
+                |row| row.bg(rgb(p.surface_subtle)),
+            )
+            .text_color(rgb(if entry.directory || entry.previewable {
+                p.text
+            } else {
+                p.text_muted
+            }))
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_shrink_0()
+                    .when(entry.directory, |row| {
+                        row.child(Icon::disclosure(12., expanded))
+                    }),
+            )
+            .child(file_or_folder_icon(entry.directory, &entry.name))
+            .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
+            .when(entry.directory || entry.previewable, |row| {
+                let path = entry.path.clone();
+                let hover_path = entry.path.clone();
+                row.cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        let prev = this.hovered_nav.clone();
+                        if *hovered {
+                            this.hovered_nav = Some(hover_path.clone());
+                        } else if this.hovered_nav.as_deref() == Some(hover_path.as_str()) {
+                            this.hovered_nav = None;
+                        }
+                        if prev != this.hovered_nav {
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if entry.directory {
+                            this.toggle_folder(path.clone(), cx);
+                        } else {
+                            cx.emit(FilePreviewEvent::OpenRequested(path.clone()));
+                        }
+                    }))
+            })
+            .when(!entry.path.is_empty(), |row| {
+                let right_path = entry.path.clone();
+                let right_name = entry.name.clone();
+                let is_directory = entry.directory;
+                let is_previewable = entry.previewable;
+                row.on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let focus = cx.focus_handle();
+                        focus.focus(window, cx);
+                        this.tree_menu = Some(TreeContextMenu {
+                            path: right_path.clone(),
+                            name: right_name.clone(),
+                            directory: is_directory,
+                            previewable: is_previewable,
+                            window: window.window_handle().window_id(),
+                            position: event.position,
+                            focus,
+                        });
+                        cx.notify();
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn relative_tree_path(&self, path: &str) -> Option<String> {
+        let (root, _) = self.navigation.as_ref()?;
+        let relative = std::path::Path::new(path)
+            .strip_prefix(std::path::Path::new(root))
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        (!relative.is_empty() && relative != path).then_some(relative)
+    }
+
+    fn tree_context_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let state = self.tree_menu.as_ref()?;
+        if state.window != window.window_handle().window_id() {
+            return None;
+        }
+        let path = state.path.clone();
+        let name = state.name.clone();
+        let relative_path = self.relative_tree_path(&path);
+        let expanded = state.directory
+            && self
+                .folders
+                .get(&path)
+                .is_some_and(|node| node.expanded);
+        let mut items: Vec<gpui::AnyElement> = Vec::new();
+        if state.directory {
+            let toggle_path = path.clone();
+            items.push(
+                MenuItem::new(
+                    "tree-menu-toggle-dir",
+                    if expanded { "收起目录" } else { "展开目录" },
+                )
+                .theme(self.theme)
+                .render()
+                .debug_selector(|| "tree-menu-toggle-dir".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tree_menu = None;
+                    this.toggle_folder(toggle_path.clone(), cx);
+                }))
+                .into_any_element(),
+            );
+        } else if state.previewable {
+            let open_path = path.clone();
+            items.push(
+                MenuItem::new("tree-menu-open-file", "打开文件")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tree-menu-open-file".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tree_menu = None;
+                        cx.emit(FilePreviewEvent::OpenRequested(open_path.clone()));
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if !items.is_empty() {
+            items.push(menu_separator(self.theme).into_any_element());
+        }
+        let copy_path = path.clone();
+        items.push(
+            MenuItem::new(
+                "tree-menu-copy-path",
+                if state.directory {
+                    "复制目录路径"
+                } else {
+                    "复制文件路径"
+                },
+            )
+            .theme(self.theme)
+            .render()
+            .debug_selector(|| "tree-menu-copy-path".into())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tree_menu = None;
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path.clone()));
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
+        if let Some(rel) = relative_path {
+            items.push(
+                MenuItem::new("tree-menu-copy-relative", "复制相对路径")
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tree-menu-copy-relative".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tree_menu = None;
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(rel.clone()));
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        items.push(
+            MenuItem::new("tree-menu-copy-name", "复制名称")
+                .theme(self.theme)
+                .render()
+                .debug_selector(|| "tree-menu-copy-name".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tree_menu = None;
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if !path.starts_with("ssh://") {
+            items.push(menu_separator(self.theme).into_any_element());
+            let reveal_path = path.clone();
+            let reveal_label = if cfg!(target_os = "macos") {
+                "在访达中显示"
+            } else {
+                "在文件管理器中显示"
+            };
+            items.push(
+                MenuItem::new("tree-menu-reveal", reveal_label)
+                    .theme(self.theme)
+                    .render()
+                    .debug_selector(|| "tree-menu-reveal".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tree_menu = None;
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open")
+                            .arg("-R")
+                            .arg(&reveal_path)
+                            .spawn();
+                        #[cfg(target_os = "windows")]
+                        let _ = std::process::Command::new("explorer")
+                            .arg(format!("/select,{reveal_path}"))
+                            .spawn();
+                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                        if let Some(parent) = std::path::Path::new(&reveal_path).parent() {
+                            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let menu = context_menu_surface("file-preview-tree-menu", self.theme, 212.)
+            .debug_selector(|| "file-preview-tree-menu".into())
+            .track_focus(&state.focus)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.tree_menu = None;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.tree_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .children(items);
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(state.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .with_priority(40)
+            .into_any_element(),
+        )
+    }
+
     fn navigation_tree(
         &self,
         entries: &[FilePreviewEntry],
@@ -962,89 +1336,68 @@ impl FilePreview {
                 .h_full()
                 .child(div().p_4().child("空目录"));
         }
+        let base = &self.navigation_scroll.0.borrow().base_handle;
+        let max_y = f32::from(base.max_offset().y).max(0.0);
+        let scroll_top = (-f32::from(base.offset().y)).clamp(0.0, max_y);
+        let sticky_rows = Self::sticky_tree_ancestors(&rows, scroll_top);
         let rows = std::rc::Rc::new(rows);
         let count = rows.len();
-        div().id("file-preview-tree").h_full().min_h_0().child(
-            gpui::uniform_list(
-                "file-preview-tree-rows",
-                count,
-                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                    range
-                        .map(|index| {
-                            let (entry, depth) = rows[index].clone();
-                            let path = entry.path.clone();
-                            let expanded =
-                                this.folders.get(&path).is_some_and(|node| node.expanded);
-
-                            div()
-                                .id(SharedString::from(format!("tree-entry:{path}")))
-                                .debug_selector(move || format!("preview-entry:{path}"))
-                                .h(px(26.))
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .pl(px(8. + depth as f32 * 16.))
-                                .pr_2()
-                                .py_1()
-                                .when(entry.path == this.path, |row| row.bg(rgb(p.accent_tint)))
-                                .when(
-                                    entry.path != this.path
-                                        && this.hovered_nav.as_deref() == Some(entry.path.as_str())
-                                        && (entry.directory || entry.previewable),
-                                    |row| row.bg(rgb(p.surface_subtle)),
-                                )
-                                .text_color(rgb(if entry.directory || entry.previewable {
-                                    p.text
-                                } else {
-                                    p.text_muted
-                                }))
-                                .child(
-                                    div()
-                                        .w(px(14.))
-                                        .flex_shrink_0()
-                                        .when(entry.directory, |row| {
-                                            row.child(Icon::disclosure(12., expanded))
-                                        }),
-                                )
-                                .child(file_or_folder_icon(entry.directory, &entry.name))
-                                .child(div().min_w_0().text_ellipsis().child(entry.name.clone()))
-                                .when(entry.directory || entry.previewable, |row| {
-                                    let path = entry.path.clone();
-                                    let hover_path = entry.path.clone();
-                                    row.cursor_pointer()
-                                        .on_hover(cx.listener(move |this, hovered, _, cx| {
-                                            let prev = this.hovered_nav.clone();
-                                            if *hovered {
-                                                this.hovered_nav = Some(hover_path.clone());
-                                            } else if this.hovered_nav.as_deref()
-                                                == Some(hover_path.as_str())
-                                            {
-                                                this.hovered_nav = None;
-                                            }
-                                            if prev != this.hovered_nav {
-                                                cx.notify();
-                                            }
-                                        }))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if entry.directory {
-                                                this.toggle_folder(path.clone(), cx);
-                                            } else {
-                                                cx.emit(FilePreviewEvent::OpenRequested(
-                                                    path.clone(),
-                                                ));
-                                            }
-                                        }))
-                                })
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
+        div()
+            .id("file-preview-tree")
+            .relative()
             .h_full()
-            .w_full()
-            .track_scroll(&self.navigation_scroll),
-        )
+            .min_h_0()
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+            .child(
+                gpui::uniform_list(
+                    "file-preview-tree-rows",
+                    count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|index| {
+                                let (entry, depth) = rows[index].clone();
+                                let expanded = this
+                                    .folders
+                                    .get(&entry.path)
+                                    .is_some_and(|node| node.expanded);
+                                this.render_tree_row(entry, depth, expanded, false, cx)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .h_full()
+                .w_full()
+                .track_scroll(&self.navigation_scroll),
+            )
+            .when(!sticky_rows.is_empty(), |tree| {
+                let sticky_items = sticky_rows
+                    .into_iter()
+                    .map(|(entry, depth)| {
+                        let expanded = self
+                            .folders
+                            .get(&entry.path)
+                            .is_some_and(|node| node.expanded);
+                        self.render_tree_row(entry, depth, expanded, true, cx)
+                    })
+                    .collect::<Vec<_>>();
+                tree.child(
+                    div()
+                        .debug_selector(|| "file-preview-tree-sticky".into())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bg(rgb(p.panel))
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .shadow_sm()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .children(sticky_items),
+                )
+            })
     }
 
     /// Retain the folder independently of the currently previewed file.
@@ -1838,7 +2191,17 @@ impl Render for FilePreview {
                         .child(body),
                 )
             })
-            .when(
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            if this.editable
+                && event.keystroke.modifiers.platform
+                && event.keystroke.key.eq_ignore_ascii_case("s")
+            {
+                this.request_save(cx);
+                cx.stop_propagation();
+            }
+        }))
+        .children(self.tree_context_menu(window, cx))
+        .when(
                 self.content_only
                     && self.search_open
                     && !self.markdown_preview
@@ -2516,5 +2879,96 @@ mod tests {
         // Verify OpenRequested was emitted for /Users/ygy and popover closed
         assert_eq!(*opened.borrow(), vec!["/Users/ygy".to_owned()]);
         assert_eq!(view.read_with(window, |p, _| p.open_breadcrumb()), None);
+    }
+
+    #[test]
+    fn sticky_tree_ancestors_pins_parent_folders_when_scrolled() {
+        let entry = |name: &str, directory: bool| FilePreviewEntry {
+            name: name.into(),
+            path: format!("/repo/{name}"),
+            directory,
+            previewable: !directory,
+        };
+        let rows = vec![
+            (entry("crates", true), 0),
+            (entry("glint-api", true), 1),
+            (entry("src", true), 2),
+            (entry("a.rs", false), 3),
+            (entry("b.rs", false), 3),
+            (entry("c.rs", false), 3),
+        ];
+        assert!(FilePreview::sticky_tree_ancestors(&rows, 0.0).is_empty());
+        let sticky = FilePreview::sticky_tree_ancestors(&rows, 26.0 * 3.5);
+        let names = sticky
+            .into_iter()
+            .map(|(e, d)| (e.name, d))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("crates".to_owned(), 0),
+                ("glint-api".to_owned(), 1),
+                ("src".to_owned(), 2),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn tree_context_menu_copies_full_and_relative_paths(cx: &mut gpui::TestAppContext) {
+        let (view, window) = cx.add_window_view(|_, cx| FilePreview::new(cx));
+        window.simulate_resize(gpui::size(px(900.), px(600.)));
+        view.update(window, |preview, cx| {
+            let entries = vec![
+                FilePreviewEntry {
+                    name: "src".into(),
+                    path: "/repo/src".into(),
+                    directory: true,
+                    previewable: false,
+                },
+                FilePreviewEntry {
+                    name: "main.rs".into(),
+                    path: "/repo/main.rs".into(),
+                    directory: false,
+                    previewable: true,
+                },
+            ];
+            preview.set_expanded(true, cx);
+            preview.set_navigation("/repo".into(), entries.clone(), false, cx);
+            preview.set_directory("/repo".into(), None, entries, cx);
+        });
+        window.run_until_parked();
+
+        let file_bounds = window.debug_bounds("preview-entry:/repo/main.rs").unwrap();
+        window.simulate_mouse_down(
+            file_bounds.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        window.run_until_parked();
+        assert!(window.debug_bounds("file-preview-tree-menu").is_some());
+
+        let copy_rel = window.debug_bounds("tree-menu-copy-relative").unwrap();
+        window.simulate_click(copy_rel.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "main.rs"
+        );
+        assert!(window.debug_bounds("file-preview-tree-menu").is_none());
+
+        let dir_bounds = window.debug_bounds("preview-entry:/repo/src").unwrap();
+        window.simulate_mouse_down(
+            dir_bounds.center(),
+            gpui::MouseButton::Right,
+            Default::default(),
+        );
+        window.run_until_parked();
+        let copy_path = window.debug_bounds("tree-menu-copy-path").unwrap();
+        window.simulate_click(copy_path.center(), Default::default());
+        window.run_until_parked();
+        assert_eq!(
+            window.read_from_clipboard().unwrap().text().unwrap(),
+            "/repo/src"
+        );
     }
 }

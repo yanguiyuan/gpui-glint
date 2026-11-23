@@ -2,10 +2,11 @@ use super::{Avatar, Icon, PastedImage, PromptEditor, PromptEditorEvent};
 use crate::theme::ThemePreset;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, BoxShadow, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton, ObjectFit,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage,
-    Subscription, Window, actions, deferred, div, img, point, px, relative, rgb, rgba,
+    Animation, AnimationExt as _, App, AppContext, BoxShadow, ColorExt, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
+    MouseButton, ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, Subscription, Window, actions, deferred, div, img, point, px, relative,
+    rgb, rgba,
 };
 use std::{collections::HashMap, ops::Range};
 
@@ -2419,54 +2420,26 @@ impl Composer {
         let theme = self.theme;
         let p = theme.palette();
         let dark = theme.is_dark();
-        let surface_bg = if dark {
-            rgba(theme.menu_material())
+        let (surface_bg, surface_border) = if dark {
+            (rgba(theme.menu_material()), rgba(theme.glass_line()))
         } else {
-            rgb(p.surface)
-        };
-        let surface_border = if dark {
-            rgba(theme.glass_line())
-        } else {
-            rgb(p.border)
+            (rgba(0xf8f9fbed), rgba(0x00000018))
         };
         let hover_bg = if dark {
-            rgba(0xffffff14)
+            rgba(0xffffff12)
         } else {
-            rgb(p.surface_subtle)
+            rgba(0x0000000a)
         };
-
-        let mut panel = div()
-            .id("glass-composer-context-panel-scroll")
-            .track_scroll(&self.context_scroll)
-            .absolute()
-            .left_0()
-            .right_0()
-            .bottom(relative(1.))
-            .mb(px(8.))
-            .max_h(px(420.))
-            .overflow_y_scroll()
-            .p(px(10.))
-            .flex()
-            .flex_col()
-            .rounded(px(14.))
-            .border_1()
-            .border_color(surface_border)
-            .bg(surface_bg)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.close_context_panel(cx);
-            }))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .px(px(10.))
-                    .pb(px(8.))
-                    .text_size(px(15.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(p.text))
-                    .child(self.context_title.clone()),
-            );
+        let selected_bg = if dark {
+            rgba(0x2d7df633)
+        } else {
+            rgba(0x3b82f61c)
+        };
+        let selected_border = if dark {
+            rgba(0x2d7df666)
+        } else {
+            rgba(0x3b82f640)
+        };
 
         let query = self
             .context_query(cx)
@@ -2477,6 +2450,19 @@ impl Composer {
         let selected_index = self
             .context_selected
             .min(self.matching_context_entries(cx).len().saturating_sub(1));
+
+        let mut list = div()
+            .id("glass-composer-context-panel-scroll")
+            .track_scroll(&self.context_scroll)
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(2.));
+
+        let mut rendered_sections = 0usize;
         for section in &self.context_sections {
             let entries: Vec<_> = section
                 .entries
@@ -2486,15 +2472,27 @@ impl Composer {
             if entries.is_empty() {
                 continue;
             }
+            if rendered_sections > 0 {
+                list = list.child(
+                    div()
+                        .my(px(4.))
+                        .mx(px(8.))
+                        .h(px(1.))
+                        .flex_shrink_0()
+                        .bg(rgb(p.border).opacity(0.6)),
+                );
+            }
+            rendered_sections += 1;
             let start_index = matches;
             matches += entries.len();
             if let Some(title) = &section.title {
-                panel = panel.child(
+                list = list.child(
                     div()
-                        .px(px(10.))
-                        .pt(px(6.))
-                        .pb(px(4.))
-                        .text_size(px(12.))
+                        .px(px(8.))
+                        .pt(px(4.))
+                        .pb(px(3.))
+                        .text_size(px(11.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(p.text_muted))
                         .child(title.clone()),
                 );
@@ -2502,7 +2500,12 @@ impl Composer {
             for (index, entry) in entries.into_iter().enumerate() {
                 let selected = start_index + index == selected_index;
                 let entry_color = theme.color(entry.color.unwrap_or(p.accent));
-                panel = panel.child(
+                let description = entry
+                    .description
+                    .as_ref()
+                    .filter(|desc| desc.as_ref() != entry.label.as_ref())
+                    .cloned();
+                list = list.child(
                     div()
                         .id(SharedString::from(format!(
                             "glass-composer-context-{}",
@@ -2512,15 +2515,22 @@ impl Composer {
                             let id = entry.id.clone();
                             move || format!("composer-context:{id}")
                         })
-                        .h(px(40.))
-                        .px(px(10.))
+                        .h(px(34.))
+                        .flex_shrink_0()
+                        .px(px(8.))
                         .flex()
                         .items_center()
                         .gap(px(10.))
                         .rounded(px(8.))
+                        .border_1()
+                        .border_color(if selected {
+                            selected_border
+                        } else {
+                            rgba(0x00000000)
+                        })
                         .cursor_pointer()
-                        .when(selected, |row| row.bg(hover_bg))
-                        .hover(move |style| style.bg(hover_bg))
+                        .when(selected, |row| row.bg(selected_bg))
+                        .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
                         .on_click({
                             let entry = entry.clone();
                             cx.listener(move |this, _, window, cx| {
@@ -2531,20 +2541,27 @@ impl Composer {
                         .when_some(entry.icon, |row, icon| {
                             row.child(
                                 div()
+                                    .w(px(22.))
+                                    .h(px(22.))
                                     .flex_shrink_0()
+                                    .rounded(px(6.))
+                                    .bg(rgb(entry_color).opacity(0.12))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .text_color(rgb(entry_color))
-                                    .child(icon.render(16.)),
+                                    .child(icon.render(13.)),
                             )
                         })
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(14.))
+                                .text_size(px(13.))
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(p.text))
+                                .text_color(rgb(if selected { p.accent } else { p.text }))
                                 .child(entry.label.clone()),
                         )
-                        .when_some(entry.description.clone(), |row, description| {
+                        .when_some(description, |row, description| {
                             row.child(
                                 div()
                                     .flex_1()
@@ -2560,49 +2577,124 @@ impl Composer {
         }
 
         if matches == 0 {
-            panel = panel.child(
+            list = list.child(
                 div()
-                    .p_3()
+                    .p_4()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.))
                     .text_color(rgb(p.text_muted))
                     .debug_selector(|| "composer-context-empty".into())
                     .child(format!("没有匹配“{query}”的上下文")),
             );
         }
-        if !self.context_hints.is_empty() {
-            panel = panel.child(
+
+        let panel = div()
+            .id("glass-composer-context-panel")
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(relative(1.))
+            .mb(px(8.))
+            .max_h(px(420.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(14.))
+            .border_1()
+            .border_color(surface_border)
+            .bg(surface_bg)
+            .shadow_xl()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_context_panel(cx);
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
                 div()
-                    .mt(px(8.))
-                    .pt(px(10.))
+                    .px(px(14.))
+                    .py(px(10.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(p.border).opacity(0.6))
                     .flex()
                     .items_center()
-                    .gap(px(12.))
-                    .children(self.context_hints.iter().map(|(key, label)| {
+                    .justify_between()
+                    .gap_2()
+                    .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.))
-                            .child(
-                                div()
-                                    .h(px(20.))
-                                    .px(px(6.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(5.))
-                                    .border_1()
-                                    .border_color(surface_border)
-                                    .text_size(px(11.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(key.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(p.text_muted))
-                                    .child(label.clone()),
-                            )
-                    })),
-            );
-        }
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(p.text))
+                            .child(self.context_title.clone()),
+                    )
+                    .when(!query.is_empty(), |header| {
+                        header.child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(5.))
+                                .bg(rgb(p.accent_tint))
+                                .text_size(px(11.))
+                                .text_color(rgb(p.accent))
+                                .child(format!("@{query}")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(list)
+                    .child(
+                        super::ScrollFade::new(if dark { p.panel } else { 0xf8f9fb })
+                            .from_scroll(&self.context_scroll)
+                            .height(14.)
+                            .render(),
+                    ),
+            )
+            .when(!self.context_hints.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(rgb(p.border).opacity(0.6))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .children(self.context_hints.iter().map(|(key, label)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .child(
+                                    div()
+                                        .h(px(20.))
+                                        .px(px(6.))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(surface_border)
+                                        .text_size(px(11.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(key.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(p.text_muted))
+                                        .child(label.clone()),
+                                )
+                        })),
+                )
+            });
 
         deferred(panel).with_priority(20).into_any_element()
     }

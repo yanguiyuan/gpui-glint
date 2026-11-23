@@ -232,20 +232,16 @@ impl Workbench {
         let (index, position) = self.response_header_menu?;
         let (name, value) = self.response_data.as_ref()?.headers.get(index)?.clone();
         let p = self.theme.palette();
-        let mut menu = div()
-            .id("response-header-context-menu")
-            .debug_selector(|| "response-header-context-menu".into())
-            .w(px(300.))
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded(px(7.))
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.surface))
-            .shadow_lg()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+        let mut menu = gpui_glint::components::context_menu_surface(
+            "response-header-context-menu",
+            self.theme,
+            300.,
+        )
+        .debug_selector(|| "response-header-context-menu".into())
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.response_header_menu = None;
                 cx.notify();
             }))

@@ -175,7 +175,7 @@ mod plugin_page;
 pub use plugin_page::{PluginPage, PluginPageEvent};
 
 mod menu;
-pub use menu::{DropdownMenu, MenuItem};
+pub use menu::{DropdownMenu, MenuItem, context_menu_surface, menu_separator};
 
 mod image_masonry;
 pub use image_masonry::{ImageMasonry, ImageMasonryEvent, ImageMasonryItem};

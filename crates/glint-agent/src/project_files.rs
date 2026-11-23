@@ -1032,10 +1032,6 @@ impl ProjectFiles {
                             view
                         });
                         cx.subscribe(&view, move |this, _, _: &ConflictResolved, cx| {
-                            if let Some(index) = this.documents.iter().position(|doc| doc.id == id)
-                            {
-                                this.close(index, cx);
-                            }
                             this.refresh_changes(cx);
                         })
                         .detach();
@@ -1355,19 +1351,43 @@ impl ProjectFiles {
             }
             return;
         }
-        let view = cx.new(|cx| FilePreview::new(cx).quote_label("交给 Agent"));
+        let view = cx.new(|cx| {
+            FilePreview::new(cx)
+                .editable(true)
+                .quote_label("交给 Agent")
+        });
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&view, |this, preview, event: &FilePreviewEvent, cx| {
-            if let FilePreviewEvent::QuoteRequested { path, selection } = event
-                && let Some(project) = &this.root
-                && let Some(index) = this.active
-                && matches!(&this.documents[index].view, DocumentView::File(view) if *view == preview)
-            {
-                cx.emit(ProjectExcerpt {
-                    project: project.clone(),
-                    path: path.clone(),
-                    selection: selection.clone(),
-                });
+            match event {
+                FilePreviewEvent::QuoteRequested { path, selection } => {
+                    if let Some(project) = &this.root
+                        && let Some(index) = this.active
+                        && matches!(&this.documents[index].view, DocumentView::File(view) if *view == preview)
+                    {
+                        cx.emit(ProjectExcerpt {
+                            project: project.clone(),
+                            path: path.clone(),
+                            selection: selection.clone(),
+                        });
+                    }
+                }
+                FilePreviewEvent::SaveRequested { path, content } => {
+                    let save_path = std::path::PathBuf::from(path);
+                    let content = content.clone();
+                    let preview_weak = preview.downgrade();
+                    let work = cx.background_executor().spawn(async move {
+                        std::fs::write(&save_path, content.as_bytes()).map_err(|e| e.to_string())?;
+                        Ok::<_, String>(content)
+                    });
+                    cx.spawn(async move |weak, cx| {
+                        if let Ok(saved) = work.await {
+                            let _ = preview_weak.update(cx, |v, cx| v.mark_saved(&saved, cx));
+                            let _ = weak.update(cx, |this, cx| this.refresh_changes(cx));
+                        }
+                    })
+                    .detach();
+                }
+                _ => {}
             }
         })
         .detach();
@@ -1510,19 +1530,13 @@ impl ProjectFiles {
             .documents
             .iter()
             .position(|document| document.id == tab)?;
-        let p = self.theme.palette();
-        let menu = div()
-            .id("project-document-tab-menu")
-            .track_focus(&state.focus)
-            .w(px(192.))
-            .p_1()
-            .rounded(px(7.))
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.surface))
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+        let menu = gpui_glint::components::context_menu_surface(
+            "project-document-tab-menu",
+            self.theme,
+            196.,
+        )
+        .track_focus(&state.focus)
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.tab_menu = None;
                 cx.notify();
             }))
@@ -1651,7 +1665,17 @@ impl Render for ProjectFiles {
                     .into_owned();
                 let file_icon = Icon::for_file_name(&label);
                 let (label, icon) = match &document.view {
-                    DocumentView::File(_) => (label, file_icon),
+                    DocumentView::File(view) => {
+                        let dirty = view.read(cx).is_dirty(cx);
+                        (
+                            if dirty {
+                                format!("{label} •")
+                            } else {
+                                label
+                            },
+                            file_icon,
+                        )
+                    }
                     DocumentView::Conflict { .. } => (label, Icon::GitConflict),
                     DocumentView::Diff(diff) => (
                         if diff.base.is_some() {
@@ -1706,6 +1730,8 @@ impl Render for ProjectFiles {
             let document = &self.documents[index];
             match &document.view {
                 DocumentView::File(view) => {
+                    let is_dirty = view.read(cx).is_dirty(cx);
+                    let save_view = view.clone();
                     let controls = view.update(cx, |view, cx| view.document_controls(cx));
                     let status = self
                         .definition_error
@@ -1729,6 +1755,19 @@ impl Render for ProjectFiles {
                                     )
                                     .theme(self.theme)
                                     .render(cx),
+                                )
+                            })
+                            .when(is_dirty, |row| {
+                                row.child(
+                                    Button::new("保存")
+                                        .size(ButtonSize::Small)
+                                        .kind(ButtonKind::Tinted)
+                                        .theme(self.theme)
+                                        .render()
+                                        .debug_selector(|| "project-file-save".into())
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            save_view.update(cx, |view, cx| view.request_save(cx));
+                                        })),
                                 )
                             })
                             .child(controls),
@@ -2581,6 +2620,14 @@ mod tests {
         window.simulate_click(theirs, Default::default());
         let save = wait_for(window, "save-merge-conflict");
         window.simulate_click(save, Default::default());
+        window.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(root.join("冲突 [1].txt")).unwrap(),
+            "theirs\n"
+        );
+        assert!(window.debug_bounds(selector).is_some());
+        let check = wait_for(window, checkbox);
+        window.simulate_click(check, Default::default());
 
         wait_for(
             window,

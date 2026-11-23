@@ -298,6 +298,7 @@ impl ClosableTabs {
                     .items_center()
                     .child(
                         IconButton::new(Icon::Plus, "新建标签页")
+                            .plain()
                             .theme(self.theme)
                             .render()
                             .on_click(move |_, window, cx| {

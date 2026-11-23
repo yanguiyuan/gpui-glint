@@ -270,14 +270,6 @@ pub fn save(file: &Conflict, result: &str) -> Result<(), String> {
         return Err("文件路径已变化，请刷新后重试".into());
     }
     crate::atomic_file::replace(&file.path, Some(&file.original), result)?;
-    if index(&file.root, &file.label)? != file.index {
-        return Err("结果已保存，但 Git 状态已变化，未暂存；请刷新后检查".into());
-    }
-    git(
-        &file.root,
-        &["--literal-pathspecs", "add", "--", &file.label],
-    )
-    .map_err(|e| format!("结果已保存，但暂存失败：{e}"))?;
     Ok(())
 }
 
@@ -528,6 +520,9 @@ pub(crate) mod tests {
         assert_eq!(hunks(&file.original).unwrap().len(), 1);
         assert!(save(file, &file.original).unwrap_err().contains("冲突标记"));
         save(file, "merged\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "merged\n");
+        assert_eq!(load(dir.path()).unwrap().0.len(), 1);
+        stage_resolved(dir.path(), &file.label).unwrap();
         assert!(load(dir.path()).unwrap().0.is_empty());
         assert_eq!(
             git(dir.path(), &["show", ":0:冲突 [1].txt"]).unwrap(),

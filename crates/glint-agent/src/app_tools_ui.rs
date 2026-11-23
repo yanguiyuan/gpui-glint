@@ -15,6 +15,7 @@ pub struct MarkdownView {
 
 pub struct ToolPanel {
     active: bool,
+    task_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     output_scroll: ScrollHandle,
     output_scrollbar: gpui_glint::components::ScrollbarState,
@@ -1141,6 +1142,7 @@ impl AgentWorkspace {
                 .detach();
                 ToolPanel {
                     active: false,
+                    task_panel: None,
                     output_panel: None,
                     output_scroll: ScrollHandle::new(),
                     output_scrollbar: Default::default(),
@@ -1229,6 +1231,73 @@ impl AgentWorkspace {
                 .as_str()
                 .map(|code| (code.lines().take(10).count().max(1) as f32 * 21. + 16.).min(240.))
                 .unwrap_or(64.);
+            let task_panel = (record.call.name == "code_mode").then(|| {
+                let task_script = script.clone();
+                let task_output_panel = output_panel.clone();
+                let task_pending_id = pending_id.clone();
+                let task_result = result.clone();
+                let task = entry.task_panel.get_or_insert_with(|| {
+                    let panel = cx.new(|cx| {
+                        let mut panel = CollapsePanel::new("编排任务")
+                            .icon(Icon::Code)
+                            .compact()
+                            .theme(theme);
+                        panel.set_expanded(true, cx);
+                        panel
+                    });
+                    cx.subscribe(
+                        &panel,
+                        |_, _, _: &gpui_glint::components::CollapsePanelEvent, cx| cx.notify(),
+                    )
+                    .detach();
+                    panel
+                });
+                task.update(cx, |panel, cx| {
+                    panel.set_theme(theme, cx);
+                    panel.set_content(
+                        move |_, _| {
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .when_some(task_script.clone(), |body, card| {
+                                    body.child(
+                                        div()
+                                            .id("code-mode-source")
+                                            .debug_selector(|| "code-mode-source".into())
+                                            .h(px(source_height))
+                                            .flex_shrink_0()
+                                            .overflow_hidden()
+                                            .rounded(px(8.))
+                                            .child(card),
+                                    )
+                                })
+                                .child(if let Some(output_panel) = &task_output_panel {
+                                    div()
+                                        .debug_selector(|| "code-mode-result-toggle".into())
+                                        .child(output_panel.clone())
+                                        .into_any_element()
+                                } else if pending_body {
+                                    div()
+                                        .w_full()
+                                        .py_1()
+                                        .child(pending_skeleton(task_pending_id.clone(), theme))
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .text_size(px(12.))
+                                        .child(task_result.clone())
+                                        .into_any_element()
+                                })
+                                .into_any_element()
+                        },
+                        cx,
+                    );
+                });
+                task.clone()
+            });
             let weak = cx.entity().downgrade();
             let scope = format!("{key}:tool:{}", record.call.id);
             let preview_root = self.history.active().project.clone();
@@ -1261,9 +1330,11 @@ impl AgentWorkspace {
             // the trigger icon and skips the indent guide. That holds for tool
             // orchestration too: the script and its return value read as one
             // answer, not as a list to be grouped.
+            let is_code_mode = record.call.name == "code_mode";
             entry.panel.update(cx, |panel, cx| {
                 panel.set_theme(theme, cx);
                 panel.set_expandable(!is_file_op, cx);
+                panel.set_guard_line(is_code_mode, cx);
                 panel.set_icon(if is_file_op { None } else { Some(presentation.icon) }, cx);
                 panel.set_summary(presentation.summary.clone(), cx);
                 if is_edit {
@@ -1734,7 +1805,7 @@ impl AgentWorkspace {
                                 .into_any_element();
                         }
                         let body = (|| {
-                            if script.is_some() || output_panel.is_some() || !nested.is_empty() {
+                            if task_panel.is_some() || !nested.is_empty() {
                                 return weak
                                     .update(cx, |this, cx| {
                                         div()
@@ -1742,42 +1813,15 @@ impl AgentWorkspace {
                                             .min_w_0()
                                             .flex()
                                             .flex_col()
-                                            .gap_3()
-                                            .when_some(script.clone(), |body, card| {
+                                            .gap_1()
+                                            .when_some(task_panel.clone(), |body, task| {
                                                 body.child(
                                                     div()
-                                                        .id("code-mode-source")
                                                         .debug_selector(|| {
-                                                            "code-mode-source".into()
+                                                            "code-mode-task-item".into()
                                                         })
-                                                        .h(px(source_height))
-                                                        .flex_shrink_0()
-                                                        .overflow_hidden()
-                                                        .rounded(px(8.))
-                                                        .child(card),
+                                                        .child(task),
                                                 )
-                                            })
-                                            .child(if let Some(output_panel) = &output_panel {
-                                                div()
-                                                    .debug_selector(|| {
-                                                        "code-mode-result-toggle".into()
-                                                    })
-                                                    .child(output_panel.clone())
-                                                    .into_any_element()
-                                            } else if pending_body {
-                                                div()
-                                                    .w_full()
-                                                    .py_1()
-                                                    .child(pending_skeleton(
-                                                        pending_id.clone(),
-                                                        theme,
-                                                    ))
-                                                    .into_any_element()
-                                            } else {
-                                                div()
-                                                    .text_size(px(12.))
-                                                    .child(result.clone())
-                                                    .into_any_element()
                                             })
                                             .children(
                                                 nested.iter().map(|record| {
@@ -1863,6 +1907,9 @@ impl AgentWorkspace {
                                 ))
                                 .into_any_element()
                         })();
+                        if is_code_mode {
+                            return body;
+                        }
                         gpui_glint::components::OperationPanel::new(operation_title.clone())
                             .theme(theme)
                             .child(body)
@@ -2073,6 +2120,7 @@ impl AgentWorkspace {
                         .entry(format!("{key}:{index}:thinking"))
                         .or_insert_with(|| ToolPanel {
                             active: false,
+                            task_panel: None,
                             output_panel: None,
                             output_scroll: ScrollHandle::new(),
                             output_scrollbar: Default::default(),

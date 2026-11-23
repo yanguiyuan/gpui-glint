@@ -454,16 +454,13 @@ impl Workbench {
         if let Some((node, position)) = &self.json_menu {
             let node = node.clone();
             let p = self.theme.palette();
-            let menu = div()
-                .id("json-path-context-menu")
-                .w(px(260.))
-                .p_2()
-                .rounded(px(7.))
-                .border_1()
-                .border_color(rgb(p.border))
-                .bg(rgb(p.surface))
-                .shadow_lg()
-                .on_mouse_down_out(cx.listener(|host, _, _, cx| {
+            let menu = gpui_glint::components::context_menu_surface(
+                "json-path-context-menu",
+                self.theme,
+                260.,
+            )
+            .p_2()
+            .on_mouse_down_out(cx.listener(|host, _, _, cx| {
                     host.json_menu = None;
                     cx.notify();
                 }))

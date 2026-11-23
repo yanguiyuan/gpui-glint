@@ -263,10 +263,12 @@ pub struct CodeCard {
     document_managed: bool,
     command_mode: bool,
     block_editing: bool,
+    conflict_highlights: bool,
     dark: bool,
     history: Vec<Snapshot>,
     future: Vec<Snapshot>,
     scroll: ScrollHandle,
+    scroll_y: ScrollHandle,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -649,10 +651,12 @@ impl CodeCard {
             document_managed: false,
             command_mode: false,
             block_editing: false,
+            conflict_highlights: false,
             dark: false,
             history: Vec::new(),
             future: Vec::new(),
             scroll: ScrollHandle::new(),
+            scroll_y: ScrollHandle::new(),
             selected_range: end..end,
             selection_reversed: false,
             marked_range: None,
@@ -759,6 +763,21 @@ impl CodeCard {
         self.block_editing = value;
         self
     }
+
+    /// Highlight Git merge conflict markers inline with one-click resolution actions.
+    pub fn conflict_highlights(mut self, value: bool) -> Self {
+        self.conflict_highlights = value;
+        self
+    }
+
+    pub fn set_conflict_editor(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.viewport != value || self.conflict_highlights != value {
+            self.viewport = value;
+            self.conflict_highlights = value;
+            self.viewport_cache = None;
+            cx.notify();
+        }
+    }
     pub fn selected_excerpt(&self) -> Option<CodeSelection> {
         let range = &self.selected_range;
         if range.is_empty() {
@@ -831,18 +850,8 @@ impl CodeCard {
             return None;
         }
         let theme = self.reference_theme();
-        let p = theme.palette();
         let selected = !self.selected_range.is_empty();
-        let menu = div()
-            .id("code-card-context-menu")
-            .w(px(220.))
-            .p_1()
-            .rounded(px(7.))
-            .bg(rgb(p.surface))
-            .border_1()
-            .border_color(rgb(p.border))
-            .shadow_lg()
-            .occlude()
+        let menu = super::context_menu_surface("code-card-context-menu", theme, 220.)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -851,6 +860,7 @@ impl CodeCard {
             }))
             .child(
                 super::MenuItem::new("code-card-copy", "复制")
+                    .shortcut("⌘ C")
                     .theme(theme)
                     .disabled(!selected)
                     .render()
@@ -872,8 +882,10 @@ impl CodeCard {
                         })),
                 )
             })
+            .child(super::menu_separator(theme))
             .child(
                 super::MenuItem::new("code-card-select-all", "全选")
+                    .shortcut("⌘ A")
                     .theme(theme)
                     .render()
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3106,7 +3118,7 @@ impl Element for CodeLine {
         self.input
             .update(cx, |input, cx| input.activate_window(window, cx));
         let focus = self.input.read(cx).focus_handle.clone();
-        if self.start == 0 && !self.input.read(cx).read_only {
+        if self.start == 0 && !self.input.read(cx).read_only && !self.input.read(cx).viewport {
             window.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.input.clone()),
@@ -3427,6 +3439,337 @@ impl CodeCard {
             }
         }
     }
+    fn sticky_line_indent(line: &str) -> usize {
+        let mut indent = 0usize;
+        for ch in line.chars() {
+            match ch {
+                ' ' => indent += 1,
+                '\t' => indent += 4,
+                _ => break,
+            }
+        }
+        indent
+    }
+
+    fn is_sticky_ignorable(trimmed: &str) -> bool {
+        trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with('#')
+    }
+
+    fn is_sticky_scope_opener(trimmed: &str) -> bool {
+        trimmed.ends_with('{') || trimmed.ends_with(':') || trimmed.ends_with("=>")
+    }
+
+    fn sticky_scope_lines(
+        content: &str,
+        ranges: &[Range<usize>],
+        target_line: usize,
+    ) -> Vec<usize> {
+        const MAX_STICKY_SCOPES: usize = 5;
+        if target_line == 0 || target_line >= ranges.len() {
+            return Vec::new();
+        }
+        let mut min_indent = None;
+        for idx in target_line..ranges.len() {
+            let line = &content[ranges[idx].clone()];
+            if !Self::is_sticky_ignorable(line.trim()) {
+                min_indent = Some(Self::sticky_line_indent(line));
+                break;
+            }
+        }
+        let Some(mut min_indent) = min_indent else {
+            return Vec::new();
+        };
+        let mut scopes = Vec::new();
+        for idx in (0..target_line).rev() {
+            let line = &content[ranges[idx].clone()];
+            let trimmed = line.trim();
+            if Self::is_sticky_ignorable(trimmed) {
+                continue;
+            }
+            let indent = Self::sticky_line_indent(line);
+            if indent < min_indent {
+                min_indent = indent;
+                if Self::is_sticky_scope_opener(trimmed) {
+                    scopes.push(idx);
+                }
+                if indent == 0 {
+                    break;
+                }
+            }
+        }
+        scopes.reverse();
+        if scopes.len() > MAX_STICKY_SCOPES {
+            scopes.drain(..scopes.len() - MAX_STICKY_SCOPES);
+        }
+        scopes
+    }
+
+    fn sticky_scopes_for_scroll(
+        content: &str,
+        ranges: &[Range<usize>],
+        scroll_top: f32,
+        line_height: f32,
+    ) -> Vec<usize> {
+        if scroll_top <= 0.5 || ranges.is_empty() || line_height <= 0. {
+            return Vec::new();
+        }
+        let max_line = ranges.len() - 1;
+        let base_probe = ((scroll_top / line_height).floor() as usize).min(max_line);
+        let mut scopes = Self::sticky_scope_lines(content, ranges, base_probe);
+        while !scopes.is_empty() {
+            let probe = (((scroll_top + scopes.len() as f32 * line_height) / line_height).floor()
+                as usize)
+                .min(max_line);
+            let next = Self::sticky_scope_lines(content, ranges, probe);
+            let prev_len = scopes.len();
+            scopes.retain(|line| next.contains(line));
+            if scopes.len() == prev_len {
+                break;
+            }
+        }
+        scopes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_sticky_scopes(
+        &self,
+        scopes: &[usize],
+        ranges: &[Range<usize>],
+        tokens: &[(Range<usize>, TokenKind)],
+        refs: &[TextReference],
+        gutter_width: Pixels,
+        gutter_pr: f32,
+        scroll_x: Pixels,
+        font: &gpui::Font,
+        font_size: Pixels,
+        line_height: Pixels,
+        colors: CodeColors,
+        use_viewport_scroll: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if scopes.is_empty() {
+            return None;
+        }
+        let reference_theme = self.reference_theme();
+        let input = cx.entity();
+        let rows = scopes
+            .iter()
+            .filter_map(|&index| {
+                let range = ranges.get(index)?.clone();
+                let start = range.start;
+                let runs = token_slice(tokens, range.clone())
+                    .iter()
+                    .map(|(token, kind)| TextRun {
+                        letter_spacing: None,
+                        len: token.end.min(range.end) - token.start.max(range.start),
+                        font: font.clone(),
+                        color: gpui::rgb_to_hsla(rgb(kind.color(colors))),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    })
+                    .collect::<Vec<_>>();
+                let runs = reference_runs(runs, start, refs, reference_theme);
+                let shaped = EditorLine::shape(
+                    window,
+                    false,
+                    self.content[range].to_owned().into(),
+                    font_size,
+                    &runs,
+                    None,
+                );
+                let line_number = (index + 1).to_string();
+                let target_y = -(index as f32 * f32::from(line_height));
+                Some(
+                    div()
+                        .id(SharedString::from(format!("code-sticky-line:{index}")))
+                        .debug_selector(move || format!("code-sticky-line:{index}"))
+                        .w_full()
+                        .h(line_height)
+                        .flex()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(colors.head).opacity(0.45)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if use_viewport_scroll {
+                                this.viewport_scroll
+                                    .scroll_to_item(index, gpui::ScrollStrategy::Top);
+                            } else {
+                                let x = this.scroll_y.offset().x;
+                                this.scroll_y.set_offset(point(x, px(target_y)));
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(gutter_width)
+                                .h_full()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .font_family(crate::code_font::family())
+                                .overflow_hidden()
+                                .pr(px(gutter_pr))
+                                .border_r_1()
+                                .border_color(rgb(colors.border))
+                                .child(div().flex_1().text_right().child(line_number)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .ml(px(8.) + scroll_x)
+                                        .w(shaped.width.max(px(1.)) + px(18.))
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .child(CodeLine {
+                                            input: input.clone(),
+                                            start,
+                                            width: shaped.width,
+                                            line: shaped,
+                                            line_height,
+                                            search_matches: Vec::new(),
+                                        }),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .debug_selector(|| "code-card-sticky-scopes".into())
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bg(rgb(colors.surface))
+                .border_b_1()
+                .border_color(rgb(colors.border))
+                .shadow_sm()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    fn parse_inline_conflicts(
+        content: &str,
+        ranges: &[Range<usize>],
+    ) -> Vec<(usize, usize, usize, String, String)> {
+        let mut hunks = Vec::new();
+        let mut start: Option<(usize, String)> = None;
+        let mut mid: Option<usize> = None;
+        for (line_idx, range) in ranges.iter().enumerate() {
+            let line = content[range.clone()].trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix("<<<<<<<") {
+                start = Some((line_idx, rest.trim().to_owned()));
+                mid = None;
+            } else if start.is_some() && mid.is_none() && line.starts_with("=======") {
+                mid = Some(line_idx);
+            } else if let (Some((s, ours)), Some(m)) = (&start, mid)
+                && let Some(rest) = line.strip_prefix(">>>>>>>")
+            {
+                hunks.push((*s, m, line_idx, ours.clone(), rest.trim().to_owned()));
+                start = None;
+                mid = None;
+            }
+        }
+        hunks
+    }
+
+    fn resolve_inline_conflict(&mut self, hunk_index: usize, side: usize, cx: &mut Context<Self>) {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for (idx, byte) in self.content.bytes().enumerate() {
+            if byte == b'\n' {
+                ranges.push(start..idx);
+                start = idx + 1;
+            }
+        }
+        if start <= self.content.len() {
+            ranges.push(start..self.content.len());
+        }
+        let hunks = Self::parse_inline_conflicts(&self.content, &ranges);
+        let Some((s, m, e, _, _)) = hunks.get(hunk_index).map(|(s, m, e, _, _)| (*s, *m, *e, (), ())) else {
+            return;
+        };
+        let replace_start = ranges[s].start;
+        let replace_end = if e + 1 < ranges.len() {
+            ranges[e + 1].start
+        } else {
+            self.content.len()
+        };
+        let ours_start = if s + 1 < ranges.len() {
+            ranges[s + 1].start
+        } else {
+            ranges[m].start
+        };
+        let ours = &self.content[ours_start..ranges[m].start];
+        let theirs_start = if m + 1 < ranges.len() {
+            ranges[m + 1].start
+        } else {
+            ranges[e].start
+        };
+        let theirs = &self.content[theirs_start..ranges[e].start];
+        let replacement = match side {
+            0 => ours.to_owned(),
+            1 => theirs.to_owned(),
+            _ => format!("{ours}{theirs}"),
+        };
+        if !self.read_only {
+            self.remember();
+        }
+        let mut next = String::with_capacity(self.content.len());
+        next.push_str(&self.content[..replace_start]);
+        next.push_str(&replacement);
+        next.push_str(&self.content[replace_end..]);
+        self.content = next.into();
+        let cursor = (replace_start + replacement.len()).min(self.content.len());
+        self.selected_range = cursor..cursor;
+        self.marked_range = None;
+        self.changed(cx);
+    }
+
+    fn attach_editing_actions(&self, card: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        card.on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::soft_newline))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::continue_after))
+    }
+
     fn render_viewport(
         &mut self,
         window: &mut Window,
@@ -3460,7 +3803,7 @@ impl CodeCard {
             let reset_scroll = self
                 .viewport_cache
                 .as_ref()
-                .is_none_or(|cache| cache.key.content != key.content);
+                .is_none_or(|cache| self.read_only && cache.key.content != key.content);
             let mut offset = 0;
             let ranges = self
                 .content
@@ -3575,6 +3918,42 @@ impl CodeCard {
                 gpui::ScrollStrategy::Top,
             );
         }
+        let sticky_overlay = if !folding {
+            let cache = self.viewport_cache.as_ref().unwrap();
+            let base = &self.viewport_scroll.0.borrow().base_handle;
+            let max_y = f32::from(base.max_offset().y).max(0.0);
+            let scroll_top = (-f32::from(base.offset().y)).clamp(0.0, max_y);
+            let scopes = Self::sticky_scopes_for_scroll(
+                &self.content,
+                &cache.ranges,
+                scroll_top,
+                LINE_HEIGHT,
+            );
+            self.render_sticky_scopes(
+                &scopes,
+                &cache.ranges,
+                &cache.tokens,
+                &refs,
+                gutter_width,
+                if folding { 5. } else { 9. },
+                self.scroll.offset().x,
+                &font,
+                font_size,
+                px(LINE_HEIGHT),
+                colors,
+                true,
+                window,
+                cx,
+            )
+        } else {
+            None
+        };
+        let inline_conflicts = if self.conflict_highlights {
+            let cache = self.viewport_cache.as_ref().unwrap();
+            Self::parse_inline_conflicts(&self.content, &cache.ranges)
+        } else {
+            Vec::new()
+        };
         let list = gpui::uniform_list(
             "code-card-viewport-lines",
             count,
@@ -3584,6 +3963,7 @@ impl CodeCard {
                 let input = cx.entity();
                 let offset = this.scroll.offset().x;
                 let selected_lines = this.selected_lines;
+                let conflict_total = inline_conflicts.len();
                 let cache = this.viewport_cache.as_mut().unwrap();
                 // Bound shaped glyph memory while retaining the document/token index.
                 if cache.lines.len() > 512 {
@@ -3619,15 +3999,30 @@ impl CodeCard {
                             .or_insert_with(|| {
                                 let runs = token_slice(&cache.tokens, range.clone())
                                     .iter()
-                                    .map(|(token, kind)| TextRun {
-                                        letter_spacing: None,
-                                        len: token.end.min(range.end)
-                                            - token.start.max(range.start),
-                                        font: font.clone(),
-                                        color: gpui::rgb_to_hsla(rgb(kind.color(colors))),
-                                        background_color: None,
-                                        underline: None,
-                                        strikethrough: None,
+                                    .filter_map(|(token, kind)| {
+                                        let from = token.start.max(range.start);
+                                        let to = token.end.min(range.end);
+                                        (from < to).then(|| TextRun {
+                                            letter_spacing: None,
+                                            len: to - from,
+                                            font: font.clone(),
+                                            color: gpui::rgb_to_hsla(rgb(kind.color(colors))),
+                                            background_color: None,
+                                            underline: this
+                                                .marked_range
+                                                .as_ref()
+                                                .filter(|marked| {
+                                                    marked.start < to && marked.end > from
+                                                })
+                                                .map(|_| UnderlineStyle {
+                                                    color: Some(gpui::rgb_to_hsla(rgb(
+                                                        colors.text,
+                                                    ))),
+                                                    thickness: px(1.),
+                                                    wavy: false,
+                                                }),
+                                            strikethrough: None,
+                                        })
                                     })
                                     .collect::<Vec<_>>();
                                 let runs = reference_runs(runs, start, &refs, reference_theme);
@@ -3654,11 +4049,70 @@ impl CodeCard {
                             px(LINE_HEIGHT),
                             cx,
                         );
-                        div()
+                        let conflict_role = inline_conflicts
+                            .iter()
+                            .enumerate()
+                            .find_map(|(h, (s, m, e, ours_lbl, theirs_lbl))| {
+                                if index < *s || index > *e {
+                                    None
+                                } else {
+                                    Some((h, *s, *m, *e, ours_lbl.clone(), theirs_lbl.clone()))
+                                }
+                            });
+                        let row_bg = match &conflict_role {
+                            Some((_, s, m, e, _, _)) => {
+                                if index == *s {
+                                    Some(if this.dark {
+                                        rgba(0x2563eb45)
+                                    } else {
+                                        rgb(0xc7dcff)
+                                    })
+                                } else if index > *s && index < *m {
+                                    Some(if this.dark {
+                                        rgba(0x2563eb1f)
+                                    } else {
+                                        rgb(0xeff5ff)
+                                    })
+                                } else if index == *m {
+                                    Some(if this.dark {
+                                        rgba(0x16a34a40)
+                                    } else {
+                                        rgb(0xccebd6)
+                                    })
+                                } else if index > *m && index < *e {
+                                    Some(if this.dark {
+                                        rgba(0x16a34a1c)
+                                    } else {
+                                        rgb(0xedf9f0)
+                                    })
+                                } else {
+                                    Some(if this.dark {
+                                        rgba(0x16a34a28)
+                                    } else {
+                                        rgb(0xdaf2e1)
+                                    })
+                                }
+                            }
+                            None => None,
+                        };
+                        let mut row = div()
                             .w_full()
                             .h(px(LINE_HEIGHT))
                             .flex()
-                            .when(selected, |row| row.bg(rgb(colors.selection).opacity(0.65)))
+                            .when_some(row_bg, |row, bg_color| row.bg(bg_color))
+                            .when(row_bg.is_none() && selected, |row| {
+                                row.bg(rgb(colors.selection).opacity(0.65))
+                            });
+                        if let Some((h, s, m, _, _, _)) = &conflict_role {
+                            if index == *s + 1 {
+                                let h = *h;
+                                row = row.debug_selector(move || format!("merge-side:{h}:0"));
+                            } else if index == *m + 1 {
+                                let h = *h;
+                                row = row.debug_selector(move || format!("merge-side:{h}:1"));
+                            }
+                        }
+                        let row = row
                             .child(
                                 div()
                                     .w(gutter_width)
@@ -3713,8 +4167,106 @@ impl CodeCard {
                                                 }),
                                         )
                                     }),
-                            )
-                            .child(
+                            );
+                        if let Some((h, s, m, e, ours_lbl, theirs_lbl)) = conflict_role
+                            && (index == s || index == m || index == e)
+                        {
+                            let accent_text = if this.dark { 0x93c5fd } else { 0x1d4ed8 };
+                            let incoming_text = if this.dark { 0x86efac } else { 0x15803d };
+                            let bar = if index == s {
+                                let label = if ours_lbl.is_empty() {
+                                    "当前".to_owned()
+                                } else {
+                                    format!("当前 · {ours_lbl}")
+                                };
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .text_size(px(11.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(colors.text))
+                                                    .child(label),
+                                            )
+                                            .children(
+                                                [
+                                                    ("采用当前", 0usize),
+                                                    ("采用传入", 1usize),
+                                                    ("保留两者", 2usize),
+                                                ]
+                                                .into_iter()
+                                                .map(|(btn_label, side)| {
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "inline-merge-choice:{h}:{side}"
+                                                        )))
+                                                        .debug_selector(move || {
+                                                            format!("merge-choice:{h}:{side}")
+                                                        })
+                                                        .cursor_pointer()
+                                                        .text_color(rgb(accent_text))
+                                                        .hover(|s| s.underline())
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                cx.stop_propagation();
+                                                                this.resolve_inline_conflict(
+                                                                    h, side, cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child(btn_label)
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(colors.comment))
+                                            .child(format!("{}/{}", h + 1, conflict_total)),
+                                    )
+                            } else if index == m {
+                                let label = if theirs_lbl.is_empty() {
+                                    "传入".to_owned()
+                                } else {
+                                    format!("传入 · {theirs_lbl}")
+                                };
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(incoming_text))
+                                    .child(label)
+                            } else {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .border_b_1()
+                                    .border_color(rgb(incoming_text).opacity(0.4))
+                            };
+                            return row.child(bar).into_any_element();
+                        }
+                        row.child(
                                 div().flex_1().min_w_0().h_full().overflow_hidden().child(
                                     div()
                                         .relative()
@@ -3747,6 +4299,7 @@ impl CodeCard {
                                         .children(reference_tooltips),
                                 ),
                             )
+                            .into_any_element()
                     })
                     .collect::<Vec<_>>()
             }),
@@ -3774,6 +4327,7 @@ impl CodeCard {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::quote_selection))
+            .when(!self.read_only, |card| self.attach_editing_actions(card, cx))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.context_menu.take().is_some() {
                     cx.stop_propagation();
@@ -3802,6 +4356,7 @@ impl CodeCard {
                             .min_w_0()
                             .min_h_0()
                             .child(list)
+                            .children(sticky_overlay)
                             .child(
                                 gpui::canvas(
                                     |bounds, window, _| {
@@ -3809,7 +4364,17 @@ impl CodeCard {
                                     },
                                     {
                                         let entity = cx.entity().downgrade();
-                                        move |_, hitbox: gpui::Hitbox, window, _cx| {
+                                        let strong = cx.entity();
+                                        let focus = self.focus_handle.clone();
+                                        let read_only = self.read_only;
+                                        move |bounds, hitbox: gpui::Hitbox, window, cx| {
+                                            if !read_only {
+                                                window.handle_input(
+                                                    &focus,
+                                                    ElementInputHandler::new(bounds, strong.clone()),
+                                                    cx,
+                                                );
+                                            }
                                             window.on_mouse_event(
                                     move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
                                         if phase == gpui::DispatchPhase::Capture
@@ -3856,7 +4421,7 @@ impl Render for CodeCard {
             CodeColors::LIGHT
         };
         let context_menu = self.context_menu_view(window, cx);
-        if self.viewport && self.read_only && !self.prose {
+        if self.viewport && !self.prose {
             return self
                 .render_viewport(window, cx, colors)
                 .children(context_menu);
@@ -4627,6 +5192,81 @@ impl Render for CodeCard {
                 );
             }
             return container.children(completion_popup).children(context_menu);
+        }
+        if self.viewport && !self.prose {
+            let mut ranges = Vec::new();
+            let mut start = 0usize;
+            for (idx, byte) in self.content.bytes().enumerate() {
+                if byte == b'\n' {
+                    ranges.push(start..idx);
+                    start = idx + 1;
+                }
+            }
+            if start <= self.content.len() {
+                ranges.push(start..self.content.len());
+            }
+            let max_y = f32::from(self.scroll_y.max_offset().y).max(0.0);
+            let scroll_top = (-f32::from(self.scroll_y.offset().y)).clamp(0.0, max_y);
+            let scopes = Self::sticky_scopes_for_scroll(
+                &self.content,
+                &ranges,
+                scroll_top,
+                f32::from(line_height),
+            );
+            let sticky_overlay = if scopes.is_empty() {
+                None
+            } else {
+                let tokens = tokens(&self.content, &self.language);
+                let font = window.text_style().font();
+                self.render_sticky_scopes(
+                    &scopes,
+                    &ranges,
+                    &tokens,
+                    &refs,
+                    viewport_gutter_width(ranges.len()),
+                    9.,
+                    self.scroll.offset().x,
+                    &font,
+                    font_size,
+                    line_height,
+                    colors,
+                    false,
+                    window,
+                    cx,
+                )
+            };
+            return div()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .when(self.inline_preview.is_none(), |card| {
+                    card.rounded(px(9.)).border_1()
+                })
+                .border_color(rgb(colors.border))
+                .overflow_hidden()
+                .bg(rgb(colors.surface))
+                .children(self.show_header.then_some(head))
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .id("code-card-vertical-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll_y)
+                                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                                .child(source),
+                        )
+                        .children(sticky_overlay),
+                )
+                .children(completion_popup)
+                .children(context_menu);
         }
         div()
             .w_full()
@@ -5999,5 +6639,71 @@ mod tests {
             link_tooltip_label(r"\\?\D:\Workspace\IM\main.go#L10", None),
             r"D:\Workspace\IM\main.go（第 10 行）"
         );
+    }
+
+    #[test]
+    fn sticky_scopes_pins_enclosing_blocks_when_scrolled() {
+        let source = "\
+impl Workbench {
+    pub fn oauth_before_send(&mut self) -> bool {
+        self.sending = Some(spawn(|| {
+            match result {
+                Ok(v) => {
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let f = 6;
+                    println!(\"{v} {a} {b} {c} {d} {e} {f}\");
+                }
+                Err(e) => {
+                    println!(\"{e}\");
+                }
+            }
+        }));
+        true
+    }
+}
+";
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for (idx, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                ranges.push(start..idx);
+                start = idx + 1;
+            }
+        }
+        assert!(CodeCard::sticky_scopes_for_scroll(source, &ranges, 0.0, 20.0).is_empty());
+        let scopes = CodeCard::sticky_scopes_for_scroll(source, &ranges, 20.0 * 5.2, 20.0);
+        assert_eq!(scopes, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[gpui::test]
+    fn editable_viewport_accepts_text_input_after_scrolling(cx: &mut gpui::TestAppContext) {
+        let source = (1..=80)
+            .map(|n| format!("let line_{n} = {n};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (editor, window) = cx.add_window_view(|_, cx| {
+            CodeCard::new(cx, "rust", source)
+                .show_header(false)
+                .read_only(false)
+                .viewport()
+        });
+        window.simulate_resize(size(px(600.), px(240.)));
+        editor.update(window, |editor, cx| {
+            editor.reveal_line_range(60, 60, cx);
+        });
+        window.update(|window, cx| {
+            let focus = editor.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        window.run_until_parked();
+        window.simulate_input("abc");
+        window.run_until_parked();
+        editor.read_with(window, |editor, _| {
+            assert!(editor.content().contains("abc"));
+        });
     }
 }

@@ -513,20 +513,15 @@ impl Workbench {
     pub(super) fn tab_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (index, position) = self.tab_menu?;
         let tab_position = self.tabs.iter().position(|&i| i == index)?;
-        let p = self.theme.palette();
-        let menu = div()
-            .id("request-tab-context-menu")
-            .w(px(200.))
-            .p_1()
-            .rounded(px(7.))
-            .border_1()
-            .border_color(rgb(p.border))
-            .bg(rgb(p.surface))
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+        let menu = gpui_glint::components::context_menu_surface(
+            "request-tab-context-menu",
+            self.theme,
+            200.,
+        )
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if this.tab_menu.take().is_some() {
                     cx.notify();
                 }
@@ -549,7 +544,7 @@ impl Workbench {
                         this.open_request_preview(index, window, cx)
                     })),
             )
-            .child(div().h(px(1.)).my_1().bg(rgb(p.border)))
+            .child(gpui_glint::components::menu_separator(self.theme))
             .child(
                 MenuItem::new("tab-close-others", "关闭其他标签页")
                     .disabled(self.tabs.len() <= 1)

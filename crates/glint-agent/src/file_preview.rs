@@ -474,10 +474,10 @@ impl State {
                     target.path = path.clone();
                     target.line = None;
                     target.end_line = None;
-                target.end_line = None;
                     this.open_file_preview(target, cx);
                 }
             }
+            FilePreviewEvent::SaveRequested { .. } => {}
         })
         .detach();
         Self {

@@ -2986,6 +2986,7 @@ impl AgentWorkspace {
             .when(busy, |controls| {
                 controls.child(
                     IconButton::new(Icon::Pause, "停止当前终端")
+                        .plain()
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -2998,6 +2999,7 @@ impl AgentWorkspace {
             .when(!busy, |controls| {
                 controls.child(
                     IconButton::new(Icon::Refresh, "重启当前终端")
+                        .plain()
                         .theme(self.theme)
                         .render()
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -3023,6 +3025,7 @@ impl AgentWorkspace {
             })
             .child(
                 IconButton::new(Icon::Copy, "复制输出")
+                    .plain()
                     .theme(self.theme)
                     .render()
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -3041,6 +3044,7 @@ impl AgentWorkspace {
                         },
                         "切换终端位置",
                     )
+                    .plain()
                     .theme(self.theme)
                     .render()
                     .debug_selector(|| "project-terminal-dock".into())
@@ -3056,6 +3060,7 @@ impl AgentWorkspace {
             })
             .child(
                 IconButton::new(Icon::Close, "隐藏终端（继续运行）")
+                    .plain()
                     .theme(self.theme)
                     .render()
                     .debug_selector(|| "project-terminal-hide".into())

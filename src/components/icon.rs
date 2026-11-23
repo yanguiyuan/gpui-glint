@@ -570,9 +570,10 @@ impl IconButton {
             .text_color(rgb(theme.color(0x505661)))
             .cursor_pointer()
             .hover(move |style| {
+                let p = theme.palette();
                 let style = style.text_color(rgb(theme.color(0x0874e8)));
                 if plain {
-                    style
+                    style.bg(rgb(p.surface_subtle))
                 } else {
                     style.bg(rgb(theme.color(0xf0f4f9)))
                 }

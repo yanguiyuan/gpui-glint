@@ -692,21 +692,13 @@ impl DataTable {
     }
     fn menu_element(&self, row: &TableRow, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
-        let mut menu = div()
-            .id("table-action-menu")
+        let mut menu = super::context_menu_surface("table-action-menu", self.theme, 180.)
             .absolute()
             .bottom(px(38.))
             .right_0()
-            .w(px(180.))
-            .p(px(6.))
             .flex()
             .flex_col()
             .gap(px(2.))
-            .rounded(px(11.))
-            .border_1()
-            .border_color(rgb(self.theme.palette().border))
-            .bg(rgb(self.theme.palette().surface))
-            .shadow_lg()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -720,12 +712,7 @@ impl DataTable {
             let action_id = action.id.clone();
             let danger = action.danger;
             if danger && index > 0 {
-                menu = menu.child(
-                    div()
-                        .h(px(1.))
-                        .my(px(3.))
-                        .bg(rgb(self.theme.palette().border)),
-                );
+                menu = menu.child(super::menu_separator(self.theme));
             }
             let color = action.color.unwrap_or(if danger {
                 theme.color(0xff3b30)
