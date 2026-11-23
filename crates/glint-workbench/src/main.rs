@@ -26,6 +26,7 @@ struct Workbench {
     api: Entity<glint_api::Workbench>,
     agent: Entity<glint_agent::AgentWorkspace>,
     db: Entity<glint_db::DbWorkspace>,
+    markdown: Entity<glint_mdeditor::MarkdownWorkspace>,
     navigation: Entity<Navigation>,
     route: Route,
     theme: ThemePreset,
@@ -71,6 +72,11 @@ impl Workbench {
             glint_api::Workbench::hosted_with_vault(shell.clone(), Some(vault.clone()), cx)
         });
         let db = cx.new(|cx| glint_db::DbWorkspace::hosted(shell.clone(), cx));
+        let markdown = cx.new(|cx| {
+            let mut markdown = glint_mdeditor::MarkdownWorkspace::hosted(shell.clone(), cx);
+            markdown.set_host_theme(ThemePreset::Moonstone, cx);
+            markdown
+        });
         let (tools, api_tools_task, plugin_catalog_subscription) =
             api_tools::ApiTools::connect(&api, &db, cx);
         let agent = cx.new(|cx| {
@@ -171,6 +177,14 @@ impl Workbench {
                     cx.notify();
                 }
             }),
+            cx.observe(&markdown, |this, _, cx| {
+                let theme = this.markdown.read(cx).host_theme();
+                if theme != this.theme {
+                    this.sync_theme(theme, cx);
+                    this.sync_navigation(cx);
+                    cx.notify();
+                }
+            }),
         ];
         Self {
             vault,
@@ -178,6 +192,7 @@ impl Workbench {
             api,
             agent,
             db,
+            markdown,
             navigation,
             route: Route::Agent(glint_agent::Page::Chat),
             theme: ThemePreset::Moonstone,
@@ -206,6 +221,14 @@ impl Workbench {
                 }
                 self.route = Route::Db;
             }
+            Action::Navigate(Route::Markdown) => {
+                if matches!(self.route, Route::Api(_)) {
+                    self.api.update(cx, |api, cx| api.deactivate(window, cx));
+                }
+                self.route = Route::Markdown;
+                let focus = self.markdown.read(cx).focus.clone();
+                window.focus(&focus, cx);
+            }
             Action::NewSession => {
                 self.dispatch(
                     Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
@@ -227,6 +250,8 @@ impl Workbench {
                     .update(cx, |agent, cx| agent.set_host_theme(self.theme, cx));
                 self.db
                     .update(cx, |db, cx| db.set_host_theme(self.theme, cx));
+                self.markdown
+                    .update(cx, |md, cx| md.set_host_theme(self.theme, cx));
             }
         }
         self.sync_navigation(cx);
@@ -269,6 +294,11 @@ impl Workbench {
                 db.set_host_theme(theme, cx);
             }
         });
+        self.markdown.update(cx, |md, cx| {
+            if md.host_theme() != theme {
+                md.set_host_theme(theme, cx);
+            }
+        });
     }
 }
 
@@ -280,6 +310,7 @@ impl Render for Workbench {
                 Route::Agent(_) => self.agent.clone().into_any_element(),
                 Route::Api(_) => self.api.clone().into_any_element(),
                 Route::Db => self.db.clone().into_any_element(),
+                Route::Markdown => self.markdown.clone().into_any_element(),
             })
     }
 }
@@ -313,6 +344,7 @@ fn main() {
             app_icon::install();
             glint_api::initialize(cx);
             glint_agent::initialize(cx);
+            glint_mdeditor::bind_workspace_keys(cx);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -335,9 +367,12 @@ fn main() {
                 |window, cx| {
                     let app = cx.new(|cx| Workbench::new(window, cx));
                     let api = app.read(cx).api.downgrade();
+                    let markdown = app.read(cx).markdown.downgrade();
                     window.on_window_should_close(cx, move |_, cx| {
                         let _ = api.update(cx, |api, cx| api.flush(cx));
-                        true
+                        markdown
+                            .update(cx, |md, cx| md.flush(cx))
+                            .unwrap_or(true)
                     });
                     app.update(cx, |app, cx| {
                         app.dispatch(

@@ -103,6 +103,7 @@ pub enum CodeCardEvent {
     QuoteRequested,
     LinkActivated(SharedString),
     Changed(SharedString),
+    LanguageChanged(SharedString),
     Focused,
     SelectionStarted {
         editor: gpui::EntityId,
@@ -241,6 +242,7 @@ pub struct CodeCard {
     focus_handle: FocusHandle,
     content: SharedString,
     language: SharedString,
+    language_menu_open: bool,
     read_only: bool,
     preview_links: bool,
     quote_context: bool,
@@ -627,6 +629,7 @@ impl CodeCard {
             focus_handle: cx.focus_handle(),
             content,
             language: language.into(),
+            language_menu_open: false,
             read_only: false,
             preview_links: false,
             quote_context: false,
@@ -4250,6 +4253,148 @@ impl Render for CodeCard {
         }
         let json_valid = self.json_valid();
         let can_format = json_valid == Some(true) && !self.read_only;
+        let active_language = if self.language.is_empty() {
+            SharedString::from("text")
+        } else {
+            self.language.clone()
+        };
+        let language_chip = if self.read_only {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    super::Icon::for_language(&self.language)
+                        .render(13.)
+                        .text_color(rgb(colors.comment)),
+                )
+                .child(active_language)
+                .into_any_element()
+        } else {
+            const PRESET_LANGUAGES: [&str; 15] = [
+                "text",
+                "go",
+                "json",
+                "rust",
+                "typescript",
+                "javascript",
+                "python",
+                "sql",
+                "bash",
+                "yaml",
+                "toml",
+                "html",
+                "css",
+                "markdown",
+                "mermaid",
+            ];
+            let theme = if self.dark {
+                ThemePreset::DarkObsidian
+            } else {
+                ThemePreset::Moonstone
+            };
+            let p = theme.palette();
+            let trigger = div()
+                .id("code-card-language-trigger")
+                .debug_selector(|| "code-card-language-trigger".into())
+                .px(px(6.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgba(if self.dark { 0xffffff14 } else { 0x0000000a })))
+                .child(
+                    super::Icon::for_language(&self.language)
+                        .render(13.)
+                        .text_color(rgb(colors.comment)),
+                )
+                .child(active_language.clone())
+                .child(
+                    super::Icon::ChevronDown
+                        .render(10.)
+                        .text_color(rgb(colors.comment)),
+                );
+            let menu_content = if self.language_menu_open {
+                let mut options: Vec<SharedString> = PRESET_LANGUAGES
+                    .iter()
+                    .map(|&name| SharedString::from(name))
+                    .collect();
+                if !options
+                    .iter()
+                    .any(|option| option.eq_ignore_ascii_case(active_language.as_ref()))
+                {
+                    options.insert(0, active_language.clone());
+                }
+                div()
+                    .id("code-card-language-menu")
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(options.into_iter().map(|lang| {
+                        let selected = lang.eq_ignore_ascii_case(active_language.as_ref());
+                        let option_lang = lang.clone();
+                        let selector = format!("code-card-language-option:{lang}");
+                        div()
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
+                            .px(px(8.))
+                            .py(px(5.))
+                            .rounded(px(5.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .text_color(rgb(if selected { p.accent } else { p.text }))
+                            .bg(if selected {
+                                rgb(p.accent_tint)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .hover(|style| style.bg(rgb(p.surface_subtle)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.language_menu_open = false;
+                                this.set_language(option_lang.clone(), cx);
+                                cx.emit(CodeCardEvent::LanguageChanged(this.language.clone()));
+                                cx.notify();
+                            }))
+                            .child(super::Icon::for_language(&lang).render(13.).text_color(rgb(
+                                if selected { p.accent } else { p.text_muted },
+                            )))
+                            .child(div().flex_1().child(lang))
+                            .when(selected, |row| {
+                                row.child(
+                                    super::Icon::CheckCircle
+                                        .render(11.)
+                                        .text_color(rgb(p.accent)),
+                                )
+                            })
+                    }))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            };
+            let weak = cx.entity().downgrade();
+            super::Popover::new("code-card-language-popover", trigger, menu_content)
+                .open(self.language_menu_open)
+                .align_left()
+                .width(168.)
+                .trigger_height(22.)
+                .gap(4.)
+                .padding(4.)
+                .theme(theme)
+                .on_open_change(move |open, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.language_menu_open = open;
+                        cx.notify();
+                    });
+                })
+                .into_any_element()
+        };
         let mut head = div()
             .h(px(35.))
             .flex_shrink_0()
@@ -4262,16 +4407,7 @@ impl Render for CodeCard {
             .bg(rgb(colors.head))
             .text_size(px(10.))
             .text_color(rgb(colors.comment))
-            .child(
-                super::Icon::for_language(&self.language)
-                    .render(13.)
-                    .text_color(rgb(colors.comment)),
-            )
-            .child(if self.language.is_empty() {
-                SharedString::from("text")
-            } else {
-                self.language.clone()
-            })
+            .child(language_chip)
             .child(div().flex_1());
         if let Some(valid) = json_valid {
             head = head.child(
@@ -5814,5 +5950,37 @@ mod tests {
     #[test]
     fn ime_offsets_are_relative_to_composition() {
         assert_eq!(utf16_range("中😀文", &(1..3)), 3..7);
+    }
+
+    #[gpui::test]
+    fn language_dropdown_switches_language_and_emits_event(cx: &mut gpui::TestAppContext) {
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let (editor, window) = cx.add_window_view(|_, cx| CodeCard::new(cx, "go", "{\"a\":1}"));
+        let _observer = window.new(|cx: &mut Context<()>| {
+            cx.subscribe(&editor, move |_, _, event: &CodeCardEvent, _| {
+                if let CodeCardEvent::LanguageChanged(lang) = event {
+                    recorded.borrow_mut().push(lang.to_string());
+                }
+            })
+            .detach();
+        });
+        window.simulate_resize(size(px(640.), px(400.)));
+        window.run_until_parked();
+        let trigger = window
+            .debug_bounds("code-card-language-trigger")
+            .expect("language trigger");
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        let option = window
+            .debug_bounds("code-card-language-option:json")
+            .expect("json option in language menu");
+        window.simulate_click(option.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.language.as_ref(), "json");
+            assert!(!editor.language_menu_open);
+        });
+        assert_eq!(events.borrow().as_slice(), &["json"]);
     }
 }

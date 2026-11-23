@@ -3431,6 +3431,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glint-mdeditor"
+version = "0.1.0"
+dependencies = [
+ "gpui-ce",
+ "gpui-glint",
+ "gpui_ce_platform",
+ "objc2 0.6.4",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "glint-plugin"
 version = "0.1.0"
 dependencies = [
@@ -3524,6 +3536,7 @@ dependencies = [
  "glint-agent",
  "glint-api",
  "glint-db",
+ "glint-mdeditor",
  "glint-vault",
  "gpui-ce",
  "gpui-glint",

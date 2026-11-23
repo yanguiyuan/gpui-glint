@@ -1,17 +1,14 @@
-mod app_icon;
-mod storage;
-
+use crate::storage;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FontWeight, PathPromptOptions, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba,
-    size,
+    App, AppContext, Context, Entity, Focusable, FontWeight, PathPromptOptions, Subscription,
+    Window, div, prelude::*, px, rgb, rgba,
 };
 use gpui_glint::{
     components::{
         AppLayout, Button, ButtonKind, ButtonSize, CodeCard, CodeCardEvent, DocumentEditor,
-        DocumentEvent, DropdownGroup, DropdownItem, GlintAssets, GroupedDropdown, Icon, IconButton,
-        SearchInput, SegmentOption, SegmentedControl, TextEntry, ThemeSelector, ThemeSelectorEvent,
-        Toast, ToastHost, ToastKind, Tooltip, bind_document_editor_keys, bind_text_entry_keys,
+        DocumentEvent, DropdownGroup, DropdownItem, GroupedDropdown, Icon, IconButton,
+        SearchInput, SegmentOption, SegmentedControl, ShellRenderer, TextEntry, Toast, ToastHost,
+        ToastKind, Tooltip, WorkspaceSlots, bind_document_editor_keys, bind_text_entry_keys,
     },
     theme::ThemePreset,
 };
@@ -29,6 +26,7 @@ gpui::actions!(
         OpenDocument,
         SaveDocument,
         CloseDocument,
+        FindInDocument,
         QuitWorkspace
     ]
 );
@@ -46,8 +44,9 @@ struct OpenDoc {
     _subscriptions: Vec<Subscription>,
 }
 
-struct MarkdownWorkspace {
-    focus: gpui::FocusHandle,
+pub struct MarkdownWorkspace {
+    pub focus: gpui::FocusHandle,
+    shell: Option<ShellRenderer>,
     more_menu: Entity<GroupedDropdown>,
     root: PathBuf,
     recent: Vec<PathBuf>,
@@ -57,19 +56,57 @@ struct MarkdownWorkspace {
     next_id: u64,
     theme: ThemePreset,
     sidebar_visible: bool,
-    theme_selector: Entity<ThemeSelector>,
     search: Entity<TextEntry>,
+    doc_search: Entity<TextEntry>,
+    doc_search_open: bool,
+    doc_search_match: Option<(usize, usize)>,
     notice: String,
     toasts: Entity<ToastHost>,
     search_query: String,
     search_matches: HashSet<PathBuf>,
     search_task: Option<gpui::Task<()>>,
     _search_subscription: Subscription,
-    _theme_subscription: Subscription,
+    _doc_search_subscription: Subscription,
 }
 
 impl MarkdownWorkspace {
-    fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn default_library_root() -> PathBuf {
+        let root = storage::library_path().expect("无法确定文档库位置");
+        let new_library = !root.exists();
+        fs::create_dir_all(&root).expect("无法创建文档库");
+        if new_library {
+            storage::create(&root, "示例文档", include_str!("welcome.md"))
+                .expect("无法创建欢迎文档");
+        }
+        root
+    }
+
+    pub fn hosted(shell: ShellRenderer, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(Self::default_library_root(), cx);
+        this.shell = Some(shell);
+        this
+    }
+
+    pub fn host_theme(&self) -> ThemePreset {
+        self.theme
+    }
+
+    pub fn set_host_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
+        self.set_theme(theme, cx);
+    }
+
+    pub fn flush(&mut self, cx: &mut Context<Self>) -> bool {
+        let ids: Vec<_> = self.documents.iter().map(|doc| doc.id).collect();
+        let mut saved = true;
+        for id in ids {
+            saved &= self.save(id);
+        }
+        self.persist_session();
+        cx.notify();
+        saved
+    }
+
+    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextEntry::new(cx, "搜索文档内容或标题", ""));
         let subscription = cx.observe(&search, |this, search, cx| {
             let query = search.read(cx).value().trim().to_owned();
@@ -86,6 +123,10 @@ impl MarkdownWorkspace {
             }
             cx.notify();
         });
+        let doc_search = cx.new(|cx| TextEntry::new(cx, "在当前文档中查找", ""));
+        let doc_search_subscription = cx.observe(&doc_search, |this, _, cx| {
+            this.sync_doc_search(true, cx);
+        });
         let owner = cx.weak_entity();
         let more_menu = cx.new(|_| {
             GroupedDropdown::new("更多")
@@ -97,17 +138,10 @@ impl MarkdownWorkspace {
                 })
         });
         let toasts = cx.new(|_| ToastHost::new());
-        let theme_selector = cx.new(|cx| ThemeSelector::new(cx).width(220.));
-        let theme_subscription = cx.subscribe(
-            &theme_selector,
-            |this, _, event: &ThemeSelectorEvent, cx| {
-                let ThemeSelectorEvent::Changed(theme) = event;
-                this.set_theme(*theme, cx);
-            },
-        );
         let mut this = Self {
             toasts,
             focus: cx.focus_handle(),
+            shell: None,
             more_menu,
             recent: Vec::new(),
             sidebar_filter: 0,
@@ -116,15 +150,17 @@ impl MarkdownWorkspace {
             next_id: 1,
             theme: ThemePreset::Sage,
             sidebar_visible: true,
-            theme_selector,
             root,
             search,
+            doc_search,
+            doc_search_open: false,
+            doc_search_match: None,
             notice: "改动自动保存到本机".into(),
             search_query: String::new(),
             search_matches: HashSet::new(),
             search_task: None,
             _search_subscription: subscription,
-            _theme_subscription: theme_subscription,
+            _doc_search_subscription: doc_search_subscription,
         };
         let session = fs::read_to_string(this.root.join("session.json"))
             .ok()
@@ -186,11 +222,9 @@ impl MarkdownWorkspace {
         {
             this.open_path(path, cx);
         }
-        this.theme_selector.update(cx, |selector, cx| {
-            selector.set_selected(this.theme, cx);
-            selector.set_theme(this.theme, cx);
-        });
         this.search
+            .update(cx, |entry, cx| entry.set_theme(this.theme, cx));
+        this.doc_search
             .update(cx, |entry, cx| entry.set_theme(this.theme, cx));
         this.more_menu
             .update(cx, |menu, cx| menu.set_theme(this.theme, cx));
@@ -338,6 +372,97 @@ impl MarkdownWorkspace {
             return;
         }
         self.open_path(path, cx);
+    }
+
+    fn active_doc_query(&self, cx: &gpui::App) -> String {
+        if self.doc_search_open {
+            self.doc_search.read(cx).value().to_owned()
+        } else {
+            self.search_query.clone()
+        }
+    }
+
+    fn sync_doc_search(&mut self, reveal_first: bool, cx: &mut Context<Self>) {
+        let query = self.active_doc_query(cx);
+        let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
+            self.doc_search_match = None;
+            return;
+        };
+        let editor = doc.editor.clone();
+        let source = doc.source.clone();
+        let source_mode = doc.source_mode;
+        editor.update(cx, |editor, cx| editor.set_search_query(query.clone(), cx));
+        source.update(cx, |source, cx| source.set_search_query(query.clone(), cx));
+        if query.is_empty() {
+            self.doc_search_match = None;
+        } else if source_mode {
+            self.doc_search_match = source.update(cx, |source, cx| {
+                let count = source.search_match_count();
+                if count == 0 {
+                    None
+                } else if reveal_first {
+                    source.reveal_search_match(0, cx).then_some((0, count))
+                } else {
+                    Some((0, count))
+                }
+            });
+        } else {
+            self.doc_search_match = editor.update(cx, |editor, cx| {
+                let count = editor.search_match_count();
+                if count == 0 {
+                    None
+                } else if reveal_first {
+                    editor.reveal_search_match(0, cx).then_some((0, count))
+                } else {
+                    Some((0, count))
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    fn step_doc_search(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
+            return;
+        };
+        let Some((current, count)) = self.doc_search_match else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let next = if previous {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        };
+        if doc.source_mode {
+            doc.source
+                .update(cx, |source, cx| source.reveal_search_match(next, cx));
+        } else {
+            doc.editor
+                .update(cx, |editor, cx| editor.reveal_search_match(next, cx));
+        }
+        self.doc_search_match = Some((next, count));
+        cx.notify();
+    }
+
+    fn open_doc_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active.is_none() {
+            return;
+        }
+        self.doc_search_open = true;
+        let focus = self.doc_search.focus_handle(cx);
+        window.focus(&focus, cx);
+        self.sync_doc_search(true, cx);
+    }
+
+    fn close_doc_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.doc_search_open = false;
+        self.doc_search_match = None;
+        self.sync_doc_search(false, cx);
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     fn refresh_search(&mut self, cx: &mut Context<Self>) {
@@ -636,11 +761,9 @@ impl MarkdownWorkspace {
 
     fn set_theme(&mut self, theme: ThemePreset, cx: &mut Context<Self>) {
         self.theme = theme;
-        self.theme_selector.update(cx, |selector, cx| {
-            selector.set_selected(theme, cx);
-            selector.set_theme(theme, cx);
-        });
         self.search
+            .update(cx, |entry, cx| entry.set_theme(theme, cx));
+        self.doc_search
             .update(cx, |entry, cx| entry.set_theme(theme, cx));
         self.more_menu
             .update(cx, |menu, cx| menu.set_theme(theme, cx));
@@ -698,22 +821,33 @@ impl Render for MarkdownWorkspace {
         self.more_menu
             .update(cx, |menu, cx| menu.set_groups(groups, cx));
         let workspace = cx.entity();
-        let topbar = div()
+        let hosted = self.shell.is_some();
+        let mut topbar = div()
             .size_full()
-            .pl(px(if cfg!(target_os = "macos") { 84. } else { 16. }))
+            .pl(px(if hosted {
+                0.
+            } else if cfg!(target_os = "macos") {
+                84.
+            } else {
+                16.
+            }))
             .pr_4()
             .flex()
             .items_center()
             .gap_3()
             .text_size(px(12.))
-            .text_color(rgb(p.text_muted))
-            .child(div().size(px(8.)).rounded(px(3.)).bg(rgb(p.accent)))
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(p.text))
-                    .child("GLINT MARKDOWN"),
-            )
+            .text_color(rgb(p.text_muted));
+        if !hosted {
+            topbar = topbar
+                .child(div().size(px(8.)).rounded(px(3.)).bg(rgb(p.accent)))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.text))
+                        .child("GLINT MARKDOWN"),
+                );
+        }
+        let topbar = topbar
             .child(
                 Tooltip::new(
                     div()
@@ -758,7 +892,6 @@ impl Render for MarkdownWorkspace {
                 },
             )
             .child(gpui_glint::components::window_drag_region())
-            .child(self.theme_selector.clone())
             .when(has_document, |bar| {
                 bar.child(
                     SegmentedControl::new([SegmentOption::new("排版"), SegmentOption::new("源码")])
@@ -938,7 +1071,7 @@ impl Render for MarkdownWorkspace {
                     .child("导入副本 · 自动保存 · 无需联网"),
             );
 
-        let mut content = div().size_full().min_w_0();
+        let mut content = div().relative().size_full().min_w_0();
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
             if doc.source_mode {
                 content = content.child(
@@ -960,6 +1093,86 @@ impl Render for MarkdownWorkspace {
                         .border_color(rgb(p.border))
                         .overflow_hidden()
                         .child(doc.editor.clone()),
+                );
+            }
+            if self.doc_search_open {
+                let status = self.doc_search_match.map_or_else(
+                    || "无匹配".to_owned(),
+                    |(index, count)| format!("{} / {count}", index + 1),
+                );
+                let has_query = !self.doc_search.read(cx).value().is_empty();
+                content = content.child(
+                    div()
+                        .debug_selector(|| "markdown-doc-search-bar".into())
+                        .absolute()
+                        .top(px(12.))
+                        .right(px(16.))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .bg(rgb(p.surface))
+                        .shadow_md()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("markdown-doc-search-input")
+                                .w(px(200.))
+                                .h(px(28.))
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "escape" {
+                                            this.close_doc_search(window, cx);
+                                            cx.stop_propagation();
+                                        } else if event.keystroke.key == "enter" {
+                                            this.step_doc_search(
+                                                event.keystroke.modifiers.shift,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .child(self.doc_search.clone()),
+                        )
+                        .when(has_query, |bar| {
+                            bar.child(
+                                div()
+                                    .px_1()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(p.text_muted))
+                                    .child(status),
+                            )
+                        })
+                        .when(self.doc_search_match.is_some(), |bar| {
+                            bar.children(
+                                [
+                                    (Icon::ChevronUp, "上一个匹配", true),
+                                    (Icon::ChevronDown, "下一个匹配", false),
+                                ]
+                                .map(|(icon, label, previous)| {
+                                    IconButton::new(icon, label)
+                                        .plain()
+                                        .theme(self.theme)
+                                        .render()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.step_doc_search(previous, cx)
+                                        }))
+                                }),
+                            )
+                        })
+                        .child(
+                            IconButton::new(Icon::Close, "关闭搜索")
+                                .plain()
+                                .theme(self.theme)
+                                .render()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_doc_search(window, cx);
+                                })),
+                        ),
                 );
             }
         } else {
@@ -1024,14 +1237,71 @@ impl Render for MarkdownWorkspace {
                     this.close_document(id, cx);
                 }
             }))
-            .child(
+            .on_action(cx.listener(|this, _: &FindInDocument, window, cx| {
+                this.open_doc_search(window, cx);
+            }))
+            .child(if let Some(shell) = &self.shell {
+                shell(WorkspaceSlots {
+                    topbar: topbar.into_any_element(),
+                    sidebar: sidebar.into_any_element(),
+                    sidebar_width: 244.,
+                    sidebar_visible: self.sidebar_visible,
+                    sidebar_resize_handle: None,
+                    content: content.into_any_element(),
+                    theme: self.theme,
+                })
+            } else {
                 AppLayout::new(topbar, sidebar, content)
                     .sidebar_width(244.)
                     .sidebar_visible(self.sidebar_visible)
-                    .theme(self.theme),
-            )
+                    .theme(self.theme)
+                    .into_any_element()
+            })
             .child(self.toasts.clone())
     }
+}
+
+pub fn bind_workspace_keys(cx: &mut App) {
+    bind_text_entry_keys(cx);
+    bind_document_editor_keys(cx);
+    for modifier in ["cmd", "ctrl"] {
+        cx.bind_keys([
+            gpui::KeyBinding::new(
+                &format!("{modifier}-n"),
+                NewDocument,
+                Some("MarkdownWorkspace"),
+            ),
+            gpui::KeyBinding::new(
+                &format!("{modifier}-o"),
+                OpenDocument,
+                Some("MarkdownWorkspace"),
+            ),
+            gpui::KeyBinding::new(
+                &format!("{modifier}-s"),
+                SaveDocument,
+                Some("MarkdownWorkspace"),
+            ),
+            gpui::KeyBinding::new(
+                &format!("{modifier}-w"),
+                CloseDocument,
+                Some("MarkdownWorkspace"),
+            ),
+            gpui::KeyBinding::new(
+                &format!("{modifier}-f"),
+                FindInDocument,
+                Some("MarkdownWorkspace"),
+            ),
+        ]);
+    }
+}
+
+#[allow(dead_code)]
+pub fn open_external(
+    workspace: &Entity<MarkdownWorkspace>,
+    path: PathBuf,
+    cx: &mut App,
+) {
+    workspace.update(cx, |workspace, cx| workspace.open_external(path, cx));
 }
 
 /// `~/...` abbreviation for paths under the home directory.
@@ -1046,134 +1316,54 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn main() {
-    let cli_path = std::env::args().nth(1);
-    if cli_path
-        .as_deref()
-        .is_some_and(|arg| arg == "-h" || arg == "--help")
-    {
-        println!("用法：mdeditor [Markdown 文件路径]");
-        println!("  不带参数时打开本机文档库；带路径时直接打开该文件预览。");
-        return;
-    }
-    let root = storage::library_path().expect("无法确定文档库位置");
-    let new_library = !root.exists();
-    fs::create_dir_all(&root).expect("无法创建文档库");
-    if new_library {
-        storage::create(&root, "示例文档", include_str!("welcome.md")).expect("无法创建欢迎文档");
-    }
-    gpui_platform::application()
-        .with_assets(GlintAssets)
-        .run(move |cx: &mut App| {
-            app_icon::install();
-            bind_text_entry_keys(cx);
-            bind_document_editor_keys(cx);
-            cx.set_menus(vec![
-                gpui::Menu {
-                    disabled: false,
-                    name: "Glint Markdown".into(),
-                    items: vec![gpui::MenuItem::action("退出 Glint Markdown", QuitWorkspace)],
-                },
-                gpui::Menu {
-                    disabled: false,
-                    name: "文件".into(),
-                    items: vec![
-                        gpui::MenuItem::action("新建文档", NewDocument),
-                        gpui::MenuItem::action("打开 Markdown…", OpenDocument),
-                        gpui::MenuItem::action("保存", SaveDocument),
-                        gpui::MenuItem::action("关闭文档", CloseDocument),
-                    ],
-                },
-            ]);
-            cx.bind_keys([
-                gpui::KeyBinding::new("cmd-q", QuitWorkspace, None),
-                gpui::KeyBinding::new("ctrl-q", QuitWorkspace, None),
-            ]);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            for modifier in ["cmd", "ctrl"] {
-                cx.bind_keys([
-                    gpui::KeyBinding::new(
-                        &format!("{modifier}-n"),
-                        NewDocument,
-                        Some("MarkdownWorkspace"),
-                    ),
-                    gpui::KeyBinding::new(
-                        &format!("{modifier}-o"),
-                        OpenDocument,
-                        Some("MarkdownWorkspace"),
-                    ),
-                    gpui::KeyBinding::new(
-                        &format!("{modifier}-s"),
-                        SaveDocument,
-                        Some("MarkdownWorkspace"),
-                    ),
-                    gpui::KeyBinding::new(
-                        &format!("{modifier}-w"),
-                        CloseDocument,
-                        Some("MarkdownWorkspace"),
-                    ),
-                ]);
-            }
-            let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(16.), px(14.))),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    let workspace = cx.new(|cx| MarkdownWorkspace::new(root, cx));
-                    if let Some(path) = cli_path.clone() {
-                        workspace
-                            .update(cx, |workspace, cx| workspace.open_external(path.into(), cx));
-                    }
-                    let focus = workspace.read(cx).focus.clone();
-                    window.focus(&focus, cx);
-                    let quit_workspace = workspace.downgrade();
-                    cx.on_action(move |_: &QuitWorkspace, cx| {
-                        let saved = quit_workspace
-                            .update(cx, |this, cx| {
-                                let ids: Vec<_> = this.documents.iter().map(|doc| doc.id).collect();
-                                let mut saved = true;
-                                for id in ids {
-                                    saved &= this.save(id);
-                                }
-                                this.persist_session();
-                                cx.notify();
-                                saved
-                            })
-                            .unwrap_or(true);
-                        if saved {
-                            cx.quit();
-                        }
-                    });
-                    let weak = workspace.downgrade();
-                    window.on_window_should_close(cx, move |_, cx| {
-                        weak.update(cx, |this, cx| {
-                            let ids: Vec<_> = this.documents.iter().map(|doc| doc.id).collect();
-                            let mut saved = true;
-                            for id in ids {
-                                saved &= this.save(id);
-                            }
-                            this.persist_session();
-                            cx.notify();
-                            saved
-                        })
-                        .unwrap_or(true)
-                    });
-                    workspace
-                },
-            )
-            .expect("无法打开编辑器窗口");
-            cx.activate(true);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{px, size};
+
+    #[gpui::test]
+    fn ctrl_f_opens_document_search_steps_matches_and_escape_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_workspace_keys);
+        let dir = tempfile::tempdir().unwrap();
+        storage::create(
+            dir.path(),
+            "测试文档",
+            "第一段 关键词\n\n第二段 关键词\n",
+        )
+        .unwrap();
+        let (workspace, window) =
+            cx.add_window_view(|_, cx| MarkdownWorkspace::new(dir.path().to_path_buf(), cx));
+        window.simulate_resize(size(px(1200.), px(800.)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("markdown-doc-search-bar").is_none());
+        let focus = workspace.read_with(window, |ws, _| ws.focus.clone());
+        window.update(|window, cx| window.focus(&focus, cx));
+        window.simulate_keystrokes("ctrl-f");
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("markdown-doc-search-bar").is_some(),
+            "ctrl-f must open the document search bar"
+        );
+        workspace.update(window, |ws, cx| {
+            ws.doc_search
+                .update(cx, |entry, cx| entry.set_value("关键词", cx));
         });
+        window.run_until_parked();
+        workspace.read_with(window, |ws, _| {
+            assert_eq!(ws.doc_search_match, Some((0, 2)));
+        });
+        window.simulate_keystrokes("enter");
+        window.run_until_parked();
+        workspace.read_with(window, |ws, _| {
+            assert_eq!(ws.doc_search_match, Some((1, 2)));
+        });
+        window.simulate_keystrokes("escape");
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("markdown-doc-search-bar").is_none(),
+            "escape must close the document search bar"
+        );
+    }
 }

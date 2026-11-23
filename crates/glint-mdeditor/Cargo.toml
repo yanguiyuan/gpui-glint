@@ -1,0 +1,22 @@
+[package]
+name = "glint-mdeditor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Markdown document editor and library workspace for Glint."
+license = "MIT"
+publish = false
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+gpui-glint = { path = "../.." }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
+[dev-dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2", features = ["test-support"] }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "wayland", "x11", "test-support"] }
+tempfile = "3"

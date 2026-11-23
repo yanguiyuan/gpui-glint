@@ -6,6 +6,7 @@ pub enum Route {
     Api(glint_api::Page),
     Agent(glint_agent::Page),
     Db,
+    Markdown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +89,7 @@ mod tests {
                 Action::Navigate(Route::Api(glint_api::Page::Mcp)),
             ),
             ("nav-db", Action::Navigate(Route::Db)),
+            ("nav-markdown", Action::Navigate(Route::Markdown)),
             (
                 "nav-agent",
                 Action::Navigate(Route::Agent(glint_agent::Page::Chat)),
@@ -215,6 +217,7 @@ impl Render for Navigation {
                 Route::Api(Api::Mcp),
             ),
             ("nav-db", Icon::Database, "数据库管理", Route::Db),
+            ("nav-markdown", Icon::Text, "Markdown 文档", Route::Markdown),
             ("nav-vault", Icon::Key, "密码箱", Route::Api(Api::Vault)),
             (
                 "nav-settings",

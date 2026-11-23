@@ -399,6 +399,54 @@ impl DocumentEditor {
         }
         cx.notify();
     }
+
+    /// Total case-insensitive matches of the current `search_query` across title and blocks.
+    pub fn search_match_count(&self) -> usize {
+        if self.search_query.is_empty() {
+            return 0;
+        }
+        let title_matches = self
+            .title
+            .as_deref()
+            .map_or(0, |t| super::search_highlight::match_ranges(t, &self.search_query).len());
+        let block_matches: usize = self
+            .blocks
+            .iter()
+            .map(|b| super::search_highlight::match_ranges(&b.markdown, &self.search_query).len())
+            .sum();
+        title_matches + block_matches
+    }
+
+    /// Scroll the document viewport to the zero-based `index` match of `search_query`.
+    pub fn reveal_search_match(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.search_query.is_empty() {
+            return false;
+        }
+        let mut cursor = 0usize;
+        if let Some(title) = self.title.as_deref() {
+            let count = super::search_highlight::match_ranges(title, &self.search_query).len();
+            if index < cursor + count {
+                self.scroll.scroll_to_item(0);
+                cx.notify();
+                return true;
+            }
+            cursor += count;
+        }
+        let title_offset = usize::from(self.title.is_some());
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            let count =
+                super::search_highlight::match_ranges(&block.markdown, &self.search_query).len();
+            if index < cursor + count {
+                self.reveal_block = Some(block.id);
+                self.scroll.scroll_to_item(block_idx + title_offset);
+                cx.notify();
+                return true;
+            }
+            cursor += count;
+        }
+        false
+    }
+
     /// Controls whether the editor clips its outer corners to a rounded shape.
     pub fn rounded_corners(mut self, rounded: bool) -> Self {
         self.rounded_corners = rounded;
@@ -749,6 +797,20 @@ impl DocumentEditor {
         }
         self.changed(cx);
     }
+    fn source_language_changed(&mut self, id: u64, language: &str, cx: &mut Context<Self>) {
+        let Some(i) = self.index(id) else { return };
+        if self.blocks[i].kind() != DocumentBlockKind::Code || self.source_mode == Some(id) {
+            return;
+        }
+        let (old_lang, body) = md::code(&self.blocks[i].markdown);
+        if old_lang == language {
+            return;
+        }
+        self.remember();
+        self.edit_group = None;
+        self.blocks[i].markdown = md::fence(language, &body);
+        self.changed(cx);
+    }
     fn source_event(&mut self, id: u64, event: &CodeCardEvent, cx: &mut Context<Self>) {
         match event {
             CodeCardEvent::QuoteRequested => {}
@@ -774,6 +836,9 @@ impl DocumentEditor {
             }
             CodeCardEvent::FormatApplied => self.edit_group = None,
             CodeCardEvent::Changed(value) => self.source_changed(id, value, cx),
+            CodeCardEvent::LanguageChanged(language) => {
+                self.source_language_changed(id, language, cx)
+            }
             CodeCardEvent::ContinueAfter => self.insert_after(id, "", cx),
             CodeCardEvent::UndoRequested => self.undo(cx),
             CodeCardEvent::RedoRequested => self.redo(cx),
@@ -4108,5 +4173,24 @@ mod tests {
         let leaf = super::block_leaves(&result[0].markdown).remove(0);
         let text = super::rich_text::RichText::parse(&format!("{}\n\n{references}", leaf.source));
         assert_eq!(text.text, "keep 链续 tail");
+    }
+
+    #[gpui::test]
+    fn code_block_language_change_updates_markdown_fence(cx: &mut gpui::TestAppContext) {
+        let (doc, window) = cx.add_window_view(|_, cx| {
+            super::DocumentEditor::new(cx, "```go\n{\"ok\":true}\n```")
+        });
+        window.simulate_resize(gpui::size(gpui::px(800.), gpui::px(500.)));
+        window.run_until_parked();
+        let id = doc.read_with(window, |doc, _| doc.blocks[0].id);
+        let code = doc.read_with(window, |doc, _| doc.views[&id].source.clone());
+        code.update(window, |code, cx| {
+            code.set_language("json", cx);
+            cx.emit(super::CodeCardEvent::LanguageChanged("json".into()));
+        });
+        window.run_until_parked();
+        doc.read_with(window, |doc, _| {
+            assert_eq!(doc.markdown(), "```json\n{\"ok\":true}\n```");
+        });
     }
 }
