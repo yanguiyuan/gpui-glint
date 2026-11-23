@@ -236,7 +236,7 @@ pub struct CodeCard {
     search_query: SharedString,
     active_search_match: Option<Range<usize>>,
     pending_reveal: Option<Range<usize>>,
-    selected_line: Option<usize>,
+    selected_lines: Option<(usize, usize)>,
     track_selected_line: bool,
     focus_handle: FocusHandle,
     content: SharedString,
@@ -589,7 +589,8 @@ impl CodeCard {
             return false;
         };
         if self.track_selected_line {
-            self.selected_line = Some(self.source_line_at_offset(range.start));
+            let line = self.source_line_at_offset(range.start);
+            self.selected_lines = Some((line, line));
         }
         self.active_search_match = Some(range.clone());
         self.pending_reveal = Some(range);
@@ -621,7 +622,7 @@ impl CodeCard {
             search_query: "".into(),
             active_search_match: None,
             pending_reveal: None,
-            selected_line: None,
+            selected_lines: None,
             track_selected_line: false,
             focus_handle: cx.focus_handle(),
             content,
@@ -896,23 +897,56 @@ impl CodeCard {
         self
     }
 
-    /// The highlighted one-based source line, independent of the text selection.
+    /// The first highlighted one-based source line, independent of the text selection.
     pub fn selected_line(&self) -> Option<usize> {
-        self.selected_line
+        self.selected_lines.map(|(start, _)| start)
+    }
+
+    /// The highlighted inclusive one-based source line range, independent of the text selection.
+    pub fn selected_lines(&self) -> Option<(usize, usize)> {
+        self.selected_lines
+    }
+
+    fn is_line_selected(&self, line: usize) -> bool {
+        self.selected_lines
+            .is_some_and(|(start, end)| start <= line && line <= end)
+    }
+
+    fn source_line_count(&self) -> usize {
+        self.source_ranges().map_or_else(
+            || 1 + self.content.bytes().filter(|&b| b == b'\n').count(),
+            |ranges| ranges.len().max(1),
+        )
+    }
+
+    fn normalize_line_range(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start == 0 || end == 0 {
+            return None;
+        }
+        let total = self.source_line_count();
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if lo > total {
+            return None;
+        }
+        Some((lo, hi.min(total)))
     }
 
     /// Highlight a one-based source line without scrolling or changing focus.
     /// Pass `None` or an out-of-range number to clear the highlight.
     pub fn set_selected_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
-        let line = line.filter(|&line| {
-            line != 0
-                && self.source_ranges().map_or_else(
-                    || self.content.split('\n').nth(line - 1).is_some(),
-                    |ranges| line <= ranges.len(),
-                )
-        });
-        if self.selected_line != line {
-            self.selected_line = line;
+        self.set_selected_lines(line.map(|line| (line, line)), cx);
+    }
+
+    /// Highlight an inclusive one-based source line range without scrolling or changing focus.
+    /// Pass `None` or an out-of-range start line to clear the highlight.
+    pub fn set_selected_lines(&mut self, lines: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        let lines = lines.and_then(|(start, end)| self.normalize_line_range(start, end));
+        if self.selected_lines != lines {
+            self.selected_lines = lines;
             cx.notify();
         }
     }
@@ -956,9 +990,22 @@ impl CodeCard {
 
     /// Reveal a one-based source line in the read-only viewport without focus changes.
     pub fn reveal_line(&mut self, line: usize, cx: &mut Context<Self>) {
-        let offset = self.source_line_start(line);
+        self.reveal_line_range(line, line, cx);
+    }
+
+    /// Reveal and highlight an inclusive one-based source line range in the read-only viewport.
+    pub fn reveal_line_range(&mut self, start_line: usize, end_line: usize, cx: &mut Context<Self>) {
+        let (start_line, end_line) = if start_line <= end_line {
+            (start_line, end_line)
+        } else {
+            (end_line, start_line)
+        };
+        let offset = self.source_line_start(start_line);
         if self.track_selected_line {
-            self.selected_line = Some(self.source_line_at_offset(offset));
+            let resolved_start = self.source_line_at_offset(offset);
+            let total = self.source_line_count();
+            let resolved_end = end_line.max(resolved_start).min(total);
+            self.selected_lines = Some((resolved_start, resolved_end));
         }
         self.pending_reveal = Some(offset..offset);
         cx.notify();
@@ -992,7 +1039,7 @@ impl CodeCard {
         self.content = value.into();
         self.active_search_match = None;
         self.pending_reveal = None;
-        self.selected_line = None;
+        self.selected_lines = None;
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
         self.history.clear();
@@ -1210,7 +1257,7 @@ impl CodeCard {
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.active_search_match = None;
         self.pending_reveal = None;
-        self.selected_line = None;
+        self.selected_lines = None;
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.reveal_cursor = true;
         let value = if let Some(rich) = &mut self.rich {
@@ -1587,7 +1634,8 @@ impl CodeCard {
                 event.position.y >= bounds.top() && event.position.y < bounds.bottom()
             })
         {
-            self.selected_line = Some(self.source_line_at_offset(*start));
+            let line = self.source_line_at_offset(*start);
+            self.selected_lines = Some((line, line));
         }
         if self.document_managed {
             cx.emit(CodeCardEvent::SelectionStarted {
@@ -3531,6 +3579,7 @@ impl CodeCard {
                 let content = this.content.clone();
                 let input = cx.entity();
                 let offset = this.scroll.offset().x;
+                let selected_lines = this.selected_lines;
                 let cache = this.viewport_cache.as_mut().unwrap();
                 // Bound shaped glyph memory while retaining the document/token index.
                 if cache.lines.len() > 512 {
@@ -3539,7 +3588,8 @@ impl CodeCard {
                 indexes
                     .map(|visible_index| {
                         let index = cache.visible[visible_index];
-                        let selected = this.selected_line == Some(index + 1);
+                        let selected = selected_lines
+                            .is_some_and(|(start, end)| start <= index + 1 && index + 1 <= end);
                         let fold = if folding {
                             cache.folds.as_ref().and_then(|folds| folds.get(&index))
                         } else {
@@ -4107,7 +4157,7 @@ impl Render for CodeCard {
             if start > 0 && self.content.as_bytes()[start - 1] == b'\n' {
                 source_line += 1;
             }
-            let selected = self.selected_line == Some(source_line);
+            let selected = self.is_line_selected(source_line);
             let current = focused
                 && self.selected_range.is_empty()
                 && self.document_selection.is_none()
@@ -5194,6 +5244,24 @@ mod tests {
         editor.read_with(window, |editor, _| {
             assert!(editor.viewport_scroll.0.borrow().base_handle.offset().y < px(-10_000.));
             assert_eq!(editor.selected_range, selection);
+        });
+        editor.update(window, |editor, cx| {
+            editor.set_selected_lines(Some((10, 25)), cx);
+        });
+        editor.read_with(window, |editor, _| {
+            assert_eq!(editor.selected_lines(), Some((10, 25)));
+            assert_eq!(editor.selected_line(), Some(10));
+            assert!(!editor.is_line_selected(9));
+            assert!(editor.is_line_selected(10));
+            assert!(editor.is_line_selected(18));
+            assert!(editor.is_line_selected(25));
+            assert!(!editor.is_line_selected(26));
+        });
+        editor.update(window, |editor, cx| {
+            editor.reveal_line_range(120, 135, cx);
+        });
+        editor.read_with(window, |editor, _| {
+            assert!(editor.pending_reveal.is_some());
         });
     }
 

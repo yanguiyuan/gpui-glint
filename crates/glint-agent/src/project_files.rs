@@ -995,6 +995,7 @@ impl ProjectFiles {
             root: Some(root.clone()),
             path,
             line: None,
+            end_line: None,
         };
         let work = cx.background_executor().spawn(read(target));
         self.task = Some(cx.spawn(async move |weak, cx| {
@@ -1032,6 +1033,7 @@ impl ProjectFiles {
             root: self.root.clone(),
             path: path.clone(),
             line: None,
+            end_line: None,
         };
         let work = cx.background_executor().spawn(read(target));
         let task = cx.spawn(async move |weak, cx| {
@@ -1292,6 +1294,7 @@ impl ProjectFiles {
             root: self.root.clone(),
             path: path.clone(),
             line: None,
+            end_line: None,
         };
         let work = cx.background_executor().spawn(read(target));
         let document_view = view.downgrade();

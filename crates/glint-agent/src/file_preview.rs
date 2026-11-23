@@ -26,7 +26,18 @@ pub struct Target {
     pub root: Option<PathBuf>,
     pub path: String,
     pub line: Option<usize>,
+    pub end_line: Option<usize>,
 }
+
+fn parse_line_span(anchor: &str) -> Option<(usize, Option<usize>)> {
+    let mut parts = anchor.split('-');
+    let start = parts.next()?.parse::<usize>().ok()?;
+    let end = parts
+        .next()
+        .and_then(|part| part.strip_prefix('L').unwrap_or(part).parse::<usize>().ok());
+    Some((start, end))
+}
+
 fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
     let mut value = value
         .trim()
@@ -41,16 +52,19 @@ fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
         return None;
     }
     let mut line = None;
-    if let Some((path, anchor)) = value.rsplit_once("#L") {
-        if let Ok(number) = anchor.split('-').next()?.parse::<usize>() {
-            line = Some(number);
-            value = path.to_owned();
-        }
+    let mut end_line = None;
+    if let Some((path, anchor)) = value.rsplit_once("#L")
+        && let Some((start, end)) = parse_line_span(anchor)
+    {
+        line = Some(start);
+        end_line = end;
+        value = path.to_owned();
     }
     for _ in 0..2 {
         if let Some((path, number)) = value.rsplit_once(':') {
-            if let Ok(number) = number.split('-').next().unwrap_or(number).parse::<usize>() {
-                line = Some(number);
+            if let Some((start, end)) = parse_line_span(number) {
+                line = Some(start);
+                end_line = end;
                 value = path.to_owned();
             } else {
                 break;
@@ -86,6 +100,7 @@ fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
             root: root.clone(),
             path: value,
             line,
+            end_line,
         });
     }
     let path = if let Some(suffix) = value.strip_prefix("~/") {
@@ -102,6 +117,7 @@ fn target(value: &str, root: &Option<PathBuf>) -> Option<Target> {
         root: root.clone(),
         path: path.to_string_lossy().into_owned(),
         line,
+        end_line,
     })
 }
 
@@ -197,6 +213,7 @@ async fn load_with_navigation(
                 root,
                 path: parent,
                 line: None,
+                end_line: None,
             })
             .await
             {
@@ -425,6 +442,7 @@ impl State {
                 };
                 target.path = path.clone();
                 target.line = None;
+                target.end_line = None;
                 let request = *request;
                 let path = path.clone();
                 let work = cx.background_executor().spawn(async move {
@@ -455,6 +473,8 @@ impl State {
                 if let Some(mut target) = this.file_preview.target.clone() {
                     target.path = path.clone();
                     target.line = None;
+                    target.end_line = None;
+                target.end_line = None;
                     this.open_file_preview(target, cx);
                 }
             }
@@ -587,6 +607,7 @@ impl AgentWorkspace {
             if !reference.text_attachment {
                 if let Some(mut target) = target(&reference.path, origin) {
                     target.line = reference.start_line;
+                    target.end_line = reference.end_line;
                     self.open_file_preview(target, cx);
                 }
                 return;
@@ -670,6 +691,7 @@ impl AgentWorkspace {
                 root: Some(root),
                 path,
                 line: None,
+                end_line: None,
             },
             cx,
         );
@@ -695,6 +717,7 @@ impl AgentWorkspace {
             .map(str::to_owned);
         self.file_preview.task = Some(cx.spawn(async move |weak, cx| {
             let line = target.line;
+            let end_line = target.end_line;
             let work = cx.background_executor().spawn(async move {
                 if target.root.as_deref().is_some_and(ssh_project::is_remote) {
                     provider::Job::start(load_with_navigation(target, known_directory))?
@@ -752,7 +775,7 @@ impl AgentWorkspace {
                         view.set_file(path, parent, language, content, cx);
                         view.set_rendered_preview(rendered, cx);
                         if let Some(line) = line {
-                            view.reveal_line(line, cx);
+                            view.reveal_line_range(line, end_line.unwrap_or(line), cx);
                         }
                     }
                     Ok((path, parent, Loaded::Directory(mut entries, truncated))) => {
@@ -843,6 +866,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     line: Some(42),
+                    end_line: None,
                 })
             );
         });
@@ -946,6 +970,7 @@ mod tests {
             root: None,
             path: path.to_string_lossy().into_owned(),
             line: None,
+            end_line: None,
         };
         let (_, _, loaded) = load(target.clone()).await.unwrap();
         assert!(matches!(loaded, Loaded::Image(data) if data == bytes));
@@ -968,6 +993,7 @@ mod tests {
             root: Some(dir.path().into()),
             path: path.to_string_lossy().into_owned(),
             line: None,
+            end_line: None,
         };
         let mut reference = gpui_glint::components::ComposerReference::file(
             path.to_string_lossy().into_owned(),
@@ -1031,6 +1057,12 @@ mod tests {
             markdown_target("src/main.rs:42:5", &root).unwrap().line,
             Some(42)
         );
+        let range = target("src/main.rs#L1-500", &root).unwrap();
+        assert_eq!(range.line, Some(1));
+        assert_eq!(range.end_line, Some(500));
+        let github_range = target("src/main.rs#L10-L25", &root).unwrap();
+        assert_eq!(github_range.line, Some(10));
+        assert_eq!(github_range.end_line, Some(25));
     }
     #[gpui::test]
     fn ordinary_file_references_load_display_preview_without_sending_source(
@@ -1199,6 +1231,7 @@ mod tests {
                     root: Some(root.clone()),
                     path: root.to_string_lossy().into_owned(),
                     line: None,
+                    end_line: None,
                 },
                 cx,
             );
@@ -1300,6 +1333,7 @@ mod tests {
                     root: Some(root.clone()),
                     path: root.join("a.rs").to_string_lossy().into_owned(),
                     line: None,
+                    end_line: None,
                 },
                 cx,
             );
@@ -1403,6 +1437,7 @@ mod tests {
                     root: Some(dir.path().into()),
                     path: dir.path().to_string_lossy().into_owned(),
                     line: None,
+                    end_line: None,
                 },
                 cx,
             );

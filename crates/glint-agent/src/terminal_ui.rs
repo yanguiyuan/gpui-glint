@@ -143,6 +143,7 @@ impl OpenFile {
             root: Some(root.to_path_buf()),
             path: self.path.to_string_lossy().into_owned(),
             line: self.line,
+            end_line: None,
         })
     }
 }

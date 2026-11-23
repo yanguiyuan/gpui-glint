@@ -81,6 +81,12 @@ pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbS
         }
     }
 
+    let sep = if !prefix_str.is_empty() && !prefix_str.starts_with("ssh://") {
+        '\\'
+    } else {
+        '/'
+    };
+
     if normal_names.is_empty() {
         let display = if has_root {
             if prefix_str.is_empty() {
@@ -88,7 +94,7 @@ pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbS
             } else if prefix_str.ends_with('/') || prefix_str.ends_with('\\') {
                 prefix_str
             } else {
-                format!("{prefix_str}/")
+                format!("{prefix_str}{sep}")
             }
         } else {
             prefix_str
@@ -113,10 +119,10 @@ pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbS
         } else if prefix_str.ends_with('/') || prefix_str.ends_with('\\') {
             prefix_str.clone()
         } else {
-            format!("{prefix_str}/")
+            format!("{prefix_str}{sep}")
         }
     } else if !prefix_str.is_empty() {
-        format!("{prefix_str}/")
+        format!("{prefix_str}{sep}")
     } else {
         String::new()
     };
@@ -133,7 +139,7 @@ pub fn split_breadcrumbs(full_path: &str, is_leaf_file: bool) -> Vec<BreadcrumbS
         {
             current_path.push_str(&name);
         } else {
-            current_path.push('/');
+            current_path.push(sep);
             current_path.push_str(&name);
         }
 
@@ -277,7 +283,7 @@ pub struct FilePreview {
     search_match: Option<(usize, usize)>,
     search_open: bool,
     pending_search: Option<(String, Option<usize>)>,
-    pending_line: Option<usize>,
+    pending_line: Option<(usize, usize)>,
     _search_subscription: gpui::Subscription,
     subscriptions: Vec<gpui::Subscription>,
 }
@@ -551,8 +557,8 @@ impl FilePreview {
         self.page = Page::File(editor);
         self.search_match = None;
         self.search.update(cx, |entry, cx| entry.set_value("", cx));
-        if let Some(line) = self.pending_line.take() {
-            self.reveal_line(line, cx);
+        if let Some((start, end)) = self.pending_line.take() {
+            self.reveal_line_range(start, end, cx);
         }
         if let Some((query, line)) = self.pending_search.take() {
             self.set_document_search(query, line, cx);
@@ -715,12 +721,26 @@ impl FilePreview {
         cx.notify();
     }
     pub fn reveal_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.reveal_line_range(line, line, cx);
+    }
+
+    pub fn reveal_line_range(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let range = if start_line <= end_line {
+            (start_line, end_line)
+        } else {
+            (end_line, start_line)
+        };
         if let Page::File(editor) = &self.page {
             self.markdown_preview = false;
-            editor.update(cx, |editor, cx| editor.reveal_line(line, cx));
+            editor.update(cx, |editor, cx| editor.reveal_line_range(range.0, range.1, cx));
             cx.notify();
         } else if matches!(self.page, Page::Loading) {
-            self.pending_line = Some(line);
+            self.pending_line = Some(range);
         }
     }
 
@@ -2270,6 +2290,33 @@ mod tests {
         assert_eq!(ssh_segs[0].name, "user");
         assert_eq!(ssh_segs.last().unwrap().name, "index.js");
         assert_eq!(ssh_segs.last().unwrap().dir_path, "ssh://user@host/home/user/app");
+
+        #[cfg(windows)]
+        {
+            let win_verbatim = split_breadcrumbs(
+                r"\\?\D:\Workspace\IM\kim\internal\logic\app_message.go",
+                true,
+            );
+            assert_eq!(win_verbatim[0].name, "Workspace");
+            assert_eq!(win_verbatim[1].name, "IM");
+            assert_eq!(win_verbatim[1].dir_path, r"\\?\D:\Workspace\IM");
+            assert_eq!(
+                win_verbatim.last().unwrap().dir_path,
+                r"\\?\D:\Workspace\IM\kim\internal\logic"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let nested = dir.path().join("Workspace").join("IM");
+            std::fs::create_dir_all(&nested).unwrap();
+            let file = nested.join("app_message.go");
+            std::fs::write(&file, "package logic\n").unwrap();
+            let canonical = file.canonicalize().unwrap();
+            let segs = split_breadcrumbs(&canonical.to_string_lossy(), true);
+            let im_seg = segs.iter().find(|s| s.name == "IM").unwrap();
+            let entries = FilePreview::read_local_directory_entries(&im_seg.dir_path)
+                .expect("Windows verbatim breadcrumb dir_path must be readable");
+            assert!(entries.iter().any(|e| e.name == "app_message.go"));
+        }
     }
 
     #[gpui::test]

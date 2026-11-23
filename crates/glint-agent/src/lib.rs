@@ -2579,38 +2579,42 @@ impl AgentWorkspace {
                                 .items_end()
                                 .gap_2()
                                 .when(!self.is_editing_message(index) && !message.images.is_empty(), |col| {
-                                    let decoded_images: Vec<std::sync::Arc<Image>> = message
+                                    let slots: Vec<Option<std::sync::Arc<Image>>> = message
                                         .images
                                         .iter()
                                         .enumerate()
-                                        .filter_map(|(i, img)| {
+                                        .map(|(i, img)| {
                                             let key = format!("{}:{index}:img{i}", self.history.active);
                                             self.user_image(key, img, cx)
                                         })
                                         .collect();
+                                    let gallery: Vec<std::sync::Arc<Image>> =
+                                        slots.iter().flatten().cloned().collect();
+                                    let mut gallery_cursor = 0usize;
                                     col.child(div().flex().flex_wrap().justify_end().gap_2().children(
-                                        decoded_images.iter().enumerate().map(
-                                            |(image_index, source)| {
-                                                let gallery = decoded_images.clone();
-                                                let selector = format!(
-                                                    "message-image:{index}:{image_index}"
-                                                );
-                                                div()
-                                                    .id(("message-image", index * 16 + image_index))
-                                                    .debug_selector(move || selector.clone())
-                                                    .w(px(160.))
-                                                    .h(px(120.))
-                                                    .flex_shrink_0()
-                                                    .overflow_hidden()
-                                                    .rounded(px(12.))
-                                                    .border_1()
-                                                    .border_color(rgb(p.border))
-                                                    .cursor_pointer()
+                                        slots.into_iter().enumerate().map(|(image_index, source)| {
+                                            let selector =
+                                                format!("message-image:{index}:{image_index}");
+                                            let card = div()
+                                                .id(("message-image", index * 16 + image_index))
+                                                .debug_selector(move || selector.clone())
+                                                .w(px(160.))
+                                                .h(px(120.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .rounded(px(12.))
+                                                .border_1()
+                                                .border_color(rgb(p.border));
+                                            if let Some(source) = source {
+                                                let gallery = gallery.clone();
+                                                let gallery_index = gallery_cursor;
+                                                gallery_cursor += 1;
+                                                card.cursor_pointer()
                                                     .hover(|style| {
                                                         style.border_color(rgb(p.accent))
                                                     })
                                                     .child(
-                                                        img(source.clone())
+                                                        img(source)
                                                             .size_full()
                                                             .object_fit(ObjectFit::Cover),
                                                     )
@@ -2618,22 +2622,38 @@ impl AgentWorkspace {
                                                         move |this, _, window, cx| {
                                                             this.open_image_preview(
                                                                 gallery.clone(),
-                                                                image_index,
+                                                                gallery_index,
                                                                 window,
                                                                 cx,
                                                             );
                                                         },
                                                     ))
-                                            },
-                                        ),
+                                            } else {
+                                                card.bg(rgb(bubble_bg))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .px_3()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(p.text_muted))
+                                                    .child("图片无法显示")
+                                            }
+                                        }),
                                     ))
                                 })
                                 .when_some(self.message_retry_editor(index, cx), |col, editor| {
                                     col.child(div().w_full().max_w(px(620.)).child(editor))
                                 })
                                 .when(!self.is_editing_message(index) && has_text, |col| {
+                                    let needs_full_width =
+                                        !message.blocks.is_empty() || has_rich_markdown;
                                     col.child(
                                         div()
+                                            .debug_selector(move || {
+                                                format!("user-message-bubble:{index}").into()
+                                            })
+                                            .when(needs_full_width, |bubble| bubble.w_full())
+                                            .min_w_0()
                                             .max_w(px(620.))
                                             .rounded(px(18.))
                                             .border_1()

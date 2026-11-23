@@ -17,6 +17,7 @@ pub struct ToolPanel {
     active: bool,
     output_panel: Option<Entity<gpui_glint::components::CollapsePanel>>,
     output_scroll: ScrollHandle,
+    output_scrollbar: gpui_glint::components::ScrollbarState,
     diff_scroll: ScrollHandle,
     signature: String,
     theme: ThemePreset,
@@ -1079,6 +1080,7 @@ impl AgentWorkspace {
                     active: false,
                     output_panel: None,
                     output_scroll: ScrollHandle::new(),
+                    output_scrollbar: Default::default(),
                     diff_scroll: ScrollHandle::new(),
                     signature: String::new(),
                     theme,
@@ -1094,6 +1096,7 @@ impl AgentWorkspace {
             )
             .then(|| crate::command_output::Output::parse(&result, theme));
             let result_scroll = entry.output_scroll.clone();
+            let output_scrollbar = entry.output_scrollbar.clone();
             let diff_scroll = entry.diff_scroll.clone();
             if record.result == "执行中…" {
                 scroll_follow::follow_if_at_bottom(&result_scroll);
@@ -1623,7 +1626,8 @@ impl AgentWorkspace {
                                                     div()
                                                         .w_full()
                                                         .min_w_0()
-                                                        .px_3()
+                                                        .pl_3()
+                                                        .pr(px(16.))
                                                         .py(px(10.))
                                                         .child(
                                                             if pending_body {
@@ -1655,7 +1659,12 @@ impl AgentWorkspace {
                                                 .from_scroll(&result_scroll)
                                                 .height(16.)
                                                 .render(),
-                                        ),
+                                        )
+                                        .child(tool_output_scrollbar(
+                                            &result_scroll,
+                                            &output_scrollbar,
+                                            theme,
+                                        )),
                                 )
                                 .into_any_element();
                         }
@@ -1737,30 +1746,49 @@ impl AgentWorkspace {
                                     .unwrap_or_else(|_| div().into_any_element());
                             }
                             div()
-                                .id("tool-output")
-                                .debug_selector(|| "tool-output".into())
+                                .relative()
                                 .w_full()
                                 .min_w_0()
                                 .flex_shrink_0()
-                                .max_h(px(320.))
-                                .relative()
-                                .overflow_y_scroll()
-                                .track_scroll(&result_scroll)
-                                .text_size(px(12.))
-                                .line_height(px(20.))
-                                .font_family("monospace")
-                                .text_color(rgb(p.text_muted))
-                                .child(div().w_full().min_w_0().child(if pending_body {
+                                .child(
                                     div()
-                                        .py_1()
-                                        .child(pending_skeleton(pending_id.clone(), theme))
-                                        .into_any_element()
-                                } else if let Some(output) = &command_output {
-                                    output.render().into_any_element()
-                                } else {
-                                    div().child(result.clone()).into_any_element()
-                                }))
-                                .child(crate::command_output::scroll_guard(&result_scroll, 20.))
+                                        .id("tool-output")
+                                        .debug_selector(|| "tool-output".into())
+                                        .w_full()
+                                        .min_w_0()
+                                        .max_h(px(320.))
+                                        .relative()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&result_scroll)
+                                        .text_size(px(12.))
+                                        .line_height(px(20.))
+                                        .font_family("monospace")
+                                        .text_color(rgb(p.text_muted))
+                                        .child(div().w_full().min_w_0().pr(px(14.)).child(
+                                            if pending_body {
+                                                div()
+                                                    .py_1()
+                                                    .child(pending_skeleton(
+                                                        pending_id.clone(),
+                                                        theme,
+                                                    ))
+                                                    .into_any_element()
+                                            } else if let Some(output) = &command_output {
+                                                output.render().into_any_element()
+                                            } else {
+                                                div().child(result.clone()).into_any_element()
+                                            },
+                                        ))
+                                        .child(crate::command_output::scroll_guard(
+                                            &result_scroll,
+                                            20.,
+                                        )),
+                                )
+                                .child(tool_output_scrollbar(
+                                    &result_scroll,
+                                    &output_scrollbar,
+                                    theme,
+                                ))
                                 .into_any_element()
                         })();
                         gpui_glint::components::OperationPanel::new(operation_title.clone())
@@ -1975,6 +2003,7 @@ impl AgentWorkspace {
                             active: false,
                             output_panel: None,
                             output_scroll: ScrollHandle::new(),
+                            output_scrollbar: Default::default(),
                             diff_scroll: ScrollHandle::new(),
                             signature: String::new(),
                             theme,
@@ -2471,6 +2500,25 @@ type OutputCard = (
     f32,
 );
 
+/// Right-edge vertical scrollbar overlay for scrollable tool output panes.
+fn tool_output_scrollbar(
+    scroll: &ScrollHandle,
+    state: &gpui_glint::components::ScrollbarState,
+    theme: ThemePreset,
+) -> gpui::Div {
+    div()
+        .debug_selector(|| "tool-output-scrollbar".into())
+        .absolute()
+        .top(px(4.))
+        .right(px(2.))
+        .bottom(px(4.))
+        .child(
+            gpui_glint::components::Scrollbar::vertical(scroll, state)
+                .theme(theme)
+                .render(),
+        )
+}
+
 fn code_mode_result_view(
     cards: &[OutputCard],
     theme: ThemePreset,
@@ -2886,6 +2934,94 @@ mod tests {
         assert!(
             outer.offset().y < before,
             "at the output boundary the conversation can take over"
+        );
+    }
+
+    #[gpui::test]
+    fn dragging_command_output_scrollbar_scrolls_without_moving_outer_conversation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Preview {
+            host: Entity<AgentWorkspace>,
+            panel: Entity<gpui_glint::components::CollapsePanel>,
+            outer: ScrollHandle,
+        }
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("command-scrollbar-outer")
+                    .h(px(400.))
+                    .w(px(600.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.outer)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().h(px(300.)).flex_shrink_0())
+                            .child(self.panel.clone())
+                            .child(div().h(px(500.)).flex_shrink_0()),
+                    )
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (preview, window) = cx.add_window_view(|_, cx| {
+            let host =
+                cx.new(|cx| AgentWorkspace::with_path(directory.path().join("sessions.json"), cx));
+            let record = tools::rejected(
+                tools::ToolCall {
+                    id: "scrollbar".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"program":"cargo"}),
+                },
+                "\x1b[32mChecking crate\x1b[0m\n".repeat(100),
+            );
+            let panel = host.update(cx, |host, cx| host.tool_panel("scrollbar", &record, cx));
+            panel.update(cx, |panel, cx| panel.set_expanded(true, cx));
+            Preview {
+                host,
+                panel,
+                outer: ScrollHandle::new(),
+            }
+        });
+        preview.update(window, |view, cx| {
+            view.outer.set_offset(point(px(0.), px(-250.)));
+            cx.notify();
+        });
+        window.run_until_parked();
+        let (outer, inner) = preview.read_with(window, |view, cx| {
+            (
+                view.outer.clone(),
+                view.host.read(cx).tool_panels.borrow()["scrollbar:tool:scrollbar"]
+                    .output_scroll
+                    .clone(),
+            )
+        });
+        let rail = window
+            .debug_bounds("tool-output-scrollbar")
+            .expect("command output scrollbar rail");
+        let before_outer = outer.offset().y;
+        assert_eq!(inner.offset().y, px(0.));
+        let start = point(rail.center().x, rail.top() + px(12.));
+        let end = point(rail.center().x, rail.bottom() - px(12.));
+        window.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+        window.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+        window.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+        window.run_until_parked();
+        assert!(
+            inner.offset().y < px(0.),
+            "dragging the scrollbar must scroll the command output: {:?}",
+            inner.offset()
+        );
+        assert_eq!(
+            outer.offset().y,
+            before_outer,
+            "dragging the command output scrollbar must not scroll the outer conversation"
         );
     }
 
@@ -3533,6 +3669,46 @@ mod tests {
         assert!(
             window.debug_bounds("agent-image-lightbox").is_none(),
             "clicking the scrim must close the viewer"
+        );
+    }
+
+    #[gpui::test]
+    fn user_rich_markdown_bubble_does_not_collapse_and_broken_image_shows_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("providers.json"),
+            r#"{"providers":[],"active":null,"active_model":""}"#,
+        )
+        .unwrap();
+        let (host, window) = cx.add_window_view(|_, cx| {
+            let mut host = AgentWorkspace::with_path(directory.path().join("sessions.json"), cx);
+            host.history.active_mut().push_message(
+                Role::User,
+                "请看这段 `example` 说明文字\n第二行内容".into(),
+                vec![crate::model::MessageImage {
+                    media_type: "image/png".into(),
+                    data: "not-valid-base64!".into(),
+                    file: None,
+                }],
+            );
+            host
+        });
+        let _ = &host;
+        window.simulate_resize(size(px(1000.), px(760.)));
+        window.run_until_parked();
+        let image_card = window
+            .debug_bounds("message-image:0:0")
+            .expect("broken image must still render a fallback card");
+        assert!(image_card.size.width >= px(150.));
+        assert!(image_card.size.height >= px(110.));
+        let bubble = window
+            .debug_bounds("user-message-bubble:0")
+            .expect("user message bubble");
+        assert!(
+            bubble.size.width > px(100.),
+            "rich markdown bubble must not collapse to an empty pill: {bubble:?}"
         );
     }
 
